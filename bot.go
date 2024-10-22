@@ -31,5 +31,17 @@ func Bot() *tg.Bot {
 		return DownloadSong(b, ctx)
 	})
 
+	b.Handle("/album", func(ctx tg.Context) error {
+		return ctx.Reply("Album support is WIP.")
+	})
+
+	b.Handle("/playlist", func(ctx tg.Context) error {
+		return ctx.Reply("Playlist support is WIP.")
+	})
+
+	b.Handle("/artist", func(ctx tg.Context) error {
+		return ctx.Reply("Artist support is WIP.")
+	})
+
 	return b
 }

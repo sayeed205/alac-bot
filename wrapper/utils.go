@@ -589,7 +589,7 @@ func decryptSong(info *SongInfo, keys []string, manifest *AutoSong, bot *tg.Bot,
 		for range ticker.C {
 			percentage := float64(totalProcessed) / float64(totalSize) * 100
 			_, err := bot.Edit(msg, fmt.Sprintf("Decrypting - (%.2f%%)", percentage))
-			if err != nil {
+			if !strings.Contains(err.Error(), "not modified") {
 				fmt.Println("Error updating message:", err)
 			}
 		}

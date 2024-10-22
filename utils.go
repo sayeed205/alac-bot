@@ -3,6 +3,7 @@ package main
 import (
 	"alac-bot/wrapper"
 	"fmt"
+	"os"
 	"regexp"
 
 	tg "gopkg.in/telebot.v4"
@@ -22,17 +23,42 @@ func DownloadSong(b *tg.Bot, ctx tg.Context) error {
 	if !isValid {
 		return ctx.Send("Invalid URL!")
 	}
-
 	fmt.Println(args)
-	err := wrapper.App(args[0], b, ctx)
+	msg, err := b.Send(ctx.Sender(), "Getting information...", &tg.SendOptions{ReplyTo: ctx.Message().ReplyTo})
+	if err != nil {
+		return err
+	}
 
-	//_, err := b.Send(user, args[0])
-
-	//_, err = b.Edit(msg, "edited the message")
-
+	downloadFolder := "downloads"
+	meta, file, err := wrapper.App(args[0], downloadFolder, b, ctx, msg)
 	if err != nil {
 		fmt.Println("Error in wrapper", err)
+		_ = ctx.Reply(fmt.Sprintf("%v", err))
+		_ = b.Delete(msg)
+		return err
 	}
+
+	msg, err = b.Edit(msg, "Uploading "+meta.Attributes.Name)
+	song := &tg.Audio{
+		File:      tg.FromDisk(file.Name()),
+		Duration:  meta.Attributes.DurationInMillis / 1000,
+		Title:     meta.Attributes.Name,
+		Performer: meta.Attributes.ArtistName,
+		FileName:  meta.Attributes.Name,
+	}
+	err = ctx.Reply(song)
+	if err != nil {
+		fmt.Println("Failed to upload song.", err)
+		_, _ = b.Send(ctx.Sender(), "Failed to upload song")
+		return err
+	}
+	_ = b.Delete(msg)
+
+	err = os.Remove(file.Name())
+	if err != nil {
+		fmt.Println("Error removing file", err)
+	}
+
 	return err
 }
 
