@@ -24,7 +24,7 @@ func DownloadSong(b *tg.Bot, ctx tg.Context) error {
 		return ctx.Send("Invalid URL!")
 	}
 	fmt.Println(args)
-	msg, err := b.Send(ctx.Sender(), "Getting information...", &tg.SendOptions{ReplyTo: ctx.Message().ReplyTo})
+	msg, err := b.Send(ctx.Chat(), "Getting information...", &tg.SendOptions{ReplyTo: ctx.Message().ReplyTo})
 	if err != nil {
 		return err
 	}
