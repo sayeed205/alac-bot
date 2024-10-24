@@ -153,3 +153,23 @@ type SongInfo struct {
 	samples       []SampleInfo
 	totalDataSize int64
 }
+
+type Syllable struct {
+	Timestamp uint   `json:"timestamp"`
+	Text      string `json:"text"`
+	Part      bool   `json:"part"`
+}
+
+type Line struct {
+	Timestamp      uint       `json:"timestamp"`
+	Text           []Syllable `json:"text"`
+	Endtime        uint       `json:"endtime"`
+	OppositeTurn   bool       `json:"oppositeTurn"`
+	Background     bool       `json:"background"`
+	BackgroundText []Syllable `json:"backgroundText"`
+}
+
+type AppleLyricsResponse struct {
+	Type    string `json:"type"`
+	Content []Line `json:"content"`
+}

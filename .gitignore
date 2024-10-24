@@ -137,3 +137,4 @@ fabric.properties
 !.env.example
 *.m4a
 .env
+*.lrc

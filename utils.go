@@ -14,6 +14,7 @@ import (
 
 func DownloadSong(ctx tg.Context) error {
 	b := Bot()
+	ID := fmt.Sprintf("%d:%d:%d", ctx.Chat().ID, ctx.Sender().ID, ctx.Message().ID)
 
 	msg, err := b.Send(ctx.Chat(), "Getting information...", &tg.SendOptions{ReplyTo: ctx.Message()})
 	if err != nil {
@@ -73,14 +74,18 @@ func DownloadSong(ctx tg.Context) error {
 		fmt.Println("Error removing file", err)
 	}
 
+	removeFromQueue(ID)
+
 	return err
 }
 
 func validateSongUrl(url string) bool {
 	// Regular expression for album URLs with an optional 'i' query parameter and other query params
-	albumURLRegex := regexp.MustCompile(`^https://music\.apple\.com/([a-z]{2})/album/[a-zA-Z0-9\-]+/([0-9]+)(\?i=([0-9]+).*)?$`)
+	albumURLRegex := regexp.MustCompile(`^https://music\.apple\.com/([a-z]{2})/album/[a-zA-Z0-9\-%.]+/([0-9]+)(\?i=([0-9]+).*)?$`)
+
 	// Regular expression for song URLs with optional query params
-	songURLRegex := regexp.MustCompile(`^https://music\.apple\.com/([a-z]{2})/song/[a-zA-Z0-9\-]+/([0-9]+)(\?.*)?$`)
+	// Updated to allow percent-encoded characters in the song name
+	songURLRegex := regexp.MustCompile(`^https://music\.apple\.com/([a-z]{2})/song/[a-zA-Z0-9\-%.]+/([0-9]+)(\?.*)?$`)
 
 	// Check if the URL matches either the album or song pattern
 	if albumURLRegex.MatchString(url) || songURLRegex.MatchString(url) {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"regexp"
 	"sync"
 
 	tg "gopkg.in/telebot.v4"
@@ -45,9 +46,28 @@ func handleCommand(req CommandRequest) {
 	default:
 		err = fmt.Errorf("unknown command: %s", req.Command)
 	}
+	removeFromQueue(req.ID)
+	//for i, req := range queue {
+	//	if req.ID == ID {
+	//		// Remove the request by index
+	//		queue = append(queue[:i], queue[i+1:]...)
+	//		break
+	//	}
+	//}
 
 	if err != nil {
-		req.Context.Send(fmt.Sprintf("Error processing command: %s", err.Error()))
+		er := regexp.MustCompile(`https?://\S+`).ReplaceAllString(err.Error(), "")
+		_ = req.Context.Send(fmt.Sprintf("Error processing command: %s", er))
 		return
+	}
+}
+
+func removeFromQueue(ID string) {
+	for i, req := range queue {
+		if req.ID == ID {
+			// Remove the request by index
+			queue = append(queue[:i], queue[i+1:]...)
+			break
+		}
 	}
 }

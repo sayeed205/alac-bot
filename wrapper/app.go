@@ -3,16 +3,20 @@ package wrapper
 import (
 	eerrors "errors"
 	"fmt"
-	"github.com/abema/go-mp4"
-	tg "gopkg.in/telebot.v4"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	mp4tag "github.com/Sorrow446/go-mp4tag"
+	"github.com/abema/go-mp4"
+	tg "gopkg.in/telebot.v4"
 )
 
 var (
-	forbiddenNames = regexp.MustCompile(`[/\\<>:"|?*]`)
+	forbiddenNames = regexp.MustCompile(`[\\/<>:"|?*]`)
 )
 
 func App(urlStr string, folder string, bot *tg.Bot, ctx tg.Context, msg *tg.Message) (*AutoSong, *os.File, error) {
@@ -29,6 +33,7 @@ func App(urlStr string, folder string, bot *tg.Bot, ctx tg.Context, msg *tg.Mess
 		fmt.Println("Error getting song metadata :", err)
 		return nil, nil, err
 	}
+	//album := meta.Relationships.Albums.Data[0]
 
 	msg, err = bot.Edit(msg, "Found information")
 	if err != nil {
@@ -49,12 +54,18 @@ func App(urlStr string, folder string, bot *tg.Bot, ctx tg.Context, msg *tg.Mess
 	songName := fmt.Sprintf("%d.%d. %s - %s", meta.Attributes.DiscNumber, meta.Attributes.TrackNumber, meta.Attributes.Name, meta.Attributes.ArtistName) // 1.1. Never Go... - Rik As....
 	songName = fmt.Sprintf("%s.m4a", forbiddenNames.ReplaceAllString(songName, "_"))
 
-	//lrc := ""
-	//if userToken != "" {
-	//	lrc, err = GetLyrics(urlStr, authToken)
-	//	if err != nil {
-	//		fmt.Printf("Failed to parse lyrics: %s \n", err)
-	//	}
+	lrc := ""
+	if os.Getenv("MEDIA_USER_TOKEN") != "" {
+		lrc, err = GetLyrics(urlStr, authToken)
+		if err != nil {
+			fmt.Printf("Failed to parse lyrics: %s \n", err)
+		}
+	}
+	//fmt.Println(lrc)
+	//err = os.WriteFile(fmt.Sprintf("%d.lrc", lrc), []byte(lrc), 0644)
+	//if err != nil {
+	//	fmt.Printf("Failed to write lyrics to file: %s\n", err)
+	//	//return
 	//}
 
 	// todo)) check if file already exists
@@ -128,7 +139,44 @@ func App(urlStr string, folder string, bot *tg.Bot, ctx tg.Context, msg *tg.Mess
 		return nil, nil, err
 	}
 
-	//todo))
+	artwork := meta.Attributes.Artwork
+	coverUrl := strings.Replace(artwork.URL, "{w}x{h}", fmt.Sprintf("%dx%d", artwork.Width, artwork.Height), -1)
+
+	resp, err := http.Get(coverUrl)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+
+	cover, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, nil, err
+	}
+	mp4t, err := mp4tag.Open(file)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer mp4t.Close()
+
+	//albumID, err := strconv.ParseInt(album.ID, 10, 32)
+	//if err != nil {
+	//	return nil, nil, err
+	//}
+	tags := &mp4tag.MP4Tags{
+		Pictures: []*mp4tag.MP4Picture{{Data: cover}},
+		Lyrics:   lrc,
+		//AlbumArtist:   album.Attributes.ArtistName,
+		//Artist:        meta.Attributes.ArtistName,
+		//Composer:      meta.Attributes.ComposerName,
+		//Copyright:     album.Attributes.Copyright,
+		//ItunesAlbumID: int32(albumID),
+		//Date:          meta.Attributes.ReleaseDate,
+	}
+
+	err = mp4t.Write(tags, []string{})
+	if err != nil {
+		return nil, nil, err
+	}
 
 	return meta, create, err
 }

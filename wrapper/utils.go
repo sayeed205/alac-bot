@@ -7,8 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/abema/go-mp4"
-	tg "gopkg.in/telebot.v4"
 	"io"
 	"log"
 	"math"
@@ -22,8 +20,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/abema/go-mp4"
 	"github.com/beevik/etree"
 	"github.com/grafov/m3u8"
+	tg "gopkg.in/telebot.v4"
 )
 
 const (
@@ -38,7 +38,7 @@ func ExtractUrlMeta(inputURL string) (*URLMeta, error) {
 	// Pattern for album or song: https://music.apple.com/<storefront>/album|song/<name>/<id>
 	// Pattern for playlist: https://music.apple.com/library/playlist/<id>
 	reAlbumOrSong := regexp.MustCompile(`https://music\.apple\.com/(?P<storefront>[a-z]{2})/(?P<type>album|song)/.*/(?P<id>[0-9]+)`)
-	rePlaylist := regexp.MustCompile(`https://music\.apple\.com/library/playlist/(?P<id>[a-zA-Z0-9\.]+)`)
+	rePlaylist := regexp.MustCompile(`https://music\.apple\.com/library/playlist/(?P<id>[a-zA-Z0-9.]+)`)
 
 	// First, try matching the playlist URL
 	if matches := rePlaylist.FindStringSubmatch(inputURL); matches != nil {
@@ -188,14 +188,25 @@ func GetEnhanceHls(songId string) (string, error) {
 }
 
 func GetLyrics(urlStr string, token string) (string, error) {
-	userToken := os.Getenv("MEDIA_USER_TOKEN")
 	meta, err := ExtractUrlMeta(urlStr)
 	if err != nil {
 		return "", err
 	}
 
+	lrc, err := GetLyricsFromApi(meta.ID)
+	if err == nil {
+		if lrc != "" {
+			return lrc, err
+		}
+	}
+
+	userToken := os.Getenv("MEDIA_USER_TOKEN")
+
 	req, err := http.NewRequest("GET",
 		fmt.Sprintf("https://amp-api.music.apple.com/v1/catalog/%s/songs/%s/syllable-lyrics", meta.Storefront, meta.ID), nil)
+	if err != nil {
+		return "", nil
+	}
 
 	req.Header.Set("Origin", "https://music.apple.com")
 	req.Header.Set("Referer", "https://music.apple.com/")
@@ -327,6 +338,105 @@ func GetLyrics(urlStr string, token string) (string, error) {
 		}
 	}
 	return strings.Join(lrcLines, "\n"), nil
+}
+
+func toLrcTimestamp(timestamp uint) string {
+	// Convert milliseconds to time.Duration
+	duration := time.Duration(timestamp) * time.Millisecond
+
+	// Extract minutes, seconds, and milliseconds
+	minutes := int(duration.Minutes())
+	seconds := int(duration.Seconds()) % 60
+	milliseconds := int(duration.Milliseconds()) % 1000
+
+	// Format the output as MM:SS.mmm
+	return fmt.Sprintf("%02d:%02d.%03d", minutes, seconds, milliseconds)
+}
+
+func GetLyricsFromApi(id string) (string, error) {
+	// Make HTTP GET request to fetch lyrics
+	resp, err := http.Get("https://paxsenix.alwaysdata.net/getAppleMusicLyrics.php?id=" + id)
+	if err != nil {
+		fmt.Printf("Failed to fetch lyrics: %s\n", err)
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	// Read the response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Printf("Failed to read response body: %s\n", err)
+		return "", err
+	}
+
+	// If status code is not in the 200-299 range or body is empty, return empty
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 || len(body) == 0 {
+		return "", err
+	}
+
+	// Parse the JSON response
+	var jsonResponse AppleLyricsResponse
+	err = json.Unmarshal(body, &jsonResponse)
+	if err != nil {
+		fmt.Printf("Failed to parse JSON response: %s\n", err)
+		return "", err
+	}
+
+	// If the content is empty, return empty
+	if len(jsonResponse.Content) == 0 {
+		return "", err
+	}
+
+	// Build the synced lyrics
+	var syncedLyrics strings.Builder
+	lines := jsonResponse.Content
+
+	switch jsonResponse.Type {
+	case "Syllable":
+		for _, line := range lines {
+			syncedLyrics.WriteString(fmt.Sprintf("[%s]", toLrcTimestamp(line.Timestamp)))
+
+			if line.OppositeTurn {
+				syncedLyrics.WriteString("v2: ")
+			} else {
+				syncedLyrics.WriteString("v1: ")
+			}
+
+			for _, syllable := range line.Text {
+				syncedLyrics.WriteString(fmt.Sprintf("<%s>%s", toLrcTimestamp(syllable.Timestamp), syllable.Text))
+				if !syllable.Part {
+					syncedLyrics.WriteString(" ")
+				}
+			}
+
+			if line.Background {
+				syncedLyrics.WriteString(fmt.Sprintf("<%s>\n", toLrcTimestamp(line.Text[len(line.Text)-1].Timestamp)))
+
+				syncedLyrics.WriteString("[bg: ")
+
+				for _, syllable := range line.BackgroundText {
+					syncedLyrics.WriteString(fmt.Sprintf("<%s>%s", toLrcTimestamp(syllable.Timestamp), syllable.Text))
+					if !syllable.Part {
+						syncedLyrics.WriteString(" ")
+					}
+				}
+
+				syncedLyrics.WriteString(fmt.Sprintf("<%s>]\n", toLrcTimestamp(line.Endtime)))
+			} else {
+				syncedLyrics.WriteString(fmt.Sprintf("<%s>\n", toLrcTimestamp(line.Endtime)))
+			}
+		}
+
+	case "Line":
+		for _, line := range lines {
+			syncedLyrics.WriteString(fmt.Sprintf("[%s]%s\n", toLrcTimestamp(line.Timestamp), line.Text[0].Text))
+		}
+
+	default:
+		return "", err
+	}
+
+	return syncedLyrics.String(), nil
 }
 
 func parseTime(time string) string {

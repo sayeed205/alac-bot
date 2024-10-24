@@ -3,6 +3,7 @@ module alac-bot
 go 1.23.2
 
 require (
+	github.com/Sorrow446/go-mp4tag v0.0.0-20240130220823-68ce31d53e37
 	github.com/abema/go-mp4 v1.2.0
 	github.com/beevik/etree v1.4.1
 	github.com/grafov/m3u8 v0.12.0
