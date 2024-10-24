@@ -76,7 +76,7 @@ func main() {
 	b.Handle("/song", func(ctx tg.Context) error {
 		chatId := ctx.Chat().ID
 		senderId := ctx.Sender().ID
-		if !isAuthorized(chatId) || !isAuthorized(senderId) || senderId != adminId || chatId != adminId {
+		if !isAuthorized(chatId) || !isAuthorized(senderId) || senderId != adminId {
 			return nil
 		}
 
