@@ -92,8 +92,6 @@ func GetSongMeta(urlStr string, token string) (*AutoSong, error) {
 
 	URL := fmt.Sprintf("https://amp-api.music.apple.com/v1/catalog/%s/%s/%s", urlMeta.Storefront, urlMeta.URLType, urlMeta.ID)
 
-	fmt.Println("Hitting :", URL)
-
 	req, err := http.NewRequest("GET", URL, nil)
 	if err != nil {
 		return nil, err

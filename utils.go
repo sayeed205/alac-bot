@@ -5,12 +5,13 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"time"
 
 	tg "gopkg.in/telebot.v4"
 )
 
-func DownloadSong(b *tg.Bot, ctx tg.Context) error {
-
+func DownloadSong(ctx tg.Context) error {
+	b := Bot()
 	args := ctx.Args()
 
 	if len(args) > 1 {
@@ -24,7 +25,7 @@ func DownloadSong(b *tg.Bot, ctx tg.Context) error {
 		return ctx.Send("Invalid URL!")
 	}
 	fmt.Println(args)
-	msg, err := b.Send(ctx.Chat(), "Getting information...", &tg.SendOptions{ReplyTo: ctx.Message().ReplyTo})
+	msg, err := b.Send(ctx.Chat(), "Getting information...", &tg.SendOptions{ReplyTo: ctx.Message()})
 	if err != nil {
 		return err
 	}
@@ -39,6 +40,10 @@ func DownloadSong(b *tg.Bot, ctx tg.Context) error {
 	}
 
 	msg, err = b.Edit(msg, "Uploading "+meta.Attributes.Name)
+	if err != nil {
+		return err
+	}
+
 	song := &tg.Audio{
 		File:      tg.FromDisk(file.Name()),
 		Duration:  meta.Attributes.DurationInMillis / 1000,
@@ -77,9 +82,24 @@ func validateSongUrl(url string) bool {
 	return false
 }
 
-func validateAlbumUrl(url string) bool {
-	albumURLRegex := regexp.MustCompile(`^https://music\.apple\.com/([a-z]{2})/album/[a-zA-Z0-9\-]+/([0-9]+)(\?.*)?$`)
+// func validateAlbumUrl(url string) bool {
+// 	albumURLRegex := regexp.MustCompile(`^https://music\.apple\.com/([a-z]{2})/album/[a-zA-Z0-9\-]+/([0-9]+)(\?.*)?$`)
 
-	// Check if the URL matches the album pattern
-	return albumURLRegex.MatchString(url)
+func sendTempMsg(ctx tg.Context, txt string, t time.Duration) error {
+	b := Bot()
+	msg, err := b.Send(ctx.Sender(), txt, &tg.SendOptions{ReplyTo: ctx.Message()})
+	if err != nil {
+		fmt.Println("Failed to send message", err)
+		return err
+	}
+	if t > 0 {
+		go func() error {
+			time.Sleep(t * time.Second)
+			if err := b.Delete(msg); err != nil {
+				fmt.Println("Failed to delete message:", err)
+			}
+			return err
+		}()
+	}
+	return err
 }
