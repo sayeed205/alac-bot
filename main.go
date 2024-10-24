@@ -1,6 +1,7 @@
 package main
 
 import (
+	"alac-bot/wrapper"
 	"fmt"
 	"github.com/kamva/mgm/v3"
 	"go.mongodb.org/mongo-driver/bson"
@@ -77,6 +78,30 @@ func main() {
 		senderId := ctx.Sender().ID
 		if !isAuthorized(chatId) || !isAuthorized(senderId) || senderId != adminId || chatId != adminId {
 			return nil
+		}
+
+		args := ctx.Args()
+
+		if len(args) > 1 {
+			return ctx.Send("Too many arguments!")
+		} else if len(args) == 0 {
+			return ctx.Send("No url detected!")
+		}
+
+		isValid := validateSongUrl(args[0])
+		if !isValid {
+			return ctx.Send("Invalid URL!")
+		}
+
+		urlMeta, err := wrapper.ExtractUrlMeta(args[0])
+		if err != nil {
+			return err
+		}
+
+		file := getFile("song", urlMeta.ID)
+
+		if file != nil {
+			return ctx.Reply(&tg.Audio{File: tg.File{FileID: file.FileIds[0]}})
 		}
 
 		ID := fmt.Sprintf("%d:%d:%d", ctx.Chat().ID, ctx.Sender().ID, ctx.Message().ID)

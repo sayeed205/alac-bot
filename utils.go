@@ -3,6 +3,7 @@ package main
 import (
 	"alac-bot/wrapper"
 	"fmt"
+	"github.com/kamva/mgm/v3"
 	"os"
 	"regexp"
 	"time"
@@ -12,26 +13,14 @@ import (
 
 func DownloadSong(ctx tg.Context) error {
 	b := Bot()
-	args := ctx.Args()
 
-	if len(args) > 1 {
-		return ctx.Send("Too many arguments!")
-	} else if len(args) == 0 {
-		return ctx.Send("No url detected!")
-	}
-
-	isValid := validateSongUrl(args[0])
-	if !isValid {
-		return ctx.Send("Invalid URL!")
-	}
-	fmt.Println(args)
 	msg, err := b.Send(ctx.Chat(), "Getting information...", &tg.SendOptions{ReplyTo: ctx.Message()})
 	if err != nil {
 		return err
 	}
 
 	downloadFolder := "downloads"
-	meta, file, err := wrapper.App(args[0], downloadFolder, b, ctx, msg)
+	meta, file, err := wrapper.App(ctx.Args()[0], downloadFolder, b, ctx, msg)
 	if err != nil {
 		fmt.Println("Error in wrapper", err)
 		_ = ctx.Reply(fmt.Sprintf("%v", err))
@@ -58,6 +47,13 @@ func DownloadSong(ctx tg.Context) error {
 		return err
 	}
 	_ = b.Delete(msg)
+
+	newSong := CreateFile([]string{song.FileID}, "song", meta.ID)
+
+	err = mgm.Coll(newSong).Create(newSong)
+	if err != nil {
+		fmt.Println("Failed to upload song.", err)
+	}
 
 	err = os.Remove(file.Name())
 	if err != nil {
