@@ -45,7 +45,8 @@ Available commands
   - takes single id
   - works by replying to a user message
   - works by empty msg without any id in a group
-- `song` - takes a single URL of an Apple Music song 
+- `/song` 
+  - takes a single URL of an Apple Music song 
   - `https://music.apple.com/in/song/never-gonna-give-you-up/1559523359`
   - `https://music.apple.com/in/album/never-gonna-give-you-up/1559523357?i=1559523359`
   - Both counts as a song url as album has "i" query params to indicate it's a single song
