@@ -6,6 +6,7 @@ import (
 	"github.com/kamva/mgm/v3"
 	"os"
 	"regexp"
+	"strconv"
 	"time"
 
 	tg "gopkg.in/telebot.v4"
@@ -38,7 +39,19 @@ func DownloadSong(ctx tg.Context) error {
 		Duration:  meta.Attributes.DurationInMillis / 1000,
 		Title:     meta.Attributes.Name,
 		Performer: meta.Attributes.ArtistName,
-		FileName:  meta.Attributes.Name,
+		FileName:  file.Name(),
+	}
+	dmpId, err := strconv.ParseInt(os.Getenv("DUMP_ID"), 10, 64)
+	if err != nil {
+		return err
+	}
+	dump, err := b.ChatByID(dmpId)
+	if err != nil {
+		return err
+	}
+	_, err = b.Send(dump, song)
+	if err != nil {
+		return err
 	}
 	err = ctx.Reply(song)
 	if err != nil {

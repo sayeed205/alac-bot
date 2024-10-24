@@ -24,9 +24,9 @@ To set up the Apple Bot project, follow these steps:
     - `BOT_TOKEN`: OmaeWaMouShindeiru
     - `MONGO_URL`: The connection string for your MongoDB database.(default db "alac-bot", hard coded hui hui)
     - `MEDIA_USER_TOKEN`: Needed if you want to embed lyrics (not implemented yet)
-    - `DEVICE_URL`: 127.0.0.1:20020 check out [guide](https://github.com/zhaarey/wrapper)
-    - `DECRYPTION_URL`: 127.0.0.1:10020 check out [guide](https://github.com/zhaarey/wrapper)
-
+    - `DEVICE_URL`: 127.0.0.1:20020 - check out [guide](https://github.com/zhaarey/wrapper)
+    - `DECRYPTION_URL`: 127.0.0.1:10020 - check out [guide](https://github.com/zhaarey/wrapper)
+    - `DUMP_ID`: -100xxxx - dumping channel id
 ## Running the Bot
 
 To run the bot, execute the following command in your terminal:
