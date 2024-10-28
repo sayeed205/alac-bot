@@ -3,10 +3,11 @@ package main
 import (
 	"alac-bot/wrapper"
 	"fmt"
-	"github.com/kamva/mgm/v3"
-	"go.mongodb.org/mongo-driver/bson"
 	"log"
 	"strconv"
+
+	"github.com/kamva/mgm/v3"
+	"go.mongodb.org/mongo-driver/bson"
 
 	tg "gopkg.in/telebot.v4"
 )
@@ -76,9 +77,12 @@ func main() {
 	b.Handle("/song", func(ctx tg.Context) error {
 		chatId := ctx.Chat().ID
 		senderId := ctx.Sender().ID
-		if !isAuthorized(chatId) || !isAuthorized(senderId) {
-			if senderId != adminId {
-				return nil
+		if !isAuthorized(chatId) {
+			if !isAuthorized(senderId) {
+				if senderId != adminId {
+					fmt.Printf("Unauthorize: %d", chatId)
+					return nil
+				}
 			}
 		}
 
