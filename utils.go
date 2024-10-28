@@ -55,7 +55,8 @@ func DownloadSong(ctx tg.Context) error {
 	if err != nil {
 		return err
 	}
-	err = ctx.Reply(song)
+	err = ctx.Send(&tg.Audio{File: tg.File{FileID: song.FileID}, Caption: fmt.Sprintf("[%v](tg://user?id=%d)", ctx.Sender().FirstName, ctx.Sender().ID)}, &tg.SendOptions{})
+
 	if err != nil {
 		fmt.Println("Failed to upload song.", err)
 		_, _ = b.Send(ctx.Sender(), "Failed to upload song")
