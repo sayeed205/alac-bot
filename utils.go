@@ -3,11 +3,12 @@ package main
 import (
 	"alac-bot/wrapper"
 	"fmt"
-	"github.com/kamva/mgm/v3"
 	"os"
 	"regexp"
 	"strconv"
 	"time"
+
+	"github.com/kamva/mgm/v3"
 
 	tg "gopkg.in/telebot.v4"
 )
@@ -21,7 +22,7 @@ func DownloadSong(ctx tg.Context) error {
 		return err
 	}
 
-	downloadFolder := "downloads"
+	downloadFolder := os.Getenv("DONWLOAD_FOLDER")
 	meta, file, err := wrapper.App(ctx.Args()[0], downloadFolder, b, ctx, msg)
 	if err != nil {
 		fmt.Println("Error in wrapper", err)
