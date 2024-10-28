@@ -53,13 +53,22 @@ func DownloadSong(ctx tg.Context) error {
 	}
 	_, err = b.Send(dump, song)
 	if err != nil {
+		fmt.Printf("Dump upload error: %d", err)
 		return err
 	}
-	err = ctx.Send(&tg.Audio{File: tg.File{FileID: song.FileID}, Caption: fmt.Sprintf("[%v](tg://user?id=%d)", ctx.Sender().FirstName, ctx.Sender().ID)}, &tg.SendOptions{})
+
+	err = ctx.Send(&tg.Audio{
+		File:    tg.File{FileID: song.FileID},
+		Caption: fmt.Sprintf("[%v](tg://user?id=%d)", ctx.Sender().FirstName, ctx.Sender().ID),
+	}, &tg.SendOptions{
+		ParseMode: "Markdown",
+	})
 
 	if err != nil {
 		fmt.Println("Failed to upload song.", err)
-		_, _ = b.Send(ctx.Sender(), "Failed to upload song")
+		_, _ = b.Send(ctx.Chat(), fmt.Sprintf("Failed to upload song [%v](tg://user?id=%d)", ctx.Sender().FirstName, ctx.Sender().ID), &tg.SendOptions{
+			ParseMode: "Markdown",
+		})
 		return err
 	}
 	_ = b.Delete(msg)
