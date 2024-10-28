@@ -28,8 +28,9 @@ func Bot() *tg.Bot {
 			if err != nil {
 				log.Fatal(err)
 			}
+			b := bot.Me
+			log.Println("Bot is now running.  Press CTRL-C to exit.", b.FirstName+b.LastName)
 		}
 	}
 	return bot
-
 }

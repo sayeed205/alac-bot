@@ -138,3 +138,6 @@ fabric.properties
 *.m4a
 .env
 *.lrc
+*.Dockerfile
+*.ttml
+*.ps1

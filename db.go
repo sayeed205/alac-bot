@@ -18,15 +18,17 @@ func init() {
 	}
 	adminId, err = strconv.ParseInt(os.Getenv("ADMIN_ID"), 10, 64)
 
-	log.Println("ADMIN_ID", adminId)
 	if err != nil {
 		//panic("ADMIN_ID is not set")
 		log.Println(err)
 	}
 
 	// Setup the mgm default config
-	err := mgm.SetDefaultConfig(nil, "alac-bot", options.Client().ApplyURI(os.Getenv("MONGO_URL")))
+	err := mgm.SetDefaultConfig(nil, os.Getenv("DB_NAME"), options.Client().ApplyURI(os.Getenv("MONGO_URL")))
 
+	_, _, db, _ := mgm.DefaultConfigs()
+
+	log.Println("Connected to database: ", db.Name())
 	if err != nil {
 		panic(err)
 	}
