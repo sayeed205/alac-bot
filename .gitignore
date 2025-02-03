@@ -11,3 +11,4 @@ dist/
 bot-data
 wrapper.*
 !wrapper.go
+downloads

@@ -35,10 +35,16 @@ const (
 	prefetchKey = "skd://itunes.apple.com/P000000000/s1/e1"
 )
 
+func getEnv(key, fallback string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return fallback
+}
+
 var (
-	deviceUrl = os.Getenv("DEVICE_URL")
-	// decryptionUrl = "127.0.0.1:10020"
-	decryptionUrl  = os.Getenv("DEC_URL")
+	deviceUrl      = getEnv("M3U8_URL", "127.0.0.1:20020")
+	decryptionUrl  = getEnv("DEC_URL", "127.0.0.1:10020")
 	forbiddenNames = regexp.MustCompile(`[\\/<>:"|?*]`)
 )
 
