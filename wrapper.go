@@ -1,4 +1,6 @@
-package wrapper
+package main
+
+import "C"
 
 import (
 	"bufio"
@@ -14,16 +16,18 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Sorrow446/go-mp4tag"
+
 	"github.com/abema/go-mp4"
-	"github.com/beevik/etree"
 	"github.com/grafov/m3u8"
-	tg "gopkg.in/telebot.v4"
+	"github.com/schollz/progressbar/v3"
 )
 
 const (
@@ -31,29 +35,165 @@ const (
 	prefetchKey = "skd://itunes.apple.com/P000000000/s1/e1"
 )
 
-//func Extract
+var (
+	deviceUrl = os.Getenv("DEVICE_URL")
+	// decryptionUrl = "127.0.0.1:10020"
+	decryptionUrl  = os.Getenv("DEC_URL")
+	forbiddenNames = regexp.MustCompile(`[\\/<>:"|?*]`)
+)
 
-func ExtractUrlMeta(inputURL string) (*URLMeta, error) {
-	// Define regex patterns to match album, song, and playlist URLs
-	// Pattern for album or song: https://music.apple.com/<storefront>/album|song/<name>/<id>
-	// Pattern for playlist: https://music.apple.com/library/playlist/<id>
-	reAlbumOrSong := regexp.MustCompile(`https://music\.apple\.com/(?P<storefront>[a-z]{2})/(?P<type>album|song)/.*/(?P<id>[0-9]+)`)
-	rePlaylist := regexp.MustCompile(`https://music\.apple\.com/library/playlist/(?P<id>[a-zA-Z0-9.]+)`)
+func prettyPrint(b []byte) ([]byte, error) {
+	var out bytes.Buffer
+	err := json.Indent(&out, b, "", "  ")
+	return out.Bytes(), err
+}
 
-	// First, try matching the playlist URL
-	if matches := rePlaylist.FindStringSubmatch(inputURL); matches != nil {
-		// Extract the playlist ID and return the metadata
-		id := matches[1]
-		return &URLMeta{
-			Storefront: "", // Playlists don't have a storefront
-			URLType:    "playlists",
-			ID:         id,
-		}, nil
+//export DownloadSong
+func DownloadSong(_url *C.char) *C.char {
+	link := C.GoString(_url)
+	link = strings.TrimFunc(link, func(r rune) bool {
+		return r < 32 || r == 127
+	})
+	if idx := strings.IndexByte(link, 0); idx != -1 {
+		link = link[:idx]
+	}
+	urlMeta, err := ExtractUrlMeta(link)
+	if err != nil {
+		fmt.Println("Error extracting url meta:", err)
+		return returnError(err.Error())
 	}
 
-	// Next, try matching the album or song URL
-	if matches := reAlbumOrSong.FindStringSubmatch(inputURL); matches != nil {
-		// Extract the storefront, type (album or song), and id
+	token, err := GetToken()
+	if err != nil {
+		fmt.Println("Error getting token:", err)
+		return returnError(err.Error())
+	}
+
+	meta, err := GetSongMeta(urlMeta, token)
+	if err != nil {
+		fmt.Println("Error getting song meta:", err)
+		return returnError(err.Error())
+	}
+
+	if meta.Attributes.ExtendedAssetUrls["enhancedHls"] == "" {
+		return returnError("ALAC not available")
+	}
+
+	enhancedHls, err := GetEnhanceHls(meta.ID)
+
+	if err != nil {
+		fmt.Println("Error getting enhanced hls:", err)
+		return returnError(err.Error())
+	}
+
+	if strings.HasSuffix(enhancedHls, "m3u8") {
+		meta.Attributes.ExtendedAssetUrls["enhancedHls"] = enhancedHls
+	}
+
+	songName := fmt.Sprintf("%s - %s", meta.Attributes.Name, meta.Attributes.ArtistName) // Never Go... - Rik As....
+	songName = fmt.Sprintf("%s.m4a", forbiddenNames.ReplaceAllString(songName, "_"))
+
+	// check if file exits
+	if _, err := os.Stat(filepath.Join("downloads", songName)); err == nil {
+		fmt.Println("Song already exists:", songName)
+		return C.CString("downloads/" + songName)
+	}
+
+	trackUrl, keys, err := ExtractMedia(meta.Attributes.ExtendedAssetUrls["enhancedHls"])
+	if err != nil {
+		fmt.Println("\u26A0 Failed to extract info from manifest:", err)
+	}
+
+	info, err := extractSong(trackUrl)
+
+	if err != nil {
+		return returnError(err.Error())
+	}
+
+	samplesOk := true
+	for samplesOk {
+		var totalSize int64 = 0
+		for _, i := range info.samples {
+			totalSize += int64(len(i.data))
+			if int(i.descIndex) >= len(keys) {
+				fmt.Println("Decryption size mismatch.")
+				samplesOk = false
+			}
+		}
+		info.totalDataSize = totalSize
+		break
+	}
+
+	if !samplesOk {
+		return returnError("Decryption size mismatch.")
+	}
+
+	decrypted, err := decryptSong(info, keys, meta)
+
+	if err != nil {
+		return returnError(err.Error())
+	}
+
+	err = os.MkdirAll("downloads", os.ModePerm)
+	if err != nil {
+		fmt.Println("Failed to create folder:", err)
+		return returnError(err.Error())
+	}
+
+	file := filepath.Join("downloads", songName)
+	create, err := os.Create(file)
+	if err != nil {
+		fmt.Println("Failed to create file:", err)
+		return returnError(err.Error())
+	}
+	defer create.Close()
+
+	err = WriteM4a(mp4.NewWriter(create), info, meta, decrypted)
+	if err != nil {
+		fmt.Println("Failed to write m4a.", err)
+		return returnError(err.Error())
+	}
+
+	artwork := meta.Attributes.Artwork
+	coverUrl := strings.Replace(artwork.URL, "{w}x{h}", fmt.Sprintf("%dx%d", artwork.Width, artwork.Height), -1)
+	resp, err := http.Get(coverUrl)
+	if err != nil {
+		return returnError(err.Error())
+	}
+	defer resp.Body.Close()
+
+	cover, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return returnError(err.Error())
+	}
+	mp4t, err := mp4tag.Open(file)
+	if err != nil {
+		return returnError(err.Error())
+	}
+	defer mp4t.Close()
+
+	tags := &mp4tag.MP4Tags{
+		Pictures: []*mp4tag.MP4Picture{{Data: cover}},
+		//todo)) add lyrics
+		//Lyrics:   lrc,
+		//Year:     int32(year),
+	}
+
+	err = mp4t.Write(tags, []string{})
+	if err != nil {
+		return returnError(err.Error())
+	}
+
+	return C.CString(file)
+}
+
+func ExtractUrlMeta(inputURL string) (*URLMeta, error) {
+	// Define a regex pattern to match album, song, and playlist URLs, including full playlist ID with hyphens
+	reAlbumOrSongOrPlaylist := regexp.MustCompile(`https://music\.apple\.com/(?P<storefront>[a-z]{2})/(?P<type>album|song|playlist)/.*/(?P<id>[0-9a-zA-Z\-.]+)`)
+
+	// Try matching the input URL
+	if matches := reAlbumOrSongOrPlaylist.FindStringSubmatch(inputURL); matches != nil {
+		// Extract the storefront, type (album, song, or playlist), and ID
 		storefront := matches[1]
 		urlType := matches[2]
 		id := matches[3]
@@ -75,7 +215,7 @@ func ExtractUrlMeta(inputURL string) (*URLMeta, error) {
 		// Return the parsed metadata
 		return &URLMeta{
 			Storefront: storefront,
-			URLType:    urlType + "s",
+			URLType:    urlType + "s", // Pluralize to "albums", "songs", or "playlists"
 			ID:         id,
 		}, nil
 	}
@@ -83,13 +223,65 @@ func ExtractUrlMeta(inputURL string) (*URLMeta, error) {
 	return nil, fmt.Errorf("invalid Apple Music URL format")
 }
 
-func GetSongMeta(urlStr string, token string) (*AutoSong, error) {
-	urlMeta, err := ExtractUrlMeta(urlStr)
+func GetToken() (string, error) {
+	client := &http.Client{}
 
+	// Step 1: Fetch the main page to find the JS file
+	mainPageURL := "https://beta.music.apple.com"
+	req, err := http.NewRequest("GET", mainPageURL, nil)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	// Read the response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	// Find the index-legacy JS URI using regex
+	regex := regexp.MustCompile(`/assets/index-legacy-[^/]+\.js`)
+	indexJsUri := regex.FindString(string(body))
+	if indexJsUri == "" {
+		return "", errors.New("index JS file not found")
+	}
+
+	// Step 2: Fetch the JS file to extract the token
+	jsFileURL := mainPageURL + indexJsUri
+	req, err = http.NewRequest("GET", jsFileURL, nil)
+	if err != nil {
+		return "", err
+	}
+
+	resp, err = client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	// Read the JS file content
+	body, err = io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	// Extract the token using regex
+	regex = regexp.MustCompile(`eyJh[^"]+`)
+	token := regex.FindString(string(body))
+	if token == "" {
+		return "", errors.New("token not found in JS file")
+	}
+
+	return token, nil
+}
+
+func GetSongMeta(urlMeta *URLMeta, token string) (*AutoSong, error) {
 	URL := fmt.Sprintf("https://amp-api.music.apple.com/v1/catalog/%s/%s/%s", urlMeta.Storefront, urlMeta.URLType, urlMeta.ID)
 
 	req, err := http.NewRequest("GET", URL, nil)
@@ -111,7 +303,7 @@ func GetSongMeta(urlStr string, token string) (*AutoSong, error) {
 	query.Set("extend", "extendedAssetUrls")
 	//query.Set("fields[albums]", "artistName,artwork,name,releaseDate,url,relationships")
 	//query.Set("fields[record-labels]", "name")
-	query.Set("l", os.Getenv("LANGUAGE"))
+	query.Set("l", "")
 	req.URL.RawQuery = query.Encode()
 
 	// Make the HTTP request
@@ -143,7 +335,7 @@ func GetSongMeta(urlStr string, token string) (*AutoSong, error) {
 
 func GetEnhanceHls(songId string) (string, error) {
 	var EnhancedHls string
-	conn, err := net.Dial("tcp", os.Getenv("DEVICE_URL"))
+	conn, err := net.Dial("tcp", deviceUrl)
 
 	if err != nil {
 		log.Println("Error connecting to device:", err)
@@ -187,283 +379,8 @@ func GetEnhanceHls(songId string) (string, error) {
 	return EnhancedHls, nil
 }
 
-func GetLyrics(urlStr string, token string) (string, error) {
-	meta, err := ExtractUrlMeta(urlStr)
-	if err != nil {
-		return "", err
-	}
-
-	lrc, err := GetLyricsFromApi(meta.ID)
-	if err == nil {
-		if lrc != "" {
-			return lrc, err
-		}
-	}
-
-	userToken := os.Getenv("MEDIA_USER_TOKEN")
-
-	req, err := http.NewRequest("GET",
-		fmt.Sprintf("https://amp-api.music.apple.com/v1/catalog/%s/songs/%s/syllable-lyrics", meta.Storefront, meta.ID), nil)
-	if err != nil {
-		return "", nil
-	}
-
-	req.Header.Set("Origin", "https://music.apple.com")
-	req.Header.Set("Referer", "https://music.apple.com/")
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
-	cookie := http.Cookie{Name: "media-user-token", Value: userToken}
-	req.AddCookie(&cookie)
-	do, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer do.Body.Close()
-
-	obj := new(SongLyrics)
-	err = json.NewDecoder(do.Body).Decode(&obj)
-	ttml := ""
-	if obj.Data != nil {
-		ttml = obj.Data[0].Attributes.Ttml
-	} else {
-		return "", errors.New("failed to get lyrics")
-	}
-
-	parsedTTML := etree.NewDocument()
-	err = parsedTTML.ReadFromString(ttml)
-	if err != nil {
-		return "", err
-	}
-
-	var lrcLines []string
-	timingAttr := parsedTTML.FindElement("tt").SelectAttr("itunes:timing")
-	if timingAttr != nil {
-		if timingAttr.Value == "Word" {
-			//lrc, err := conventSyllableTTMLToLRC(ttml)
-			for _, div := range parsedTTML.FindElement("tt").FindElement("body").FindElements("div") {
-				lineStart := parseTime(div.SelectAttr("begin").Value)
-				lineEnd := parseTime(div.SelectAttr("end").Value)
-				for _, line := range div.ChildElements() {
-					v := line.SelectAttr("ttm:agent").Value
-					var lrcSyllables []string
-					var i int = 0
-
-					for _, syllable := range line.Child {
-						if _, ok := syllable.(*etree.CharData); ok {
-							if i > 0 {
-								lrcSyllables = append(lrcSyllables, " ")
-								continue
-							}
-							continue
-						}
-						lyric := syllable.(*etree.Element)
-						if lyric.SelectAttr("begin") == nil {
-							continue
-						}
-						beginTime := parseTime(lyric.SelectAttr("begin").Value)
-
-						var text string
-						if lyric.SelectAttr("text") == nil {
-							var textTmp []string
-							for _, span := range lyric.Child {
-								if _, ok := span.(*etree.CharData); ok {
-									textTmp = append(textTmp, span.(*etree.CharData).Data)
-								} else {
-									textTmp = append(textTmp, span.(*etree.Element).Text())
-								}
-							}
-							text = strings.Join(textTmp, "")
-						} else {
-							text = lyric.SelectAttr("text").Value
-						}
-						lrcSyllables = append(lrcSyllables, fmt.Sprintf("<%s>%s", beginTime, text))
-						i += 1
-					}
-
-					lrcLines = append(lrcLines, "["+lineStart+"]"+v+": "+strings.Join(lrcSyllables, "")+"<"+lineEnd+">")
-				}
-			}
-			return strings.Join(lrcLines, "\n"), nil
-		}
-		if timingAttr.Value == "None" {
-			for _, p := range parsedTTML.FindElements("//p") {
-				line := p.Text()
-				line = strings.TrimSpace(line)
-				if line != "" {
-					lrcLines = append(lrcLines, line)
-				}
-			}
-			return strings.Join(lrcLines, "\n"), nil
-		}
-	}
-
-	for _, item := range parsedTTML.FindElement("tt").FindElement("body").ChildElements() {
-		for _, lyric := range item.ChildElements() {
-			var h, m, s, ms int
-			if lyric.SelectAttr("begin") == nil {
-				return "", errors.New("no synchronised lyrics")
-			}
-			if strings.Contains(lyric.SelectAttr("begin").Value, ":") {
-				_, err = fmt.Sscanf(lyric.SelectAttr("begin").Value, "%d:%d:%d.%d", &h, &m, &s, &ms)
-				if err != nil {
-					_, err = fmt.Sscanf(lyric.SelectAttr("begin").Value, "%d:%d.%d", &m, &s, &ms)
-					if err != nil {
-						_, err = fmt.Sscanf(lyric.SelectAttr("begin").Value, "%d:%d", &m, &s)
-					}
-					h = 0
-				}
-			} else {
-				_, err = fmt.Sscanf(lyric.SelectAttr("begin").Value, "%d.%d", &s, &ms)
-				h, m = 0, 0
-			}
-			if err != nil {
-				return "", err
-			}
-			var text string
-			if lyric.SelectAttr("text") == nil {
-				var textTmp []string
-				for _, span := range lyric.Child {
-					if _, ok := span.(*etree.CharData); ok {
-						textTmp = append(textTmp, span.(*etree.CharData).Data)
-					} else {
-						textTmp = append(textTmp, span.(*etree.Element).Text())
-					}
-				}
-				text = strings.Join(textTmp, "")
-			} else {
-				text = lyric.SelectAttr("text").Value
-			}
-			m += h * 60
-			ms = ms / 10
-			lrcLines = append(lrcLines, fmt.Sprintf("[%02d:%02d.%02d]%s", m, s, ms, text))
-		}
-	}
-	return strings.Join(lrcLines, "\n"), nil
-}
-
-func toLrcTimestamp(timestamp uint) string {
-	// Convert milliseconds to time.Duration
-	duration := time.Duration(timestamp) * time.Millisecond
-
-	// Extract minutes, seconds, and milliseconds
-	minutes := int(duration.Minutes())
-	seconds := int(duration.Seconds()) % 60
-	milliseconds := int(duration.Milliseconds()) % 1000
-
-	// Format the output as MM:SS.mmm
-	return fmt.Sprintf("%02d:%02d.%03d", minutes, seconds, milliseconds)
-}
-
-func GetLyricsFromApi(id string) (string, error) {
-	// Make HTTP GET request to fetch lyrics
-	resp, err := http.Get("https://paxsenix.alwaysdata.net/getAppleMusicLyrics.php?id=" + id)
-	if err != nil {
-		fmt.Printf("Failed to fetch lyrics: %s\n", err)
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	// Read the response body
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Printf("Failed to read response body: %s\n", err)
-		return "", err
-	}
-
-	// If status code is not in the 200-299 range or body is empty, return empty
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 || len(body) == 0 {
-		return "", err
-	}
-
-	// Parse the JSON response
-	var jsonResponse AppleLyricsResponse
-	err = json.Unmarshal(body, &jsonResponse)
-	if err != nil {
-		fmt.Printf("Failed to parse JSON response: %s\n", err)
-		return "", err
-	}
-
-	// If the content is empty, return empty
-	if len(jsonResponse.Content) == 0 {
-		return "", err
-	}
-
-	// Build the synced lyrics
-	var syncedLyrics strings.Builder
-	lines := jsonResponse.Content
-
-	switch jsonResponse.Type {
-	case "Syllable":
-		for _, line := range lines {
-			syncedLyrics.WriteString(fmt.Sprintf("[%s]", toLrcTimestamp(line.Timestamp)))
-
-			if line.OppositeTurn {
-				syncedLyrics.WriteString("v2: ")
-			} else {
-				syncedLyrics.WriteString("v1: ")
-			}
-
-			for _, syllable := range line.Text {
-				syncedLyrics.WriteString(fmt.Sprintf("<%s>%s", toLrcTimestamp(syllable.Timestamp), syllable.Text))
-				if !syllable.Part {
-					syncedLyrics.WriteString(" ")
-				}
-			}
-
-			if line.Background {
-				syncedLyrics.WriteString(fmt.Sprintf("<%s>\n", toLrcTimestamp(line.Text[len(line.Text)-1].Timestamp)))
-
-				syncedLyrics.WriteString("[bg: ")
-
-				for _, syllable := range line.BackgroundText {
-					syncedLyrics.WriteString(fmt.Sprintf("<%s>%s", toLrcTimestamp(syllable.Timestamp), syllable.Text))
-					if !syllable.Part {
-						syncedLyrics.WriteString(" ")
-					}
-				}
-
-				syncedLyrics.WriteString(fmt.Sprintf("<%s>]\n", toLrcTimestamp(line.Endtime)))
-			} else {
-				syncedLyrics.WriteString(fmt.Sprintf("<%s>\n", toLrcTimestamp(line.Endtime)))
-			}
-		}
-
-	case "Line":
-		for _, line := range lines {
-			syncedLyrics.WriteString(fmt.Sprintf("[%s]%s\n", toLrcTimestamp(line.Timestamp), line.Text[0].Text))
-		}
-
-	default:
-		return "", err
-	}
-
-	return syncedLyrics.String(), nil
-}
-
-func parseTime(time string) string {
-	parts := strings.Split(time, ":")
-	if len(parts) == 1 {
-		// If no colon, assume it's in the format of seconds.milliseconds
-		seconds, err := strconv.ParseFloat(parts[0], 64)
-		if err != nil {
-			return time // Return unchanged if parsing fails
-		}
-		if seconds < 60 {
-			return fmt.Sprintf("00:%06.3f", seconds) // Pad to ensure 2 digits for seconds
-		}
-		return time // If seconds >= 60, no need to modify
-	} else if len(parts) == 2 {
-		minutes := parts[0]
-		seconds, err := strconv.ParseFloat(parts[1], 64)
-		if err != nil {
-			return time // Return unchanged if parsing fails
-		}
-		return fmt.Sprintf("%s:%06.3f", minutes, seconds) // Format as MM:SS.SSS
-	}
-
-	return time // Return unchanged if no match
-}
-
 func ExtractMedia(urlStr string) (string, []string, error) {
+	println("urlStr:", urlStr)
 	masterUrl, err := url.Parse(urlStr)
 	if err != nil {
 		return "", nil, err
@@ -539,7 +456,26 @@ func extractSong(url string) (*SongInfo, error) {
 		return nil, errors.New(track.Status)
 	}
 
-	rawSong, err := io.ReadAll(track.Body)
+	contentLength := track.ContentLength
+	bar := progressbar.NewOptions64(contentLength,
+		progressbar.OptionClearOnFinish(),
+		progressbar.OptionSetElapsedTime(false),
+		progressbar.OptionSetPredictTime(false),
+		progressbar.OptionShowElapsedTimeOnFinish(),
+		progressbar.OptionShowCount(),
+		progressbar.OptionEnableColorCodes(true),
+		progressbar.OptionShowBytes(true),
+		//progressbar.OptionSetDescription("Downloading..."),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "",
+			SaucerHead:    "",
+			SaucerPadding: "",
+			BarStart:      "",
+			BarEnd:        "",
+		}),
+	)
+
+	rawSong, err := io.ReadAll(io.TeeReader(track.Body, bar))
 	if err != nil {
 		return nil, err
 	}
@@ -658,25 +594,8 @@ func extractSong(url string) (*SongInfo, error) {
 	return extracted, nil
 }
 
-func (*Alac) GetType() mp4.BoxType {
-	return BoxTypeAlac()
-}
-
-func (s *SongInfo) Duration() (ret uint64) {
-	for i := range s.samples {
-		ret += uint64(s.samples[i].duration)
-	}
-	return
-}
-
-func BoxTypeAlac() mp4.BoxType { return mp4.StrToBoxType("alac") }
-
-func init() {
-	mp4.AddBoxDef((*Alac)(nil))
-}
-
-func decryptSong(info *SongInfo, keys []string, manifest *AutoSong, bot *tg.Bot, ctx tg.Context, msg *tg.Message) ([]byte, error) {
-	conn, err := net.Dial("tcp", os.Getenv("DECRYPTION_URL"))
+func decryptSong(info *SongInfo, keys []string, manifest *AutoSong) ([]byte, error) {
+	conn, err := net.Dial("tcp", decryptionUrl)
 	if err != nil {
 		return nil, err
 	}
@@ -684,24 +603,29 @@ func decryptSong(info *SongInfo, keys []string, manifest *AutoSong, bot *tg.Bot,
 
 	var decrypted []byte
 	var lastIndex uint32 = math.MaxUint8
+	bar := progressbar.NewOptions64(info.totalDataSize,
+		progressbar.OptionClearOnFinish(),
+		progressbar.OptionSetElapsedTime(false),
+		progressbar.OptionSetPredictTime(false),
+		progressbar.OptionShowElapsedTimeOnFinish(),
+		progressbar.OptionShowCount(),
+		progressbar.OptionEnableColorCodes(true),
+		progressbar.OptionShowBytes(true),
+		//progressbar.OptionSetDescription("Decrypting..."),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "",
+			SaucerHead:    "",
+			SaucerPadding: "",
+			BarStart:      "",
+			BarEnd:        "",
+		}),
+	)
 
 	var pd, totalProcessed int
-	totalSize := info.totalDataSize
 
 	// Set up ticker for 5 seconds interval updates
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-
-	// Start a goroutine to update the Telegram message every 5 seconds
-	go func() {
-		for range ticker.C {
-			percentage := float64(totalProcessed) / float64(totalSize) * 100
-			_, err := bot.Edit(msg, fmt.Sprintf("Decrypting - (%.2f%%)", percentage))
-			if err != nil && !strings.Contains(err.Error(), "not modified") {
-				fmt.Println("Error updating message:", err)
-			}
-		}
-	}()
 
 	for _, sp := range info.samples {
 		if lastIndex != sp.descIndex {
@@ -754,11 +678,12 @@ func decryptSong(info *SongInfo, keys []string, manifest *AutoSong, bot *tg.Bot,
 		}
 
 		decrypted = append(decrypted, de...)
+		bar.Add(len(sp.data))
 		pd = len(sp.data)
 		totalProcessed += pd
 	}
 
-	msg, err = bot.Edit(msg, "Decryption complete")
+	//msg, err = bot.Edit(msg, "Decryption complete")
 	if err != nil {
 		return nil, err
 	}
@@ -1586,3 +1511,160 @@ func WriteM4a(w *mp4.Writer, info *SongInfo, meta *AutoSong, data []byte) error 
 	return nil
 
 }
+
+// <---------------------------STRUCTS---------------------------------> //
+
+type URLMeta struct {
+	Storefront string
+	URLType    string
+	ID         string
+}
+
+type AutoSong struct {
+	ID            string         `json:"id"`
+	Type          string         `json:"type"`
+	Href          string         `json:"href"`
+	Attributes    SongAttributes `json:"attributes"`
+	Relationships Relationships  `json:"relationships"`
+}
+
+type SongAttributes struct {
+	AlbumName                 string            `json:"albumName"`
+	HasTimeSyncedLyrics       bool              `json:"hasTimeSyncedLyrics"`
+	GenreNames                []string          `json:"genreNames"`
+	TrackNumber               int               `json:"trackNumber"`
+	DurationInMillis          int               `json:"durationInMillis"`
+	ReleaseDate               string            `json:"releaseDate"`
+	IsVocalAttenuationAllowed bool              `json:"isVocalAttenuationAllowed"`
+	IsMasteredForItunes       bool              `json:"isMasteredForItunes"`
+	ISRC                      string            `json:"isrc"`
+	Artwork                   Artwork           `json:"artwork"`
+	AudioLocale               string            `json:"audioLocale"`
+	ComposerName              string            `json:"composerName"`
+	URL                       string            `json:"url"`
+	PlayParams                PlayParams        `json:"playParams"`
+	DiscNumber                int               `json:"discNumber"`
+	IsAppleDigitalMaster      bool              `json:"isAppleDigitalMaster"`
+	HasLyrics                 bool              `json:"hasLyrics"`
+	AudioTraits               []string          `json:"audioTraits"`
+	Name                      string            `json:"name"`
+	Previews                  []Preview         `json:"previews"`
+	ArtistName                string            `json:"artistName"`
+	ExtendedAssetUrls         map[string]string `json:"extendedAssetUrls"`
+}
+
+type Artwork struct {
+	Width      int    `json:"width"`
+	URL        string `json:"url"`
+	Height     int    `json:"height"`
+	TextColor1 string `json:"textColor1"`
+	TextColor2 string `json:"textColor2"`
+	TextColor3 string `json:"textColor3"`
+	TextColor4 string `json:"textColor4"`
+	BgColor    string `json:"bgColor"`
+	HasP3      bool   `json:"hasP3"`
+}
+
+type PlayParams struct {
+	ID   string `json:"id"`
+	Kind string `json:"kind"`
+}
+
+type Preview struct {
+	URL string `json:"url"`
+}
+
+type Relationships struct {
+	Albums  Relationship `json:"albums"`
+	Artists Relationship `json:"artists"`
+}
+
+type Relationship struct {
+	Href string             `json:"href"`
+	Data []RelationshipData `json:"data"`
+}
+
+type RelationshipData struct {
+	ID         string           `json:"id"`
+	Type       string           `json:"type"`
+	Href       string           `json:"href"`
+	Attributes *AlbumAttributes `json:"attributes,omitempty"` // Nullable for albums
+}
+
+type AlbumAttributes struct {
+	Copyright           string     `json:"copyright"`
+	GenreNames          []string   `json:"genreNames"`
+	ReleaseDate         string     `json:"releaseDate"`
+	UPC                 string     `json:"upc"`
+	IsMasteredForItunes bool       `json:"isMasteredForItunes"`
+	Artwork             Artwork    `json:"artwork"`
+	PlayParams          PlayParams `json:"playParams"`
+	URL                 string     `json:"url"`
+	RecordLabel         string     `json:"recordLabel"`
+	TrackCount          int        `json:"trackCount"`
+	IsCompilation       bool       `json:"isCompilation"`
+	IsPrerelease        bool       `json:"isPrerelease"`
+	AudioTraits         []string   `json:"audioTraits"`
+	IsSingle            bool       `json:"isSingle"`
+	Name                string     `json:"name"`
+	ArtistName          string     `json:"artistName"`
+	IsComplete          bool       `json:"isComplete"`
+}
+
+type SongResponse struct {
+	Data []AutoSong `json:"data"`
+}
+
+// <------------------------------------------------------------> //
+
+func returnError(message string) *C.char {
+	return C.CString(fmt.Sprintf("error::%s", message))
+}
+
+func init() {
+	mp4.AddBoxDef((*Alac)(nil))
+}
+
+func BoxTypeAlac() mp4.BoxType { return mp4.StrToBoxType("alac") }
+
+func (s *SongInfo) Duration() (ret uint64) {
+	for i := range s.samples {
+		ret += uint64(s.samples[i].duration)
+	}
+	return
+}
+
+func (*Alac) GetType() mp4.BoxType {
+	return BoxTypeAlac()
+}
+
+type SongInfo struct {
+	r             io.ReadSeeker
+	alacParam     *Alac
+	samples       []SampleInfo
+	totalDataSize int64
+}
+
+type Alac struct {
+	mp4.FullBox `mp4:"extend"`
+
+	FrameLength       uint32 `mp4:"size=32"`
+	CompatibleVersion uint8  `mp4:"size=8"`
+	BitDepth          uint8  `mp4:"size=8"`
+	Pb                uint8  `mp4:"size=8"`
+	Mb                uint8  `mp4:"size=8"`
+	Kb                uint8  `mp4:"size=8"`
+	NumChannels       uint8  `mp4:"size=8"`
+	MaxRun            uint16 `mp4:"size=16"`
+	MaxFrameBytes     uint32 `mp4:"size=32"`
+	AvgBitRate        uint32 `mp4:"size=32"`
+	SampleRate        uint32 `mp4:"size=32"`
+}
+
+type SampleInfo struct {
+	data      []byte
+	duration  uint32
+	descIndex uint32
+}
+
+func main() {}

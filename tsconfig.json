@@ -1,0 +1,24 @@
+{
+    "compilerOptions": {
+        "incremental": true,
+        "target": "es2022",
+        "module": "ESNext",
+        "moduleResolution": "Bundler",
+        "allowImportingTsExtensions": true,
+        "allowJs": true,
+        "strict": true,
+        "inlineSources": true,
+        "noEmit": true,
+        "outDir": "./dist",
+        "sourceMap": true,
+        "allowSyntheticDefaultImports": true,
+        "esModuleInterop": true,
+        "skipLibCheck": true
+    },
+    "include": [
+        "./src"
+    ],
+    "exclude": [
+        "**/node_modules"
+    ]
+}
