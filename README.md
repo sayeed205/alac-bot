@@ -28,6 +28,8 @@ bun dev # or bun start
 -   `M3U8_URL` - URL of the device checkout - [wrapper](https://github.com/zhaarey/wrapper)
 -   `DEC_URL` - URL of the decryptor checkout - [wrapper](https://github.com/zhaarey/wrapper)
 
+**_Note:_** Don't forget to add the bot to the dump channel and give it admin rights.
+
 ## Commands
 
 -   `/start` - Start the bot
