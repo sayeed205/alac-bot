@@ -12,6 +12,7 @@ import {
 } from '@/modules/alac/service.ts'
 import { authService, type IAuthService } from '@/modules/auth/service.ts'
 
+import { registerBackupCommands } from './backup.ts'
 import { registerCleanCommand } from './clean.ts'
 import { registerDeleteCommand } from './delete.ts'
 import { registerHealthCommand } from './health.ts'
@@ -65,4 +66,5 @@ export function registerAlacCommands(
   registerIndexCommand(ctx)
   registerSearchCommand(ctx)
   registerRipCommand(ctx)
+  registerBackupCommands(ctx)
 }
