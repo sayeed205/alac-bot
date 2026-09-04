@@ -1,6 +1,6 @@
 import { existsSync, unlinkSync } from 'node:fs'
 
-import { html, type TelegramClient } from '@mtcute/bun'
+import { BotKeyboard, html, type TelegramClient } from '@mtcute/bun'
 import { type Dispatcher, filters } from '@mtcute/dispatcher'
 
 import { env } from '@/env.ts'
@@ -21,7 +21,7 @@ import {
 } from '@/modules/alac/service.ts'
 import { formatStatsHtml } from '@/modules/alac/stats.ts'
 import { authService, type IAuthService } from '@/modules/auth/service.ts'
-import { debug, error, info, infoSpan } from '@/utils/logger.ts'
+import { debug, debugSpan, error, info, infoSpan } from '@/utils/logger.ts'
 import { formatByteProgress } from '@/utils/progress.ts'
 
 function parseDynamicHtml(content: string) {
@@ -36,11 +36,9 @@ export function registerAlacHandlers(
   queue: IRipQueue = defaultQueue,
   auth: IAuthService = authService,
 ) {
+  // Command: /stats
   dp.onNewMessage(filters.command('stats'), async (msg) => {
-    using _statsSpan = infoSpan('stats_cmd', {
-      user_id: msg.sender.id,
-      chat_id: msg.chat.id,
-    }).enter()
+    using _statsSpan = infoSpan('stats').enter()
 
     const isAdmin = auth.isAdmin(msg.sender.id)
     if (!isAdmin) {
@@ -51,20 +49,163 @@ export function registerAlacHandlers(
       return
     }
 
-    info('Generating analytics stats report for admin', {
-      user_id: msg.sender.id,
-    })
+    info('Stats requested', { user: msg.sender.id })
 
     const stats = await service.getStats()
     await msg.replyText(parseDynamicHtml(formatStatsHtml(stats)))
   })
 
+  // Command: /search <query>
+  dp.onNewMessage(filters.command('search'), async (msg) => {
+    using _searchSpan = infoSpan('search').enter()
+
+    const isAuthed = await auth.isAuthorized(msg.sender.id, msg.chat.id)
+    if (!isAuthed) {
+      debug('Unauthorized user attempted /search', { user_id: msg.sender.id })
+      return
+    }
+
+    const textParts = msg.text.trim().split(/\s+/)
+    const query = textParts.slice(1).join(' ').trim()
+    if (!query) {
+      await msg.replyText(
+        parseDynamicHtml(
+          '<b>Usage:</b> <code>/search &lt;track title, artist, or album&gt;</code><br/><br/><i>Searches all lossless tracks already cached in the database for instant download.</i>',
+        ),
+      )
+      return
+    }
+
+    const results = await service.searchCachedTracks(query, 8)
+    info('Search query', { query, matches: results.length })
+
+    if (results.length === 0) {
+      await msg.replyText(
+        parseDynamicHtml(
+          `No cached tracks found matching "<b>${html.escape(query)}</b>".<br/><br/>💡 Use <code>/alac &lt;apple_music_link&gt;</code> to rip and cache it.`,
+        ),
+      )
+      return
+    }
+
+    const formatSecs = (sec: number | null) => {
+      if (!sec || sec <= 0) return ''
+      const m = Math.floor(sec / 60)
+      const s = String(sec % 60).padStart(2, '0')
+      return ` • ${m}:${s}`
+    }
+
+    const listLines = results.map((t, idx) => {
+      const title = html.escape(t.title || `Track ${t.appleTrackId}`)
+      const artist = html.escape(t.artist || 'Unknown Artist')
+      const quality =
+        t.bitDepth && t.sampleRate
+          ? ` • ALAC ${t.bitDepth}b/${Math.round(t.sampleRate / 1000)}kHz`
+          : ' • ALAC'
+      const dur = formatSecs(t.duration)
+      return `<b>${idx + 1}. ${title}</b> — ${artist}<br/><i>${quality}${dur}</i>`
+    })
+
+    const buttons = results.map((t, idx) => {
+      const rawTitle = t.title || `Track ${t.appleTrackId}`
+      const shortTitle =
+        rawTitle.length > 28 ? `${rawTitle.slice(0, 25)}...` : rawTitle
+      return [
+        BotKeyboard.callback(
+          `🎵 ${idx + 1}. ${shortTitle}`,
+          `dl:${t.appleTrackId}`,
+        ),
+      ]
+    })
+
+    buttons.push([BotKeyboard.callback('❌ Close', 'search_close')])
+
+    await msg.replyText(
+      parseDynamicHtml(
+        `<b>🔍 Found ${results.length} cached track${results.length > 1 ? 's' : ''} for "<i>${html.escape(query)}</i>":</b><br/><br/>` +
+          `${listLines.join('<br/><br/>')}<br/><br/>` +
+          `<i>Tap a button below for instant delivery:</i>`,
+      ),
+      { replyMarkup: BotKeyboard.inline(buttons) },
+    )
+  })
+
+  // Callback query for search download buttons
+  dp.onCallbackQuery(
+    filters.or(filters.startsWith('dl:'), filters.equals('search_close')),
+    async (query) => {
+      const data = query.dataStr
+      if (!data) return
+
+      if (data === 'search_close') {
+        await query.answer()
+        await tg
+          .deleteMessagesById(query.chat.id, [query.messageId])
+          .catch(() => null)
+        return
+      }
+
+      if (data.startsWith('dl:')) {
+        const appleTrackId = data.slice(3)
+        using _dlSpan = infoSpan('search_dl').enter()
+
+        const chatId = query.chat.id
+        const isAuthed = await auth.isAuthorized(query.user.id, chatId)
+        if (!isAuthed) {
+          await query.answer({ text: 'Unauthorized', alert: true })
+          return
+        }
+
+        const cached = await service.findCachedTrack(appleTrackId)
+        if (!cached) {
+          await query.answer({
+            text: 'Track is no longer cached in dump channel.',
+            alert: true,
+          })
+          return
+        }
+
+        // Immediately acknowledge button click so Telegram stops spinner
+        await query.answer({ text: '⚡ Delivering lossless track from cache!' })
+
+        try {
+          await tg.sendCopy({
+            toChatId: chatId,
+            fromChatId: env.DUMP_CHANNEL_ID,
+            message: cached.messageId,
+            replyTo: query.messageId,
+          })
+
+          info('Delivered cached track', {
+            track: cached.title || appleTrackId,
+            user: query.user.id,
+          })
+
+          await service.logRequest({
+            telegramId: query.user.id,
+            chatId,
+            appleTrackId,
+            isCacheHit: true,
+            durationMs: 100,
+            status: 'completed',
+          })
+        } catch (err: unknown) {
+          error('Failed to deliver cached track via search callback', {
+            track_id: appleTrackId,
+            error: String(err),
+          })
+          await query.answer({
+            text: 'Failed to retrieve audio from dump channel.',
+            alert: true,
+          })
+        }
+      }
+    },
+  )
+
+  // Command: /alac & /rerip
   dp.onNewMessage(filters.command(['alac', 'rerip']), async (msg) => {
-    using _cmdSpan = infoSpan('alac_cmd', {
-      user_id: msg.sender.id,
-      chat_id: msg.chat.id,
-      msg_id: msg.id,
-    }).enter()
+    using _cmdSpan = infoSpan('alac').enter()
 
     const isAuthed = await auth.isAuthorized(msg.sender.id, msg.chat.id)
     if (!isAuthed) {
@@ -100,10 +241,10 @@ export function registerAlacHandlers(
       return
     }
 
-    info('Processing rip request', {
-      target_id: parsed.trackId,
-      is_album: parsed.isAlbum,
-      is_force: isForce,
+    info('Rip request', {
+      target: parsed.trackId,
+      type: parsed.isAlbum ? 'album' : 'track',
+      force: isForce,
     })
 
     // Determine target track IDs (single track vs full album)
@@ -138,10 +279,8 @@ export function registerAlacHandlers(
       const trackId = trackIds[index]
       if (!trackId) continue
 
-      using _trackSpan = infoSpan('track_job', {
+      using _trackSpan = debugSpan('track_job', {
         track_id: trackId,
-        index: index + 1,
-        total: trackIds.length,
       }).enter()
 
       const trackPrefix =
@@ -162,10 +301,9 @@ export function registerAlacHandlers(
             })
 
             const durationMs = Date.now() - startTime
-            info('Cache hit, delivered track from dump channel', {
+            info('Cache hit: delivered', {
               track_id: trackId,
-              message_id: cached.messageId,
-              duration_ms: durationMs,
+              time: `${durationMs}ms`,
             })
 
             await service.logRequest({
@@ -230,7 +368,7 @@ export function registerAlacHandlers(
 
               await updateStatus('Uploading to Telegram...', true)
               const uploadStart = Date.now()
-              info('Uploading lossless track to Telegram dump channel...', {
+              debug('Uploading track to dump channel', {
                 track_id: trackId,
                 file: ripResult.filePath,
               })
@@ -267,12 +405,18 @@ export function registerAlacHandlers(
                 fileUniqueId = dumpMsg.media.uniqueFileId
               }
 
-              // Save / update in database
+              // Save / update in database with rich audio metadata
               await service.saveTrack({
                 appleTrackId: trackId,
                 messageId: dumpMsg.id,
                 fileId,
                 fileUniqueId,
+                title: ripResult.title,
+                artist: ripResult.artist,
+                album: ripResult.album,
+                duration: ripResult.duration,
+                bitDepth: ripResult.bitDepth,
+                sampleRate: ripResult.sampleRate,
               })
 
               // Deliver clean copy to destination chat
@@ -289,11 +433,9 @@ export function registerAlacHandlers(
                 .catch(() => null)
 
               const totalDurationMs = Date.now() - startTime
-              info('Track rip and upload complete', {
-                track_id: trackId,
-                dump_message_id: dumpMsg.id,
-                upload_duration_ms: Date.now() - uploadStart,
-                total_duration_ms: totalDurationMs,
+              info('Track completed', {
+                track: `${ripResult.artist} - ${ripResult.title}`,
+                time: `${(totalDurationMs / 1000).toFixed(1)}s`,
               })
 
               // Log success
@@ -337,7 +479,18 @@ export function registerAlacHandlers(
           stack: err instanceof Error ? err.stack : undefined,
         })
 
-        await updateStatus(`Failed: ${errorMsg}`, true)
+        const escapedError = html.escape(errorMsg)
+        const failText = `${albumHeader ? `${albumHeader}<br/>` : ''}${trackPrefix}❌ <b>Failed:</b> <code>${escapedError}</code>`
+
+        try {
+          await tg.editMessage({
+            chatId: msg.chat.id,
+            message: statusMsg.id,
+            text: parseDynamicHtml(failText),
+          })
+        } catch {
+          await msg.replyText(parseDynamicHtml(failText)).catch(() => null)
+        }
 
         await service.logRequest({
           telegramId: msg.sender.id,

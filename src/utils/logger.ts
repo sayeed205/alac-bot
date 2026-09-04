@@ -68,6 +68,7 @@ export function initTracing(levelOverride?: string): void {
   FmtSubscriber.setGlobalDefault({
     level,
     color: true,
+    abbreviateLongFieldValues: 40,
   })
 
   initialized = true

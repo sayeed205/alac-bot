@@ -1,4 +1,4 @@
-import { and, avg, count, desc, eq, inArray } from 'drizzle-orm'
+import { and, avg, count, desc, eq, ilike, inArray, or } from 'drizzle-orm'
 
 import { type AppDatabase, db as defaultDb } from '@/db/index.ts'
 import { type NewRequest, requests, type Track, tracks } from '@/db/schema.ts'
@@ -9,6 +9,12 @@ export interface SaveTrackInput {
   messageId: number
   fileId: string
   fileUniqueId?: string
+  title?: string
+  artist?: string
+  album?: string
+  duration?: number
+  bitDepth?: number
+  sampleRate?: number
 }
 
 export interface TopTrackStat {
@@ -31,6 +37,7 @@ export interface AlacStats {
 export interface IAlacService {
   findCachedTrack(appleTrackId: string): Promise<Track | null>
   findCachedTracks(appleTrackIds: string[]): Promise<Map<string, Track>>
+  searchCachedTracks(query: string, limit?: number): Promise<Track[]>
   saveTrack(input: SaveTrackInput): Promise<Track>
   deleteTrack(appleTrackId: string): Promise<boolean>
   logRequest(data: NewRequest): Promise<void>
@@ -88,6 +95,36 @@ export class AlacService implements IAlacService {
     return result
   }
 
+  async searchCachedTracks(query: string, limit = 10): Promise<Track[]> {
+    using _ = debugSpan('db_search_cached_tracks', { query, limit }).enter()
+
+    const trimmed = query.trim()
+    if (!trimmed) {
+      return []
+    }
+
+    const pattern = `%${trimmed}%`
+    const rows = await this.db
+      .select()
+      .from(tracks)
+      .where(
+        or(
+          ilike(tracks.title, pattern),
+          ilike(tracks.artist, pattern),
+          ilike(tracks.album, pattern),
+          eq(tracks.appleTrackId, trimmed),
+        ),
+      )
+      .limit(limit)
+
+    debug('Track search query completed', {
+      query: trimmed,
+      matches: rows.length,
+    })
+
+    return rows
+  }
+
   async saveTrack(input: SaveTrackInput): Promise<Track> {
     using _ = debugSpan('db_save_track', {
       appleTrackId: input.appleTrackId,
@@ -101,6 +138,12 @@ export class AlacService implements IAlacService {
         messageId: input.messageId,
         fileId: input.fileId,
         fileUniqueId: input.fileUniqueId,
+        title: input.title,
+        artist: input.artist,
+        album: input.album,
+        duration: input.duration,
+        bitDepth: input.bitDepth,
+        sampleRate: input.sampleRate,
         updatedAt: new Date(),
       })
       .onConflictDoUpdate({
@@ -109,6 +152,12 @@ export class AlacService implements IAlacService {
           messageId: input.messageId,
           fileId: input.fileId,
           fileUniqueId: input.fileUniqueId,
+          title: input.title,
+          artist: input.artist,
+          album: input.album,
+          duration: input.duration,
+          bitDepth: input.bitDepth,
+          sampleRate: input.sampleRate,
           updatedAt: new Date(),
         },
       })

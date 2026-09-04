@@ -31,21 +31,31 @@ describe('AlacService', () => {
     expect(track).toBeNull()
   })
 
-  it('saves and retrieves a cached track', async () => {
+  it('saves and retrieves a cached track with rich metadata', async () => {
     const saved = await service.saveTrack({
       appleTrackId: '123456789',
       messageId: 42,
       fileId: 'tg_file_id_test',
       fileUniqueId: 'tg_unique_id_test',
+      title: 'Never Gonna Give You Up',
+      artist: 'Rick Astley',
+      album: 'Whenever You Need Somebody',
+      duration: 215,
+      bitDepth: 16,
+      sampleRate: 44100,
     })
 
     expect(saved.appleTrackId).toBe('123456789')
     expect(saved.messageId).toBe(42)
+    expect(saved.title).toBe('Never Gonna Give You Up')
+    expect(saved.artist).toBe('Rick Astley')
+    expect(saved.bitDepth).toBe(16)
 
     const fetched = await service.findCachedTrack('123456789')
     expect(fetched).not.toBeNull()
     expect(fetched?.messageId).toBe(42)
-    expect(fetched?.fileId).toBe('tg_file_id_test')
+    expect(fetched?.title).toBe('Never Gonna Give You Up')
+    expect(fetched?.artist).toBe('Rick Astley')
   })
 
   it('upserts an existing track when saved with updated details', async () => {
@@ -53,11 +63,47 @@ describe('AlacService', () => {
       appleTrackId: '123456789',
       messageId: 100,
       fileId: 'tg_file_id_updated',
+      title: 'Never Gonna Give You Up (Remastered)',
     })
 
     const fetched = await service.findCachedTrack('123456789')
     expect(fetched?.messageId).toBe(100)
-    expect(fetched?.fileId).toBe('tg_file_id_updated')
+    expect(fetched?.title).toBe('Never Gonna Give You Up (Remastered)')
+  })
+
+  it('searches cached tracks by title, artist, or track ID', async () => {
+    // Empty search query returns empty array
+    expect(await service.searchCachedTracks('')).toEqual([])
+    expect(await service.searchCachedTracks('   ')).toEqual([])
+
+    // Save another track for search diversity
+    await service.saveTrack({
+      appleTrackId: '555666777',
+      messageId: 200,
+      fileId: 'tg_file_id_3',
+      title: 'Together Forever',
+      artist: 'Rick Astley',
+      album: 'Whenever You Need Somebody',
+      duration: 205,
+    })
+
+    // Search by title substring (case-insensitive)
+    const titleResults = await service.searchCachedTracks('give you up')
+    expect(titleResults.length).toBe(1)
+    expect(titleResults[0]?.appleTrackId).toBe('123456789')
+
+    // Search by artist substring matches multiple tracks
+    const artistResults = await service.searchCachedTracks('astley')
+    expect(artistResults.length).toBe(2)
+
+    // Search by direct apple track ID
+    const idResults = await service.searchCachedTracks('555666777')
+    expect(idResults.length).toBe(1)
+    expect(idResults[0]?.title).toBe('Together Forever')
+
+    // Search with no matches
+    const noResults = await service.searchCachedTracks('NonExistentArtistXYZ')
+    expect(noResults.length).toBe(0)
   })
 
   it('batch retrieves multiple cached tracks with findCachedTracks', async () => {
@@ -128,10 +174,16 @@ describe('AlacService', () => {
   })
 
   it('deletes an existing track', async () => {
-    const deleted = await service.deleteTrack('123456789')
+    await service.saveTrack({
+      appleTrackId: 'test_delete_id',
+      messageId: 300,
+      fileId: 'tg_file_id_del',
+    })
+
+    const deleted = await service.deleteTrack('test_delete_id')
     expect(deleted).toBe(true)
 
-    const fetched = await service.findCachedTrack('123456789')
+    const fetched = await service.findCachedTrack('test_delete_id')
     expect(fetched).toBeNull()
   })
 })

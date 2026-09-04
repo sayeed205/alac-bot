@@ -1,7 +1,7 @@
 import { mkdir, unlink } from 'node:fs/promises'
 import { join } from 'node:path'
 
-import { debug, error, info, infoSpan } from '@/utils/logger.ts'
+import { debug, debugSpan, error, info, infoSpan } from '@/utils/logger.ts'
 import { formatByteProgress } from '@/utils/progress.ts'
 
 import { fetchTrackMeta } from './itunes.ts'
@@ -55,7 +55,7 @@ export class AlacTrackRipper implements ITrackRipper {
     trackId: string,
     onProgress?: (status: string) => void,
   ): Promise<TrackRipResult> {
-    using _ = infoSpan('ripper', { track_id: trackId }).enter()
+    using _ = debugSpan('ripper', { track_id: trackId }).enter()
     const ripStart = Date.now()
 
     await mkdir(this.outputDir, { recursive: true })
@@ -161,7 +161,7 @@ export class AlacTrackRipper implements ITrackRipper {
     const sampleRate = streamResp.headers.get('x-samplerate') || '44100'
     const contentLength = Number(streamResp.headers.get('content-length')) || 0
 
-    info('Mirror stream connected', {
+    debug('Mirror stream connected', {
       track_id: trackId,
       connect_duration_ms: Date.now() - streamStart,
       codec,
@@ -211,7 +211,7 @@ export class AlacTrackRipper implements ITrackRipper {
       }
       await fileSink.end()
 
-      info('Stream download completed', {
+      debug('Stream download completed', {
         track_id: trackId,
         downloaded_bytes: downloadedBytes,
         stream_duration_ms: Date.now() - streamStart,
@@ -232,7 +232,7 @@ export class AlacTrackRipper implements ITrackRipper {
         lyrics,
       })
 
-      info('Tagging finished', {
+      debug('Tagging finished', {
         track_id: trackId,
         has_lyrics: Boolean(lyrics),
         has_cover: Boolean(coverBuffer),

@@ -353,11 +353,11 @@ export function registerAuthHandlers(
   })
 
   // Callback query for pagination & actions
-  dp.onCallbackQuery(async (query) => {
-    const data = query.dataStr
-    if (!data || (!data.startsWith('auth') && data !== 'noop')) {
-      return
-    }
+  dp.onCallbackQuery(
+    filters.or(filters.startsWith('auth'), filters.equals('noop')),
+    async (query) => {
+      const data = query.dataStr
+      if (!data) return
 
     if (!service.isAdmin(query.user.id)) {
       await query.answer({ text: 'Unauthorized.', alert: true })

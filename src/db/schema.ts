@@ -17,19 +17,32 @@ export const users = pgTable('users', {
     .notNull(),
 })
 
-export const tracks = pgTable('tracks', {
-  id: serial('id').primaryKey(),
-  appleTrackId: text('apple_track_id').notNull().unique(),
-  messageId: integer('message_id').notNull(),
-  fileId: text('file_id').notNull(),
-  fileUniqueId: text('file_unique_id'),
-  createdAt: timestamp('created_at', { withTimezone: true })
-    .defaultNow()
-    .notNull(),
-  updatedAt: timestamp('updated_at', { withTimezone: true })
-    .defaultNow()
-    .notNull(),
-})
+export const tracks = pgTable(
+  'tracks',
+  {
+    id: serial('id').primaryKey(),
+    appleTrackId: text('apple_track_id').notNull().unique(),
+    messageId: integer('message_id').notNull(),
+    fileId: text('file_id').notNull(),
+    fileUniqueId: text('file_unique_id'),
+    title: text('title'),
+    artist: text('artist'),
+    album: text('album'),
+    duration: integer('duration'),
+    bitDepth: integer('bit_depth'),
+    sampleRate: integer('sample_rate'),
+    createdAt: timestamp('created_at', { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    index('tracks_title_idx').on(table.title),
+    index('tracks_artist_idx').on(table.artist),
+  ],
+)
 
 export const requests = pgTable(
   'requests',
