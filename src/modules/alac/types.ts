@@ -22,7 +22,7 @@ export interface TrackRipResult {
   artist: string
   album?: string
   duration?: number
-  bitDepth?: string
-  sampleRate?: string
+  bitDepth?: number
+  sampleRate?: number
   codec?: string
 }

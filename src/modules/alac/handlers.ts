@@ -138,7 +138,7 @@ export function registerAlacHandlers(
       if (!data) return
 
       if (data === 'search_close') {
-        await query.answer()
+        await query.answer({})
         await tg
           .deleteMessagesById(query.chat.id, [query.messageId])
           .catch(() => null)
@@ -448,7 +448,7 @@ export function registerAlacHandlers(
               })
             } finally {
               // Guaranteed immediate cleanup of local audio file
-              if (ripResult?.filePath && existsSync(ripResult.filePath)) {
+              if (ripResult && existsSync(ripResult.filePath)) {
                 try {
                   unlinkSync(ripResult.filePath)
                 } catch {}

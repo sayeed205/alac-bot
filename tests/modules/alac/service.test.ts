@@ -16,7 +16,7 @@ describe('AlacService', () => {
     client = new PGlite()
     await client.waitReady
     const testDb = drizzle(client, { schema })
-    await migrate(testDb, { migrationsFolder: './drizzle' } || {})
+    await migrate(testDb, { migrationsFolder: './drizzle' })
     service = new AlacService(testDb as unknown as AppDatabase)
   })
 

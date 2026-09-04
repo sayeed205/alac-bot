@@ -38,14 +38,14 @@ export class FakeTrackRipper implements ITrackRipper {
       album: this.mockResult?.album || 'Mock Album',
       duration: this.mockResult?.duration || 210,
       codec: 'alac',
-      bitDepth: '24',
-      sampleRate: '96000',
+      bitDepth: 24,
+      sampleRate: 96000,
     }
   }
 }
 
 export class AlacTrackRipper implements ITrackRipper {
-  private outputDir: string
+  private readonly outputDir: string
 
   constructor(outputDir?: string) {
     this.outputDir = outputDir || join(process.cwd(), 'bot-data', 'downloads')
@@ -157,8 +157,12 @@ export class AlacTrackRipper implements ITrackRipper {
     }
 
     const codec = streamResp.headers.get('x-codec') || 'alac'
-    const bitDepth = streamResp.headers.get('x-bitdepth') || '16'
-    const sampleRate = streamResp.headers.get('x-samplerate') || '44100'
+    const rawBitDepth = streamResp.headers.get('x-bitdepth')
+    const rawSampleRate = streamResp.headers.get('x-samplerate')
+    const bitDepth = rawBitDepth ? Number.parseInt(rawBitDepth, 10) : 16
+    const sampleRate = rawSampleRate
+      ? Number.parseInt(rawSampleRate, 10)
+      : 44100
     const contentLength = Number(streamResp.headers.get('content-length')) || 0
 
     debug('Mirror stream connected', {

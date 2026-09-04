@@ -1,6 +1,5 @@
+import { env } from '@/env.ts'
 import { debug, error, info, infoSpan } from '@/utils/logger.ts'
-
-import { env } from '../../env.ts'
 
 const MANIFEST_URL_B64 =
   'aHR0cHM6Ly9naXN0LmdpdGh1YnVzZXJjb250ZW50LmNvbS9NYW5PZkluZmluaXR5L2VjNmRiNzlmMDMxZDU4NjQwYzg0YjIyNWM0Yzc4Y2FiL3Jhdw=='

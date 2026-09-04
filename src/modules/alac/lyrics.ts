@@ -13,7 +13,7 @@ export interface LyricsCandidate {
 }
 
 const WORD_SYNC_REGEX = /<\d{1,3}:\d{2}(?:[.:]\d{2,3})?>/
-const LINE_SYNC_REGEX = /\[\d{1,3}:\d{2}(?:[.:]\d{2,3})?\]/
+const LINE_SYNC_REGEX = /\[\d{1,3}:\d{2}(?:[.:]\d{2,3})?]/
 
 function formatTimestamp(timeStr: string): string {
   let totalSec = 0

@@ -43,7 +43,6 @@ describe('Handlers Dispatcher & Callback Query Flow', () => {
       authorize: mock(() => Promise.resolve({ newlyAdded: true })),
       revoke: mock(() => Promise.resolve({ revoked: true })),
       listAuthorized: mock(() => Promise.resolve([])),
-      getAuthorizedCount: mock(() => Promise.resolve(1)),
     }
 
     const mockAlacService: IAlacService = {
@@ -53,6 +52,7 @@ describe('Handlers Dispatcher & Callback Query Flow', () => {
           appleTrackId: id,
           messageId: 42,
           fileId: 'fid',
+          fileUniqueId: 'uid',
           title: 'Test Song',
           artist: 'Test Artist',
           album: 'Test Album',
