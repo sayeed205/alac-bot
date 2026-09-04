@@ -3,8 +3,8 @@ import fs from 'node:fs'
 import type { PgliteDatabase } from 'drizzle-orm/pglite'
 import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js'
 
-import { db, isProduction } from './index.ts'
-import type * as schema from './schema.ts'
+import { db, isProduction } from '@/db/index.ts'
+import type * as schema from '@/db/schema.ts'
 
 export async function runMigrations() {
   if (!fs.existsSync('./drizzle/meta/_journal.json')) {

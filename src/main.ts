@@ -1,7 +1,11 @@
 import { TelegramClient } from '@mtcute/bun'
 import { Dispatcher, filters } from '@mtcute/dispatcher'
 
-import { env } from './env.ts'
+import { runMigrations } from '@/db/migrate.ts'
+import { env } from '@/env.ts'
+import { registerAuthHandlers } from '@/modules/auth/index.ts'
+
+await runMigrations()
 
 const tg = new TelegramClient({
   apiId: env.API_ID,
@@ -10,6 +14,8 @@ const tg = new TelegramClient({
 })
 
 const dp = Dispatcher.for(tg)
+
+registerAuthHandlers(dp, tg)
 
 dp.onNewMessage(filters.start, async (msg) => {
   await msg.answerText('Hello, world!')

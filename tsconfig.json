@@ -14,7 +14,10 @@
     "strict": true,
     "incremental": true,
     "skipLibCheck": true,
-    "types": ["bun"]
+    "types": ["bun"],
+    "paths": {
+      "@/*": ["./src/*"]
+    }
   },
   "include": ["./src"],
   "exclude": ["**/node_modules"]

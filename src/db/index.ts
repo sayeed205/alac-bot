@@ -5,8 +5,8 @@ import {
 } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
 
-import { env } from '../env.ts'
-import * as schema from './schema.ts'
+import * as schema from '@/db/schema.ts'
+import { env } from '@/env.ts'
 
 export type AppDatabase =
   | PgliteDatabase<typeof schema>

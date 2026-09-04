@@ -1,2 +1,63 @@
-// Export your Drizzle schema definitions here
-export {}
+import {
+  bigint,
+  boolean,
+  index,
+  integer,
+  pgTable,
+  serial,
+  text,
+  timestamp,
+} from 'drizzle-orm/pg-core'
+
+export const users = pgTable('users', {
+  telegramId: bigint('telegram_id', { mode: 'number' }).primaryKey(),
+  name: text('name'),
+  createdAt: timestamp('created_at', { withTimezone: true })
+    .defaultNow()
+    .notNull(),
+})
+
+export const tracks = pgTable('tracks', {
+  id: serial('id').primaryKey(),
+  appleTrackId: text('apple_track_id').notNull().unique(),
+  messageId: integer('message_id').notNull(),
+  fileId: text('file_id').notNull(),
+  fileUniqueId: text('file_unique_id'),
+  createdAt: timestamp('created_at', { withTimezone: true })
+    .defaultNow()
+    .notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true })
+    .defaultNow()
+    .notNull(),
+})
+
+export const requests = pgTable(
+  'requests',
+  {
+    id: serial('id').primaryKey(),
+    telegramId: bigint('telegram_id', { mode: 'number' }).notNull(),
+    chatId: bigint('chat_id', { mode: 'number' }).notNull(),
+    appleTrackId: text('apple_track_id').notNull(),
+    isCacheHit: boolean('is_cache_hit').notNull(),
+    durationMs: integer('duration_ms'),
+    status: text('status').notNull(),
+    errorReason: text('error_reason'),
+    createdAt: timestamp('created_at', { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    index('requests_apple_track_id_idx').on(table.appleTrackId),
+    index('requests_telegram_id_idx').on(table.telegramId),
+    index('requests_created_at_idx').on(table.createdAt),
+  ],
+)
+
+export type User = typeof users.$inferSelect
+export type NewUser = typeof users.$inferInsert
+
+export type Track = typeof tracks.$inferSelect
+export type NewTrack = typeof tracks.$inferInsert
+
+export type Request = typeof requests.$inferSelect
+export type NewRequest = typeof requests.$inferInsert

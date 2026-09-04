@@ -5,6 +5,7 @@ const r = z
     API_ID: z.coerce.number(),
     API_HASH: z.string(),
     BOT_TOKEN: z.string(),
+    ADMIN_ID: z.coerce.number(),
     DATABASE_URL: z.string().optional(),
     DATABASE_DIR: z.string().default('./bot-data/db'),
   })
