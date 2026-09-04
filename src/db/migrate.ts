@@ -1,0 +1,37 @@
+import fs from 'node:fs'
+
+import type { PgliteDatabase } from 'drizzle-orm/pglite'
+import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js'
+
+import { db, isProduction } from './index.ts'
+import type * as schema from './schema.ts'
+
+export async function runMigrations() {
+  if (!fs.existsSync('./drizzle/meta/_journal.json')) {
+    console.log(
+      'No migrations found in ./drizzle folder. Run `bun run db:generate` after defining your schema.',
+    )
+    return
+  }
+
+  console.log(
+    `Running migrations (${isProduction ? 'PostgreSQL' : 'PGlite local'})...`,
+  )
+  if (isProduction) {
+    const { migrate } = await import('drizzle-orm/postgres-js/migrator')
+    await migrate(db as PostgresJsDatabase<typeof schema>, {
+      migrationsFolder: './drizzle',
+    })
+  } else {
+    const { migrate } = await import('drizzle-orm/pglite/migrator')
+    await migrate(db as PgliteDatabase<typeof schema>, {
+      migrationsFolder: './drizzle',
+    })
+  }
+  console.log('Migrations completed successfully!')
+}
+
+if (import.meta.main) {
+  await runMigrations()
+  process.exit(0)
+}
