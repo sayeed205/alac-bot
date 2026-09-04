@@ -97,11 +97,9 @@ describe('AlacService', () => {
   })
 
   it('searches cached tracks by title, artist, or track ID', async () => {
-    // Empty search query returns empty array
     expect(await service.searchCachedTracks('')).toEqual([])
     expect(await service.searchCachedTracks('   ')).toEqual([])
 
-    // Save another track for search diversity
     await service.saveTrack(
       makeTrackInput({
         appleTrackId: '555666777',
@@ -114,31 +112,25 @@ describe('AlacService', () => {
       }),
     )
 
-    // Search by title substring (case-insensitive)
     const titleResults = await service.searchCachedTracks('give you up')
     expect(titleResults.length).toBe(1)
     expect(titleResults[0]?.appleTrackId).toBe('123456789')
 
-    // Search by artist substring matches multiple tracks
     const artistResults = await service.searchCachedTracks('astley')
     expect(artistResults.length).toBe(2)
 
-    // Search by direct apple track ID
     const idResults = await service.searchCachedTracks('555666777')
     expect(idResults.length).toBe(1)
     expect(idResults[0]?.title).toBe('Together Forever')
 
-    // Search with no matches
     const noResults = await service.searchCachedTracks('NonExistentArtistXYZ')
     expect(noResults.length).toBe(0)
   })
 
   it('batch retrieves multiple cached tracks with findCachedTracks', async () => {
-    // Empty list returns empty map
     const emptyMap = await service.findCachedTracks([])
     expect(emptyMap.size).toBe(0)
 
-    // Save another track
     await service.saveTrack(
       makeTrackInput({
         appleTrackId: '987654321',
@@ -169,7 +161,6 @@ describe('AlacService', () => {
       status: 'completed',
     })
 
-    // If it did not throw, it succeeded
     expect(true).toBe(true)
   })
 
@@ -238,7 +229,6 @@ describe('AlacService', () => {
     expect(allIds).toContain('sync_track_1')
     expect(allIds).toContain('sync_track_2')
 
-    // Keep only sync_track_2, pruning sync_track_1 and any older leftovers
     const prunedCount = await service.deleteTracksNotIn(['sync_track_2'])
     expect(prunedCount).toBeGreaterThanOrEqual(1)
 

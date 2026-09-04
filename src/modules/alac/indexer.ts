@@ -156,7 +156,6 @@ export async function indexDumpChannel(
   await tg.deleteMessagesById(dumpChannelId, [maxId]).catch(() => null)
 
   const BATCH_SIZE = 100
-  // Iterate backwards from maxId - 1 down to 1
   for (let end = maxId - 1; end >= 1; end -= BATCH_SIZE) {
     const start = Math.max(1, end - BATCH_SIZE + 1)
     const batchIds: number[] = []
@@ -168,7 +167,6 @@ export async function indexDumpChannel(
 
     for (const message of messages) {
       if (!message) {
-        // Message was deleted or doesn't exist
         continue
       }
 

@@ -1,8 +1,9 @@
-import { describe, expect, it } from 'bun:test'
+import { afterEach, describe, expect, it } from 'bun:test'
 
 import {
   convertTtmlToElrc,
   detectLyricsTier,
+  fetchLyrics,
   LyricsTier,
   scoreLyrics,
 } from '@/modules/alac/lyrics.ts'
@@ -76,10 +77,105 @@ describe('Lyrics Ranking & Parser', () => {
       20,
     )
 
-    // Primary line-synced score = 500 + 30 = 530
-    // Secondary word-synced score = 1000 + 20 = 1020
     expect(wordSyncedFromSecondary.score).toBeGreaterThan(
       lineSyncedFromPrimary.score,
     )
+  })
+
+  it('handles TTML with mixed word-spans and plain paragraph lines', () => {
+    const ttml = `
+      <tt xmlns="http://www.w3.org/ns/ttml">
+        <body>
+          <div>
+            <p begin="00:10.000">Plain lyric line without spans</p>
+            <p begin="00:15.000">
+              <span begin="00:15.000">Word</span>
+              <span begin="00:16.000">sync</span>
+            </p>
+          </div>
+        </body>
+      </tt>
+    `
+    const elrc = convertTtmlToElrc(ttml)
+    expect(elrc).not.toBeNull()
+    expect(elrc).toContain('[00:10.000]Plain lyric line without spans')
+    expect(elrc).toContain('[00:15.000]<00:15.000>Word <00:16.000>sync')
+  })
+
+  describe('fetchLyrics Provider Integration', () => {
+    const originalFetch = globalThis.fetch
+
+    afterEach(() => {
+      globalThis.fetch = originalFetch
+    })
+
+    it('fetches and resolves best lyrics candidate across providers', async () => {
+      globalThis.fetch = async (input: RequestInfo | URL) => {
+        const urlStr = String(input)
+        if (urlStr.includes('paxsenix.org')) {
+          return new Response(
+            JSON.stringify({
+              elrc: '[00:10.00]<00:10.00>Best <00:12.00>lyrics\n[00:15.00]<00:15.00>Line 2',
+            }),
+            { status: 200 },
+          )
+        }
+        if (urlStr.includes('lrclib.net/api/get')) {
+          return new Response(
+            JSON.stringify({
+              syncedLyrics: '[00:10.00]Line-synced lyrics\n[00:15.00]Line 2',
+            }),
+            { status: 200 },
+          )
+        }
+        return new Response('Not found', { status: 404 })
+      }
+
+      const lyrics = await fetchLyrics('12345', {
+        title: 'Song Title',
+        artist: 'Artist Name',
+        album: 'Album Name',
+        duration: 210,
+      })
+
+      expect(lyrics).not.toBeNull()
+      expect(lyrics).toContain('<00:10.00>Best')
+    })
+
+    it('falls back to LRCLIB when primary provider fails', async () => {
+      globalThis.fetch = async (input: RequestInfo | URL) => {
+        const urlStr = String(input)
+        if (urlStr.includes('lrclib.net/api/get')) {
+          return new Response(
+            JSON.stringify({
+              syncedLyrics:
+                '[00:05.00]Fallback LRC line 1\n[00:10.00]Fallback LRC line 2',
+            }),
+            { status: 200 },
+          )
+        }
+        return new Response('Error', { status: 500 })
+      }
+
+      const lyrics = await fetchLyrics('12345', {
+        title: 'Song Title',
+        artist: 'Artist Name',
+      })
+
+      expect(lyrics).toBe(
+        '[00:05.00]Fallback LRC line 1\n[00:10.00]Fallback LRC line 2',
+      )
+    })
+
+    it('returns null when all providers return empty or fail', async () => {
+      globalThis.fetch = async () => new Response('Not found', { status: 404 })
+
+      const lyrics = await fetchLyrics('99999', {
+        title: 'Unknown',
+        artist: 'Unknown',
+      })
+
+      expect(lyrics).toBeNull()
+    })
   })
 })

@@ -10,7 +10,6 @@ import { parseDynamicHtml } from './types.ts'
 export function registerSearchCommand(ctx: CommandContext): void {
   const { dp, tg, service, auth } = ctx
 
-  // Command: /search <query>
   dp.onNewMessage(filters.command('search'), async (msg) => {
     using _searchSpan = infoSpan('search').enter()
 
@@ -88,7 +87,6 @@ export function registerSearchCommand(ctx: CommandContext): void {
     )
   })
 
-  // Callback query for search download buttons
   dp.onCallbackQuery(
     filters.or(filters.startsWith('dl:'), filters.equals('search_close')),
     async (query) => {
@@ -123,7 +121,6 @@ export function registerSearchCommand(ctx: CommandContext): void {
           return
         }
 
-        // Immediately acknowledge button click so Telegram stops spinner
         await query.answer({ text: '⚡ Delivering lossless track from cache!' })
 
         try {

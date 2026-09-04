@@ -47,9 +47,7 @@ export function registerCleanCommand(ctx: CommandContext): void {
             fs.unlinkSync(fullPath)
             filesRemoved++
           }
-        } catch {
-          // Ignore individual file errors
-        }
+        } catch {}
       }
 
       info('Cleaned temporary downloads directory', {

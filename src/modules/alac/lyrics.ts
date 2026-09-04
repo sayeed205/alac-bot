@@ -121,10 +121,6 @@ export function scoreLyrics(
   }
 }
 
-// ----------------------------------------------------------------------
-// Providers
-// ----------------------------------------------------------------------
-
 const USER_AGENT = 'AlacBot/1.0'
 
 async function fetchPaxsenix(trackId: string): Promise<LyricsCandidate[]> {
@@ -146,12 +142,10 @@ async function fetchPaxsenix(trackId: string): Promise<LyricsCandidate[]> {
 
     const candidates: LyricsCandidate[] = []
 
-    // Check direct elrc
     if (data.elrc?.trim()) {
       candidates.push(scoreLyrics(data.elrc, 'Paxsenix Apple Music (ELRC)', 30))
     }
 
-    // Check TTML conversion to word-synced ELRC
     if (data.ttmlContent?.trim()) {
       const converted = convertTtmlToElrc(data.ttmlContent)
       if (converted) {
@@ -161,12 +155,10 @@ async function fetchPaxsenix(trackId: string): Promise<LyricsCandidate[]> {
       }
     }
 
-    // Check line-synced lrc
     if (data.lrc?.trim()) {
       candidates.push(scoreLyrics(data.lrc, 'Paxsenix Apple Music (LRC)', 25))
     }
 
-    // Check plain
     if (data.plain?.trim()) {
       candidates.push(
         scoreLyrics(data.plain, 'Paxsenix Apple Music (Plain)', 20),
@@ -312,10 +304,6 @@ async function fetchLrcLibSearch(
   }
 }
 
-// ----------------------------------------------------------------------
-// Main Ranked Fetcher
-// ----------------------------------------------------------------------
-
 export async function fetchLyrics(
   trackId: string,
   meta: {
@@ -325,7 +313,6 @@ export async function fetchLyrics(
     duration?: number
   },
 ): Promise<string | null> {
-  // Query all providers concurrently
   const settled = await Promise.allSettled([
     fetchPaxsenix(trackId),
     fetchBetterLyrics(meta.title, meta.artist),
@@ -341,7 +328,6 @@ export async function fetchLyrics(
     }
   }
 
-  // Filter out invalid/empty candidates
   const validCandidates = allCandidates.filter(
     (c) => c.tier !== LyricsTier.NONE && c.score > 0,
   )
@@ -350,7 +336,6 @@ export async function fetchLyrics(
     return null
   }
 
-  // Sort descending by score (Tier 1 word-by-word always dominates Tier 2 and Tier 3)
   validCandidates.sort((a, b) => b.score - a.score)
 
   const topPick = validCandidates[0]

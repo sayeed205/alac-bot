@@ -1,10 +1,5 @@
-import {
-  BotKeyboard,
-  html,
-  type Message,
-  type TelegramClient,
-} from '@mtcute/bun'
-import type { Dispatcher } from '@mtcute/dispatcher'
+import { BotKeyboard, html, type TelegramClient } from '@mtcute/bun'
+import type { Dispatcher, MessageContext } from '@mtcute/dispatcher'
 
 import type { IAuthService } from '@/modules/auth/service.ts'
 
@@ -15,7 +10,7 @@ export interface TargetPeer {
 }
 
 export interface CommandContext {
-  dp: Dispatcher<TelegramClient>
+  dp: Dispatcher
   tg: TelegramClient
   service: IAuthService
 }
@@ -69,7 +64,6 @@ export async function getPeerLink(
     return { link: `tg://user?id=${id}`, name }
   }
 
-  // Supergroups and channels start with -100
   const strId = String(id)
   if (chat && 'username' in chat && chat.username) {
     return { link: `https://t.me/${chat.username}`, name }
@@ -80,16 +74,14 @@ export async function getPeerLink(
     return { link: `https://t.me/c/${bareId}/1`, name }
   }
 
-  // Basic group
   const bareId = strId.replace(/^-/, '')
   return { link: `https://t.me/c/${bareId}/1`, name }
 }
 
 export async function resolveTarget(
-  msg: Message,
+  msg: MessageContext,
   tg: TelegramClient,
 ): Promise<TargetPeer | null> {
-  // 1. Target sender of replied message
   const reply = await msg.getReplyTo().catch(() => null)
   if (reply?.sender) {
     const sender = reply.sender
@@ -101,7 +93,6 @@ export async function resolveTarget(
     }
   }
 
-  // 2. Target passed argument (ID or @username)
   const textParts = msg.text.trim().split(/\s+/)
   const arg = textParts[1]?.trim()
   if (arg) {
@@ -128,7 +119,6 @@ export async function resolveTarget(
     return null
   }
 
-  // 3. Target current group/channel if invoked without args inside a group
   if (msg.chat.type !== 'user') {
     const chatId = msg.chat.id
     return {

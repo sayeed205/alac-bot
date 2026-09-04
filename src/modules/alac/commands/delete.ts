@@ -49,12 +49,10 @@ export function registerDeleteCommand(ctx: CommandContext): void {
       return
     }
 
-    // 1. Delete message from Telegram dump channel
     await tg
       .deleteMessagesById(env.DUMP_CHANNEL_ID, [cached.messageId])
       .catch(() => null)
 
-    // 2. Delete track record from database
     await service.deleteTrack(trackId)
 
     info('Deleted cached track', {

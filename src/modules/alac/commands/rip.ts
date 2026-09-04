@@ -66,7 +66,6 @@ export function registerRipCommand(ctx: CommandContext): void {
       force: isForce,
     })
 
-    // Determine target track IDs (single track vs full album)
     let trackIds: string[] = [parsed.trackId]
     let albumHeader = ''
 
@@ -88,12 +87,10 @@ export function registerRipCommand(ctx: CommandContext): void {
       }
     }
 
-    // 1. Batch cache lookup across all target tracks (1 fast DB query)
     const cachedTracksMap = !isForce
       ? await service.findCachedTracks(trackIds)
       : new Map()
 
-    // Process each track in sequence
     for (let index = 0; index < trackIds.length; index++) {
       const trackId = trackIds[index]
       if (!trackId) continue
@@ -107,7 +104,6 @@ export function registerRipCommand(ctx: CommandContext): void {
 
       const startTime = Date.now()
 
-      // 2. Check Cache (Fast-path)
       if (!isForce) {
         const cached = cachedTracksMap.get(trackId)
         if (cached) {
@@ -145,7 +141,6 @@ export function registerRipCommand(ctx: CommandContext): void {
         }
       }
 
-      // 3. Slow-path: Queue sequential rip job
       debug('Queueing rip job', { track_id: trackId })
       const statusMsg = await msg.replyText(
         parseDynamicHtml(
@@ -238,7 +233,6 @@ export function registerRipCommand(ctx: CommandContext): void {
                 fileUniqueId = dumpMsg.media.uniqueFileId
               }
 
-              // Save / update in database with rich audio metadata
               await service.saveTrack({
                 appleTrackId: trackId,
                 messageId: dumpMsg.id,
@@ -256,7 +250,6 @@ export function registerRipCommand(ctx: CommandContext): void {
                 trackCount: ripResult.trackCount,
               })
 
-              // Deliver clean copy to destination chat
               await tg.sendCopy({
                 toChatId: msg.chat.id,
                 fromChatId: env.DUMP_CHANNEL_ID,
@@ -264,7 +257,6 @@ export function registerRipCommand(ctx: CommandContext): void {
                 replyTo: msg.id,
               })
 
-              // Delete status message
               await tg
                 .deleteMessagesById(msg.chat.id, [statusMsg.id])
                 .catch(() => null)
@@ -275,7 +267,6 @@ export function registerRipCommand(ctx: CommandContext): void {
                 time: `${(totalDurationMs / 1000).toFixed(1)}s`,
               })
 
-              // Log success
               await service.logRequest({
                 telegramId: msg.sender.id,
                 chatId: msg.chat.id,
@@ -285,7 +276,6 @@ export function registerRipCommand(ctx: CommandContext): void {
                 status: 'completed',
               })
             } finally {
-              // Guaranteed immediate cleanup of local audio file
               if (ripResult && existsSync(ripResult.filePath)) {
                 try {
                   unlinkSync(ripResult.filePath)

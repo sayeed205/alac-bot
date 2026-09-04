@@ -48,7 +48,7 @@ export function registerInfoCommand(ctx: CommandContext): void {
       const album = html.escape(meta.album)
       const duration = formatDurationSec(meta.duration)
       const year = meta.releaseDate ? meta.releaseDate.slice(0, 4) : 'Unknown'
-      const genre = html.escape(meta.primaryGenre || 'Music')
+      const genre = html.escape(meta.genre || 'Music')
 
       let cacheStatus = '❌ <b>Not Cached</b>'
       let cacheDetails = `Use <code>/alac ${trackId}</code> to rip in lossless ALAC.`

@@ -35,7 +35,6 @@ export function registerHealthCommand(ctx: CommandContext): void {
     )
     const tgLatency = Date.now() - startPing
 
-    // Measure DB latency
     const dbStart = Date.now()
     let dbStatus = 'Operational'
     try {
@@ -45,7 +44,6 @@ export function registerHealthCommand(ctx: CommandContext): void {
     }
     const dbLatency = Date.now() - dbStart
 
-    // Check ALAC mirror availability
     let mirrorStatus = 'Online'
     const mirrorStart = Date.now()
     try {
@@ -62,7 +60,6 @@ export function registerHealthCommand(ctx: CommandContext): void {
     }
     const mirrorLatency = Date.now() - mirrorStart
 
-    // Memory & Uptime
     const memMb = (process.memoryUsage().rss / (1024 * 1024)).toFixed(1)
     const uptimeStr = formatUptime(process.uptime())
 

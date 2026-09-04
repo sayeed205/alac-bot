@@ -88,7 +88,6 @@ export async function getMirrorEndpoint(forceRefresh = false): Promise<{
     elapsed_ms: Date.now() - fetchStart,
   })
 
-  // Verify status
   const statusStart = Date.now()
   let statusResp: Response
   try {

@@ -31,14 +31,12 @@ describe('Dump Channel Indexer & Metadata Tagging', () => {
     expect(caption.text).toContain('Whenever You Need Somebody')
     expect(caption.text).toContain('"id": "1559523359"')
 
-    // Verify collapsible blockquote entity is present
     const blockquote = caption.entities?.find(
       (e: { _: string; collapsed?: boolean }) =>
         e._ === 'messageEntityBlockquote' && e.collapsed === true,
     )
     expect(blockquote).toBeDefined()
 
-    // Verify pre language-json entity is present
     const pre = caption.entities?.find(
       (e: { _: string; language?: string }) =>
         e._ === 'messageEntityPre' && e.language === 'json',
@@ -87,13 +85,11 @@ describe('Dump Channel Indexer & Metadata Tagging', () => {
       }),
       deleteTracksNotIn: mock((validIds: string[]) => {
         prunedNotIn = validIds
-        return Promise.resolve(2) // simulate 2 ghost tracks deleted
+        return Promise.resolve(2)
       }),
     } as unknown as IAlacService
 
-    // Create fake messages yielded by getMessages
     const fakeMessages = [
-      // 1. Valid ALAC audio with metadata
       {
         id: 101,
         text: '🎵 Song 1\n<blockquote expandable>{\n  "id": "track_1",\n  "title": "Song 1 Full",\n  "artist": "Artist 1 Full",\n  "album": "Album 1",\n  "bit": 24,\n  "hz": 48000,\n  "dur": 185,\n  "genre": "Rock",\n  "date": "2021-01-01",\n  "trk": 2,\n  "cnt": 12\n}</blockquote>',
@@ -106,7 +102,6 @@ describe('Dump Channel Indexer & Metadata Tagging', () => {
           duration: 180,
         },
       },
-      // 2. Non-audio media (should be skipped)
       {
         id: 102,
         text: 'A photo message',
@@ -114,7 +109,6 @@ describe('Dump Channel Indexer & Metadata Tagging', () => {
           type: 'photo',
         },
       },
-      // 3. Audio without #alac caption (legacy/unparseable, should be skipped)
       {
         id: 103,
         text: 'Just an audio file with no caption',
@@ -124,7 +118,6 @@ describe('Dump Channel Indexer & Metadata Tagging', () => {
           title: 'Unknown Song',
         },
       },
-      // 4. Valid second ALAC audio
       {
         id: 104,
         text: '🎵 Song 2\n<blockquote expandable>{\n  "id": "track_2",\n  "album": "Album 2",\n  "bit": 16,\n  "hz": 44100\n}</blockquote>',
@@ -165,7 +158,6 @@ describe('Dump Channel Indexer & Metadata Tagging', () => {
     expect(summary.pruned).toBe(2)
 
     expect(savedTracks.length).toBe(2)
-    // Saved in reverse order because we iterate from highest ID (104) down to lowest (101)
     expect(savedTracks).toContainEqual({
       appleTrackId: 'track_1',
       messageId: 101,

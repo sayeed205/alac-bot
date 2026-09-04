@@ -25,7 +25,6 @@ interface DispatcherInternal {
 
 describe('Handlers Dispatcher & Callback Query Flow', () => {
   it('does not block alac dl: callbacks when auth handlers are registered first', async () => {
-    // Mock TG client
     const fakeTg = {
       sendCopy: mock(() => Promise.resolve({ id: 100 })),
       deleteMessagesById: mock(() => Promise.resolve()),
@@ -36,7 +35,6 @@ describe('Handlers Dispatcher & Callback Query Flow', () => {
 
     const dp = Dispatcher.for(fakeTg)
 
-    // Mock services
     const mockAuth: IAuthService = {
       isAdmin: mock(() => true),
       isAuthorized: mock(() => Promise.resolve(true)),
@@ -73,7 +71,6 @@ describe('Handlers Dispatcher & Callback Query Flow', () => {
       deleteTracksNotIn: mock(() => Promise.resolve(0)),
     }
 
-    // Register commands in standard order: auth first, alac second
     registerAuthCommands(dp, fakeTg, mockAuth)
     registerAlacCommands(
       dp,
@@ -84,7 +81,6 @@ describe('Handlers Dispatcher & Callback Query Flow', () => {
       mockAuth,
     )
 
-    // Extract callback_query handlers from group 0
     const internalDp = dp as unknown as DispatcherInternal
     const group0 = internalDp._groups.get(0)
     const cbHandlers = group0?.get('callback_query') ?? []
@@ -95,7 +91,6 @@ describe('Handlers Dispatcher & Callback Query Flow', () => {
       throw new Error('Expected 2 callback handlers registered')
     }
 
-    // 1. Simulate a dl: callback query context
     const dlQueryCtx = {
       _name: 'callback_query',
       raw: { data: new Uint8Array([1]) },
@@ -106,18 +101,14 @@ describe('Handlers Dispatcher & Callback Query Flow', () => {
       answer: mock(() => Promise.resolve()),
     }
 
-    // auth check should reject dl:
     const authMatchedDl = await authCb.check(dlQueryCtx)
     expect(authMatchedDl).toBeFalsy()
 
-    // alac check should match dl:
     const alacMatchedDl = await alacCb.check(dlQueryCtx)
     expect(alacMatchedDl).toBeTruthy()
 
-    // Run alac callback handler
     await alacCb.callback(dlQueryCtx)
 
-    // Verify callback was answered and sendCopy was called
     expect(dlQueryCtx.answer).toHaveBeenCalled()
     expect(fakeTg.sendCopy).toHaveBeenCalledWith({
       toChatId: 67890,
@@ -127,7 +118,6 @@ describe('Handlers Dispatcher & Callback Query Flow', () => {
     })
     expect(mockAlacService.findCachedTrack).toHaveBeenCalledWith('1559523359')
 
-    // 2. Simulate search_close callback
     const closeQueryCtx = {
       _name: 'callback_query',
       raw: { data: new Uint8Array([1]) },
@@ -148,7 +138,6 @@ describe('Handlers Dispatcher & Callback Query Flow', () => {
     expect(closeQueryCtx.answer).toHaveBeenCalled()
     expect(fakeTg.deleteMessagesById).toHaveBeenCalledWith(67890, [99])
 
-    // 3. Simulate authpage: callback
     const authPageCtx = {
       _name: 'callback_query',
       raw: { data: new Uint8Array([1]) },

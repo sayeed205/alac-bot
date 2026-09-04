@@ -28,7 +28,7 @@ export * from './types.ts'
 
 export function registerAlacCommands(ctx: CommandContext): void
 export function registerAlacCommands(
-  dp: Dispatcher<TelegramClient>,
+  dp: Dispatcher,
   tg: TelegramClient,
   service?: IAlacService,
   ripper?: ITrackRipper,
@@ -36,7 +36,7 @@ export function registerAlacCommands(
   auth?: IAuthService,
 ): void
 export function registerAlacCommands(
-  dpOrCtx: Dispatcher<TelegramClient> | CommandContext,
+  dpOrCtx: Dispatcher | CommandContext,
   tg?: TelegramClient,
   service: IAlacService = defaultService,
   ripper: ITrackRipper = defaultRipper,
@@ -48,7 +48,7 @@ export function registerAlacCommands(
       ? dpOrCtx
       : {
           dp: dpOrCtx,
-          tg: tg ?? dpOrCtx.client,
+          tg: tg as TelegramClient,
           service,
           ripper,
           queue,

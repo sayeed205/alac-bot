@@ -12,12 +12,12 @@ export * from './types.ts'
 
 export function registerAuthCommands(ctx: CommandContext): void
 export function registerAuthCommands(
-  dp: Dispatcher<TelegramClient>,
+  dp: Dispatcher,
   tg: TelegramClient,
   service?: IAuthService,
 ): void
 export function registerAuthCommands(
-  dpOrCtx: Dispatcher<TelegramClient> | CommandContext,
+  dpOrCtx: Dispatcher | CommandContext,
   tg?: TelegramClient,
   service: IAuthService = authService,
 ): void {
@@ -26,7 +26,7 @@ export function registerAuthCommands(
       ? dpOrCtx
       : {
           dp: dpOrCtx,
-          tg: tg ?? dpOrCtx.client,
+          tg: tg as TelegramClient,
           service,
         }
 

@@ -62,12 +62,10 @@ describe('SequentialRipQueue', () => {
       },
     )
 
-    // Initially: Task 1 is processing, Task 2 is at position 1, Task 3 is at position 2
     expect(task2Positions).toEqual([1])
     expect(task3Positions).toEqual([2])
 
     await task1
-    // After Task 1 completes: Task 2 is started, Task 3 shifts to position 1
     expect(task2Start).toBe(true)
     expect(task3Positions).toContain(1)
 

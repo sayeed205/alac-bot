@@ -92,30 +92,30 @@ export class AlacTrackRipper implements ITrackRipper {
         return null
       })
 
-    const artworkPromise = meta.artworkUrl
-      ? fetch(meta.artworkUrl, {
+    const artworkPromise = (async () => {
+      if (!meta.artworkUrl) return null
+      try {
+        const r = await fetch(meta.artworkUrl, {
           headers: {
             'User-Agent': 'AlacBot/1.0',
           },
           signal: AbortSignal.timeout(15_000),
         })
-          .then(async (r) => {
-            if (!r.ok) return null
-            const buf = new Uint8Array(await r.arrayBuffer())
-            debug('Artwork prefetch completed', {
-              track_id: trackId,
-              size_bytes: buf.byteLength,
-            })
-            return buf
-          })
-          .catch((err) => {
-            debug('Artwork prefetch timed out/failed', {
-              track_id: trackId,
-              error: String(err),
-            })
-            return null
-          })
-      : Promise.resolve(null)
+        if (!r.ok) return null
+        const buf = new Uint8Array(await r.arrayBuffer())
+        debug('Artwork prefetch completed', {
+          track_id: trackId,
+          size_bytes: buf.byteLength,
+        })
+        return buf
+      } catch (err) {
+        debug('Artwork prefetch timed out/failed', {
+          track_id: trackId,
+          error: String(err),
+        })
+        return null
+      }
+    })()
 
     // Stream download from mirror
     const streamUrl = `${mirrorUrl}/api/stream/${trackId}`
@@ -139,84 +139,80 @@ export class AlacTrackRipper implements ITrackRipper {
       const elapsed = Date.now() - streamStart
       error('Mirror stream connection timed out or failed', {
         track_id: trackId,
-        streamUrl,
         elapsed_ms: elapsed,
         error: err instanceof Error ? err.message : String(err),
       })
       throw new Error(
-        `Mirror audio stream failed after ${elapsed}ms: ${err instanceof Error ? err.message : String(err)}`,
+        `Failed to connect to mirror stream after ${elapsed}ms: ${err instanceof Error ? err.message : String(err)}`,
       )
     }
 
     if (!streamResp.ok) {
-      const errBody = await streamResp.text().catch(() => '')
-      error('Mirror stream HTTP failure', {
+      const body = await streamResp.text().catch(() => '')
+      error('Mirror stream returned HTTP error', {
         track_id: trackId,
         status: streamResp.status,
-        body: errBody.slice(0, 200),
+        body,
       })
       throw new Error(
-        `Mirror stream failed (${streamResp.status}): ${errBody.slice(0, 200)}`,
+        `Mirror streaming failed with HTTP ${streamResp.status}: ${body}`,
       )
     }
 
+    if (!streamResp.body) {
+      throw new Error('Mirror stream response body is null')
+    }
+
+    // Audio format headers
     const codec = streamResp.headers.get('x-codec') || 'alac'
     const rawBitDepth = streamResp.headers.get('x-bitdepth')
     const rawSampleRate = streamResp.headers.get('x-samplerate')
-    const bitDepth = rawBitDepth ? Number.parseInt(rawBitDepth, 10) : 16
+    const bitDepth = rawBitDepth ? Number.parseInt(rawBitDepth, 10) : 24
     const sampleRate = rawSampleRate
       ? Number.parseInt(rawSampleRate, 10)
-      : 44100
-    const contentLength = Number(streamResp.headers.get('content-length')) || 0
+      : 96000
 
-    debug('Mirror stream connected', {
+    debug('Stream audio specs received', {
       track_id: trackId,
-      connect_duration_ms: Date.now() - streamStart,
       codec,
       bit_depth: bitDepth,
       sample_rate: sampleRate,
-      content_length: contentLength,
     })
 
-    const tempRawPath = join(this.outputDir, `raw_${trackId}_${Date.now()}.m4a`)
+    const rawFilename = `stream_${trackId}_${Date.now()}.raw`
+    const tempRawPath = join(this.outputDir, rawFilename)
+
     const finalFilename = buildTrackFilename(meta)
     const finalPath = join(this.outputDir, finalFilename)
 
-    const reader = streamResp.body?.getReader()
-    if (!reader) {
-      error('Mirror returned empty stream body', { track_id: trackId })
-      throw new Error('Mirror returned response without body stream')
-    }
-
-    const fileSink = Bun.file(tempRawPath).writer()
-    let downloadedBytes = 0
-    let lastReport = 0
-
     try {
+      const contentLength = Number(
+        streamResp.headers.get('content-length') || 0,
+      )
+      let downloadedBytes = 0
+      let lastProgressUpdate = 0
+
+      const reader = streamResp.body.getReader()
+      const fileSink = Bun.file(tempRawPath).writer()
+
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
-        if (value) {
-          fileSink.write(value)
-          downloadedBytes += value.byteLength
 
-          const now = Date.now()
-          if (now - lastReport > 700) {
-            lastReport = now
-            if (contentLength > 0) {
-              const progressText = formatByteProgress(
-                downloadedBytes,
-                contentLength,
-                10,
-              )
-              onProgress?.(`Streaming ALAC:<br/><code>${progressText}</code>`)
-            } else {
-              const mb = (downloadedBytes / (1024 * 1024)).toFixed(1)
-              onProgress?.(`Streaming ALAC: ${mb} MB`)
-            }
-          }
+        fileSink.write(value)
+        downloadedBytes += value.length
+
+        const now = Date.now()
+        if (now - lastProgressUpdate > 1000 && onProgress) {
+          lastProgressUpdate = now
+          const progressStr = formatByteProgress(
+            downloadedBytes,
+            contentLength > 0 ? contentLength : 0,
+          )
+          onProgress(`Downloading lossless audio: ${progressStr}`)
         }
       }
+
       await fileSink.end()
 
       debug('Stream download completed', {
@@ -257,10 +253,10 @@ export class AlacTrackRipper implements ITrackRipper {
         codec,
         bitDepth,
         sampleRate,
-        genre: meta.genre,
-        releaseDate: meta.releaseDate,
-        trackNumber: meta.trackNumber,
-        trackCount: meta.trackCount,
+        genre: meta.genre || 'Unknown',
+        releaseDate: meta.releaseDate || '',
+        trackNumber: meta.trackNumber ?? 1,
+        trackCount: meta.trackCount ?? 1,
       }
     } finally {
       await unlink(tempRawPath).catch(() => {})

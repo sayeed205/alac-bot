@@ -8,8 +8,12 @@ import { Dispatcher } from '@mtcute/dispatcher'
 import { registerCleanCommand } from '@/modules/alac/commands/clean.ts'
 import { registerDeleteCommand } from '@/modules/alac/commands/delete.ts'
 import { registerHealthCommand } from '@/modules/alac/commands/health.ts'
+import { registerHelpCommand } from '@/modules/alac/commands/help.ts'
+import { registerIndexCommand } from '@/modules/alac/commands/index_cmd.ts'
 import { registerInfoCommand } from '@/modules/alac/commands/info.ts'
 import { registerQueueCommand } from '@/modules/alac/commands/queue.ts'
+import { registerSearchCommand } from '@/modules/alac/commands/search.ts'
+import { registerStatsCommand } from '@/modules/alac/commands/stats.ts'
 import type { CommandContext } from '@/modules/alac/commands/types.ts'
 import type { IRipQueue } from '@/modules/alac/queue.ts'
 import type { ITrackRipper } from '@/modules/alac/ripper.ts'
@@ -31,7 +35,7 @@ interface DispatcherInternal {
 
 describe('ALAC Management Commands', () => {
   let fakeTg: TelegramClient
-  let dp: Dispatcher<TelegramClient>
+  let dp: Dispatcher
   let mockAuth: IAuthService
   let mockService: IAlacService
   let mockQueue: IRipQueue
@@ -73,6 +77,10 @@ describe('ALAC Management Commands', () => {
             duration: 200,
             bitDepth: 24,
             sampleRate: 48000,
+            genre: 'Pop',
+            releaseDate: '2023-01-01',
+            trackNumber: 1,
+            trackCount: 10,
             createdAt: new Date(),
             updatedAt: new Date(),
           })
@@ -90,7 +98,7 @@ describe('ALAC Management Commands', () => {
           cacheHits: 15,
           cacheMisses: 5,
           totalFailedRequests: 0,
-          cacheHitRatio: '75.0',
+          cacheHitRatio: 75.0,
           avgCacheDurationMs: 50,
           avgRipDurationMs: 2000,
           topTracks: [],
@@ -102,9 +110,12 @@ describe('ALAC Management Commands', () => {
     }
 
     mockQueue = {
-      enqueue: mock(() => Promise.resolve()),
+      enqueue: mock((task) =>
+        task(new AbortController().signal),
+      ) as unknown as IRipQueue['enqueue'],
       getPendingCount: mock(() => 0),
       isProcessing: mock(() => false),
+      clear: mock(() => {}),
     }
 
     mockRipper = {
@@ -147,6 +158,34 @@ describe('ALAC Management Commands', () => {
     }
 
     return { msg, repliedTexts }
+  }
+
+  async function dispatchCallback(data: string, userId = 1) {
+    const internalDp = dp as unknown as DispatcherInternal
+    const group0 = internalDp._groups.get(0)
+    const handlers = group0?.get('callback_query') ?? []
+
+    const answeredTexts: string[] = []
+    const cb = {
+      _name: 'callback_query',
+      dataStr: data,
+      raw: { data: Buffer.from(data) },
+      user: { id: userId },
+      chat: { id: 100 },
+      messageId: 42,
+      answer: mock((options?: { text?: string }) => {
+        if (options?.text) answeredTexts.push(options.text)
+        return Promise.resolve()
+      }),
+    }
+
+    for (const h of handlers) {
+      if (await h.check(cb)) {
+        await h.callback(cb)
+      }
+    }
+
+    return { cb, answeredTexts }
   }
 
   describe('Queue Command', () => {
@@ -267,7 +306,7 @@ describe('ALAC Management Commands', () => {
               ],
             }),
         } as unknown as Response),
-      )
+      ) as unknown as typeof fetch as unknown as typeof fetch
 
       try {
         registerInfoCommand(ctx)
@@ -292,7 +331,7 @@ describe('ALAC Management Commands', () => {
           ok: true,
           status: 200,
         } as unknown as Response),
-      )
+      ) as unknown as typeof fetch
 
       try {
         registerHealthCommand(ctx)
@@ -303,6 +342,145 @@ describe('ALAC Management Commands', () => {
       } finally {
         globalThis.fetch = originalFetch
       }
+    })
+  })
+
+  describe('Help Command', () => {
+    it('blocks unauthorized users', async () => {
+      mockAuth.isAuthorized = mock(() => Promise.resolve(false))
+      registerHelpCommand(ctx)
+      const { repliedTexts } = await dispatchMessage('/help')
+      expect(repliedTexts.length).toBe(0)
+    })
+
+    it('renders general usage guide for regular users', async () => {
+      mockAuth.isAdmin = mock(() => false)
+      registerHelpCommand(ctx)
+      const { repliedTexts } = await dispatchMessage('/help')
+      expect(repliedTexts.length).toBe(1)
+      expect(repliedTexts[0]).toContain('ALAC Bot Usage Guide')
+      expect(repliedTexts[0]).not.toContain('Admin Commands:')
+    })
+
+    it('includes admin commands section for admin users', async () => {
+      mockAuth.isAdmin = mock(() => true)
+      registerHelpCommand(ctx)
+      const { repliedTexts } = await dispatchMessage('/help')
+      expect(repliedTexts.length).toBe(1)
+      expect(repliedTexts[0]).toContain('Admin Commands:')
+    })
+  })
+
+  describe('Stats Command', () => {
+    it('blocks non-admin users', async () => {
+      mockAuth.isAdmin = mock(() => false)
+      registerStatsCommand(ctx)
+      const { repliedTexts } = await dispatchMessage('/stats')
+      expect(repliedTexts.length).toBe(1)
+      expect(repliedTexts[0]).toContain('Access Restricted')
+    })
+
+    it('renders formatted stats for admin users', async () => {
+      mockAuth.isAdmin = mock(() => true)
+      registerStatsCommand(ctx)
+      const { repliedTexts } = await dispatchMessage('/stats')
+      expect(repliedTexts.length).toBe(1)
+      expect(repliedTexts[0]).toContain('ALAC Bot Analytics')
+      expect(mockService.getStats).toHaveBeenCalled()
+    })
+  })
+
+  describe('Index Command', () => {
+    it('blocks non-admin users', async () => {
+      mockAuth.isAdmin = mock(() => false)
+      registerIndexCommand(ctx)
+      const { repliedTexts } = await dispatchMessage('/index')
+      expect(repliedTexts.length).toBe(1)
+      expect(repliedTexts[0]).toContain('Access Restricted')
+    })
+
+    it('runs dump channel index for admin users', async () => {
+      mockAuth.isAdmin = mock(() => true)
+      fakeTg.iterHistory = mock(
+        async function* () {},
+      ) as unknown as typeof fakeTg.iterHistory
+
+      registerIndexCommand(ctx)
+      const { repliedTexts } = await dispatchMessage('/index')
+      expect(repliedTexts.length).toBe(1)
+      expect(repliedTexts[0]).toContain('Initializing Dump Channel Sync')
+      expect(fakeTg.editMessage).toHaveBeenCalled()
+    })
+  })
+
+  describe('Search Command & Callbacks', () => {
+    it('blocks unauthorized users', async () => {
+      mockAuth.isAuthorized = mock(() => Promise.resolve(false))
+      registerSearchCommand(ctx)
+      const { repliedTexts } = await dispatchMessage('/search test')
+      expect(repliedTexts.length).toBe(0)
+    })
+
+    it('shows usage when search query is empty', async () => {
+      registerSearchCommand(ctx)
+      const { repliedTexts } = await dispatchMessage('/search')
+      expect(repliedTexts.length).toBe(1)
+      expect(repliedTexts[0]).toContain('Search Cached Tracks:')
+    })
+
+    it('notifies when no tracks match query', async () => {
+      mockService.searchCachedTracks = mock(() => Promise.resolve([]))
+      registerSearchCommand(ctx)
+      const { repliedTexts } = await dispatchMessage('/search NonExistentXYZ')
+      expect(repliedTexts.length).toBe(1)
+      expect(repliedTexts[0]).toContain('No cached tracks found')
+    })
+
+    it('renders search results when tracks match query', async () => {
+      mockService.searchCachedTracks = mock(() =>
+        Promise.resolve([
+          {
+            id: 1,
+            appleTrackId: '12345',
+            messageId: 42,
+            fileId: 'fid',
+            fileUniqueId: 'uid',
+            title: 'Test Song',
+            artist: 'Test Artist',
+            album: 'Test Album',
+            duration: 200,
+            bitDepth: 24,
+            sampleRate: 48000,
+            genre: 'Pop',
+            releaseDate: '2021-01-01',
+            trackNumber: 1,
+            trackCount: 1,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          },
+        ]),
+      )
+      registerSearchCommand(ctx)
+      const { repliedTexts } = await dispatchMessage('/search Test')
+      expect(repliedTexts.length).toBe(1)
+      expect(repliedTexts[0]).toContain('Found 1 cached track')
+      expect(repliedTexts[0]).toContain('Test Song')
+    })
+
+    it('handles search_close callback query', async () => {
+      registerSearchCommand(ctx)
+      const { cb } = await dispatchCallback('search_close')
+      expect(cb.answer).toHaveBeenCalled()
+      expect(fakeTg.deleteMessagesById).toHaveBeenCalled()
+    })
+
+    it('handles dl: callback query and delivers cached track', async () => {
+      registerSearchCommand(ctx)
+      const { answeredTexts } = await dispatchCallback('dl:12345')
+      expect(answeredTexts).toContain(
+        '⚡ Delivering lossless track from cache!',
+      )
+      expect(fakeTg.sendCopy).toHaveBeenCalled()
     })
   })
 })

@@ -15,7 +15,7 @@ export function parseDynamicHtml(content: string): FormattedString {
 }
 
 export interface CommandContext {
-  dp: Dispatcher<TelegramClient>
+  dp: Dispatcher
   tg: TelegramClient
   service: IAlacService
   ripper: ITrackRipper

@@ -31,7 +31,7 @@ export {
   warnSpan,
 }
 
-function parseLevel(raw?: string): Level {
+export function parseLevel(raw?: string): Level {
   const normalized = (raw || '').toLowerCase().trim()
   switch (normalized) {
     case 'trace':

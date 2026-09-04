@@ -6,7 +6,6 @@ import { renderAuthListPage } from './types.ts'
 export function registerListCommand(ctx: CommandContext): void {
   const { dp, tg, service } = ctx
 
-  // Command: /authlist [page]
   dp.onNewMessage(filters.command('authlist'), async (msg) => {
     if (!service.isAdmin(msg.sender.id)) {
       return
@@ -26,7 +25,6 @@ export function registerListCommand(ctx: CommandContext): void {
     )
   })
 
-  // Callback query for pagination & actions
   dp.onCallbackQuery(
     filters.or(filters.startsWith('auth'), filters.equals('noop')),
     async (query) => {

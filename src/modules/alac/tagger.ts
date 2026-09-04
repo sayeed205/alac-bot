@@ -38,7 +38,6 @@ export async function tagM4aFile(params: {
     args.push('-c', 'copy')
   }
 
-  // Metadata tags
   if (meta.title) args.push('-metadata', `title=${meta.title}`)
   if (meta.artist) args.push('-metadata', `artist=${meta.artist}`)
   if (meta.album) args.push('-metadata', `album=${meta.album}`)

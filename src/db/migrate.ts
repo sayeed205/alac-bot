@@ -24,7 +24,6 @@ export async function runMigrations() {
       migrationsFolder: './drizzle',
     })
   } else {
-    // Touch db to ensure pgliteClient is created
     void db
     if (pgliteClient) {
       await pgliteClient.waitReady
