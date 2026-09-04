@@ -9,6 +9,7 @@ Built with [Bun](https://bun.sh), [@mtcute/bun](https://mtcute.dev), and [Drizzl
 ## Features
 
 - **True Lossless Audio**: Streams native Apple Lossless Audio Codec (ALAC 16-bit / 24-bit up to 192kHz) directly from decryption mirrors.
+- **Automatic Fallback Engine**: If the primary mirror encounters downtime or timeouts, the bot automatically fails over to a secondary wrapper or custom mirror without interrupting downloads.
 - **Instant Dump Channel Caching**: Every ripped track is indexed with full metadata and stored in a private Telegram dump channel. Cache hits deliver in under 200ms without consuming mirror bandwidth.
 - **Full Album & Playlist Support**:
   - Individual track URLs or bare track IDs.
@@ -73,9 +74,13 @@ DATABASE_URL=postgresql://user:password@localhost:5432/alac_bot
 # Logging (trace | debug | info | warn | error | critical)
 LOG_LEVEL=info
 
-# (Optional) Static mirror override (defaults to dynamic manifest resolution)
+# (Optional) Primary mirror overrides (defaults to dynamic manifest resolution)
 # ALAC_MIRROR_URL=https://custom-mirror.example.com
 # ALAC_API_KEY=ak_custom_api_key
+
+# (Optional) Secondary wrapper fallback engine (defaults to local wrapper)
+ALAC_WRAPPER_URL=http://127.0.0.1:12340
+# ALAC_WRAPPER_API_KEY=ak_wrapper_key
 ```
 
 ### 3. Run Database Migrations
@@ -109,6 +114,35 @@ bun start
 | `LOG_LEVEL` | Tracing log level (`trace`, `debug`, `info`, `warn`, `error`) | `info` |
 | `ALAC_MIRROR_URL` | Optional static mirror URL override | Dynamic manifest |
 | `ALAC_API_KEY` | Optional static mirror API key override | Dynamic manifest |
+| `ALAC_WRAPPER_URL` | Secondary decryption wrapper / mirror URL fallback | `http://127.0.0.1:12340` |
+| `ALAC_WRAPPER_API_KEY` | Optional API key for wrapper URL | None |
+
+---
+
+## Decryption Mirrors & Wrapper Fallback Engine
+
+The bot uses a dual-engine architecture to prevent download failures during public mirror downtime:
+
+1. **Primary Decryption Mirror**: Automatically fetched and refreshed from the dynamic mirror manifest (or overridden with `ALAC_MIRROR_URL`).
+2. **Wrapper Fallback Engine**: Configured via `ALAC_WRAPPER_URL` (defaults to the local wrapper at `http://127.0.0.1:12340`).
+
+If the primary mirror is unreachable, returns HTTP 502/503, or drops the connection mid-handshake, the ripper seamlessly switches to the wrapper engine.
+
+### Swapping the Wrapper Engine with Any Link
+
+To swap the local wrapper with an alternative remote wrapper or third-party mirror in the future, simply update `ALAC_WRAPPER_URL` in `.env`:
+
+```env
+# Example 1: Local containerized wrapper
+ALAC_WRAPPER_URL=http://127.0.0.1:12340
+
+# Example 2: Remote private wrapper
+ALAC_WRAPPER_URL=https://wrapper.yourdomain.com
+
+# Example 3: Dedicated mirror with API key
+ALAC_WRAPPER_URL=https://custom-mirror.example.com
+ALAC_WRAPPER_API_KEY=your_secret_api_key
+```
 
 ---
 
@@ -149,7 +183,7 @@ bun start
 
 ## Testing & Code Quality
 
-The repository includes a test suite covering parsing, iTunes integration, playlist scraping, sequential queue handling, ripper timeouts, and database schema constraints.
+The repository includes a test suite covering parsing, iTunes integration, playlist scraping, sequential queue handling, ripper timeouts, wrapper failover, and database schema constraints.
 
 ```bash
 # Run all tests

@@ -1,7 +1,8 @@
 import { mkdir, unlink } from 'node:fs/promises'
 import { join } from 'node:path'
 
-import { debug, debugSpan, error } from '@/utils/logger.ts'
+import { env } from '@/env.ts'
+import { debug, debugSpan } from '@/utils/logger.ts'
 import { formatByteProgress } from '@/utils/progress.ts'
 
 import { fetchTrackMeta } from './itunes.ts'
@@ -9,6 +10,7 @@ import { fetchLyrics } from './lyrics.ts'
 import { getMirrorEndpoint } from './manifest.ts'
 import { buildTrackFilename, tagM4aFile } from './tagger.ts'
 import type { TrackRipResult } from './types.ts'
+import { connectAudioStreamWithWrapper } from './wrapper.ts'
 
 export type { TrackRipResult }
 
@@ -87,10 +89,9 @@ export class AlacTrackRipper implements ITrackRipper {
       throw new Error('Download was cancelled')
     }
 
-    onProgress?.(`Connecting mirror for ${meta.artist} - ${meta.title}...`)
-    const { mirrorUrl, apiKey } = await getMirrorEndpoint(false, signal)
+    onProgress?.(`Connecting stream for ${meta.artist} - ${meta.title}...`)
 
-    // Concurrently prefetch artwork and lyrics while streaming audio
+    // Concurrently prefetch artwork and lyrics while connecting and streaming audio
     const lyricsPromise = fetchLyrics(trackId, {
       title: meta.title,
       artist: meta.artist,
@@ -141,227 +142,176 @@ export class AlacTrackRipper implements ITrackRipper {
       }
     })()
 
-    // Stream download from mirror
-    const streamUrl = `${mirrorUrl}/api/stream/${trackId}`
-    debug('Initiating mirror stream connection...', {
+    // 1. Resolve primary mirror endpoint from manifest / env
+    let primaryMirror: { mirrorUrl: string; apiKey: string } | null = null
+    try {
+      primaryMirror = await getMirrorEndpoint(false, signal)
+    } catch (err) {
+      debug(
+        'Primary mirror manifest/status lookup failed, will attempt fallback',
+        {
+          track_id: trackId,
+          error: String(err),
+        },
+      )
+    }
+
+    // 2. Connect audio stream (seamlessly falling back to ALAC_WRAPPER_URL if mirror fails)
+    const streamStart = Date.now()
+    const { streamResp, sourceName, codec, bitDepth, sampleRate } =
+      await connectAudioStreamWithWrapper({
+        trackId,
+        primaryMirror,
+        wrapperUrl: env.ALAC_WRAPPER_URL,
+        wrapperApiKey: env.ALAC_WRAPPER_API_KEY,
+        signal,
+        onProgress,
+      })
+
+    debug('Stream audio specs received', {
       track_id: trackId,
-      streamUrl,
+      source: sourceName,
+      codec,
+      bit_depth: bitDepth,
+      sample_rate: sampleRate,
     })
 
-    const streamStart = Date.now()
-    const streamController = new AbortController()
+    const rawFilename = `stream_${trackId}_${Date.now()}.raw`
+    const tempRawPath = join(this.outputDir, rawFilename)
 
+    const finalFilename = buildTrackFilename(meta)
+    const finalPath = join(this.outputDir, finalFilename)
+
+    // Inactivity timeout between received chunks (45s)
+    // Allows arbitrarily long tracks to finish, but detects if stream freezes mid-stream
+    const CHUNK_INACTIVITY_TIMEOUT_MS = 45_000
+    let inactivityTimer: ReturnType<typeof setTimeout> | null = null
+
+    const streamController = new AbortController()
     const onUserAbort = () => {
       streamController.abort(new Error('Download was cancelled'))
     }
     if (signal) {
-      if (signal.aborted) {
-        throw new Error('Download was cancelled')
-      }
       signal.addEventListener('abort', onUserAbort)
     }
 
-    // Step 1: Initial Connection Timeout (30s)
-    // If mirror backend hangs or crashes on handshake, abort before hanging forever
-    let connectionTimer: ReturnType<typeof setTimeout> | null = setTimeout(
-      () => {
+    const resetInactivityTimer = () => {
+      if (inactivityTimer) clearTimeout(inactivityTimer)
+      inactivityTimer = setTimeout(() => {
         streamController.abort(
           new Error(
-            'Mirror server did not respond within 30s (server down or overloaded)',
+            `Audio stream stalled on ${sourceName}: no data received for ${CHUNK_INACTIVITY_TIMEOUT_MS / 1000}s`,
           ),
         )
-      },
-      30_000,
-    )
+      }, CHUNK_INACTIVITY_TIMEOUT_MS)
+    }
 
-    let streamResp: Response
     try {
-      try {
-        streamResp = await fetch(streamUrl, {
-          headers: {
-            'User-Agent':
-              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/145.0.0.0',
-            'X-API-Key': apiKey,
-          },
-          signal: streamController.signal,
-        })
-      } catch (err: unknown) {
-        const elapsed = Date.now() - streamStart
-        error('Mirror stream connection timed out or failed', {
-          track_id: trackId,
-          elapsed_ms: elapsed,
-          error: err instanceof Error ? err.message : String(err),
-        })
-        throw new Error(
-          `Failed to connect to mirror stream after ${elapsed}ms: ${err instanceof Error ? err.message : String(err)}`,
-        )
-      } finally {
-        if (connectionTimer) {
-          clearTimeout(connectionTimer)
-          connectionTimer = null
+      if (!streamResp.body) {
+        throw new Error(`Empty audio stream body returned from ${sourceName}`)
+      }
+
+      const contentLength = Number(
+        streamResp.headers.get('content-length') || 0,
+      )
+      let downloadedBytes = 0
+      let lastProgressUpdate = 0
+
+      const reader = streamResp.body.getReader()
+      const fileSink = Bun.file(tempRawPath).writer()
+
+      while (true) {
+        if (signal?.aborted || streamController.signal.aborted) {
+          await reader.cancel()
+          await fileSink.end()
+          throw new Error('Download was cancelled')
+        }
+
+        resetInactivityTimer()
+
+        const { done, value } = await reader.read()
+        if (done) break
+
+        fileSink.write(value)
+        downloadedBytes += value.length
+
+        const now = Date.now()
+        if (now - lastProgressUpdate > 1000 && onProgress) {
+          lastProgressUpdate = now
+          const progressStr = formatByteProgress(
+            downloadedBytes,
+            contentLength > 0 ? contentLength : 0,
+          )
+          onProgress(`Downloading lossless audio: ${progressStr}`)
         }
       }
 
-      if (!streamResp.ok) {
-        const body = await streamResp.text().catch(() => '')
-        error('Mirror stream returned HTTP error', {
-          track_id: trackId,
-          status: streamResp.status,
-          body,
-        })
-        throw new Error(
-          `Mirror streaming failed with HTTP ${streamResp.status}: ${body}`,
-        )
+      if (inactivityTimer) {
+        clearTimeout(inactivityTimer)
+        inactivityTimer = null
+      }
+      await fileSink.end()
+
+      if (signal?.aborted || streamController.signal.aborted) {
+        throw new Error('Download was cancelled')
       }
 
-      if (!streamResp.body) {
-        throw new Error('Mirror stream response body is null')
-      }
-
-      // Audio format headers
-      const codec = streamResp.headers.get('x-codec') || 'alac'
-      const rawBitDepth = streamResp.headers.get('x-bitdepth')
-      const rawSampleRate = streamResp.headers.get('x-samplerate')
-      const bitDepth = rawBitDepth ? Number.parseInt(rawBitDepth, 10) : 24
-      const sampleRate = rawSampleRate
-        ? Number.parseInt(rawSampleRate, 10)
-        : 96000
-
-      debug('Stream audio specs received', {
+      debug('Stream download completed', {
         track_id: trackId,
-        codec,
-        bit_depth: bitDepth,
-        sample_rate: sampleRate,
+        source: sourceName,
+        downloaded_bytes: downloadedBytes,
+        stream_duration_ms: Date.now() - streamStart,
       })
 
-      const rawFilename = `stream_${trackId}_${Date.now()}.raw`
-      const tempRawPath = join(this.outputDir, rawFilename)
+      onProgress?.('Tagging and embedding lossless artwork...')
+      const tagStart = Date.now()
+      const [coverBuffer, lyrics] = await Promise.all([
+        artworkPromise,
+        lyricsPromise,
+      ])
 
-      const finalFilename = buildTrackFilename(meta)
-      const finalPath = join(this.outputDir, finalFilename)
-
-      // Step 2: Inactivity timeout between received chunks (45s)
-      // Allows arbitrarily long tracks to finish, but detects if mirror freezes mid-stream
-      const CHUNK_INACTIVITY_TIMEOUT_MS = 45_000
-      let inactivityTimer: ReturnType<typeof setTimeout> | null = null
-
-      const resetInactivityTimer = () => {
-        if (inactivityTimer) clearTimeout(inactivityTimer)
-        inactivityTimer = setTimeout(() => {
-          streamController.abort(
-            new Error(
-              `Mirror stream stalled: no data received for ${CHUNK_INACTIVITY_TIMEOUT_MS / 1000}s`,
-            ),
-          )
-        }, CHUNK_INACTIVITY_TIMEOUT_MS)
+      if (signal?.aborted) {
+        throw new Error('Download was cancelled')
       }
 
-      try {
-        const contentLength = Number(
-          streamResp.headers.get('content-length') || 0,
-        )
-        let downloadedBytes = 0
-        let lastProgressUpdate = 0
+      await tagM4aFile({
+        rawAudioPath: tempRawPath,
+        outputPath: finalPath,
+        meta,
+        coverBuffer,
+        lyrics,
+      })
 
-        const reader = streamResp.body.getReader()
-        const fileSink = Bun.file(tempRawPath).writer()
+      debug('Tagging finished', {
+        track_id: trackId,
+        has_lyrics: Boolean(lyrics),
+        has_cover: Boolean(coverBuffer),
+        tag_duration_ms: Date.now() - tagStart,
+        total_duration_ms: Date.now() - ripStart,
+      })
 
-        while (true) {
-          if (signal?.aborted) {
-            await reader.cancel()
-            await fileSink.end()
-            throw new Error('Download was cancelled')
-          }
-
-          resetInactivityTimer()
-
-          const { done, value } = await reader.read()
-          if (done) break
-
-          fileSink.write(value)
-          downloadedBytes += value.length
-
-          const now = Date.now()
-          if (now - lastProgressUpdate > 1000 && onProgress) {
-            lastProgressUpdate = now
-            const progressStr = formatByteProgress(
-              downloadedBytes,
-              contentLength > 0 ? contentLength : 0,
-            )
-            onProgress(`Downloading lossless audio: ${progressStr}`)
-          }
-        }
-
-        if (inactivityTimer) {
-          clearTimeout(inactivityTimer)
-          inactivityTimer = null
-        }
-        await fileSink.end()
-
-        if (signal?.aborted) {
-          throw new Error('Download was cancelled')
-        }
-
-        debug('Stream download completed', {
-          track_id: trackId,
-          downloaded_bytes: downloadedBytes,
-          stream_duration_ms: Date.now() - streamStart,
-        })
-
-        onProgress?.('Tagging and embedding lossless artwork...')
-        const tagStart = Date.now()
-        const [coverBuffer, lyrics] = await Promise.all([
-          artworkPromise,
-          lyricsPromise,
-        ])
-
-        if (signal?.aborted) {
-          throw new Error('Download was cancelled')
-        }
-
-        await tagM4aFile({
-          rawAudioPath: tempRawPath,
-          outputPath: finalPath,
-          meta,
-          coverBuffer,
-          lyrics,
-        })
-
-        debug('Tagging finished', {
-          track_id: trackId,
-          has_lyrics: Boolean(lyrics),
-          has_cover: Boolean(coverBuffer),
-          tag_duration_ms: Date.now() - tagStart,
-          total_duration_ms: Date.now() - ripStart,
-        })
-
-        return {
-          filePath: finalPath,
-          title: meta.title,
-          artist: meta.artist,
-          album: meta.album,
-          duration: meta.duration,
-          codec,
-          bitDepth,
-          sampleRate,
-          genre: meta.genre || 'Unknown',
-          releaseDate: meta.releaseDate || '',
-          trackNumber: meta.trackNumber ?? 1,
-          trackCount: meta.trackCount ?? 1,
-        }
-      } finally {
-        if (inactivityTimer) {
-          clearTimeout(inactivityTimer)
-        }
-        await unlink(tempRawPath).catch(() => {})
+      return {
+        filePath: finalPath,
+        title: meta.title,
+        artist: meta.artist,
+        album: meta.album,
+        duration: meta.duration,
+        codec,
+        bitDepth,
+        sampleRate,
+        genre: meta.genre || 'Unknown',
+        releaseDate: meta.releaseDate || '',
+        trackNumber: meta.trackNumber ?? 1,
+        trackCount: meta.trackCount ?? 1,
       }
     } finally {
-      if (connectionTimer) {
-        clearTimeout(connectionTimer)
+      if (inactivityTimer) {
+        clearTimeout(inactivityTimer)
       }
       if (signal) {
         signal.removeEventListener('abort', onUserAbort)
       }
+      await unlink(tempRawPath).catch(() => {})
     }
   }
 }
