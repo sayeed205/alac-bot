@@ -1,13 +1,16 @@
-import { existsSync, readdirSync, statSync } from 'node:fs'
+import { mkdir, unlink } from 'node:fs/promises'
 import { join } from 'node:path'
 
-export interface TrackRipResult {
-  filePath: string
-  title: string
-  artist: string
-  album?: string
-  duration?: number
-}
+import { debug, error, info, infoSpan } from '@/utils/logger.ts'
+import { formatByteProgress } from '@/utils/progress.ts'
+
+import { fetchTrackMeta } from './itunes.ts'
+import { fetchLyrics } from './lyrics.ts'
+import { getMirrorEndpoint } from './manifest.ts'
+import { buildTrackFilename, tagM4aFile } from './tagger.ts'
+import type { TrackRipResult } from './types.ts'
+
+export type { TrackRipResult }
 
 export interface ITrackRipper {
   rip(
@@ -34,131 +37,223 @@ export class FakeTrackRipper implements ITrackRipper {
       artist: this.mockResult?.artist || 'Mock Artist',
       album: this.mockResult?.album || 'Mock Album',
       duration: this.mockResult?.duration || 210,
+      codec: 'alac',
+      bitDepth: '24',
+      sampleRate: '96000',
     }
   }
 }
 
-function findLatestM4aFile(dir: string): string | null {
-  if (!existsSync(dir)) return null
-
-  let latestFile: string | null = null
-  let latestMtime = 0
-
-  function scan(currentDir: string) {
-    const entries = readdirSync(currentDir, { withFileTypes: true })
-    for (const entry of entries) {
-      const fullPath = join(currentDir, entry.name)
-      if (entry.isDirectory()) {
-        scan(fullPath)
-      } else if (entry.isFile() && entry.name.endsWith('.m4a')) {
-        const stats = statSync(fullPath)
-        if (stats.mtimeMs > latestMtime) {
-          latestMtime = stats.mtimeMs
-          latestFile = fullPath
-        }
-      }
-    }
-  }
-
-  scan(dir)
-  return latestFile
-}
-
-export class AppleBruhRipper implements ITrackRipper {
-  private pythonPath: string
-  private scriptPath: string
+export class AlacTrackRipper implements ITrackRipper {
   private outputDir: string
 
-  constructor(options?: {
-    pythonPath?: string
-    scriptPath?: string
-    outputDir?: string
-  }) {
-    this.pythonPath =
-      options?.pythonPath ||
-      process.env.ALAC_PYTHON_PATH ||
-      '/home/hitarashi/sayeed/github/applebruh/.venv/bin/python3'
-    this.scriptPath =
-      options?.scriptPath ||
-      process.env.ALAC_SCRIPT_PATH ||
-      '/home/hitarashi/sayeed/github/applebruh/alac.py'
-    this.outputDir =
-      options?.outputDir ||
-      process.env.ALAC_OUTPUT_DIR ||
-      join(process.cwd(), 'bot-data', 'downloads')
+  constructor(outputDir?: string) {
+    this.outputDir = outputDir || join(process.cwd(), 'bot-data', 'downloads')
   }
 
   async rip(
     trackId: string,
     onProgress?: (status: string) => void,
   ): Promise<TrackRipResult> {
-    onProgress?.('Connecting to Apple Music server...')
+    using _ = infoSpan('ripper', { track_id: trackId }).enter()
+    const ripStart = Date.now()
 
-    const proc = Bun.spawn(
-      [
-        this.pythonPath,
-        this.scriptPath,
-        '--track-id',
-        trackId,
-        '--out',
-        this.outputDir,
-      ],
-      {
-        stdout: 'pipe',
-        stderr: 'pipe',
-      },
-    )
+    await mkdir(this.outputDir, { recursive: true })
 
-    let artist = 'Unknown Artist'
-    let title = `Track ${trackId}`
+    onProgress?.('Fetching track metadata...')
+    const meta = await fetchTrackMeta(trackId)
 
-    const reader = proc.stdout.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ''
+    onProgress?.(`Connecting mirror for ${meta.artist} - ${meta.title}...`)
+    const { mirrorUrl, apiKey } = await getMirrorEndpoint()
 
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      const lines = buffer.split('\n')
-      buffer = lines.pop() || ''
+    // Concurrently prefetch artwork and lyrics while streaming audio
+    const lyricsPromise = fetchLyrics(trackId, {
+      title: meta.title,
+      artist: meta.artist,
+      album: meta.album,
+      duration: meta.duration,
+    })
+      .then((l) => {
+        debug('Lyrics prefetch completed', {
+          track_id: trackId,
+          found: Boolean(l),
+        })
+        return l
+      })
+      .catch((err) => {
+        debug('Lyrics prefetch failed', {
+          track_id: trackId,
+          error: String(err),
+        })
+        return null
+      })
 
-      for (const line of lines) {
-        const clean = line.trim()
-        if (!clean) continue
+    const artworkPromise = meta.artworkUrl
+      ? fetch(meta.artworkUrl, {
+          headers: {
+            'User-Agent': 'AlacBot/1.0',
+          },
+          signal: AbortSignal.timeout(15_000),
+        })
+          .then(async (r) => {
+            if (!r.ok) return null
+            const buf = new Uint8Array(await r.arrayBuffer())
+            debug('Artwork prefetch completed', {
+              track_id: trackId,
+              size_bytes: buf.byteLength,
+            })
+            return buf
+          })
+          .catch((err) => {
+            debug('Artwork prefetch timed out/failed', {
+              track_id: trackId,
+              error: String(err),
+            })
+            return null
+          })
+      : Promise.resolve(null)
 
-        // Detect track header: e.g. "Artist — Title"
-        if (clean.includes(' — ') && !clean.startsWith('Album:')) {
-          const parts = clean.split(' — ')
-          artist = parts[0]?.replace(/^\[\d+\/\d+\]\s*/, '').trim() || artist
-          title = parts[1]?.trim() || title
-          onProgress?.(`Ripping ${artist} — ${title}...`)
-        } else if (clean.startsWith('Album:')) {
-          onProgress?.(`Ripping ${clean}...`)
-        }
-      }
-    }
+    // Stream download from mirror
+    const streamUrl = `${mirrorUrl}/api/stream/${trackId}`
+    debug('Initiating mirror stream connection...', {
+      track_id: trackId,
+      streamUrl,
+    })
 
-    const exitCode = await proc.exited
-    if (exitCode !== 0) {
-      const stderr = await new Response(proc.stderr).text()
+    const streamStart = Date.now()
+    let streamResp: Response
+    try {
+      streamResp = await fetch(streamUrl, {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/145.0.0.0',
+          'X-API-Key': apiKey,
+        },
+        signal: AbortSignal.timeout(120_000),
+      })
+    } catch (err: unknown) {
+      const elapsed = Date.now() - streamStart
+      error('Mirror stream connection timed out or failed', {
+        track_id: trackId,
+        streamUrl,
+        elapsed_ms: elapsed,
+        error: err instanceof Error ? err.message : String(err),
+      })
       throw new Error(
-        `Ripper failed with exit code ${exitCode}: ${stderr.trim() || 'Unknown error'}`,
+        `Mirror audio stream failed after ${elapsed}ms: ${err instanceof Error ? err.message : String(err)}`,
       )
     }
 
-    // Locate the downloaded file in output directory
-    const audioFile = findLatestM4aFile(this.outputDir)
-    if (!audioFile) {
-      throw new Error('Rip completed but output audio file was not found')
+    if (!streamResp.ok) {
+      const errBody = await streamResp.text().catch(() => '')
+      error('Mirror stream HTTP failure', {
+        track_id: trackId,
+        status: streamResp.status,
+        body: errBody.slice(0, 200),
+      })
+      throw new Error(
+        `Mirror stream failed (${streamResp.status}): ${errBody.slice(0, 200)}`,
+      )
     }
 
-    return {
-      filePath: audioFile,
-      title,
-      artist,
+    const codec = streamResp.headers.get('x-codec') || 'alac'
+    const bitDepth = streamResp.headers.get('x-bitdepth') || '16'
+    const sampleRate = streamResp.headers.get('x-samplerate') || '44100'
+    const contentLength = Number(streamResp.headers.get('content-length')) || 0
+
+    info('Mirror stream connected', {
+      track_id: trackId,
+      connect_duration_ms: Date.now() - streamStart,
+      codec,
+      bit_depth: bitDepth,
+      sample_rate: sampleRate,
+      content_length: contentLength,
+    })
+
+    const tempRawPath = join(this.outputDir, `raw_${trackId}_${Date.now()}.m4a`)
+    const finalFilename = buildTrackFilename(meta)
+    const finalPath = join(this.outputDir, finalFilename)
+
+    const reader = streamResp.body?.getReader()
+    if (!reader) {
+      error('Mirror returned empty stream body', { track_id: trackId })
+      throw new Error('Mirror returned response without body stream')
+    }
+
+    const fileSink = Bun.file(tempRawPath).writer()
+    let downloadedBytes = 0
+    let lastReport = 0
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        if (value) {
+          fileSink.write(value)
+          downloadedBytes += value.byteLength
+
+          const now = Date.now()
+          if (now - lastReport > 700) {
+            lastReport = now
+            if (contentLength > 0) {
+              const progressText = formatByteProgress(
+                downloadedBytes,
+                contentLength,
+                10,
+              )
+              onProgress?.(`Streaming ALAC:<br/><code>${progressText}</code>`)
+            } else {
+              const mb = (downloadedBytes / (1024 * 1024)).toFixed(1)
+              onProgress?.(`Streaming ALAC: ${mb} MB`)
+            }
+          }
+        }
+      }
+      await fileSink.end()
+
+      info('Stream download completed', {
+        track_id: trackId,
+        downloaded_bytes: downloadedBytes,
+        stream_duration_ms: Date.now() - streamStart,
+      })
+
+      onProgress?.('Tagging and embedding lossless artwork...')
+      const tagStart = Date.now()
+      const [coverBuffer, lyrics] = await Promise.all([
+        artworkPromise,
+        lyricsPromise,
+      ])
+
+      await tagM4aFile({
+        rawAudioPath: tempRawPath,
+        outputPath: finalPath,
+        meta,
+        coverBuffer,
+        lyrics,
+      })
+
+      info('Tagging finished', {
+        track_id: trackId,
+        has_lyrics: Boolean(lyrics),
+        has_cover: Boolean(coverBuffer),
+        tag_duration_ms: Date.now() - tagStart,
+        total_duration_ms: Date.now() - ripStart,
+      })
+
+      return {
+        filePath: finalPath,
+        title: meta.title,
+        artist: meta.artist,
+        album: meta.album,
+        duration: meta.duration,
+        codec,
+        bitDepth,
+        sampleRate,
+      }
+    } finally {
+      await unlink(tempRawPath).catch(() => {})
     }
   }
 }
 
-export const defaultRipper = new AppleBruhRipper()
+export const defaultRipper: ITrackRipper = new AlacTrackRipper()

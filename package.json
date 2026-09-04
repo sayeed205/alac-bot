@@ -16,6 +16,7 @@
     "start": "bun ./src/main.ts"
   },
   "dependencies": {
+    "@bcheidemann/tracing": "npm:@jsr/bcheidemann__tracing",
     "@mtcute/bun": "^0.32.1",
     "@mtcute/dispatcher": "^0.32.1",
     "drizzle-orm": "^0.45.2",

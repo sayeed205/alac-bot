@@ -10,6 +10,7 @@ describe('parseAlacInput', () => {
     expect(res).toEqual({
       trackId: '1193701400',
       force: false,
+      isAlbum: false,
     })
   })
 
@@ -20,6 +21,7 @@ describe('parseAlacInput', () => {
     expect(res).toEqual({
       trackId: '1193701400',
       force: true,
+      isAlbum: false,
     })
   })
 
@@ -30,6 +32,7 @@ describe('parseAlacInput', () => {
     expect(res).toEqual({
       trackId: '1193701400',
       force: true,
+      isAlbum: false,
     })
   })
 
@@ -39,16 +42,18 @@ describe('parseAlacInput', () => {
     expect(res).toEqual({
       trackId: '1122334455',
       force: false,
+      isAlbum: false,
     })
   })
 
-  it('extracts track ID from direct /album/ link without ?i=', () => {
+  it('extracts album ID from direct /album/ link without ?i=', () => {
     const input =
       '/alac https://music.apple.com/us/album/blinding-lights/1499378108'
     const res = parseAlacInput(input)
     expect(res).toEqual({
       trackId: '1499378108',
       force: false,
+      isAlbum: true,
     })
   })
 
@@ -58,6 +63,7 @@ describe('parseAlacInput', () => {
     expect(res).toEqual({
       trackId: '1440841730',
       force: false,
+      isAlbum: false,
     })
   })
 
@@ -68,6 +74,7 @@ describe('parseAlacInput', () => {
     expect(res).toEqual({
       trackId: '2000',
       force: false,
+      isAlbum: false,
     })
   })
 
@@ -77,6 +84,7 @@ describe('parseAlacInput', () => {
     expect(res).toEqual({
       trackId: '2000',
       force: true,
+      isAlbum: false,
     })
   })
 

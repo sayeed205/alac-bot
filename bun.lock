@@ -5,6 +5,7 @@
     "": {
       "name": "alac-bot",
       "dependencies": {
+        "@bcheidemann/tracing": "npm:@jsr/bcheidemann__tracing",
         "@mtcute/bun": "^0.32.1",
         "@mtcute/dispatcher": "^0.32.1",
         "drizzle-orm": "^0.45.2",
@@ -22,6 +23,8 @@
     },
   },
   "packages": {
+    "@bcheidemann/tracing": ["@jsr/bcheidemann__tracing@0.10.0", "https://npm.jsr.io/~/11/@jsr/bcheidemann__tracing/0.10.0.tgz", { "dependencies": { "@jsr/bcheidemann__parse-params": "^0.5.1", "@jsr/std__fmt": "^0.225.4", "@opentelemetry/api": "^1.9.0" } }, "sha512-EAMzHPRv7kV1IGP53pgHZxgdFEr8B90xjs81n34oJjS5997xM9+/GlaIM5lYidqP85HOmb9jEsOHg/tlj0Perg=="],
+
     "@biomejs/biome": ["@biomejs/biome@2.5.12", "", { "optionalDependencies": { "@biomejs/cli-darwin-arm64": "2.5.12", "@biomejs/cli-darwin-x64": "2.5.12", "@biomejs/cli-linux-arm64": "2.5.12", "@biomejs/cli-linux-arm64-musl": "2.5.12", "@biomejs/cli-linux-x64": "2.5.12", "@biomejs/cli-linux-x64-musl": "2.5.12", "@biomejs/cli-win32-arm64": "2.5.12", "@biomejs/cli-win32-x64": "2.5.12" }, "bin": { "biome": "bin/biome" } }, "sha512-Lw4VHZRebrReBBnlHa12JQjnIBm3JJAA55PDB9LbBVBF0q4RYphm6KfmIjqtPhf61MxZ5Q9KoK8R8x+7per5Aw=="],
 
     "@biomejs/cli-darwin-arm64": ["@biomejs/cli-darwin-arm64@2.5.12", "", { "os": "darwin", "cpu": "arm64" }, "sha512-lCRY1rwgNeWNgTr4DI/u6ZwXTRwRLHAvbaio1YLLGS+4r1nhvB2ssyPqIpfUSmRveNfv0fn/N58C7CAdK2XVrg=="],
@@ -108,6 +111,10 @@
 
     "@fuman/utils": ["@fuman/utils@0.0.21", "", {}, "sha512-2N5bPK18uGgZRans+ZQ33SE+xSGj4BZNnJbSUnGdH/i4ADTdz/ziC/16Qy3/Jqzbrwr21IpuKObnELp8DDfkDQ=="],
 
+    "@jsr/bcheidemann__parse-params": ["@jsr/bcheidemann__parse-params@0.5.1", "https://npm.jsr.io/~/11/@jsr/bcheidemann__parse-params/0.5.1.tgz", { "dependencies": { "acorn": "8.12.0" } }, "sha512-kq3BL37N1fksTu6Zk92YD2+jZZ508xE0o3NF0oSyvvpSJybBRA6g8qabP97tyl0l8nLO642tyu6ThzPivMG5sw=="],
+
+    "@jsr/std__fmt": ["@jsr/std__fmt@0.225.6", "https://npm.jsr.io/~/11/@jsr/std__fmt/0.225.6.tgz", {}, "sha512-5wll7CImyrJfen4fecziNSxZ5S6Fo3H1rQqKMQDewRGHAnFVqcHLe8wwCuDLK+HTbSPy6AkR3b136WpjVdOjTQ=="],
+
     "@mtcute/bun": ["@mtcute/bun@0.32.1", "", { "dependencies": { "@fuman/bun": "0.0.21", "@fuman/io": "0.0.21", "@fuman/net": "0.0.21", "@fuman/utils": "0.0.21", "@mtcute/core": "^0.32.1", "@mtcute/html-parser": "^0.32.1", "@mtcute/markdown-parser": "^0.32.1", "@mtcute/wasm": "^0.32.0" } }, "sha512-vknEutpnPgv+Tih/HA0o5DbP/JYnlJO5i+/BJjgXUFSqHhIJ2OTFrfvJDZjpXEOWtr0tsaGh9ryZORvHJ1Lv3w=="],
 
     "@mtcute/core": ["@mtcute/core@0.32.1", "", { "dependencies": { "@fuman/io": "0.0.21", "@fuman/net": "0.0.21", "@fuman/utils": "0.0.21", "@mtcute/file-id": "^0.32.0", "@mtcute/tl-runtime": "^0.32.0", "@types/events": "3.0.0", "long": "^5.3.2" } }, "sha512-bkUlAmpAupqwqEHZ5dDtPTkh2p8j9ksSuBb771Mc8qJ73ygrsV4qNll0b84K/tXi4n2nQ2uUuJ2NlY1bjfSiSw=="],
@@ -123,6 +130,8 @@
     "@mtcute/tl-runtime": ["@mtcute/tl-runtime@0.32.0", "", { "dependencies": { "@fuman/utils": "0.0.21", "long": "^5.3.2" } }, "sha512-9TdepMheddBismZDYVng9a0m+D4TqUPWcFc83JiArsXv+pmQiNWzXcoyoTUODUA35i6VOIdO5CuNd8hnKoZHpg=="],
 
     "@mtcute/wasm": ["@mtcute/wasm@0.32.0", "", {}, "sha512-Hkp+h7OYN1GPpJ3HYeQfBM/OgvF0oWCuS2OY0shwigQmNJib2gX7fIH+KDd5UsRNuHptWASawMjKA+wLnGpSvw=="],
+
+    "@opentelemetry/api": ["@opentelemetry/api@1.9.1", "", {}, "sha512-gLyJlPHPZYdAk1JENA9LeHejZe1Ti77/pTeFm/nMXmQH/HFZlcS/O2XJB+L8fkbrNSqhdtlvjBVjxwUYanNH5Q=="],
 
     "@types/bun": ["@types/bun@1.4.0", "", { "dependencies": { "bun-types": "1.4.0" } }, "sha512-K+lZULY23vRgK/CfTjFIV+tyifaNdSMlPh9j+6mQ/cLfpOznLyAuzgV/JQysyECpkBQLVMSyvjlr2fBUSA9wFQ=="],
 
@@ -169,6 +178,8 @@
     "@typescript/typescript-win32-arm64": ["@typescript/typescript-win32-arm64@7.0.2", "", { "os": "win32", "cpu": "arm64" }, "sha512-Gyl1Vy6OsWesLzmq+EP0Fb7b4Nid5232AvcA2SFcdYreldpNtYFFofPjnt62y9hQy7VTaZp65ICJjuAQRaVcIQ=="],
 
     "@typescript/typescript-win32-x64": ["@typescript/typescript-win32-x64@7.0.2", "", { "os": "win32", "cpu": "x64" }, "sha512-0BQ3HkAHHlKLSp1qRvf3SUhGpGsDuhB/jgFw75guyqbxJqEaS0Cw/VFO8i2nHglJUzQCRtMMR/IBAKE3ETMC4g=="],
+
+    "acorn": ["acorn@8.12.0", "", { "bin": { "acorn": "bin/acorn" } }, "sha512-RTvkC4w+KNXrM39/lWCUaG0IbRkWdCv7W/IOW9oU6SawyxulvkQy5HQPVTKxEjczcUvapcrw3cFx/60VN/NRNw=="],
 
     "buffer-from": ["buffer-from@1.1.2", "", {}, "sha512-E+XQCRwSbaaiChtv6k6Dwgc+bx+Bs6vuKJHHl5kox/BaKbhiXzqQOwK4cO22yElGp2OCmjwVhT3HmxgyPGnJfQ=="],
 

@@ -9,6 +9,11 @@ const r = z
     DUMP_CHANNEL_ID: z.union([z.coerce.number(), z.string()]),
     DATABASE_URL: z.string().optional(),
     DATABASE_DIR: z.string().default('./bot-data/db'),
+    ALAC_MIRROR_URL: z.string().optional(),
+    ALAC_API_KEY: z.string().optional(),
+    LOG_LEVEL: z
+      .enum(['trace', 'debug', 'info', 'warn', 'error', 'critical'])
+      .default('info'),
   })
   .safeParse(process.env)
 
