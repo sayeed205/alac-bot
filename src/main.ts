@@ -1,7 +1,7 @@
 import { TelegramClient } from '@mtcute/bun'
 import { Dispatcher, filters } from '@mtcute/dispatcher'
 
-import { pgliteClient } from '@/db/index.ts'
+import { closeDb } from '@/db/index.ts'
 import { runMigrations } from '@/db/migrate.ts'
 import { env } from '@/env.ts'
 import { registerAlacCommands } from '@/modules/alac/index.ts'
@@ -37,9 +37,7 @@ const shutdown = async () => {
     await tg.destroy()
   } catch {}
   try {
-    if (pgliteClient) {
-      await pgliteClient.close()
-    }
+    await closeDb()
   } catch {}
   process.exit(0)
 }

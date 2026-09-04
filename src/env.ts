@@ -7,8 +7,9 @@ const r = z
     BOT_TOKEN: z.string(),
     ADMIN_ID: z.coerce.number(),
     DUMP_CHANNEL_ID: z.union([z.coerce.number(), z.string()]),
-    DATABASE_URL: z.string().optional(),
-    DATABASE_DIR: z.string().default('./bot-data/db'),
+    DATABASE_URL: z
+      .string()
+      .default('postgresql://admin:password@localhost:5432/alac_bot'),
     ALAC_MIRROR_URL: z.string().optional(),
     ALAC_API_KEY: z.string().optional(),
     LOG_LEVEL: z

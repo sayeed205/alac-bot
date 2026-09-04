@@ -40,7 +40,7 @@ export function registerSearchCommand(ctx: CommandContext): void {
 
     const [cachedResults, liveResults] = await Promise.all([
       service.searchCachedTracks(query, 5),
-      searchItunesCatalog(query, 5).catch((err: unknown) => {
+      searchItunesCatalog(query, 10).catch((err: unknown) => {
         debug('Live Apple Music catalog search failed', {
           query,
           error: String(err),
@@ -51,12 +51,16 @@ export function registerSearchCommand(ctx: CommandContext): void {
 
     // Deduplicate: exclude catalog items that already exist in local cached results
     const cachedIds = new Set(cachedResults.map((c) => c.appleTrackId))
-    const catalogResults = liveResults.filter((item) => !cachedIds.has(item.id))
+    const catalogLimit = Math.max(0, 10 - cachedResults.length)
+    const catalogResults = liveResults
+      .filter((item) => !cachedIds.has(item.id))
+      .slice(0, catalogLimit)
 
     info('Search query results', {
       query,
       cachedMatches: cachedResults.length,
       catalogMatches: catalogResults.length,
+      totalMatches: cachedResults.length + catalogResults.length,
     })
 
     if (cachedResults.length === 0 && catalogResults.length === 0) {
@@ -79,8 +83,11 @@ export function registerSearchCommand(ctx: CommandContext): void {
     const sections: string[] = []
     const keyboardButtons: ReturnType<typeof BotKeyboard.callback>[][] = []
 
+    let displayIndex = 1
+
     if (cachedResults.length > 0) {
-      const cachedLines = cachedResults.map((t, idx) => {
+      const cachedStartIndex = displayIndex
+      const cachedLines = cachedResults.map((t) => {
         const title = html.escape(t.title || `Track ${t.appleTrackId}`)
         const artist = html.escape(t.artist || 'Unknown Artist')
         const quality =
@@ -88,7 +95,9 @@ export function registerSearchCommand(ctx: CommandContext): void {
             ? ` • ALAC ${t.bitDepth}b/${Math.round(t.sampleRate / 1000)}kHz`
             : ' • ALAC'
         const dur = formatSecs(t.duration)
-        return `<b>${idx + 1}. ${title}</b> — ${artist}<br/><i>${quality}${dur}</i>`
+        const line = `<b>${displayIndex}. ${title}</b> — ${artist}<br/><i>${quality}${dur}</i>`
+        displayIndex++
+        return line
       })
 
       sections.push(
@@ -103,7 +112,7 @@ export function registerSearchCommand(ctx: CommandContext): void {
           rawTitle.length > 28 ? `${rawTitle.slice(0, 25)}...` : rawTitle
         keyboardButtons.push([
           BotKeyboard.callback(
-            `⚡ ${i + 1}. ${shortTitle}`,
+            `⚡ ${cachedStartIndex + i}. ${shortTitle}`,
             `dl:${t.appleTrackId}`,
           ),
         ])
@@ -111,11 +120,14 @@ export function registerSearchCommand(ctx: CommandContext): void {
     }
 
     if (catalogResults.length > 0) {
-      const catalogLines = catalogResults.map((t, idx) => {
+      const catalogStartIndex = displayIndex
+      const catalogLines = catalogResults.map((t) => {
         const title = html.escape(t.title || `Track ${t.id}`)
         const artist = html.escape(t.artist || 'Unknown Artist')
         const dur = formatSecs(t.duration)
-        return `<b>${idx + 1}. ${title}</b> — ${artist}<i>${dur}</i>`
+        const line = `<b>${displayIndex}. ${title}</b> — ${artist}<i>${dur}</i>`
+        displayIndex++
+        return line
       })
 
       sections.push(
@@ -129,7 +141,10 @@ export function registerSearchCommand(ctx: CommandContext): void {
         const shortTitle =
           rawTitle.length > 28 ? `${rawTitle.slice(0, 25)}...` : rawTitle
         keyboardButtons.push([
-          BotKeyboard.callback(`🎵 ${i + 1}. ${shortTitle}`, `rip:${t.id}`),
+          BotKeyboard.callback(
+            `🎵 ${catalogStartIndex + i}. ${shortTitle}`,
+            `rip:${t.id}`,
+          ),
         ])
       }
     }

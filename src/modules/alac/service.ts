@@ -4,10 +4,9 @@ import {
   count,
   desc,
   eq,
-  ilike,
   inArray,
   notInArray,
-  or,
+  sql,
 } from 'drizzle-orm'
 
 import { type AppDatabase, db as defaultDb } from '@/db/index.ts'
@@ -120,16 +119,24 @@ export class AlacService implements IAlacService {
     }
 
     const pattern = `%${trimmed}%`
+    const threshold = 0.35
     const rows = await this.db
       .select()
       .from(tracks)
       .where(
-        or(
-          ilike(tracks.title, pattern),
-          ilike(tracks.artist, pattern),
-          ilike(tracks.album, pattern),
-          eq(tracks.appleTrackId, trimmed),
-        ),
+        sql`(${tracks.appleTrackId} = ${trimmed}
+          OR ${tracks.title} ILIKE ${pattern}
+          OR ${tracks.artist} ILIKE ${pattern}
+          OR ${tracks.album} ILIKE ${pattern}
+          OR word_similarity(${trimmed}, ${tracks.title} || ' ' || ${tracks.artist} || ' ' || ${tracks.album}) >= ${threshold})`,
+      )
+      .orderBy(
+        sql`CASE
+          WHEN ${tracks.appleTrackId} = ${trimmed} THEN 3
+          WHEN (${tracks.title} ILIKE ${pattern} OR ${tracks.artist} ILIKE ${pattern} OR ${tracks.album} ILIKE ${pattern}) THEN 2
+          ELSE 1
+        END DESC`,
+        sql`word_similarity(${trimmed}, ${tracks.title} || ' ' || ${tracks.artist} || ' ' || ${tracks.album}) DESC`,
       )
       .limit(limit)
 

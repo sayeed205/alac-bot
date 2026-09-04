@@ -1,27 +1,30 @@
-import { afterAll, beforeAll, describe, expect, it } from 'bun:test'
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'bun:test'
 
-import { PGlite } from '@electric-sql/pglite'
 import { eq } from 'drizzle-orm'
-import { drizzle, type PgliteDatabase } from 'drizzle-orm/pglite'
-import { migrate } from 'drizzle-orm/pglite/migrator'
 
+import type { AppDatabase } from '@/db/index.ts'
 import * as schema from '@/db/schema.ts'
 
-describe('Drizzle Schema & Database Constraints (PGlite Integration)', () => {
-  let client: PGlite
-  let db: PgliteDatabase<typeof schema>
+import { setupTestDb } from '../test-db.ts'
+
+describe('Drizzle Schema & Database Constraints (PostgreSQL Integration)', () => {
+  let db: AppDatabase
+  let cleanDb: () => Promise<void>
+  let close: () => Promise<void>
 
   beforeAll(async () => {
-    client = new PGlite()
-    await client.waitReady
-    db = drizzle(client, { schema })
-    await migrate(db, { migrationsFolder: './drizzle' })
+    const testEnv = await setupTestDb()
+    db = testEnv.db
+    cleanDb = testEnv.cleanDb
+    close = testEnv.close
+  })
+
+  beforeEach(async () => {
+    await cleanDb()
   })
 
   afterAll(async () => {
-    if (client && !client.closed) {
-      await client.close()
-    }
+    await close()
   })
 
   describe('Users Table', () => {
@@ -50,6 +53,11 @@ describe('Drizzle Schema & Database Constraints (PGlite Integration)', () => {
     })
 
     it('enforces primary key constraint on duplicate telegramId', async () => {
+      await db.insert(schema.users).values({
+        telegramId: 12345678,
+        name: 'Alice Developer',
+      })
+
       let threw = false
       try {
         await db.insert(schema.users).values({
@@ -96,6 +104,23 @@ describe('Drizzle Schema & Database Constraints (PGlite Integration)', () => {
     })
 
     it('enforces unique constraint on appleTrackId', async () => {
+      await db.insert(schema.tracks).values({
+        appleTrackId: 'apple_101',
+        messageId: 42,
+        fileId: 'file_id_101',
+        fileUniqueId: 'uniq_101',
+        title: 'Original Track',
+        artist: 'Artist',
+        album: 'Album',
+        duration: 210,
+        bitDepth: 24,
+        sampleRate: 96000,
+        genre: 'Rock',
+        releaseDate: '2023',
+        trackNumber: 1,
+        trackCount: 1,
+      })
+
       let threw = false
       try {
         await db.insert(schema.tracks).values({
@@ -137,6 +162,23 @@ describe('Drizzle Schema & Database Constraints (PGlite Integration)', () => {
     })
 
     it('supports onConflictDoUpdate upsert pattern recommended by Drizzle', async () => {
+      await db.insert(schema.tracks).values({
+        appleTrackId: 'apple_101',
+        messageId: 42,
+        fileId: 'file_id_101',
+        fileUniqueId: 'uniq_101',
+        title: 'Original Track',
+        artist: 'Artist',
+        album: 'Album',
+        duration: 210,
+        bitDepth: 24,
+        sampleRate: 96000,
+        genre: 'Rock',
+        releaseDate: '2023',
+        trackNumber: 1,
+        trackCount: 1,
+      })
+
       await db
         .insert(schema.tracks)
         .values({

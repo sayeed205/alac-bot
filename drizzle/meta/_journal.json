@@ -8,6 +8,13 @@
       "when": 1788509264143,
       "tag": "0000_bouncy_gorgon",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1788510000000,
+      "tag": "0001_add_pg_trgm_and_trgm_index",
+      "breakpoints": true
     }
   ]
 }

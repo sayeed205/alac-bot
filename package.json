@@ -20,14 +20,14 @@
     "@mtcute/bun": "^0.32.1",
     "@mtcute/dispatcher": "^0.32.1",
     "drizzle-orm": "^0.45.2",
-    "postgres": "^3.4.9",
+    "pg": "^8.23.0",
     "zod": "^4.5.4"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.12",
-    "@electric-sql/pglite": "^0.5.8",
     "@types/bun": "^1.4.0",
     "@types/node": "^26.4.1",
+    "@types/pg": "^8.23.1",
     "drizzle-kit": "^0.31.10",
     "typescript": "^7.0.2"
   }
