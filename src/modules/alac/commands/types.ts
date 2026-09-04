@@ -4,6 +4,7 @@ import type { Dispatcher } from '@mtcute/dispatcher'
 
 import type { IDbDumpService } from '@/db/dump.ts'
 import type { IAuthService } from '@/modules/auth/service.ts'
+import type { ISettingsService } from '@/modules/settings/service.ts'
 
 import type { IRipQueue } from '../queue.ts'
 import type { ITrackRipper } from '../ripper.ts'
@@ -23,4 +24,5 @@ export interface CommandContext {
   queue: IRipQueue
   auth: IAuthService
   dumpService?: IDbDumpService
+  settings?: ISettingsService
 }

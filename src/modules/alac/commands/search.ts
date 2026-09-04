@@ -7,6 +7,7 @@ import { env } from '@/env.ts'
 import { formatDumpCaption } from '@/modules/alac/indexer.ts'
 import { searchItunesCatalog } from '@/modules/alac/itunes.ts'
 import type { TrackRipResult } from '@/modules/alac/ripper.ts'
+import { settingsService as defaultSettingsService } from '@/modules/settings/service.ts'
 import { debug, error, info, infoSpan } from '@/utils/logger.ts'
 import { formatByteProgress } from '@/utils/progress.ts'
 
@@ -15,6 +16,7 @@ import { parseDynamicHtml } from './types.ts'
 
 export function registerSearchCommand(ctx: CommandContext): void {
   const { dp, tg, service, ripper, queue, auth } = ctx
+  const settings = ctx.settings ?? defaultSettingsService
 
   dp.onNewMessage(filters.command('search'), async (msg) => {
     using _searchSpan = infoSpan('search').enter()
@@ -22,6 +24,17 @@ export function registerSearchCommand(ctx: CommandContext): void {
     const isAuthed = await auth.isAuthorized(msg.sender.id, msg.chat.id)
     if (!isAuthed) {
       debug('Unauthorized user attempted /search', { user_id: msg.sender.id })
+      return
+    }
+
+    const isAdmin = auth.isAdmin(msg.sender.id)
+    if (!settings.canServeCache(isAdmin)) {
+      await msg.replyText(
+        parseDynamicHtml(
+          '⚠️ <b>Service is temporarily paused for maintenance.</b><br/>' +
+            'Please check back later.',
+        ),
+      )
       return
     }
 
@@ -49,95 +62,61 @@ export function registerSearchCommand(ctx: CommandContext): void {
       }),
     ])
 
-    // Deduplicate: exclude catalog items that already exist in local cached results
-    const cachedIds = new Set(cachedResults.map((c) => c.appleTrackId))
-    const catalogLimit = Math.max(0, 10 - cachedResults.length)
-    const catalogResults = liveResults
-      .filter((item) => !cachedIds.has(item.id))
-      .slice(0, catalogLimit)
-
-    info('Search query results', {
-      query,
-      cachedMatches: cachedResults.length,
-      catalogMatches: catalogResults.length,
-      totalMatches: cachedResults.length + catalogResults.length,
-    })
-
-    if (cachedResults.length === 0 && catalogResults.length === 0) {
+    if (cachedResults.length === 0 && liveResults.length === 0) {
       await msg.replyText(
         parseDynamicHtml(
-          `🔍 <b>No tracks found</b> matching "<i>${html.escape(query)}</i>" in local cache or Apple Music catalog.<br/><br/>` +
-            '💡 Try searching with different keywords or paste a direct Apple Music link with <code>/alac</code>.',
+          `🔍 No tracks found for "<b>${html.escape(query)}</b>". Try refining your search query!`,
         ),
       )
       return
     }
 
-    const formatSecs = (sec: number | null) => {
-      if (!sec || sec <= 0) return ''
-      const m = Math.floor(sec / 60)
-      const s = String(sec % 60).padStart(2, '0')
-      return ` • ${m}:${s}`
-    }
-
     const sections: string[] = []
-    const keyboardButtons: ReturnType<typeof BotKeyboard.callback>[][] = []
-
-    let displayIndex = 1
+    const keyboardButtons: Parameters<typeof BotKeyboard.inline>[0] = []
 
     if (cachedResults.length > 0) {
-      const cachedStartIndex = displayIndex
-      const cachedLines = cachedResults.map((t) => {
-        const title = html.escape(t.title || `Track ${t.appleTrackId}`)
-        const artist = html.escape(t.artist || 'Unknown Artist')
+      const cachedLines = cachedResults.map((t, i) => {
         const quality =
           t.bitDepth && t.sampleRate
-            ? ` • ALAC ${t.bitDepth}b/${Math.round(t.sampleRate / 1000)}kHz`
-            : ' • ALAC'
-        const dur = formatSecs(t.duration)
-        const line = `<b>${displayIndex}. ${title}</b> — ${artist}<br/><i>${quality}${dur}</i>`
-        displayIndex++
-        return line
+            ? ` [${t.bitDepth}-bit/${(t.sampleRate / 1000).toFixed(1)}kHz]`
+            : ''
+        return `${i + 1}. <b>${html.escape(t.title)}</b> — <i>${html.escape(t.artist)}</i><code>${quality}</code>`
       })
-
       sections.push(
-        `⚡ <b>Cached in Database:</b><br/><blockquote>${cachedLines.join('<br/><br/>')}</blockquote>`,
+        `⚡ <b>Instant Lossless Cache:</b><br/><blockquote>${cachedLines.join('<br/>')}</blockquote>`,
       )
 
       for (let i = 0; i < cachedResults.length; i++) {
         const t = cachedResults[i]
         if (!t) continue
-        const rawTitle = t.title || `Track ${t.appleTrackId}`
+        const rawTitle = `${t.artist} - ${t.title}`
         const shortTitle =
           rawTitle.length > 28 ? `${rawTitle.slice(0, 25)}...` : rawTitle
         keyboardButtons.push([
           BotKeyboard.callback(
-            `⚡ ${cachedStartIndex + i}. ${shortTitle}`,
+            `⚡ ${i + 1}. ${shortTitle}`,
             `dl:${t.appleTrackId}`,
           ),
         ])
       }
     }
 
-    if (catalogResults.length > 0) {
-      const catalogStartIndex = displayIndex
-      const catalogLines = catalogResults.map((t) => {
-        const title = html.escape(t.title || `Track ${t.id}`)
-        const artist = html.escape(t.artist || 'Unknown Artist')
-        const dur = formatSecs(t.duration)
-        const line = `<b>${displayIndex}. ${title}</b> — ${artist}<i>${dur}</i>`
-        displayIndex++
-        return line
-      })
+    const cachedIds = new Set(cachedResults.map((t) => t.appleTrackId))
+    const uncachedLiveResults = liveResults.filter((t) => !cachedIds.has(t.id))
 
+    if (uncachedLiveResults.length > 0) {
+      const catalogStartIndex = cachedResults.length + 1
+      const liveLines = uncachedLiveResults.map((t, i) => {
+        return `${catalogStartIndex + i}. <b>${html.escape(t.title)}</b> — <i>${html.escape(t.artist)}</i>`
+      })
       sections.push(
-        `🎵 <b>Apple Music Catalog:</b><br/><blockquote>${catalogLines.join('<br/><br/>')}</blockquote>`,
+        `🎵 <b>Apple Music Catalog:</b><br/><blockquote>${liveLines.join('<br/>')}</blockquote>`,
       )
 
-      for (let i = 0; i < catalogResults.length; i++) {
-        const t = catalogResults[i]
+      for (let i = 0; i < uncachedLiveResults.length; i++) {
+        const t = uncachedLiveResults[i]
         if (!t) continue
-        const rawTitle = t.title || `Track ${t.id}`
+        const rawTitle = `${t.artist} - ${t.title}`
         const shortTitle =
           rawTitle.length > 28 ? `${rawTitle.slice(0, 25)}...` : rawTitle
         keyboardButtons.push([
@@ -181,12 +160,19 @@ export function registerSearchCommand(ctx: CommandContext): void {
 
       if (data.startsWith('dl:')) {
         const appleTrackId = data.slice(3)
-        using _dlSpan = infoSpan('search_dl').enter()
-
         const chatId = query.chat.id
         const isAuthed = await auth.isAuthorized(query.user.id, chatId)
         if (!isAuthed) {
           await query.answer({ text: 'Unauthorized', alert: true })
+          return
+        }
+
+        const isAdmin = auth.isAdmin(query.user.id)
+        if (!settings.canServeCache(isAdmin)) {
+          await query.answer({
+            text: '⚠️ Service is temporarily paused for maintenance.',
+            alert: true,
+          })
           return
         }
 
@@ -249,9 +235,19 @@ export function registerSearchCommand(ctx: CommandContext): void {
           return
         }
 
+        const isAdmin = auth.isAdmin(query.user.id)
+
         // Check if already in cache
         const cached = await service.findCachedTrack(appleTrackId)
         if (cached) {
+          if (!settings.canServeCache(isAdmin)) {
+            await query.answer({
+              text: '⚠️ Service is temporarily paused for maintenance.',
+              alert: true,
+            })
+            return
+          }
+
           await query.answer({
             text: '⚡ Already cached! Delivering track...',
           })
@@ -266,6 +262,15 @@ export function registerSearchCommand(ctx: CommandContext): void {
           return
         }
 
+        // Live ripping check
+        if (!settings.canRipLive(isAdmin)) {
+          await query.answer({
+            text: '⚠️ Live ripping is temporarily paused for maintenance. Only cached tracks can be played right now.',
+            alert: true,
+          })
+          return
+        }
+
         await query.answer({ text: '⏳ Queuing lossless rip...' })
 
         const statusMsg = await tg.sendText(
@@ -277,20 +282,17 @@ export function registerSearchCommand(ctx: CommandContext): void {
         )
 
         let lastUpdate = 0
-        let lastText = ''
-
-        const updateStatus = async (text: string, force = false) => {
+        const updateStatus = async (status: string, force = false) => {
           const now = Date.now()
-          if (text === lastText) return
-          if (!force && now - lastUpdate < 1200) return
+          if (!force && now - lastUpdate < 1500) return
           lastUpdate = now
-          lastText = text
-
           await tg
             .editMessage({
               chatId,
               message: statusMsg.id,
-              text: parseDynamicHtml(text),
+              text: parseDynamicHtml(
+                `🎵 <b>Ripping track:</b> <code>${appleTrackId}</code><br/>Status: ${status}`,
+              ),
             })
             .catch(() => null)
         }
@@ -344,7 +346,7 @@ export function registerSearchCommand(ctx: CommandContext): void {
                           10,
                         )
                         updateStatus(
-                          `📤 <b>Uploading to Telegram:</b><br/><code>${progressText}</code>`,
+                          `📤 <b>Uploading:</b> <code>${progressText}</code>`,
                         )
                       }
                     },
@@ -408,14 +410,16 @@ export function registerSearchCommand(ctx: CommandContext): void {
               }
             },
             {
-              onPositionChange: (pos) => {
+              onPositionChange: (pos: number) => {
                 updateStatus(
                   `⏳ <b>In Queue:</b> Position <code>#${pos}</code>`,
                   true,
                 )
               },
               onStart: () => {
-                updateStatus('Connecting to Apple Music server...', true)
+                debug('Search track rip job started', {
+                  track_id: appleTrackId,
+                })
               },
             },
           )
@@ -433,10 +437,20 @@ export function registerSearchCommand(ctx: CommandContext): void {
               chatId,
               message: statusMsg.id,
               text: parseDynamicHtml(
-                `❌ <b>Failed:</b> <code>${escapedError}</code>`,
+                `⚠️ <b>Rip failed for track ${appleTrackId}:</b><br/><code>${escapedError}</code>`,
               ),
             })
             .catch(() => null)
+
+          await service.logRequest({
+            telegramId: query.user.id,
+            chatId,
+            appleTrackId,
+            isCacheHit: false,
+            durationMs: Date.now() - startTime,
+            status: 'failed',
+            errorReason: errorMsg,
+          })
         }
       }
     },

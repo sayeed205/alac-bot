@@ -11,6 +11,10 @@ import {
   type IAlacService,
 } from '@/modules/alac/service.ts'
 import { authService, type IAuthService } from '@/modules/auth/service.ts'
+import {
+  settingsService as defaultSettingsService,
+  type ISettingsService,
+} from '@/modules/settings/service.ts'
 
 import { registerBackupCommands } from './backup.ts'
 import { registerCleanCommand } from './clean.ts'
@@ -35,6 +39,7 @@ export function registerAlacCommands(
   ripper?: ITrackRipper,
   queue?: IRipQueue,
   auth?: IAuthService,
+  settings?: ISettingsService,
 ): void
 export function registerAlacCommands(
   dpOrCtx: Dispatcher | CommandContext,
@@ -43,6 +48,7 @@ export function registerAlacCommands(
   ripper: ITrackRipper = defaultRipper,
   queue: IRipQueue = defaultQueue,
   auth: IAuthService = authService,
+  settings: ISettingsService = defaultSettingsService,
 ): void {
   const ctx: CommandContext =
     'dp' in dpOrCtx
@@ -54,6 +60,7 @@ export function registerAlacCommands(
           ripper,
           queue,
           auth,
+          settings,
         }
 
   registerHelpCommand(ctx)

@@ -15,6 +15,7 @@ import {
 } from '@/modules/alac/parser.ts'
 import { fetchPlaylistTracks } from '@/modules/alac/playlist.ts'
 import type { TrackRipResult } from '@/modules/alac/ripper.ts'
+import { settingsService as defaultSettingsService } from '@/modules/settings/service.ts'
 import { debug, debugSpan, error, info, infoSpan } from '@/utils/logger.ts'
 import { formatByteProgress, renderProgressBar } from '@/utils/progress.ts'
 
@@ -48,6 +49,7 @@ export const activeJobs = new Map<string, ActiveRipJob>()
 
 export function registerRipCommand(ctx: CommandContext): void {
   const { dp, tg, service, ripper, queue, auth } = ctx
+  const settings = ctx.settings ?? defaultSettingsService
 
   dp.onNewMessage(
     filters.command(['alac', 'rip', 'batch', 'dl', 'download', 'rerip']),
@@ -76,7 +78,7 @@ export function registerRipCommand(ctx: CommandContext): void {
             ? replyMsg.media
             : null
 
-      if (docMedia && 'fileName' in docMedia) {
+      if (docMedia) {
         const fileName = (docMedia.fileName || '').toLowerCase()
         const mimeType = (docMedia.mimeType || '').toLowerCase()
         if (fileName.endsWith('.txt') || mimeType === 'text/plain') {
@@ -147,6 +149,75 @@ export function registerRipCommand(ctx: CommandContext): void {
           ),
         )
         return
+      }
+
+      if (!isAdmin) {
+        if (!settings.canServeCache(isAdmin)) {
+          debug('Ripping paused by admin', { user_id: msg.sender.id })
+          await msg.replyText(
+            parseDynamicHtml(
+              '⚠️ <b>Ripping is temporarily paused for maintenance.</b><br/>' +
+                'Please check back later.',
+            ),
+          )
+          return
+        }
+
+        const hasAlbum = parsedItems.some((item) => item.type === 'album')
+        if (hasAlbum && !settings.canRipAlbum(isAdmin)) {
+          debug('Album ripping disabled by admin', { user_id: msg.sender.id })
+          await msg.replyText(
+            parseDynamicHtml(
+              '⚠️ <b>Album ripping is currently disabled by admin.</b><br/>' +
+                'Please request individual tracks instead.',
+            ),
+          )
+          return
+        }
+
+        const hasPlaylist = parsedItems.some((item) => item.type === 'playlist')
+        if (hasPlaylist && !settings.canRipPlaylist(isAdmin)) {
+          debug('Playlist ripping disabled by admin', {
+            user_id: msg.sender.id,
+          })
+          await msg.replyText(
+            parseDynamicHtml(
+              '⚠️ <b>Playlist ripping is currently disabled by admin.</b><br/>' +
+                'Please request individual tracks instead.',
+            ),
+          )
+          return
+        }
+
+        if (documentContent && !settings.canRipTxt(isAdmin)) {
+          debug('.TXT batch ripping disabled by admin', {
+            user_id: msg.sender.id,
+          })
+          await msg.replyText(
+            parseDynamicHtml(
+              '⚠️ <b>.TXT file ripping is currently disabled by admin.</b><br/>' +
+                'Please request individual links instead.',
+            ),
+          )
+          return
+        }
+
+        if (
+          !documentContent &&
+          parsedItems.length > 1 &&
+          !settings.canRipMultiLink(isAdmin)
+        ) {
+          debug('Multi-link ripping disabled by admin', {
+            user_id: msg.sender.id,
+          })
+          await msg.replyText(
+            parseDynamicHtml(
+              '⚠️ <b>Multi-link ripping is currently disabled by admin.</b><br/>' +
+                'Please request tracks or collections one at a time.',
+            ),
+          )
+          return
+        }
       }
 
       const isGroup = msg.chat.id !== msg.sender.id
@@ -305,6 +376,18 @@ export function registerRipCommand(ctx: CommandContext): void {
         return
       }
 
+      // Apply collection limits for non-admin users
+      const maxCollectionLimit = settings.getMaxCollectionTracks()
+      let cappedCount = 0
+      if (
+        !isAdmin &&
+        maxCollectionLimit > 0 &&
+        tracksToProcess.length > maxCollectionLimit
+      ) {
+        cappedCount = tracksToProcess.length - maxCollectionLimit
+        tracksToProcess.splice(maxCollectionLimit)
+      }
+
       const isMultiTrack = tracksToProcess.length > 1
       if (!jobHeader) {
         jobHeader = isMultiTrack
@@ -327,6 +410,7 @@ export function registerRipCommand(ctx: CommandContext): void {
       let cachedCount = 0
       let rippedCount = 0
       const failedTracks: { id: string; error: string }[] = []
+      const skippedUncachedTracks: string[] = []
       const jobStartTime = Date.now()
       let lastStatusUpdate = 0
       let lastStatusText = ''
@@ -339,15 +423,25 @@ export function registerRipCommand(ctx: CommandContext): void {
         if (currentJob.isCancelled || jobController.signal.aborted) return
 
         const total = tracksToProcess.length
-        const completed = cachedCount + rippedCount + failedTracks.length
+        const completed =
+          cachedCount +
+          rippedCount +
+          failedTracks.length +
+          skippedUncachedTracks.length
         const percent = Math.min(100, Math.round((completed / total) * 100))
         const bar = renderProgressBar(completed, total, 10)
 
         const formatted =
           `📋 <b>${jobHeader}</b><br/>` +
           `<b>Progress:</b> <code>${bar} ${completed}/${total} (${percent}%)</code><br/>` +
-          `<b>Status:</b> ⚡ ${cachedCount} cached • 🎵 ${rippedCount} ripped${failedTracks.length > 0 ? ` • ⚠️ ${failedTracks.length} failed` : ''}<br/>` +
-          `<b>Current:</b> ${currentStatus}` +
+          `<b>Status:</b> ⚡ ${cachedCount} cached • 🎵 ${rippedCount} ripped` +
+          (skippedUncachedTracks.length > 0
+            ? ` • 🟡 ${skippedUncachedTracks.length} skipped`
+            : '') +
+          (failedTracks.length > 0
+            ? ` • ⚠️ ${failedTracks.length} failed`
+            : '') +
+          `<br/><b>Current:</b> ${currentStatus}` +
           (isGroup ? '<br/><i>Files delivered to your private DM 📩</i>' : '')
 
         const now = Date.now()
@@ -368,10 +462,31 @@ export function registerRipCommand(ctx: CommandContext): void {
 
       await updateProgress('Checking local cache...', true)
 
+      const isLiveRippingAllowed = settings.canRipLive(isAdmin)
       const allTrackIds = tracksToProcess.map((t) => t.id)
       const cachedTracksMap = !isForce
         ? await service.findCachedTracks(allTrackIds)
         : new Map()
+
+      // In cache-only mode for a single track: reject early if not cached
+      if (
+        !isLiveRippingAllowed &&
+        tracksToProcess.length === 1 &&
+        !cachedTracksMap.has(tracksToProcess[0]?.id)
+      ) {
+        activeJobs.delete(jobId)
+        await tg
+          .editMessage({
+            chatId: msg.chat.id,
+            message: resolvingStatus.id,
+            text: parseDynamicHtml(
+              '⚠️ <b>Live ripping is currently disabled for maintenance.</b><br/>' +
+                'This track is not yet in the local cache. Only cached tracks can be played right now.',
+            ),
+          })
+          .catch(() => null)
+        return
+      }
 
       for (let index = 0; index < tracksToProcess.length; index++) {
         if (currentJob.isCancelled || jobController.signal.aborted) {
@@ -423,6 +538,15 @@ export function registerRipCommand(ctx: CommandContext): void {
               })
             }
           }
+        }
+
+        // Check if live ripping is disallowed (cache-only mode)
+        if (!isLiveRippingAllowed) {
+          skippedUncachedTracks.push(trackId)
+          await updateProgress(
+            `🟡 Skipped (uncached in cache-only mode): ${trackId}`,
+          )
+          continue
         }
 
         // Rip via queue
@@ -640,15 +764,36 @@ export function registerRipCommand(ctx: CommandContext): void {
       const totalElapsedSec = ((Date.now() - jobStartTime) / 1000).toFixed(1)
       const totalTracks = tracksToProcess.length
 
-      let summaryHtml =
-        `✅ <b>Download Complete!</b><br/><br/>` +
-        `<blockquote>• <b>Target:</b> ${jobHeader}<br/>` +
-        `• <b>Total Tracks:</b> <code>${totalTracks}</code><br/>` +
-        `• <b>Delivered:</b> ⚡ <code>${cachedCount}</code> cached • 🎵 <code>${rippedCount}</code> ripped<br/>` +
-        (failedTracks.length > 0
-          ? `• <b>Failed:</b> ⚠️ <code>${failedTracks.length}</code><br/>`
-          : '') +
-        `• <b>Time Elapsed:</b> <code>${totalElapsedSec}s</code></blockquote>`
+      let summaryHtml = ''
+      if (
+        cachedCount === 0 &&
+        rippedCount === 0 &&
+        skippedUncachedTracks.length > 0
+      ) {
+        summaryHtml =
+          '⚠️ <b>No Cached Tracks Available</b><br/><br/>' +
+          `<blockquote>• <b>Target:</b> ${jobHeader}<br/>` +
+          `• <b>Total Requested:</b> <code>${totalTracks}</code><br/>` +
+          `• <b>Skipped (Uncached):</b> 🟡 <code>${skippedUncachedTracks.length}</code><br/>` +
+          '• <b>Note:</b> Live ripping is currently disabled for maintenance.</blockquote>'
+      } else {
+        summaryHtml =
+          `✅ <b>Download Complete!</b><br/><br/>` +
+          `<blockquote>• <b>Target:</b> ${jobHeader}<br/>` +
+          `• <b>Total Tracks:</b> <code>${totalTracks}</code><br/>` +
+          `• <b>Delivered:</b> ⚡ <code>${cachedCount}</code> cached • 🎵 <code>${rippedCount}</code> ripped<br/>` +
+          (skippedUncachedTracks.length > 0
+            ? `• <b>Skipped (Uncached):</b> 🟡 <code>${skippedUncachedTracks.length}</code><br/>`
+            : '') +
+          (failedTracks.length > 0
+            ? `• <b>Failed:</b> ⚠️ <code>${failedTracks.length}</code><br/>`
+            : '') +
+          `• <b>Time Elapsed:</b> <code>${totalElapsedSec}s</code></blockquote>`
+      }
+
+      if (cappedCount > 0) {
+        summaryHtml += `<br/>ℹ️ <i>Queue was capped to ${maxCollectionLimit} tracks (settings limit).</i>`
+      }
 
       if (isGroup) {
         summaryHtml +=
@@ -674,6 +819,52 @@ export function registerRipCommand(ctx: CommandContext): void {
         .catch(() => null)
     },
   )
+
+  // /cancel command handler
+  dp.onNewMessage(filters.command('cancel'), async (msg) => {
+    const callerId = msg.sender.id
+    const isAdmin = auth.isAdmin(callerId)
+
+    let targetJob: ActiveRipJob | undefined
+    for (const job of activeJobs.values()) {
+      if (job.chatId === msg.chat.id && (job.userId === callerId || isAdmin)) {
+        targetJob = job
+        break
+      }
+    }
+
+    if (!targetJob || targetJob.completed || targetJob.isCancelled) {
+      await msg.replyText(
+        parseDynamicHtml('ℹ️ <b>No active download to cancel in this chat.</b>'),
+      )
+      return
+    }
+
+    const cancellerName = msg.sender.displayName || (isAdmin ? 'Admin' : 'User')
+    targetJob.isCancelled = true
+    targetJob.cancelledBy = cancellerName
+    targetJob.controller.abort()
+    activeJobs.delete(targetJob.id)
+
+    await msg.replyText(
+      parseDynamicHtml('🛑 <b>Download has been cancelled.</b>'),
+    )
+
+    const processed = targetJob.cachedCount + targetJob.rippedCount
+    const cancelledHtml =
+      `🛑 <b>Download Cancelled</b><br/><br/>` +
+      `<blockquote>• <b>Target:</b> ${targetJob.jobHeader || 'Download'}<br/>` +
+      `• <b>Cancelled by:</b> <b>${html.escape(cancellerName)}</b><br/>` +
+      `• <b>Progress when cancelled:</b> <code>${processed}/${targetJob.totalTracks} tracks delivered</code></blockquote>`
+
+    await tg
+      .editMessage({
+        chatId: targetJob.chatId,
+        message: targetJob.statusMsgId,
+        text: parseDynamicHtml(cancelledHtml),
+      })
+      .catch(() => null)
+  })
 
   // Interactive Cancel button callback query handler
   dp.onCallbackQuery(filters.startsWith('cancel:'), async (query) => {
@@ -722,80 +913,5 @@ export function registerRipCommand(ctx: CommandContext): void {
         text: parseDynamicHtml(cancelledHtml),
       })
       .catch(() => null)
-  })
-
-  // /cancel command handler
-  dp.onNewMessage(filters.command('cancel'), async (msg) => {
-    using _ = infoSpan('cancel').enter()
-
-    const isAuthed = await auth.isAuthorized(msg.sender.id, msg.chat.id)
-    if (!isAuthed) return
-
-    const callerId = msg.sender.id
-    const isAdmin = auth.isAdmin(callerId)
-
-    const replyMsg = await msg.getReplyTo().catch(() => null)
-    let targetJob: ActiveRipJob | undefined
-
-    if (replyMsg) {
-      for (const j of activeJobs.values()) {
-        if (j.chatId === msg.chat.id && j.statusMsgId === replyMsg.id) {
-          targetJob = j
-          break
-        }
-      }
-    }
-
-    if (!targetJob) {
-      // Find the latest active job in this chat that caller owns (or any job if admin)
-      const candidates = Array.from(activeJobs.values()).filter(
-        (j) => j.chatId === msg.chat.id && (j.userId === callerId || isAdmin),
-      )
-      targetJob = candidates[candidates.length - 1]
-    }
-
-    if (!targetJob) {
-      await msg.replyText(
-        parseDynamicHtml(
-          'ℹ️ <b>No active downloads found</b> to cancel in this chat.',
-        ),
-      )
-      return
-    }
-
-    const isOwner = callerId === targetJob.userId
-    if (!isAdmin && !isOwner) {
-      await msg.replyText(
-        parseDynamicHtml(
-          '⛔ <b>Access Restricted:</b> Only the requester or an admin can cancel this download.',
-        ),
-      )
-      return
-    }
-
-    const cancellerName = msg.sender.displayName || (isAdmin ? 'Admin' : 'User')
-    targetJob.isCancelled = true
-    targetJob.cancelledBy = cancellerName
-    targetJob.controller.abort()
-    activeJobs.delete(targetJob.id)
-
-    const processed = targetJob.cachedCount + targetJob.rippedCount
-    const cancelledHtml =
-      `🛑 <b>Download Cancelled</b><br/><br/>` +
-      `<blockquote>• <b>Target:</b> ${targetJob.jobHeader || 'Download'}<br/>` +
-      `• <b>Cancelled by:</b> <b>${html.escape(cancellerName)}</b><br/>` +
-      `• <b>Progress when cancelled:</b> <code>${processed}/${targetJob.totalTracks} tracks delivered</code></blockquote>`
-
-    await tg
-      .editMessage({
-        chatId: targetJob.chatId,
-        message: targetJob.statusMsgId,
-        text: parseDynamicHtml(cancelledHtml),
-      })
-      .catch(() => null)
-
-    await msg.replyText(
-      parseDynamicHtml('🛑 <b>Download has been cancelled.</b>'),
-    )
   })
 }

@@ -24,7 +24,7 @@ export async function setupTestDb(): Promise<{
 
   const cleanDb = async () => {
     await pool.query(
-      'TRUNCATE TABLE tracks, requests, users RESTART IDENTITY CASCADE;',
+      'TRUNCATE TABLE tracks, requests, users, settings RESTART IDENTITY CASCADE;',
     )
   }
 

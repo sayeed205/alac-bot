@@ -6,6 +6,10 @@ import { runMigrations } from '@/db/migrate.ts'
 import { env } from '@/env.ts'
 import { registerAlacCommands } from '@/modules/alac/index.ts'
 import { registerAuthCommands } from '@/modules/auth/index.ts'
+import {
+  registerSettingsCommands,
+  settingsService,
+} from '@/modules/settings/index.ts'
 import { info, infoSpan, initTracing } from '@/utils/logger.ts'
 
 initTracing(env.LOG_LEVEL)
@@ -14,6 +18,9 @@ using _startupSpan = infoSpan('startup').enter()
 
 info('Running database migrations...')
 await runMigrations()
+
+info('Loading bot settings...')
+await settingsService.init()
 
 info('Initializing Telegram client...')
 const tg = new TelegramClient({
@@ -25,6 +32,7 @@ const tg = new TelegramClient({
 const dp = Dispatcher.for(tg)
 
 registerAuthCommands(dp, tg)
+registerSettingsCommands(dp, tg)
 registerAlacCommands(dp, tg)
 
 dp.onNewMessage(filters.start, async (msg) => {

@@ -38,6 +38,7 @@ export function registerHelpCommand(ctx: CommandContext): void {
     if (isAdmin) {
       helpText +=
         '<br/><br/><blockquote><b>Admin Commands:</b><br/>' +
+        '• <code>/settings</code> — Bot operational settings & ripping toggles<br/>' +
         '• <code>/alac &lt;link&gt; -f</code> or <code>/rerip</code> — Force re-rip, bypassing cache<br/>' +
         '• <code>/delete &lt;track_id&gt;</code> — Delete track from DB & dump channel<br/>' +
         '• <code>/auth &lt;user_id | reply&gt;</code> — Whitelist user<br/>' +

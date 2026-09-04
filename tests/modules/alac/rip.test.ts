@@ -10,6 +10,8 @@ import type { IRipQueue } from '@/modules/alac/queue.ts'
 import type { ITrackRipper } from '@/modules/alac/ripper.ts'
 import type { IAlacService } from '@/modules/alac/service.ts'
 import type { IAuthService } from '@/modules/auth/service.ts'
+import type { ISettingsService } from '@/modules/settings/service.ts'
+import type { BotSettings, RippingMode } from '@/modules/settings/types.ts'
 
 interface DispatcherInternal {
   _groups: Map<
@@ -31,6 +33,8 @@ describe('ALAC Rip Command Handler', () => {
   let mockService: IAlacService
   let mockQueue: IRipQueue
   let mockRipper: ITrackRipper
+  let mockSettings: BotSettings
+  let mockSettingsService: ISettingsService
   let ctx: CommandContext
 
   beforeEach(() => {
@@ -121,6 +125,54 @@ describe('ALAC Rip Command Handler', () => {
       ),
     }
 
+    mockSettings = {
+      rippingMode: 'live',
+      albumRipEnabled: true,
+      playlistRipEnabled: true,
+      txtRipEnabled: true,
+      multiLinkRipEnabled: true,
+      maxCollectionTracks: 50,
+    }
+
+    mockSettingsService = {
+      init: mock(() => Promise.resolve()),
+      getSettings: mock(() => ({ ...mockSettings })),
+      getRippingMode: mock(() => mockSettings.rippingMode),
+      isAlbumRipEnabled: mock(() => mockSettings.albumRipEnabled),
+      isPlaylistRipEnabled: mock(() => mockSettings.playlistRipEnabled),
+      getMaxCollectionTracks: mock(() => mockSettings.maxCollectionTracks),
+      canRipLive: mock(
+        (isAdmin: boolean) => isAdmin || mockSettings.rippingMode === 'live',
+      ),
+      canServeCache: mock(
+        (isAdmin: boolean) => isAdmin || mockSettings.rippingMode !== 'paused',
+      ),
+      canRipAlbum: mock(
+        (isAdmin: boolean) => isAdmin || mockSettings.albumRipEnabled,
+      ),
+      canRipPlaylist: mock(
+        (isAdmin: boolean) => isAdmin || mockSettings.playlistRipEnabled,
+      ),
+      isTxtRipEnabled: mock(() => mockSettings.txtRipEnabled),
+      isMultiLinkRipEnabled: mock(() => mockSettings.multiLinkRipEnabled),
+      canRipTxt: mock(
+        (isAdmin: boolean) => isAdmin || mockSettings.txtRipEnabled,
+      ),
+      canRipMultiLink: mock(
+        (isAdmin: boolean) => isAdmin || mockSettings.multiLinkRipEnabled,
+      ),
+      setSetting: mock(async (k, v) => {
+        ;(mockSettings as unknown as Record<string, unknown>)[k] = v
+        return { ...mockSettings }
+      }),
+      cycleRippingMode: mock(async () => 'live' as RippingMode),
+      toggleAlbumRip: mock(async () => true),
+      togglePlaylistRip: mock(async () => true),
+      toggleTxtRip: mock(async () => true),
+      toggleMultiLinkRip: mock(async () => true),
+      setMaxCollectionTracks: mock(async (n) => n),
+    }
+
     ctx = {
       dp,
       tg: fakeTg,
@@ -128,6 +180,7 @@ describe('ALAC Rip Command Handler', () => {
       queue: mockQueue,
       ripper: mockRipper,
       auth: mockAuth,
+      settings: mockSettingsService,
     }
   })
 
@@ -557,7 +610,7 @@ describe('ALAC Rip Command Handler', () => {
 
   describe('Download Cancellation', () => {
     it('allows requester to cancel ongoing download via cancel: callback query', async () => {
-      let resolveRip: () => void
+      let resolveRip = () => {}
       const ripWaitPromise = new Promise<void>((r) => {
         resolveRip = r
       })
@@ -584,7 +637,7 @@ describe('ALAC Rip Command Handler', () => {
             })
           })
         })
-      })
+      }) as unknown as ITrackRipper['rip']
 
       registerRipCommand(ctx)
       // Start download as user 55
@@ -621,7 +674,7 @@ describe('ALAC Rip Command Handler', () => {
     })
 
     it('denies cancellation attempt from non-requester non-admin user', async () => {
-      let resolveRip: () => void
+      let resolveRip = () => {}
       const ripWaitPromise = new Promise<void>((r) => {
         resolveRip = r
       })
@@ -648,7 +701,7 @@ describe('ALAC Rip Command Handler', () => {
             })
           })
         })
-      })
+      }) as unknown as ITrackRipper['rip']
 
       registerRipCommand(ctx)
       // Started by user 55
@@ -674,7 +727,7 @@ describe('ALAC Rip Command Handler', () => {
     })
 
     it('allows admin to cancel another user download', async () => {
-      let resolveRip: () => void
+      let resolveRip = () => {}
       const ripWaitPromise = new Promise<void>((r) => {
         resolveRip = r
       })
@@ -701,7 +754,7 @@ describe('ALAC Rip Command Handler', () => {
             })
           })
         })
-      })
+      }) as unknown as ITrackRipper['rip']
 
       registerRipCommand(ctx)
       // Started by user 55
@@ -726,7 +779,7 @@ describe('ALAC Rip Command Handler', () => {
     })
 
     it('cancels active download via /cancel command', async () => {
-      let resolveRip: () => void
+      let resolveRip = () => {}
       const ripWaitPromise = new Promise<void>((r) => {
         resolveRip = r
       })
@@ -753,7 +806,7 @@ describe('ALAC Rip Command Handler', () => {
             })
           })
         })
-      })
+      }) as unknown as ITrackRipper['rip']
 
       registerRipCommand(ctx)
       // Started by user 55
@@ -770,6 +823,176 @@ describe('ALAC Rip Command Handler', () => {
 
       resolveRip?.()
       await ripPromise
+    })
+  })
+
+  describe('Settings Enforcement in Rip Command', () => {
+    it('blocks non-admin when rippingMode is paused', async () => {
+      mockSettings.rippingMode = 'paused'
+      registerRipCommand(ctx)
+
+      const { repliedTexts } = await dispatchMessage('/alac 12345', 999)
+      expect(repliedTexts.length).toBe(1)
+      expect(repliedTexts[0]).toContain('Ripping is temporarily paused')
+    })
+
+    it('allows admin when rippingMode is paused', async () => {
+      mockSettings.rippingMode = 'paused'
+      registerRipCommand(ctx)
+
+      const { repliedTexts } = await dispatchMessage('/alac 12345', 1)
+      expect(repliedTexts.length).toBe(1)
+      expect(repliedTexts[0]).toContain('Resolving tracks from Apple Music')
+    })
+
+    it('blocks non-admin from ripping albums when albumRipEnabled is false', async () => {
+      mockSettings.albumRipEnabled = false
+      registerRipCommand(ctx)
+
+      const { repliedTexts } = await dispatchMessage(
+        '/alac https://music.apple.com/us/album/test/12345',
+        999,
+      )
+      expect(repliedTexts.length).toBe(1)
+      expect(repliedTexts[0]).toContain('Album ripping is currently disabled')
+    })
+
+    it('allows admin to rip albums when albumRipEnabled is false', async () => {
+      mockSettings.albumRipEnabled = false
+      registerRipCommand(ctx)
+
+      const { repliedTexts } = await dispatchMessage(
+        '/alac https://music.apple.com/us/album/test/12345',
+        1,
+      )
+      expect(repliedTexts.length).toBe(1)
+      expect(repliedTexts[0]).toContain('Resolving tracks from Apple Music')
+    })
+
+    it('blocks non-admin from ripping playlists when playlistRipEnabled is false', async () => {
+      mockSettings.playlistRipEnabled = false
+      registerRipCommand(ctx)
+
+      const { repliedTexts } = await dispatchMessage(
+        '/alac https://music.apple.com/us/playlist/test/pl.12345',
+        999,
+      )
+      expect(repliedTexts.length).toBe(1)
+      expect(repliedTexts[0]).toContain(
+        'Playlist ripping is currently disabled',
+      )
+    })
+
+    it('rejects single uncached track in cache_only mode for non-admin', async () => {
+      mockSettings.rippingMode = 'cache_only'
+      mockService.findCachedTracks = mock(() => Promise.resolve(new Map()))
+      registerRipCommand(ctx)
+
+      await dispatchMessage('/alac 12345', 999)
+      expect(fakeTg.editMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          text: expect.objectContaining({
+            text: expect.stringContaining('Live ripping is currently disabled'),
+          }),
+        }),
+      )
+    })
+
+    it('caps collection tracks to maxCollectionTracks for non-admin', async () => {
+      mockSettings.maxCollectionTracks = 2
+      globalThis.fetch = mock((url: string | URL | Request) => {
+        const urlStr = String(url)
+        if (urlStr.includes('/lookup')) {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                resultCount: 5,
+                results: [
+                  {
+                    wrapperType: 'collection',
+                    collectionId: 555,
+                    collectionName: '5 Track Album',
+                    artistName: 'Artist',
+                  },
+                  { wrapperType: 'track', trackId: 1, trackName: 'T1' },
+                  { wrapperType: 'track', trackId: 2, trackName: 'T2' },
+                  { wrapperType: 'track', trackId: 3, trackName: 'T3' },
+                  { wrapperType: 'track', trackId: 4, trackName: 'T4' },
+                ],
+              }),
+              { status: 200 },
+            ),
+          )
+        }
+        return Promise.resolve(new Response('{}', { status: 404 }))
+      }) as unknown as typeof fetch
+
+      registerRipCommand(ctx)
+      await dispatchMessage(
+        '/alac https://music.apple.com/us/album/test/555',
+        999,
+      )
+
+      // Only 2 tracks should be ripped because of cap
+      expect(mockRipper.rip).toHaveBeenCalledTimes(2)
+    })
+
+    it('blocks non-admin from ripping .txt batch when txtRipEnabled is false', async () => {
+      mockSettings.txtRipEnabled = false
+      fakeTg.downloadToFile = mock((p: string) => {
+        fs.writeFileSync(p, 'https://music.apple.com/us/album/test/123?i=111')
+        return Promise.resolve()
+      }) as unknown as TelegramClient['downloadToFile']
+      registerRipCommand(ctx)
+
+      const { repliedTexts } = await dispatchMessage('/alac', 999, 'user', {
+        media: { type: 'document', fileName: 'batch.txt', raw: {} },
+      })
+      expect(repliedTexts.length).toBe(1)
+      expect(repliedTexts[0]).toContain(
+        '.TXT file ripping is currently disabled',
+      )
+    })
+
+    it('allows admin to rip .txt batch when txtRipEnabled is false', async () => {
+      mockSettings.txtRipEnabled = false
+      fakeTg.downloadToFile = mock((p: string) => {
+        fs.writeFileSync(p, 'https://music.apple.com/us/album/test/123?i=111')
+        return Promise.resolve()
+      }) as unknown as TelegramClient['downloadToFile']
+      registerRipCommand(ctx)
+
+      const { repliedTexts } = await dispatchMessage('/alac', 1, 'user', {
+        media: { type: 'document', fileName: 'batch.txt', raw: {} },
+      })
+      expect(repliedTexts.length).toBe(1)
+      expect(repliedTexts[0]).toContain('Resolving tracks from Apple Music')
+    })
+
+    it('blocks non-admin from multi-link ripping when multiLinkRipEnabled is false', async () => {
+      mockSettings.multiLinkRipEnabled = false
+      registerRipCommand(ctx)
+
+      const { repliedTexts } = await dispatchMessage(
+        '/alac https://music.apple.com/us/album/test/123?i=111 https://music.apple.com/us/album/test/123?i=222',
+        999,
+      )
+      expect(repliedTexts.length).toBe(1)
+      expect(repliedTexts[0]).toContain(
+        'Multi-link ripping is currently disabled',
+      )
+    })
+
+    it('allows admin to multi-link rip when multiLinkRipEnabled is false', async () => {
+      mockSettings.multiLinkRipEnabled = false
+      registerRipCommand(ctx)
+
+      const { repliedTexts } = await dispatchMessage(
+        '/alac https://music.apple.com/us/album/test/123?i=111 https://music.apple.com/us/album/test/123?i=222',
+        1,
+      )
+      expect(repliedTexts.length).toBe(1)
+      expect(repliedTexts[0]).toContain('Resolving tracks from Apple Music')
     })
   })
 })

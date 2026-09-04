@@ -3,6 +3,7 @@ import {
   boolean,
   index,
   integer,
+  jsonb,
   pgTable,
   serial,
   text,
@@ -70,6 +71,14 @@ export const requests = pgTable(
   ],
 )
 
+export const settings = pgTable('settings', {
+  key: text('key').primaryKey(),
+  value: jsonb('value').notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true })
+    .defaultNow()
+    .notNull(),
+})
+
 export type User = typeof users.$inferSelect
 export type NewUser = typeof users.$inferInsert
 
@@ -78,3 +87,6 @@ export type NewTrack = typeof tracks.$inferInsert
 
 export type Request = typeof requests.$inferSelect
 export type NewRequest = typeof requests.$inferInsert
+
+export type Setting = typeof settings.$inferSelect
+export type NewSetting = typeof settings.$inferInsert
