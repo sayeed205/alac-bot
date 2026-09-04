@@ -13,62 +13,86 @@ export interface DumpCaptionMetadata {
   appleTrackId: string
   title: string
   artist: string
-  album?: string
-  duration?: number
-  bitDepth?: number
-  sampleRate?: number
+  album: string
+  duration: number
+  bitDepth: number
+  sampleRate: number
+  genre: string
+  releaseDate: string
+  trackNumber: number
+  trackCount: number
 }
 
-const DUMP_PAYLOAD_REGEX = /#alac:(\{.*?\})/s
+const DUMP_PAYLOAD_REGEX = /(\{[\s\S]*?"id"\s*:\s*"[^"]+"[\s\S]*?\})/s
 
 export interface ParsedDumpMetadata {
   appleTrackId: string
-  album?: string
-  bitDepth?: number
-  sampleRate?: number
+  title: string
+  artist: string
+  album: string
+  duration: number
+  bitDepth: number
+  sampleRate: number
+  genre: string
+  releaseDate: string
+  trackNumber: number
+  trackCount: number
 }
 
 /**
- * Formats a clean human-readable track caption with hidden machine-readable spoiler metadata.
+ * Formats a clean human-readable track caption with an expandable blockquote containing
+ * rich metadata and machine-readable payload.
  */
 export function formatDumpCaption(meta: DumpCaptionMetadata): FormattedString {
   const parts: string[] = []
   parts.push(
     `🎵 <b>${html.escape(meta.title)}</b> — ${html.escape(meta.artist)}`,
   )
-  if (meta.album) {
-    parts.push(`💽 ${html.escape(meta.album)}`)
-  }
+  parts.push(`💽 ${html.escape(meta.album)}`)
 
-  const specParts: string[] = ['ALAC']
-  if (meta.bitDepth) {
-    specParts.push(`${meta.bitDepth}-bit`)
-  }
-  if (meta.sampleRate) {
-    specParts.push(`${(meta.sampleRate / 1000).toFixed(1)} kHz`)
-  }
-  if (meta.duration && meta.duration > 0) {
-    const m = Math.floor(meta.duration / 60)
-    const s = String(meta.duration % 60).padStart(2, '0')
-    specParts.push(`${m}:${s}`)
-  }
+  const m = Math.floor(meta.duration / 60)
+  const s = String(meta.duration % 60).padStart(2, '0')
+  const specParts: string[] = [
+    'ALAC',
+    `${meta.bitDepth}-bit`,
+    `${(meta.sampleRate / 1000).toFixed(1)} kHz`,
+    `${m}:${s}`,
+  ]
 
   parts.push(`🎧 ${specParts.join(' • ')}`)
 
   const payload = {
     id: meta.appleTrackId,
+    title: meta.title,
+    artist: meta.artist,
     album: meta.album,
+    dur: meta.duration,
     bit: meta.bitDepth,
     hz: meta.sampleRate,
+    genre: meta.genre,
+    date: meta.releaseDate,
+    trk: meta.trackNumber,
+    cnt: meta.trackCount,
   }
 
-  parts.push(`<spoiler>#alac:${JSON.stringify(payload)}</spoiler>`)
+  const quoteLines: string[] = [
+    '<b>Track Specs & Metadata:</b>',
+    `• Quality: <code>ALAC ${meta.bitDepth}-bit / ${(meta.sampleRate / 1000).toFixed(1)} kHz</code>`,
+    `• Album: <b>${html.escape(meta.album)}</b>`,
+    `• Track: <code>${meta.trackNumber}/${meta.trackCount}</code>`,
+    `• Genre: <code>${html.escape(meta.genre)}</code>`,
+    `• Release Date: <code>${html.escape(meta.releaseDate)}</code>`,
+    `• Apple Track ID: <code>${html.escape(meta.appleTrackId)}</code>`,
+    `<pre language="json">${JSON.stringify(payload, null, 2)}</pre>`,
+  ]
+
+  parts.push(`<blockquote expandable>${quoteLines.join('<br/>')}</blockquote>`)
 
   return parseDynamicHtml(parts.join('<br/>'))
 }
 
 /**
- * Extracts the structured #alac:{...} metadata from message text / caption.
+ * Extracts the structured metadata from message text / caption.
  */
 export function parseDumpCaption(
   text: string | null | undefined,
@@ -83,9 +107,16 @@ export function parseDumpCaption(
 
     return {
       appleTrackId: parsed.id,
-      album: typeof parsed.album === 'string' ? parsed.album : undefined,
-      bitDepth: typeof parsed.bit === 'number' ? parsed.bit : undefined,
-      sampleRate: typeof parsed.hz === 'number' ? parsed.hz : undefined,
+      title: String(parsed.title ?? ''),
+      artist: String(parsed.artist ?? ''),
+      album: String(parsed.album ?? ''),
+      duration: Number(parsed.dur ?? 0),
+      bitDepth: Number(parsed.bit ?? 16),
+      sampleRate: Number(parsed.hz ?? 44100),
+      genre: String(parsed.genre ?? 'Music'),
+      releaseDate: String(parsed.date ?? ''),
+      trackNumber: Number(parsed.trk ?? 1),
+      trackCount: Number(parsed.cnt ?? 1),
     }
   } catch {
     return null
@@ -163,12 +194,16 @@ export async function indexDumpChannel(
         messageId: message.id,
         fileId,
         fileUniqueId,
-        title: audio.title || undefined,
-        artist: audio.performer || undefined,
-        album: meta.album,
-        duration: audio.duration || undefined,
+        title: meta.title || audio.title || 'Unknown Title',
+        artist: meta.artist || audio.performer || 'Unknown Artist',
+        album: meta.album || 'Unknown Album',
+        duration: meta.duration || audio.duration || 0,
         bitDepth: meta.bitDepth,
         sampleRate: meta.sampleRate,
+        genre: meta.genre || 'Music',
+        releaseDate: meta.releaseDate || '',
+        trackNumber: meta.trackNumber || 1,
+        trackCount: meta.trackCount || 1,
       })
 
       validTrackIds.add(meta.appleTrackId)

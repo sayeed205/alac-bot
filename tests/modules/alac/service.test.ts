@@ -6,7 +6,28 @@ import { migrate } from 'drizzle-orm/pglite/migrator'
 
 import type { AppDatabase } from '@/db/index.ts'
 import * as schema from '@/db/schema.ts'
-import { AlacService } from '@/modules/alac/service.ts'
+import { AlacService, type SaveTrackInput } from '@/modules/alac/service.ts'
+
+const makeTrackInput = (
+  overrides: Partial<SaveTrackInput> & {
+    appleTrackId: string
+    messageId: number
+    fileId: string
+  },
+): SaveTrackInput => ({
+  fileUniqueId: `uniq_${overrides.appleTrackId}`,
+  title: 'Test Title',
+  artist: 'Rick Astley',
+  album: 'Whenever You Need Somebody',
+  duration: 200,
+  bitDepth: 16,
+  sampleRate: 44100,
+  genre: 'Pop',
+  releaseDate: '1987-11-12',
+  trackNumber: 1,
+  trackCount: 10,
+  ...overrides,
+})
 
 describe('AlacService', () => {
   let client: PGlite
@@ -32,18 +53,20 @@ describe('AlacService', () => {
   })
 
   it('saves and retrieves a cached track with rich metadata', async () => {
-    const saved = await service.saveTrack({
-      appleTrackId: '123456789',
-      messageId: 42,
-      fileId: 'tg_file_id_test',
-      fileUniqueId: 'tg_unique_id_test',
-      title: 'Never Gonna Give You Up',
-      artist: 'Rick Astley',
-      album: 'Whenever You Need Somebody',
-      duration: 215,
-      bitDepth: 16,
-      sampleRate: 44100,
-    })
+    const saved = await service.saveTrack(
+      makeTrackInput({
+        appleTrackId: '123456789',
+        messageId: 42,
+        fileId: 'tg_file_id_test',
+        fileUniqueId: 'tg_unique_id_test',
+        title: 'Never Gonna Give You Up',
+        artist: 'Rick Astley',
+        album: 'Whenever You Need Somebody',
+        duration: 215,
+        bitDepth: 16,
+        sampleRate: 44100,
+      }),
+    )
 
     expect(saved.appleTrackId).toBe('123456789')
     expect(saved.messageId).toBe(42)
@@ -59,12 +82,14 @@ describe('AlacService', () => {
   })
 
   it('upserts an existing track when saved with updated details', async () => {
-    await service.saveTrack({
-      appleTrackId: '123456789',
-      messageId: 100,
-      fileId: 'tg_file_id_updated',
-      title: 'Never Gonna Give You Up (Remastered)',
-    })
+    await service.saveTrack(
+      makeTrackInput({
+        appleTrackId: '123456789',
+        messageId: 100,
+        fileId: 'tg_file_id_updated',
+        title: 'Never Gonna Give You Up (Remastered)',
+      }),
+    )
 
     const fetched = await service.findCachedTrack('123456789')
     expect(fetched?.messageId).toBe(100)
@@ -77,15 +102,17 @@ describe('AlacService', () => {
     expect(await service.searchCachedTracks('   ')).toEqual([])
 
     // Save another track for search diversity
-    await service.saveTrack({
-      appleTrackId: '555666777',
-      messageId: 200,
-      fileId: 'tg_file_id_3',
-      title: 'Together Forever',
-      artist: 'Rick Astley',
-      album: 'Whenever You Need Somebody',
-      duration: 205,
-    })
+    await service.saveTrack(
+      makeTrackInput({
+        appleTrackId: '555666777',
+        messageId: 200,
+        fileId: 'tg_file_id_3',
+        title: 'Together Forever',
+        artist: 'Rick Astley',
+        album: 'Whenever You Need Somebody',
+        duration: 205,
+      }),
+    )
 
     // Search by title substring (case-insensitive)
     const titleResults = await service.searchCachedTracks('give you up')
@@ -112,11 +139,13 @@ describe('AlacService', () => {
     expect(emptyMap.size).toBe(0)
 
     // Save another track
-    await service.saveTrack({
-      appleTrackId: '987654321',
-      messageId: 101,
-      fileId: 'tg_file_id_2',
-    })
+    await service.saveTrack(
+      makeTrackInput({
+        appleTrackId: '987654321',
+        messageId: 101,
+        fileId: 'tg_file_id_2',
+      }),
+    )
 
     const map = await service.findCachedTracks([
       '123456789',
@@ -174,11 +203,13 @@ describe('AlacService', () => {
   })
 
   it('deletes an existing track', async () => {
-    await service.saveTrack({
-      appleTrackId: 'test_delete_id',
-      messageId: 300,
-      fileId: 'tg_file_id_del',
-    })
+    await service.saveTrack(
+      makeTrackInput({
+        appleTrackId: 'test_delete_id',
+        messageId: 300,
+        fileId: 'tg_file_id_del',
+      }),
+    )
 
     const deleted = await service.deleteTrack('test_delete_id')
     expect(deleted).toBe(true)
@@ -188,16 +219,20 @@ describe('AlacService', () => {
   })
 
   it('gets all track ids and deletes tracks not in list', async () => {
-    await service.saveTrack({
-      appleTrackId: 'sync_track_1',
-      messageId: 401,
-      fileId: 'file_1',
-    })
-    await service.saveTrack({
-      appleTrackId: 'sync_track_2',
-      messageId: 402,
-      fileId: 'file_2',
-    })
+    await service.saveTrack(
+      makeTrackInput({
+        appleTrackId: 'sync_track_1',
+        messageId: 401,
+        fileId: 'file_1',
+      }),
+    )
+    await service.saveTrack(
+      makeTrackInput({
+        appleTrackId: 'sync_track_2',
+        messageId: 402,
+        fileId: 'file_2',
+      }),
+    )
 
     const allIds = await service.getAllTrackIds()
     expect(allIds).toContain('sync_track_1')

@@ -20,9 +20,13 @@ export interface TrackRipResult {
   filePath: string
   title: string
   artist: string
-  album?: string
-  duration?: number
-  bitDepth?: number
-  sampleRate?: number
-  codec?: string
+  album: string
+  duration: number
+  bitDepth: number
+  sampleRate: number
+  codec: string
+  genre: string
+  releaseDate: string
+  trackNumber: number
+  trackCount: number
 }

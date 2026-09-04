@@ -40,6 +40,10 @@ export class FakeTrackRipper implements ITrackRipper {
       codec: 'alac',
       bitDepth: 24,
       sampleRate: 96000,
+      genre: this.mockResult?.genre || 'Pop',
+      releaseDate: this.mockResult?.releaseDate || '2023-01-01',
+      trackNumber: this.mockResult?.trackNumber || 1,
+      trackCount: this.mockResult?.trackCount || 10,
     }
   }
 }
@@ -253,6 +257,10 @@ export class AlacTrackRipper implements ITrackRipper {
         codec,
         bitDepth,
         sampleRate,
+        genre: meta.genre,
+        releaseDate: meta.releaseDate,
+        trackNumber: meta.trackNumber,
+        trackCount: meta.trackCount,
       }
     } finally {
       await unlink(tempRawPath).catch(() => {})

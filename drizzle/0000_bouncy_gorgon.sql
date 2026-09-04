@@ -15,7 +15,17 @@ CREATE TABLE "tracks" (
 	"apple_track_id" text NOT NULL,
 	"message_id" integer NOT NULL,
 	"file_id" text NOT NULL,
-	"file_unique_id" text,
+	"file_unique_id" text NOT NULL,
+	"title" text NOT NULL,
+	"artist" text NOT NULL,
+	"album" text NOT NULL,
+	"duration" integer NOT NULL,
+	"bit_depth" integer NOT NULL,
+	"sample_rate" integer NOT NULL,
+	"genre" text NOT NULL,
+	"release_date" text NOT NULL,
+	"track_number" integer NOT NULL,
+	"track_count" integer NOT NULL,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL,
 	CONSTRAINT "tracks_apple_track_id_unique" UNIQUE("apple_track_id")
@@ -29,4 +39,6 @@ CREATE TABLE "users" (
 --> statement-breakpoint
 CREATE INDEX "requests_apple_track_id_idx" ON "requests" USING btree ("apple_track_id");--> statement-breakpoint
 CREATE INDEX "requests_telegram_id_idx" ON "requests" USING btree ("telegram_id");--> statement-breakpoint
-CREATE INDEX "requests_created_at_idx" ON "requests" USING btree ("created_at");
+CREATE INDEX "requests_created_at_idx" ON "requests" USING btree ("created_at");--> statement-breakpoint
+CREATE INDEX "tracks_title_idx" ON "tracks" USING btree ("title");--> statement-breakpoint
+CREATE INDEX "tracks_artist_idx" ON "tracks" USING btree ("artist");

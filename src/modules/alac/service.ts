@@ -18,13 +18,17 @@ export interface SaveTrackInput {
   appleTrackId: string
   messageId: number
   fileId: string
-  fileUniqueId?: string
-  title?: string
-  artist?: string
-  album?: string
-  duration?: number
-  bitDepth?: number
-  sampleRate?: number
+  fileUniqueId: string
+  title: string
+  artist: string
+  album: string
+  duration: number
+  bitDepth: number
+  sampleRate: number
+  genre: string
+  releaseDate: string
+  trackNumber: number
+  trackCount: number
 }
 
 export interface TopTrackStat {
@@ -156,6 +160,10 @@ export class AlacService implements IAlacService {
         duration: input.duration,
         bitDepth: input.bitDepth,
         sampleRate: input.sampleRate,
+        genre: input.genre,
+        releaseDate: input.releaseDate,
+        trackNumber: input.trackNumber,
+        trackCount: input.trackCount,
         updatedAt: new Date(),
       })
       .onConflictDoUpdate({
@@ -170,6 +178,10 @@ export class AlacService implements IAlacService {
           duration: input.duration,
           bitDepth: input.bitDepth,
           sampleRate: input.sampleRate,
+          genre: input.genre,
+          releaseDate: input.releaseDate,
+          trackNumber: input.trackNumber,
+          trackCount: input.trackCount,
           updatedAt: new Date(),
         },
       })

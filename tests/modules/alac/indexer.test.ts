@@ -11,7 +11,7 @@ import {
 import type { IAlacService, SaveTrackInput } from '@/modules/alac/service.ts'
 
 describe('Dump Channel Indexer & Metadata Tagging', () => {
-  it('formats dump caption with human-readable specs and machine-readable spoiler', () => {
+  it('formats dump caption with human-readable specs and machine-readable expandable blockquote', () => {
     const caption = formatDumpCaption({
       appleTrackId: '1559523359',
       title: 'Never Gonna Give You Up',
@@ -20,42 +20,60 @@ describe('Dump Channel Indexer & Metadata Tagging', () => {
       duration: 212,
       bitDepth: 24,
       sampleRate: 96000,
+      genre: 'Pop',
+      releaseDate: '1987-11-12',
+      trackNumber: 1,
+      trackCount: 10,
     })
 
     expect(caption.text).toContain('Never Gonna Give You Up')
     expect(caption.text).toContain('Rick Astley')
     expect(caption.text).toContain('Whenever You Need Somebody')
-    expect(caption.text).toContain('24-bit • 96.0 kHz • 3:32')
-    expect(caption.text).toContain('#alac:{"id":"1559523359"')
+    expect(caption.text).toContain('"id": "1559523359"')
 
-    // Verify spoiler entity is present
-    const spoiler = caption.entities?.find(
-      (e: { _: string }) => e._ === 'messageEntitySpoiler',
+    // Verify collapsible blockquote entity is present
+    const blockquote = caption.entities?.find(
+      (e: { _: string; collapsed?: boolean }) =>
+        e._ === 'messageEntityBlockquote' && e.collapsed === true,
     )
-    expect(spoiler).toBeDefined()
+    expect(blockquote).toBeDefined()
+
+    // Verify pre language-json entity is present
+    const pre = caption.entities?.find(
+      (e: { _: string; language?: string }) =>
+        e._ === 'messageEntityPre' && e.language === 'json',
+    )
+    expect(pre).toBeDefined()
   })
 
-  it('correctly parses dump caption with valid spoiler payload', () => {
+  it('correctly parses dump caption with valid metadata payload', () => {
     const text =
-      '🎵 Never Gonna Give You Up — Rick Astley\n💽 Whenever You Need Somebody\n🎧 ALAC • 24-bit • 96.0 kHz\n\n#alac:{"id":"1559523359","album":"Whenever You Need Somebody","bit":24,"hz":96000}'
+      '🎵 Never Gonna Give You Up — Rick Astley\n💽 Whenever You Need Somebody\n🎧 ALAC • 24-bit • 96.0 kHz\n\n{\n  "id": "1559523359",\n  "title": "Never Gonna Give You Up",\n  "artist": "Rick Astley",\n  "album": "Whenever You Need Somebody",\n  "bit": 24,\n  "hz": 96000,\n  "dur": 212,\n  "genre": "Pop",\n  "date": "1987-11-12",\n  "trk": 1,\n  "cnt": 10\n}'
 
     const parsed = parseDumpCaption(text)
     expect(parsed).toEqual({
       appleTrackId: '1559523359',
+      title: 'Never Gonna Give You Up',
+      artist: 'Rick Astley',
       album: 'Whenever You Need Somebody',
       bitDepth: 24,
       sampleRate: 96000,
+      duration: 212,
+      genre: 'Pop',
+      releaseDate: '1987-11-12',
+      trackNumber: 1,
+      trackCount: 10,
     })
   })
 
-  it('returns null when parsing text without #alac payload', () => {
+  it('returns null when parsing text without json payload', () => {
     expect(parseDumpCaption(null)).toBeNull()
     expect(parseDumpCaption('')).toBeNull()
     expect(
       parseDumpCaption('Random text without any metadata payload'),
     ).toBeNull()
-    expect(parseDumpCaption('#alac:{corrupted_json}')).toBeNull()
-    expect(parseDumpCaption('#alac:{"no_id": true}')).toBeNull()
+    expect(parseDumpCaption('{corrupted_json}')).toBeNull()
+    expect(parseDumpCaption('{"no_id": true}')).toBeNull()
   })
 
   it('indexes dump channel, saves valid tracks, and prunes deleted tracks', async () => {
@@ -78,7 +96,7 @@ describe('Dump Channel Indexer & Metadata Tagging', () => {
       // 1. Valid ALAC audio with metadata
       {
         id: 101,
-        text: '🎵 Song 1\n#alac:{"id":"track_1","album":"Album 1","bit":24,"hz":48000}',
+        text: '🎵 Song 1\n<blockquote expandable>{\n  "id": "track_1",\n  "title": "Song 1 Full",\n  "artist": "Artist 1 Full",\n  "album": "Album 1",\n  "bit": 24,\n  "hz": 48000,\n  "dur": 185,\n  "genre": "Rock",\n  "date": "2021-01-01",\n  "trk": 2,\n  "cnt": 12\n}</blockquote>',
         media: {
           type: 'audio',
           fileId: 'file_id_1',
@@ -109,7 +127,7 @@ describe('Dump Channel Indexer & Metadata Tagging', () => {
       // 4. Valid second ALAC audio
       {
         id: 104,
-        text: '🎵 Song 2\n#alac:{"id":"track_2","album":"Album 2","bit":16,"hz":44100}',
+        text: '🎵 Song 2\n<blockquote expandable>{\n  "id": "track_2",\n  "album": "Album 2",\n  "bit": 16,\n  "hz": 44100\n}</blockquote>',
         media: {
           type: 'audio',
           fileId: 'file_id_2',
@@ -153,12 +171,16 @@ describe('Dump Channel Indexer & Metadata Tagging', () => {
       messageId: 101,
       fileId: 'file_id_1',
       fileUniqueId: 'uniq_1',
-      title: 'Song 1',
-      artist: 'Artist 1',
+      title: 'Song 1 Full',
+      artist: 'Artist 1 Full',
       album: 'Album 1',
-      duration: 180,
+      duration: 185,
       bitDepth: 24,
       sampleRate: 48000,
+      genre: 'Rock',
+      releaseDate: '2021-01-01',
+      trackNumber: 2,
+      trackCount: 12,
     })
     expect(savedTracks).toContainEqual({
       appleTrackId: 'track_2',
@@ -171,6 +193,10 @@ describe('Dump Channel Indexer & Metadata Tagging', () => {
       duration: 200,
       bitDepth: 16,
       sampleRate: 44100,
+      genre: 'Music',
+      releaseDate: '',
+      trackNumber: 1,
+      trackCount: 1,
     })
 
     expect(prunedNotIn).toContain('track_1')

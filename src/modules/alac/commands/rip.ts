@@ -199,6 +199,10 @@ export function registerRipCommand(ctx: CommandContext): void {
                 duration: ripResult.duration,
                 bitDepth: ripResult.bitDepth,
                 sampleRate: ripResult.sampleRate,
+                genre: ripResult.genre,
+                releaseDate: ripResult.releaseDate,
+                trackNumber: ripResult.trackNumber,
+                trackCount: ripResult.trackCount,
               })
 
               const dumpMsg = await tg.sendMedia(
@@ -228,7 +232,7 @@ export function registerRipCommand(ctx: CommandContext): void {
               )
 
               let fileId = ''
-              let fileUniqueId: string | undefined
+              let fileUniqueId = ''
               if (dumpMsg.media && dumpMsg.media.type === 'audio') {
                 fileId = dumpMsg.media.fileId
                 fileUniqueId = dumpMsg.media.uniqueFileId
@@ -246,6 +250,10 @@ export function registerRipCommand(ctx: CommandContext): void {
                 duration: ripResult.duration,
                 bitDepth: ripResult.bitDepth,
                 sampleRate: ripResult.sampleRate,
+                genre: ripResult.genre,
+                releaseDate: ripResult.releaseDate,
+                trackNumber: ripResult.trackNumber,
+                trackCount: ripResult.trackCount,
               })
 
               // Deliver clean copy to destination chat

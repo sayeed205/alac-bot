@@ -286,11 +286,23 @@ describe('ALAC Management Commands', () => {
 
   describe('Health / Ping Command', () => {
     it('pings health services and updates status message', async () => {
-      registerHealthCommand(ctx)
-      const { repliedTexts } = await dispatchMessage('/ping')
+      const originalFetch = globalThis.fetch
+      globalThis.fetch = mock(() =>
+        Promise.resolve({
+          ok: true,
+          status: 200,
+        } as unknown as Response),
+      )
 
-      expect(repliedTexts[0]).toContain('Testing system health')
-      expect(fakeTg.editMessage).toHaveBeenCalled()
+      try {
+        registerHealthCommand(ctx)
+        const { repliedTexts } = await dispatchMessage('/ping')
+
+        expect(repliedTexts[0]).toContain('Testing system health')
+        expect(fakeTg.editMessage).toHaveBeenCalled()
+      } finally {
+        globalThis.fetch = originalFetch
+      }
     })
   })
 })
