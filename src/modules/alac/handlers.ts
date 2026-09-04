@@ -104,6 +104,11 @@ export function registerAlacHandlers(
       }
     }
 
+    // 1. Batch cache lookup across all target tracks (1 fast DB query)
+    const cachedTracksMap = !isForce
+      ? await service.findCachedTracks(trackIds)
+      : new Map()
+
     // Process each track in sequence
     for (let index = 0; index < trackIds.length; index++) {
       const trackId = trackIds[index]
@@ -120,9 +125,9 @@ export function registerAlacHandlers(
 
       const startTime = Date.now()
 
-      // 1. Check Cache (Fast-path)
+      // 2. Check Cache (Fast-path)
       if (!isForce) {
-        const cached = await service.findCachedTrack(trackId)
+        const cached = cachedTracksMap.get(trackId)
         if (cached) {
           try {
             await tg.sendCopy({
@@ -153,11 +158,13 @@ export function registerAlacHandlers(
               track_id: trackId,
               error: String(err),
             })
+            // Remove broken cache entry so future requests re-rip cleanly
+            await service.deleteTrack(trackId).catch(() => null)
           }
         }
       }
 
-      // 2. Slow-path: Queue sequential rip job
+      // 3. Slow-path: Queue sequential rip job
       debug('Queueing rip job', { track_id: trackId })
       const statusMsg = await msg.replyText(
         parseDynamicHtml(

@@ -16,7 +16,7 @@ describe('AlacService', () => {
     client = new PGlite()
     await client.waitReady
     const testDb = drizzle(client, { schema })
-    await migrate(testDb, { migrationsFolder: './drizzle' })
+    await migrate(testDb, { migrationsFolder: './drizzle' } || {})
     service = new AlacService(testDb as unknown as AppDatabase)
   })
 
@@ -58,6 +58,30 @@ describe('AlacService', () => {
     const fetched = await service.findCachedTrack('123456789')
     expect(fetched?.messageId).toBe(100)
     expect(fetched?.fileId).toBe('tg_file_id_updated')
+  })
+
+  it('batch retrieves multiple cached tracks with findCachedTracks', async () => {
+    // Empty list returns empty map
+    const emptyMap = await service.findCachedTracks([])
+    expect(emptyMap.size).toBe(0)
+
+    // Save another track
+    await service.saveTrack({
+      appleTrackId: '987654321',
+      messageId: 101,
+      fileId: 'tg_file_id_2',
+    })
+
+    const map = await service.findCachedTracks([
+      '123456789',
+      '987654321',
+      'missing_track',
+    ])
+
+    expect(map.size).toBe(2)
+    expect(map.get('123456789')?.messageId).toBe(100)
+    expect(map.get('987654321')?.messageId).toBe(101)
+    expect(map.has('missing_track')).toBe(false)
   })
 
   it('logs a request entry in the analytics requests table', async () => {
