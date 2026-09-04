@@ -1,6 +1,8 @@
-import { describe, expect, it } from 'bun:test'
-
-import { formatByteProgress, renderProgressBar } from '@/utils/progress.ts'
+import {
+  formatByteProgress,
+  formatBytes,
+  renderProgressBar,
+} from '@/utils/progress.ts'
 
 describe('Progress Bar Utility', () => {
   it('renders 0% progress bar correctly', () => {
@@ -29,5 +31,13 @@ describe('Progress Bar Utility', () => {
     const total = 30 * 1024 * 1024
     const formatted = formatByteProgress(current, total, 10)
     expect(formatted).toBe('[█████░░░░░] 50% (15.0/30.0 MB)')
+  })
+
+  it('formats bytes correctly', () => {
+    expect(formatBytes(0)).toBe('0 B')
+    expect(formatBytes(512)).toBe('512 B')
+    expect(formatBytes(1024)).toBe('1.00 KB')
+    expect(formatBytes(5 * 1024 * 1024)).toBe('5.00 MB')
+    expect(formatBytes(2.5 * 1024 * 1024 * 1024)).toBe('2.50 GB')
   })
 })

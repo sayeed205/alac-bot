@@ -3,11 +3,11 @@ import { describe, expect, it, mock } from 'bun:test'
 import type { TelegramClient } from '@mtcute/bun'
 import { Dispatcher } from '@mtcute/dispatcher'
 
-import { registerAlacHandlers } from '@/modules/alac/handlers.ts'
+import { registerAlacCommands } from '@/modules/alac/commands/index.ts'
 import type { IRipQueue } from '@/modules/alac/queue.ts'
 import type { ITrackRipper } from '@/modules/alac/ripper.ts'
 import type { IAlacService } from '@/modules/alac/service.ts'
-import { registerAuthHandlers } from '@/modules/auth/handlers.ts'
+import { registerAuthCommands } from '@/modules/auth/commands/index.ts'
 import type { IAuthService } from '@/modules/auth/service.ts'
 
 interface DispatcherInternal {
@@ -73,9 +73,9 @@ describe('Handlers Dispatcher & Callback Query Flow', () => {
       deleteTracksNotIn: mock(() => Promise.resolve(0)),
     }
 
-    // Register handlers in standard order: auth first, alac second
-    registerAuthHandlers(dp, fakeTg, mockAuth)
-    registerAlacHandlers(
+    // Register commands in standard order: auth first, alac second
+    registerAuthCommands(dp, fakeTg, mockAuth)
+    registerAlacCommands(
       dp,
       fakeTg,
       mockAlacService,

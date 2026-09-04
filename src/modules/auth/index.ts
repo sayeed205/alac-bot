@@ -1,2 +1,2 @@
-export * from './handlers.ts'
+export * from './commands/index.ts'
 export * from './service.ts'

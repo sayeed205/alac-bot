@@ -40,3 +40,15 @@ export function formatByteProgress(
 
   return `${currentMb} MB`
 }
+
+/**
+ * Formats a byte number into human-readable representation (e.g. "12.4 MB").
+ */
+export function formatBytes(bytes: number): string {
+  if (bytes <= 0 || Number.isNaN(bytes)) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  const i = Math.floor(Math.log(bytes) / Math.log(1024))
+  const unitIndex = Math.min(Math.max(i, 0), units.length - 1)
+  const val = (bytes / 1024 ** unitIndex).toFixed(unitIndex === 0 ? 0 : 2)
+  return `${val} ${units[unitIndex]}`
+}

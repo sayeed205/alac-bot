@@ -1,312 +1,22 @@
 import { existsSync, unlinkSync } from 'node:fs'
 
-import {
-  BotKeyboard,
-  html,
-  type Message,
-  type TelegramClient,
-} from '@mtcute/bun'
-import { type Dispatcher, filters } from '@mtcute/dispatcher'
+import { html } from '@mtcute/bun'
+import { filters } from '@mtcute/dispatcher'
 
 import { env } from '@/env.ts'
+import { formatDumpCaption } from '@/modules/alac/indexer.ts'
 import { fetchAlbumTracks } from '@/modules/alac/itunes.ts'
 import { parseAlacInput } from '@/modules/alac/parser.ts'
-import {
-  ripQueue as defaultQueue,
-  type IRipQueue,
-} from '@/modules/alac/queue.ts'
-import {
-  defaultRipper,
-  type ITrackRipper,
-  type TrackRipResult,
-} from '@/modules/alac/ripper.ts'
-import {
-  alacService as defaultService,
-  type IAlacService,
-} from '@/modules/alac/service.ts'
-import { formatStatsHtml } from '@/modules/alac/stats.ts'
-import { authService, type IAuthService } from '@/modules/auth/service.ts'
+import type { TrackRipResult } from '@/modules/alac/ripper.ts'
 import { debug, debugSpan, error, info, infoSpan } from '@/utils/logger.ts'
 import { formatByteProgress } from '@/utils/progress.ts'
 
-import {
-  formatDumpCaption,
-  formatIndexSummaryHtml,
-  indexDumpChannel,
-} from './indexer.ts'
+import type { CommandContext } from './types.ts'
+import { parseDynamicHtml } from './types.ts'
 
-function parseDynamicHtml(content: string) {
-  return html([content] as unknown as TemplateStringsArray)
-}
+export function registerRipCommand(ctx: CommandContext): void {
+  const { dp, tg, service, ripper, queue, auth } = ctx
 
-export function registerAlacHandlers(
-  dp: Dispatcher<TelegramClient>,
-  tg: TelegramClient,
-  service: IAlacService = defaultService,
-  ripper: ITrackRipper = defaultRipper,
-  queue: IRipQueue = defaultQueue,
-  auth: IAuthService = authService,
-) {
-  let isIndexing = false
-
-  // Command: /index (Admin only - syncs dump channel with database)
-  dp.onNewMessage(filters.command('index'), async (msg) => {
-    using _indexSpan = infoSpan('index').enter()
-
-    if (!auth.isAdmin(msg.sender.id)) {
-      debug('Non-admin attempted /index command', { user_id: msg.sender.id })
-      await msg.replyText(
-        parseDynamicHtml('This command is restricted to the bot owner.'),
-      )
-      return
-    }
-
-    if (isIndexing) {
-      await msg.replyText(
-        parseDynamicHtml('⚠️ <b>Dump channel sync is already in progress.</b>'),
-      )
-      return
-    }
-
-    isIndexing = true
-    let statusMsg: Message | null = null
-
-    try {
-      info('Starting dump channel index', { user: msg.sender.id })
-      statusMsg = await msg.replyText(
-        parseDynamicHtml('🔄 <b>Initializing Dump Channel Sync...</b>'),
-      )
-
-      let lastUpdate = Date.now()
-      const summary = await indexDumpChannel(
-        tg,
-        service,
-        env.DUMP_CHANNEL_ID,
-        async (scanned, synced) => {
-          const now = Date.now()
-          if (now - lastUpdate >= 2000 && statusMsg) {
-            lastUpdate = now
-            await tg
-              .editMessage({
-                chatId: statusMsg.chat.id,
-                message: statusMsg.id,
-                text: parseDynamicHtml(
-                  `🔄 <b>Syncing with Dump Channel...</b><br/><br/>` +
-                    `• Scanned: <code>${scanned}</code> messages<br/>` +
-                    `• Synced: <code>${synced}</code> tracks`,
-                ),
-              })
-              .catch(() => null)
-          }
-        },
-      )
-
-      info('Dump channel index completed', {
-        scanned: summary.scanned,
-        synced: summary.synced,
-        pruned: summary.pruned,
-        duration_ms: summary.durationMs,
-      })
-
-      const finalHtml = formatIndexSummaryHtml(summary)
-      if (statusMsg) {
-        await tg
-          .editMessage({
-            chatId: statusMsg.chat.id,
-            message: statusMsg.id,
-            text: finalHtml,
-          })
-          .catch(() => msg.replyText(finalHtml))
-      } else {
-        await msg.replyText(finalHtml)
-      }
-    } catch (err) {
-      error('Dump channel index failed', { error: String(err) })
-      const errText = `❌ <b>Indexing failed:</b> <code>${html.escape(String(err))}</code>`
-      if (statusMsg) {
-        await tg
-          .editMessage({
-            chatId: statusMsg.chat.id,
-            message: statusMsg.id,
-            text: parseDynamicHtml(errText),
-          })
-          .catch(() => msg.replyText(parseDynamicHtml(errText)))
-      } else {
-        await msg.replyText(parseDynamicHtml(errText))
-      }
-    } finally {
-      isIndexing = false
-    }
-  })
-
-  // Command: /stats
-  dp.onNewMessage(filters.command('stats'), async (msg) => {
-    using _statsSpan = infoSpan('stats').enter()
-
-    const isAdmin = auth.isAdmin(msg.sender.id)
-    if (!isAdmin) {
-      debug('Non-admin attempted /stats command', { user_id: msg.sender.id })
-      await msg.replyText(
-        parseDynamicHtml('This command is restricted to the bot owner.'),
-      )
-      return
-    }
-
-    info('Stats requested', { user: msg.sender.id })
-
-    const stats = await service.getStats()
-    await msg.replyText(parseDynamicHtml(formatStatsHtml(stats)))
-  })
-
-  // Command: /search <query>
-  dp.onNewMessage(filters.command('search'), async (msg) => {
-    using _searchSpan = infoSpan('search').enter()
-
-    const isAuthed = await auth.isAuthorized(msg.sender.id, msg.chat.id)
-    if (!isAuthed) {
-      debug('Unauthorized user attempted /search', { user_id: msg.sender.id })
-      return
-    }
-
-    const textParts = msg.text.trim().split(/\s+/)
-    const query = textParts.slice(1).join(' ').trim()
-    if (!query) {
-      await msg.replyText(
-        parseDynamicHtml(
-          '<b>Usage:</b> <code>/search &lt;track title, artist, or album&gt;</code><br/><br/><i>Searches all lossless tracks already cached in the database for instant download.</i>',
-        ),
-      )
-      return
-    }
-
-    const results = await service.searchCachedTracks(query, 8)
-    info('Search query', { query, matches: results.length })
-
-    if (results.length === 0) {
-      await msg.replyText(
-        parseDynamicHtml(
-          `No cached tracks found matching "<b>${html.escape(query)}</b>".<br/><br/>💡 Use <code>/alac &lt;apple_music_link&gt;</code> to rip and cache it.`,
-        ),
-      )
-      return
-    }
-
-    const formatSecs = (sec: number | null) => {
-      if (!sec || sec <= 0) return ''
-      const m = Math.floor(sec / 60)
-      const s = String(sec % 60).padStart(2, '0')
-      return ` • ${m}:${s}`
-    }
-
-    const listLines = results.map((t, idx) => {
-      const title = html.escape(t.title || `Track ${t.appleTrackId}`)
-      const artist = html.escape(t.artist || 'Unknown Artist')
-      const quality =
-        t.bitDepth && t.sampleRate
-          ? ` • ALAC ${t.bitDepth}b/${Math.round(t.sampleRate / 1000)}kHz`
-          : ' • ALAC'
-      const dur = formatSecs(t.duration)
-      return `<b>${idx + 1}. ${title}</b> — ${artist}<br/><i>${quality}${dur}</i>`
-    })
-
-    const buttons = results.map((t, idx) => {
-      const rawTitle = t.title || `Track ${t.appleTrackId}`
-      const shortTitle =
-        rawTitle.length > 28 ? `${rawTitle.slice(0, 25)}...` : rawTitle
-      return [
-        BotKeyboard.callback(
-          `🎵 ${idx + 1}. ${shortTitle}`,
-          `dl:${t.appleTrackId}`,
-        ),
-      ]
-    })
-
-    buttons.push([BotKeyboard.callback('❌ Close', 'search_close')])
-
-    await msg.replyText(
-      parseDynamicHtml(
-        `<b>🔍 Found ${results.length} cached track${results.length > 1 ? 's' : ''} for "<i>${html.escape(query)}</i>":</b><br/><br/>` +
-          `${listLines.join('<br/><br/>')}<br/><br/>` +
-          `<i>Tap a button below for instant delivery:</i>`,
-      ),
-      { replyMarkup: BotKeyboard.inline(buttons) },
-    )
-  })
-
-  // Callback query for search download buttons
-  dp.onCallbackQuery(
-    filters.or(filters.startsWith('dl:'), filters.equals('search_close')),
-    async (query) => {
-      const data = query.dataStr
-      if (!data) return
-
-      if (data === 'search_close') {
-        await query.answer({})
-        await tg
-          .deleteMessagesById(query.chat.id, [query.messageId])
-          .catch(() => null)
-        return
-      }
-
-      if (data.startsWith('dl:')) {
-        const appleTrackId = data.slice(3)
-        using _dlSpan = infoSpan('search_dl').enter()
-
-        const chatId = query.chat.id
-        const isAuthed = await auth.isAuthorized(query.user.id, chatId)
-        if (!isAuthed) {
-          await query.answer({ text: 'Unauthorized', alert: true })
-          return
-        }
-
-        const cached = await service.findCachedTrack(appleTrackId)
-        if (!cached) {
-          await query.answer({
-            text: 'Track is no longer cached in dump channel.',
-            alert: true,
-          })
-          return
-        }
-
-        // Immediately acknowledge button click so Telegram stops spinner
-        await query.answer({ text: '⚡ Delivering lossless track from cache!' })
-
-        try {
-          await tg.sendCopy({
-            toChatId: chatId,
-            fromChatId: env.DUMP_CHANNEL_ID,
-            message: cached.messageId,
-            replyTo: query.messageId,
-          })
-
-          info('Delivered cached track', {
-            track: cached.title || appleTrackId,
-            user: query.user.id,
-          })
-
-          await service.logRequest({
-            telegramId: query.user.id,
-            chatId,
-            appleTrackId,
-            isCacheHit: true,
-            durationMs: 100,
-            status: 'completed',
-          })
-        } catch (err: unknown) {
-          error('Failed to deliver cached track via search callback', {
-            track_id: appleTrackId,
-            error: String(err),
-          })
-          await query.answer({
-            text: 'Failed to retrieve audio from dump channel.',
-            alert: true,
-          })
-        }
-      }
-    },
-  )
-
-  // Command: /alac & /rerip
   dp.onNewMessage(filters.command(['alac', 'rerip']), async (msg) => {
     using _cmdSpan = infoSpan('alac').enter()
 
@@ -327,7 +37,11 @@ export function registerAlacHandlers(
       debug('Invalid alac input received', { text: msg.text })
       await msg.replyText(
         parseDynamicHtml(
-          '<b>Usage:</b><br/>• <code>/alac &lt;apple_music_link | track_id&gt;</code><br/>• Reply to a link with <code>/alac</code><br/>• <code>/alac &lt;link&gt; -f</code> (owner force re-rip)',
+          '🎵 <b>Apple Music Lossless Ripper</b><br/><br/>' +
+            '<blockquote><b>Usage:</b><br/>' +
+            '• <code>/alac &lt;apple_music_link | track_id&gt;</code><br/>' +
+            '• Reply to an Apple Music link with <code>/alac</code><br/>' +
+            '• <code>/alac &lt;link&gt; -f</code> <i>(force re-rip)</i></blockquote>',
         ),
       )
       return
@@ -339,7 +53,9 @@ export function registerAlacHandlers(
     if (isForce && !isAdmin) {
       debug('Non-admin requested force re-rip', { user_id: msg.sender.id })
       await msg.replyText(
-        parseDynamicHtml('This command option is restricted to the bot owner.'),
+        parseDynamicHtml(
+          '🔒 <b>Access Restricted:</b> Force re-rip is restricted to the bot owner.',
+        ),
       )
       return
     }
@@ -469,7 +185,7 @@ export function registerAlacHandlers(
                 await updateStatus(status)
               })
 
-              await updateStatus('Uploading to Telegram...', true)
+              await updateStatus('📤 <b>Uploading to Telegram...</b>', true)
               debug('Uploading track to dump channel', {
                 track_id: trackId,
                 file: ripResult.filePath,
@@ -504,7 +220,7 @@ export function registerAlacHandlers(
                         10,
                       )
                       updateStatus(
-                        `Uploading to Telegram:<br/><code>${progressText}</code>`,
+                        `📤 <b>Uploading to Telegram:</b><br/><code>${progressText}</code>`,
                       )
                     }
                   },
@@ -572,7 +288,10 @@ export function registerAlacHandlers(
           {
             onPositionChange: (pos) => {
               debug('Queue position changed', { track_id: trackId, pos })
-              updateStatus(`Queued (Position #${pos})`, true)
+              updateStatus(
+                `⏳ <b>In Queue:</b> Position <code>#${pos}</code>`,
+                true,
+              )
             },
             onStart: () => {
               debug('Queue job starting execution', { track_id: trackId })

@@ -23,14 +23,14 @@ export function formatStatsHtml(stats: AlacStats): string {
 
   return (
     `<b>📊 ALAC Bot Analytics</b><br/><br/>` +
-    `<b>Storage & Caching:</b><br/>` +
+    `<blockquote><b>📦 Storage & Caching</b><br/>` +
     `• Cached Tracks: <code>${stats.totalCachedTracks}</code><br/>` +
     `• Total Requests: <code>${stats.totalRequests}</code><br/>` +
     `• Cache Hit Ratio: <b>${stats.cacheHitRatio}%</b> (<code>${stats.cacheHits}</code> hits / <code>${stats.cacheMisses}</code> rips)<br/>` +
-    `• Failed Requests: <code>${stats.totalFailedRequests}</code><br/><br/>` +
-    `<b>Latency Averages:</b><br/>` +
+    `• Failed Requests: <code>${stats.totalFailedRequests}</code></blockquote><br/>` +
+    `<blockquote><b>⚡ Latency Averages</b><br/>` +
     `• Cache Retrieval: <code>${formatDurationMs(stats.avgCacheDurationMs)}</code><br/>` +
-    `• Mirror Rip Time: <code>${formatDurationMs(stats.avgRipDurationMs)}</code><br/><br/>` +
-    `<b>🔥 Top Requested Tracks:</b><br/>${topTracksSection}`
+    `• Mirror Rip Time: <code>${formatDurationMs(stats.avgRipDurationMs)}</code></blockquote><br/>` +
+    `<blockquote><b>🔥 Top Requested Tracks</b><br/>${topTracksSection}</blockquote>`
   )
 }
