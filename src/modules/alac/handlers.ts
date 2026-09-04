@@ -1,6 +1,11 @@
 import { existsSync, unlinkSync } from 'node:fs'
 
-import { BotKeyboard, html, type TelegramClient } from '@mtcute/bun'
+import {
+  BotKeyboard,
+  html,
+  type Message,
+  type TelegramClient,
+} from '@mtcute/bun'
 import { type Dispatcher, filters } from '@mtcute/dispatcher'
 
 import { env } from '@/env.ts'
@@ -24,6 +29,12 @@ import { authService, type IAuthService } from '@/modules/auth/service.ts'
 import { debug, debugSpan, error, info, infoSpan } from '@/utils/logger.ts'
 import { formatByteProgress } from '@/utils/progress.ts'
 
+import {
+  formatDumpCaption,
+  formatIndexSummaryHtml,
+  indexDumpChannel,
+} from './indexer.ts'
+
 function parseDynamicHtml(content: string) {
   return html([content] as unknown as TemplateStringsArray)
 }
@@ -36,6 +47,98 @@ export function registerAlacHandlers(
   queue: IRipQueue = defaultQueue,
   auth: IAuthService = authService,
 ) {
+  let isIndexing = false
+
+  // Command: /index (Admin only - syncs dump channel with database)
+  dp.onNewMessage(filters.command('index'), async (msg) => {
+    using _indexSpan = infoSpan('index').enter()
+
+    if (!auth.isAdmin(msg.sender.id)) {
+      debug('Non-admin attempted /index command', { user_id: msg.sender.id })
+      await msg.replyText(
+        parseDynamicHtml('This command is restricted to the bot owner.'),
+      )
+      return
+    }
+
+    if (isIndexing) {
+      await msg.replyText(
+        parseDynamicHtml('⚠️ <b>Dump channel sync is already in progress.</b>'),
+      )
+      return
+    }
+
+    isIndexing = true
+    let statusMsg: Message | null = null
+
+    try {
+      info('Starting dump channel index', { user: msg.sender.id })
+      statusMsg = await msg.replyText(
+        parseDynamicHtml('🔄 <b>Initializing Dump Channel Sync...</b>'),
+      )
+
+      let lastUpdate = Date.now()
+      const summary = await indexDumpChannel(
+        tg,
+        service,
+        env.DUMP_CHANNEL_ID,
+        async (scanned, synced) => {
+          const now = Date.now()
+          if (now - lastUpdate >= 2000 && statusMsg) {
+            lastUpdate = now
+            await tg
+              .editMessage({
+                chatId: statusMsg.chat.id,
+                message: statusMsg.id,
+                text: parseDynamicHtml(
+                  `🔄 <b>Syncing with Dump Channel...</b><br/><br/>` +
+                    `• Scanned: <code>${scanned}</code> messages<br/>` +
+                    `• Synced: <code>${synced}</code> tracks`,
+                ),
+              })
+              .catch(() => null)
+          }
+        },
+      )
+
+      info('Dump channel index completed', {
+        scanned: summary.scanned,
+        synced: summary.synced,
+        pruned: summary.pruned,
+        duration_ms: summary.durationMs,
+      })
+
+      const finalHtml = formatIndexSummaryHtml(summary)
+      if (statusMsg) {
+        await tg
+          .editMessage({
+            chatId: statusMsg.chat.id,
+            message: statusMsg.id,
+            text: finalHtml,
+          })
+          .catch(() => msg.replyText(finalHtml))
+      } else {
+        await msg.replyText(finalHtml)
+      }
+    } catch (err) {
+      error('Dump channel index failed', { error: String(err) })
+      const errText = `❌ <b>Indexing failed:</b> <code>${html.escape(String(err))}</code>`
+      if (statusMsg) {
+        await tg
+          .editMessage({
+            chatId: statusMsg.chat.id,
+            message: statusMsg.id,
+            text: parseDynamicHtml(errText),
+          })
+          .catch(() => msg.replyText(parseDynamicHtml(errText)))
+      } else {
+        await msg.replyText(parseDynamicHtml(errText))
+      }
+    } finally {
+      isIndexing = false
+    }
+  })
+
   // Command: /stats
   dp.onNewMessage(filters.command('stats'), async (msg) => {
     using _statsSpan = infoSpan('stats').enter()
@@ -372,6 +475,16 @@ export function registerAlacHandlers(
                 file: ripResult.filePath,
               })
 
+              const caption = formatDumpCaption({
+                appleTrackId: trackId,
+                title: ripResult.title,
+                artist: ripResult.artist,
+                album: ripResult.album,
+                duration: ripResult.duration,
+                bitDepth: ripResult.bitDepth,
+                sampleRate: ripResult.sampleRate,
+              })
+
               const dumpMsg = await tg.sendMedia(
                 env.DUMP_CHANNEL_ID,
                 {
@@ -380,6 +493,7 @@ export function registerAlacHandlers(
                   title: ripResult.title,
                   performer: ripResult.artist,
                   duration: ripResult.duration,
+                  caption,
                 },
                 {
                   progressCallback: (uploaded, total) => {

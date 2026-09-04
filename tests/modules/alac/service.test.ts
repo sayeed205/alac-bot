@@ -186,4 +186,31 @@ describe('AlacService', () => {
     const fetched = await service.findCachedTrack('test_delete_id')
     expect(fetched).toBeNull()
   })
+
+  it('gets all track ids and deletes tracks not in list', async () => {
+    await service.saveTrack({
+      appleTrackId: 'sync_track_1',
+      messageId: 401,
+      fileId: 'file_1',
+    })
+    await service.saveTrack({
+      appleTrackId: 'sync_track_2',
+      messageId: 402,
+      fileId: 'file_2',
+    })
+
+    const allIds = await service.getAllTrackIds()
+    expect(allIds).toContain('sync_track_1')
+    expect(allIds).toContain('sync_track_2')
+
+    // Keep only sync_track_2, pruning sync_track_1 and any older leftovers
+    const prunedCount = await service.deleteTracksNotIn(['sync_track_2'])
+    expect(prunedCount).toBeGreaterThanOrEqual(1)
+
+    const track1 = await service.findCachedTrack('sync_track_1')
+    expect(track1).toBeNull()
+
+    const track2 = await service.findCachedTrack('sync_track_2')
+    expect(track2).not.toBeNull()
+  })
 })

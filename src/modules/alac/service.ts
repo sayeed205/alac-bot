@@ -1,4 +1,14 @@
-import { and, avg, count, desc, eq, ilike, inArray, or } from 'drizzle-orm'
+import {
+  and,
+  avg,
+  count,
+  desc,
+  eq,
+  ilike,
+  inArray,
+  notInArray,
+  or,
+} from 'drizzle-orm'
 
 import { type AppDatabase, db as defaultDb } from '@/db/index.ts'
 import { type NewRequest, requests, type Track, tracks } from '@/db/schema.ts'
@@ -40,6 +50,8 @@ export interface IAlacService {
   searchCachedTracks(query: string, limit?: number): Promise<Track[]>
   saveTrack(input: SaveTrackInput): Promise<Track>
   deleteTrack(appleTrackId: string): Promise<boolean>
+  getAllTrackIds(): Promise<string[]>
+  deleteTracksNotIn(validTrackIds: string[]): Promise<number>
   logRequest(data: NewRequest): Promise<void>
   getStats(): Promise<AlacStats>
 }
@@ -179,6 +191,34 @@ export class AlacService implements IAlacService {
       .returning()
 
     return deleted.length > 0
+  }
+
+  async getAllTrackIds(): Promise<string[]> {
+    using _ = debugSpan('db_get_all_track_ids').enter()
+
+    const rows = await this.db
+      .select({ appleTrackId: tracks.appleTrackId })
+      .from(tracks)
+
+    return rows.map((r) => r.appleTrackId)
+  }
+
+  async deleteTracksNotIn(validTrackIds: string[]): Promise<number> {
+    using _ = debugSpan('db_delete_tracks_not_in', {
+      validCount: validTrackIds.length,
+    }).enter()
+
+    if (validTrackIds.length === 0) {
+      const deleted = await this.db.delete(tracks).returning()
+      return deleted.length
+    }
+
+    const deleted = await this.db
+      .delete(tracks)
+      .where(notInArray(tracks.appleTrackId, validTrackIds))
+      .returning()
+
+    return deleted.length
   }
 
   async logRequest(data: NewRequest): Promise<void> {

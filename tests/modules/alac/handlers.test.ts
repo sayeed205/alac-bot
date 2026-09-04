@@ -69,6 +69,8 @@ describe('Handlers Dispatcher & Callback Query Flow', () => {
       logRequest: mock(() => Promise.resolve()),
       getStats: mock(() => Promise.resolve({} as never)),
       deleteTrack: mock(() => Promise.resolve(true)),
+      getAllTrackIds: mock(() => Promise.resolve([])),
+      deleteTracksNotIn: mock(() => Promise.resolve(0)),
     }
 
     // Register handlers in standard order: auth first, alac second
