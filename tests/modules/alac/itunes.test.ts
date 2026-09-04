@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it } from 'bun:test'
 
-import { fetchAlbumTracks, fetchTrackMeta } from '@/modules/alac/itunes.ts'
+import {
+  fetchAlbumTracks,
+  fetchTrackMeta,
+  searchItunesCatalog,
+} from '@/modules/alac/itunes.ts'
 
 describe('iTunes API Service', () => {
   const originalFetch = globalThis.fetch
@@ -280,6 +284,83 @@ describe('iTunes API Service', () => {
       expect(fetchAlbumTracks('12345')).rejects.toThrow(
         'iTunes album lookup timed out',
       )
+    })
+  })
+
+  describe('searchItunesCatalog', () => {
+    it('searches catalog and returns mapped track items', async () => {
+      setFetch(async (input: RequestInfo | URL) => {
+        const urlStr = String(input)
+        expect(urlStr).toContain('term=Blinding%20Lights')
+        expect(urlStr).toContain('entity=song')
+        expect(urlStr).toContain('limit=5')
+
+        return new Response(
+          JSON.stringify({
+            results: [
+              {
+                wrapperType: 'track',
+                kind: 'song',
+                trackId: 1499388128,
+                trackName: 'Blinding Lights',
+                artistName: 'The Weeknd',
+                collectionName: 'After Hours',
+                trackTimeMillis: 200000,
+                artworkUrl100: 'https://example.com/100x100bb.jpg',
+              },
+            ],
+          }),
+          { status: 200 },
+        )
+      })
+
+      const results = await searchItunesCatalog('Blinding Lights', 5)
+      expect(results.length).toBe(1)
+      expect(results[0].title).toBe('Blinding Lights')
+      expect(results[0].artist).toBe('The Weeknd')
+      expect(results[0].artworkUrl).toContain('3000x3000bb.jpg')
+    })
+
+    it('falls back to US storefront when regional search returns 0 results', async () => {
+      let callCount = 0
+      setFetch(async (input: RequestInfo | URL) => {
+        callCount++
+        const urlStr = String(input)
+        if (urlStr.includes('country=fr')) {
+          return new Response(JSON.stringify({ results: [] }), { status: 200 })
+        }
+        if (urlStr.includes('country=us')) {
+          return new Response(
+            JSON.stringify({
+              results: [
+                {
+                  wrapperType: 'track',
+                  kind: 'song',
+                  trackId: 7777,
+                  trackName: 'Fallback Song',
+                  artistName: 'Artist',
+                },
+              ],
+            }),
+            { status: 200 },
+          )
+        }
+        return new Response(null, { status: 404 })
+      })
+
+      const results = await searchItunesCatalog('Rare Track', 5, 'fr')
+      expect(callCount).toBe(2)
+      expect(results.length).toBe(1)
+      expect(results[0].title).toBe('Fallback Song')
+    })
+
+    it('handles fetch errors gracefully and returns empty array', async () => {
+      setFetch(async () => {
+        throw new Error('Network timeout')
+      })
+
+      const results = await searchItunesCatalog('Failed Query')
+      expect(results).toEqual([])
     })
   })
 })

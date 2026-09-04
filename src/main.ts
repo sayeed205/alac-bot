@@ -1,6 +1,7 @@
 import { TelegramClient } from '@mtcute/bun'
 import { Dispatcher, filters } from '@mtcute/dispatcher'
 
+import { pgliteClient } from '@/db/index.ts'
 import { runMigrations } from '@/db/migrate.ts'
 import { env } from '@/env.ts'
 import { registerAlacCommands } from '@/modules/alac/index.ts'
@@ -29,6 +30,22 @@ registerAlacCommands(dp, tg)
 dp.onNewMessage(filters.start, async (msg) => {
   await msg.answerText('Hello, world!')
 })
+
+const shutdown = async () => {
+  info('Shutting down bot...')
+  try {
+    await tg.destroy()
+  } catch {}
+  try {
+    if (pgliteClient) {
+      await pgliteClient.close()
+    }
+  } catch {}
+  process.exit(0)
+}
+
+process.on('SIGINT', shutdown)
+process.on('SIGTERM', shutdown)
 
 const user = await tg.start({ botToken: env.BOT_TOKEN })
 info('Bot started successfully', {

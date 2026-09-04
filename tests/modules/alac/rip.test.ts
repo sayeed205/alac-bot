@@ -272,6 +272,85 @@ describe('ALAC Rip Command Handler', () => {
     }
   })
 
+  it('continues ripping remaining album tracks when one track fails', async () => {
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+      const urlStr = String(input)
+      if (urlStr.includes('itunes.apple.com')) {
+        return new Response(
+          JSON.stringify({
+            results: [
+              {
+                wrapperType: 'collection',
+                collectionId: 999999,
+                collectionName: 'Resilient Album',
+                artistName: 'Album Artist',
+              },
+              {
+                wrapperType: 'track',
+                trackId: 101,
+                trackName: 'Track 1',
+                artistName: 'Album Artist',
+                collectionName: 'Resilient Album',
+                trackTimeMillis: 180000,
+              },
+              {
+                wrapperType: 'track',
+                trackId: 102,
+                trackName: 'Track 2 (Broken)',
+                artistName: 'Album Artist',
+                collectionName: 'Resilient Album',
+                trackTimeMillis: 200000,
+              },
+              {
+                wrapperType: 'track',
+                trackId: 103,
+                trackName: 'Track 3',
+                artistName: 'Album Artist',
+                collectionName: 'Resilient Album',
+                trackTimeMillis: 210000,
+              },
+            ],
+          }),
+          { status: 200 },
+        )
+      }
+      return new Response('ok')
+    }) as unknown as typeof fetch
+
+    mockRipper.rip = mock(async (id: string) => {
+      if (id === '102') {
+        throw new Error('DRM decryption error')
+      }
+      return {
+        filePath: '/tmp/test_track_rip.m4a',
+        title: `Track ${id}`,
+        artist: 'Album Artist',
+        album: 'Resilient Album',
+        duration: 200,
+        bitDepth: 24,
+        sampleRate: 96000,
+        codec: 'alac',
+        genre: 'Pop',
+        releaseDate: '2023-01-01',
+        trackNumber: Number(id),
+        trackCount: 3,
+      }
+    })
+
+    try {
+      registerRipCommand(ctx)
+      await dispatchMessage(
+        '/alac https://music.apple.com/us/album/resilient/999999',
+      )
+
+      expect(mockRipper.rip).toHaveBeenCalledTimes(3)
+      expect(mockService.saveTrack).toHaveBeenCalledTimes(2)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
   it('handles rip failure gracefully and reports error to user', async () => {
     mockRipper.rip = mock(() => Promise.reject(new Error('Decryption failed')))
 

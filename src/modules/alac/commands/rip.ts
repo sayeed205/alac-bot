@@ -9,7 +9,7 @@ import { fetchAlbumTracks } from '@/modules/alac/itunes.ts'
 import { parseAlacInput } from '@/modules/alac/parser.ts'
 import type { TrackRipResult } from '@/modules/alac/ripper.ts'
 import { debug, debugSpan, error, info, infoSpan } from '@/utils/logger.ts'
-import { formatByteProgress } from '@/utils/progress.ts'
+import { formatByteProgress, renderProgressBar } from '@/utils/progress.ts'
 
 import type { CommandContext } from './types.ts'
 import { parseDynamicHtml } from './types.ts'
@@ -76,7 +76,7 @@ export function registerRipCommand(ctx: CommandContext): void {
           parsed.storefront,
         )
         trackIds = albumData.tracks.map((t) => t.id)
-        albumHeader = `Album: <b>${albumData.album.title}</b> by <b>${albumData.album.artist}</b> (${trackIds.length} tracks)`
+        albumHeader = `<b>${html.escape(albumData.album.title)}</b> by <b>${html.escape(albumData.album.artist)}</b> (${trackIds.length} tracks)`
       } catch (err: unknown) {
         const msgText = err instanceof Error ? err.message : String(err)
         error('Failed to resolve album tracks', {
@@ -88,6 +88,23 @@ export function registerRipCommand(ctx: CommandContext): void {
         )
         return
       }
+    }
+
+    const isAlbum = Boolean(parsed.isAlbum)
+    let albumStatusMsgId: number | null = null
+    let completedTracksCount = 0
+    const failedTracks: { trackId: string; error: string }[] = []
+    const albumStartTime = Date.now()
+
+    if (isAlbum) {
+      const initStatus = await msg.replyText(
+        parseDynamicHtml(
+          `💿 <b>Album:</b> ${albumHeader}<br/>` +
+            `<b>Progress:</b> <code>[░░░░░░░░░░] 0/${trackIds.length} (0%)</code><br/>` +
+            `<b>Status:</b> ⏳ Initializing queue...`,
+        ),
+      )
+      albumStatusMsgId = initStatus.id
     }
 
     const cachedTracksMap = !isForce
@@ -103,7 +120,9 @@ export function registerRipCommand(ctx: CommandContext): void {
       }).enter()
 
       const trackPrefix =
-        trackIds.length > 1 ? `[${index + 1}/${trackIds.length}] ` : ''
+        !isAlbum && trackIds.length > 1
+          ? `[${index + 1}/${trackIds.length}] `
+          : ''
 
       const startTime = Date.now()
 
@@ -132,6 +151,29 @@ export function registerRipCommand(ctx: CommandContext): void {
               durationMs,
               status: 'completed',
             })
+
+            completedTracksCount++
+            if (isAlbum && albumStatusMsgId) {
+              const percent = Math.round(
+                (completedTracksCount / trackIds.length) * 100,
+              )
+              const bar = renderProgressBar(
+                completedTracksCount,
+                trackIds.length,
+                10,
+              )
+              await tg
+                .editMessage({
+                  chatId: msg.chat.id,
+                  message: albumStatusMsgId,
+                  text: parseDynamicHtml(
+                    `💿 <b>Album:</b> ${albumHeader}<br/>` +
+                      `<b>Progress:</b> <code>${bar} ${completedTracksCount}/${trackIds.length} (${percent}%)</code><br/>` +
+                      `<b>Status:</b> ⚡ Delivered track ${index + 1} from cache`,
+                  ),
+                })
+                .catch(() => null)
+            }
             continue
           } catch (err) {
             debug('Cached message delivery failed, falling back to rip', {
@@ -145,17 +187,41 @@ export function registerRipCommand(ctx: CommandContext): void {
       }
 
       debug('Queueing rip job', { track_id: trackId })
-      const statusMsg = await msg.replyText(
-        parseDynamicHtml(
-          `${albumHeader ? `${albumHeader}<br/>` : ''}${trackPrefix}Queued (Position #1)`,
-        ),
-      )
+      let statusMsg: { id: number } | null = null
+      if (!isAlbum) {
+        statusMsg = await msg.replyText(
+          parseDynamicHtml(`${trackPrefix}Queued (Position #1)`),
+        )
+      }
 
       let lastUpdate = 0
       let lastText = ''
 
       const updateStatus = async (text: string, force = false) => {
-        const formatted = `${albumHeader ? `${albumHeader}<br/>` : ''}${trackPrefix}${text}`
+        let formatted: string
+        let targetMsgId: number
+
+        if (isAlbum && albumStatusMsgId) {
+          const percent = Math.round(
+            (completedTracksCount / trackIds.length) * 100,
+          )
+          const bar = renderProgressBar(
+            completedTracksCount,
+            trackIds.length,
+            10,
+          )
+          formatted =
+            `💿 <b>Album:</b> ${albumHeader}<br/>` +
+            `<b>Progress:</b> <code>${bar} ${completedTracksCount}/${trackIds.length} (${percent}%)</code><br/>` +
+            `<b>Current [${index + 1}/${trackIds.length}]:</b> ${text}`
+          targetMsgId = albumStatusMsgId
+        } else if (statusMsg) {
+          formatted = `${trackPrefix}${text}`
+          targetMsgId = statusMsg.id
+        } else {
+          return
+        }
+
         const now = Date.now()
         if (formatted === lastText) return
         if (!force && now - lastUpdate < 1200) return
@@ -165,7 +231,7 @@ export function registerRipCommand(ctx: CommandContext): void {
         await tg
           .editMessage({
             chatId: msg.chat.id,
-            message: statusMsg.id,
+            message: targetMsgId,
             text: parseDynamicHtml(formatted),
           })
           .catch(() => null)
@@ -264,10 +330,13 @@ export function registerRipCommand(ctx: CommandContext): void {
                 replyTo: msg.id,
               })
 
-              await tg
-                .deleteMessagesById(msg.chat.id, [statusMsg.id])
-                .catch(() => null)
+              if (!isAlbum && statusMsg) {
+                await tg
+                  .deleteMessagesById(msg.chat.id, [statusMsg.id])
+                  .catch(() => null)
+              }
 
+              completedTracksCount++
               const totalDurationMs = Date.now() - startTime
               info('Track completed', {
                 track: `${ripResult.artist} - ${ripResult.title}`,
@@ -316,17 +385,22 @@ export function registerRipCommand(ctx: CommandContext): void {
           stack: err instanceof Error ? err.stack : undefined,
         })
 
-        const escapedError = html.escape(errorMsg)
-        const failText = `${albumHeader ? `${albumHeader}<br/>` : ''}${trackPrefix}❌ <b>Failed:</b> <code>${escapedError}</code>`
-
-        try {
-          await tg.editMessage({
-            chatId: msg.chat.id,
-            message: statusMsg.id,
-            text: parseDynamicHtml(failText),
-          })
-        } catch {
-          await msg.replyText(parseDynamicHtml(failText)).catch(() => null)
+        if (isAlbum) {
+          failedTracks.push({ trackId, error: errorMsg })
+          await updateStatus(
+            `⚠️ Track ${index + 1} failed: ${html.escape(errorMsg)}`,
+            true,
+          )
+        } else if (statusMsg) {
+          const escapedError = html.escape(errorMsg)
+          const failText = `${trackPrefix}❌ <b>Failed:</b> <code>${escapedError}</code>`
+          await tg
+            .editMessage({
+              chatId: msg.chat.id,
+              message: statusMsg.id,
+              text: parseDynamicHtml(failText),
+            })
+            .catch(() => null)
         }
 
         await service.logRequest({
@@ -339,6 +413,25 @@ export function registerRipCommand(ctx: CommandContext): void {
           errorReason: errorMsg,
         })
       }
+    }
+
+    if (isAlbum && albumStatusMsgId) {
+      const totalElapsedSec = Math.round((Date.now() - albumStartTime) / 1000)
+      const failedText =
+        failedTracks.length > 0
+          ? `<br/>⚠️ <i>Failed tracks (${failedTracks.length}):</i> ${failedTracks.map((f) => `<code>${f.trackId}</code>`).join(', ')}`
+          : ''
+      const completionText =
+        `✅ <b>Album Completed:</b> ${albumHeader}<br/>` +
+        `Delivered <b>${completedTracksCount}/${trackIds.length}</b> tracks in ${totalElapsedSec}s.${failedText}`
+
+      await tg
+        .editMessage({
+          chatId: msg.chat.id,
+          message: albumStatusMsgId,
+          text: parseDynamicHtml(completionText),
+        })
+        .catch(() => null)
     }
   })
 }

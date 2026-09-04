@@ -118,8 +118,8 @@ describe('Handlers Dispatcher & Callback Query Flow', () => {
       toChatId: 67890,
       fromChatId: expect.anything(),
       message: 42,
-      replyTo: 99,
     })
+    expect(fakeTg.deleteMessagesById).toHaveBeenCalledWith(67890, [99])
     expect(mockAlacService.findCachedTrack).toHaveBeenCalledWith('1559523359')
 
     const closeQueryCtx = {

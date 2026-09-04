@@ -217,6 +217,72 @@ export async function fetchAlbumTracks(
   }
 }
 
+async function doSearchItunesCatalog(
+  term: string,
+  limit: number,
+  storefront: string,
+): Promise<AppleTrackMetadata[]> {
+  using _ = infoSpan('itunes_search', { term, limit, storefront }).enter()
+
+  const url = `https://itunes.apple.com/search?term=${encodeURIComponent(term)}&entity=song&limit=${encodeURIComponent(limit)}&country=${encodeURIComponent(storefront)}`
+  debug('Querying iTunes search API...', { url })
+
+  const start = Date.now()
+  let resp: Response
+  try {
+    resp = await fetch(url, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/145.0.0.0',
+      },
+      signal: AbortSignal.timeout(15_000),
+    })
+  } catch (err: unknown) {
+    const elapsed = Date.now() - start
+    error('iTunes search timed out / network error', {
+      term,
+      elapsed_ms: elapsed,
+      error: err instanceof Error ? err.message : String(err),
+    })
+    return []
+  }
+
+  if (!resp.ok) {
+    error('iTunes search HTTP failure', { term, status: resp.status })
+    return []
+  }
+
+  const data = (await resp.json()) as { results?: ItunesResult[] }
+  const tracks = (data.results || [])
+    .filter((r) => r.wrapperType === 'track' || r.kind === 'song')
+    .map(mapItunesItem)
+
+  info('iTunes search resolved', {
+    term,
+    matches: tracks.length,
+    elapsed_ms: Date.now() - start,
+  })
+
+  return tracks
+}
+
+export async function searchItunesCatalog(
+  term: string,
+  limit = 5,
+  storefront = 'us',
+): Promise<AppleTrackMetadata[]> {
+  const sf = (storefront || 'us').toLowerCase()
+  const results = await doSearchItunesCatalog(term, limit, sf)
+  if (results.length === 0 && sf !== 'us') {
+    debug('Retrying catalog search on US storefront fallback', {
+      term,
+      original_storefront: sf,
+    })
+    return await doSearchItunesCatalog(term, limit, 'us')
+  }
+  return results
+}
+
 function mapItunesItem(item: ItunesResult): AppleTrackMetadata {
   const artwork = formatArtworkUrl(item.artworkUrl100)
 

@@ -47,6 +47,13 @@ describe('ALAC Management Commands', () => {
       sendCopy: mock(() => Promise.resolve({ id: 100 })),
       deleteMessagesById: mock(() => Promise.resolve()),
       editMessage: mock(() => Promise.resolve({ id: 1 })),
+      sendText: mock(() => Promise.resolve({ id: 101 })),
+      sendMedia: mock(() =>
+        Promise.resolve({
+          id: 102,
+          media: { type: 'audio', fileId: 'fid', uniqueFileId: 'uid' },
+        }),
+      ),
       onUpdate: { add: mock(() => {}), remove: mock(() => {}) },
       onRawUpdate: { add: mock(() => {}), remove: mock(() => {}) },
       onError: { add: mock(() => {}), remove: mock(() => {}) },
@@ -119,7 +126,22 @@ describe('ALAC Management Commands', () => {
     }
 
     mockRipper = {
-      rip: mock(() => Promise.resolve({} as never)),
+      rip: mock(() =>
+        Promise.resolve({
+          filePath: '/tmp/test_track_rip.m4a',
+          title: 'Test Song',
+          artist: 'Test Artist',
+          album: 'Test Album',
+          duration: 200,
+          bitDepth: 24,
+          sampleRate: 48000,
+          codec: 'alac',
+          genre: 'Pop',
+          releaseDate: '2021-01-01',
+          trackNumber: 1,
+          trackCount: 1,
+        }),
+      ),
     }
 
     ctx = {
@@ -425,7 +447,7 @@ describe('ALAC Management Commands', () => {
       registerSearchCommand(ctx)
       const { repliedTexts } = await dispatchMessage('/search')
       expect(repliedTexts.length).toBe(1)
-      expect(repliedTexts[0]).toContain('Search Cached Tracks:')
+      expect(repliedTexts[0]).toContain('Search Music:')
     })
 
     it('notifies when no tracks match query', async () => {
@@ -433,7 +455,7 @@ describe('ALAC Management Commands', () => {
       registerSearchCommand(ctx)
       const { repliedTexts } = await dispatchMessage('/search NonExistentXYZ')
       expect(repliedTexts.length).toBe(1)
-      expect(repliedTexts[0]).toContain('No cached tracks found')
+      expect(repliedTexts[0]).toContain('No tracks found')
     })
 
     it('renders search results when tracks match query', async () => {
@@ -463,7 +485,7 @@ describe('ALAC Management Commands', () => {
       registerSearchCommand(ctx)
       const { repliedTexts } = await dispatchMessage('/search Test')
       expect(repliedTexts.length).toBe(1)
-      expect(repliedTexts[0]).toContain('Found 1 cached track')
+      expect(repliedTexts[0]).toContain('Search results for')
       expect(repliedTexts[0]).toContain('Test Song')
     })
 
@@ -472,6 +494,23 @@ describe('ALAC Management Commands', () => {
       const { cb } = await dispatchCallback('search_close')
       expect(cb.answer).toHaveBeenCalled()
       expect(fakeTg.deleteMessagesById).toHaveBeenCalled()
+    })
+
+    it('handles rip: callback query and enqueues lossless rip', async () => {
+      registerSearchCommand(ctx)
+      const { cb } = await dispatchCallback('rip:999888')
+
+      expect(cb.answer).toHaveBeenCalledWith(
+        expect.objectContaining({ text: expect.stringContaining('Queuing') }),
+      )
+      expect(mockQueue.enqueue).toHaveBeenCalled()
+      expect(mockRipper.rip).toHaveBeenCalledWith(
+        '999888',
+        expect.any(Function),
+      )
+      expect(mockService.saveTrack).toHaveBeenCalled()
+      expect(fakeTg.sendCopy).toHaveBeenCalled()
+      expect(fakeTg.deleteMessagesById).toHaveBeenCalledWith(100, [101, 42])
     })
 
     it('handles dl: callback query and delivers cached track', async () => {

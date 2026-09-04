@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, it, mock } from 'bun:test'
 import fs from 'node:fs'
 
+import { PGlite } from '@electric-sql/pglite'
+import { drizzle } from 'drizzle-orm/pglite'
+
 import { runMigrations } from '@/db/migrate.ts'
+import * as schema from '@/db/schema.ts'
 
 describe('Database Migrations (migrate.ts)', () => {
   const originalExistsSync = fs.existsSync
@@ -11,7 +15,11 @@ describe('Database Migrations (migrate.ts)', () => {
   })
 
   it('executes migrations successfully on existing journal', async () => {
-    expect(runMigrations()).resolves.toBeUndefined()
+    const client = new PGlite()
+    await client.waitReady
+    const testDb = drizzle(client, { schema })
+    await expect(runMigrations(testDb, client)).resolves.toBeUndefined()
+    await client.close()
   })
 
   it('warns and exits early when journal is missing', async () => {

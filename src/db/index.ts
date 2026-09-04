@@ -27,7 +27,9 @@ function getOrCreateDb(): AppDatabase {
       const client = postgres(env.DATABASE_URL)
       _instance = drizzlePostgresJs(client, { schema })
     } else {
-      pgliteClient = new PGlite(env.DATABASE_DIR)
+      const dbPath =
+        process.env.NODE_ENV === 'test' ? undefined : env.DATABASE_DIR
+      pgliteClient = new PGlite(dbPath)
       _instance = drizzlePglite(pgliteClient, { schema })
     }
   }
