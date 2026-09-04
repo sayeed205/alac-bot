@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test'
 
-import { formatByteProgress, renderProgressBar } from './progress.ts'
+import { formatByteProgress, renderProgressBar } from '@/utils/progress.ts'
 
 describe('Progress Bar Utility', () => {
   it('renders 0% progress bar correctly', () => {

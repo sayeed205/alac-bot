@@ -1,7 +1,7 @@
 import { mkdir, unlink } from 'node:fs/promises'
 import { join } from 'node:path'
 
-import { debug, debugSpan, error, info, infoSpan } from '@/utils/logger.ts'
+import { debug, debugSpan, error } from '@/utils/logger.ts'
 import { formatByteProgress } from '@/utils/progress.ts'
 
 import { fetchTrackMeta } from './itunes.ts'

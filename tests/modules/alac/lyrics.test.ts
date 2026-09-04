@@ -5,7 +5,7 @@ import {
   detectLyricsTier,
   LyricsTier,
   scoreLyrics,
-} from './lyrics.ts'
+} from '@/modules/alac/lyrics.ts'
 
 describe('Lyrics Ranking & Parser', () => {
   it('converts Apple Music TTML with word spans to Enhanced LRC', () => {

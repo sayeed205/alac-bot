@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 
-import type { AlacStats } from './service.ts'
-import { formatDurationMs, formatStatsHtml } from './stats.ts'
+import type { AlacStats } from '@/modules/alac/service.ts'
+import { formatDurationMs, formatStatsHtml } from '@/modules/alac/stats.ts'
 
 describe('Stats Formatter', () => {
   it('formats duration in milliseconds, seconds, and minutes correctly', () => {

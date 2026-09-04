@@ -1,11 +1,27 @@
 import { describe, expect, it, mock } from 'bun:test'
+
 import type { TelegramClient } from '@mtcute/bun'
 import { Dispatcher } from '@mtcute/dispatcher'
 
-import { registerAlacHandlers } from './handlers.ts'
-import type { IAlacService } from './service.ts'
+import { registerAlacHandlers } from '@/modules/alac/handlers.ts'
+import type { IRipQueue } from '@/modules/alac/queue.ts'
+import type { ITrackRipper } from '@/modules/alac/ripper.ts'
+import type { IAlacService } from '@/modules/alac/service.ts'
 import { registerAuthHandlers } from '@/modules/auth/handlers.ts'
 import type { IAuthService } from '@/modules/auth/service.ts'
+
+interface DispatcherInternal {
+  _groups: Map<
+    number,
+    Map<
+      string,
+      Array<{
+        check: (ctx: unknown) => Promise<boolean>
+        callback: (ctx: unknown) => Promise<void>
+      }>
+    >
+  >
+}
 
 describe('Handlers Dispatcher & Callback Query Flow', () => {
   it('does not block alac dl: callbacks when auth handlers are registered first', async () => {
@@ -48,10 +64,10 @@ describe('Handlers Dispatcher & Callback Query Flow', () => {
         }),
       ),
       findCachedTracks: mock(() => Promise.resolve(new Map())),
-      saveTrack: mock(() => Promise.resolve({} as any)),
+      saveTrack: mock(() => Promise.resolve({} as never)),
       searchCachedTracks: mock(() => Promise.resolve([])),
       logRequest: mock(() => Promise.resolve()),
-      getStats: mock(() => Promise.resolve({} as any)),
+      getStats: mock(() => Promise.resolve({} as never)),
       deleteTrack: mock(() => Promise.resolve(true)),
     }
 
@@ -61,20 +77,23 @@ describe('Handlers Dispatcher & Callback Query Flow', () => {
       dp,
       fakeTg,
       mockAlacService,
-      undefined as any,
-      undefined as any,
+      undefined as unknown as ITrackRipper,
+      undefined as unknown as IRipQueue,
       mockAuth,
     )
 
     // Extract callback_query handlers from group 0
-    const group0 = (dp as any)._groups.get(0)
-    const cbHandlers = group0.get('callback_query')
+    const internalDp = dp as unknown as DispatcherInternal
+    const group0 = internalDp._groups.get(0)
+    const cbHandlers = group0?.get('callback_query') ?? []
     expect(cbHandlers.length).toBe(2)
 
     const [authCb, alacCb] = cbHandlers
+    if (!authCb || !alacCb) {
+      throw new Error('Expected 2 callback handlers registered')
+    }
 
     // 1. Simulate a dl: callback query context
-    let dlAnswerText = ''
     const dlQueryCtx = {
       _name: 'callback_query',
       raw: { data: new Uint8Array([1]) },
@@ -82,10 +101,7 @@ describe('Handlers Dispatcher & Callback Query Flow', () => {
       user: { id: 12345 },
       chat: { id: 67890 },
       messageId: 99,
-      answer: mock((opts?: { text?: string }) => {
-        dlAnswerText = opts?.text || ''
-        return Promise.resolve()
-      }),
+      answer: mock(() => Promise.resolve()),
     }
 
     // auth check should reject dl:

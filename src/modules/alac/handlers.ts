@@ -367,7 +367,6 @@ export function registerAlacHandlers(
               })
 
               await updateStatus('Uploading to Telegram...', true)
-              const uploadStart = Date.now()
               debug('Uploading track to dump channel', {
                 track_id: trackId,
                 file: ripResult.filePath,

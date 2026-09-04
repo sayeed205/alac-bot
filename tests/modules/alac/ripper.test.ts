@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 
-import { buildTrackFilename, sanitizeFilename } from './tagger.ts'
-import type { AppleTrackMetadata } from './types.ts'
+import { buildTrackFilename, sanitizeFilename } from '@/modules/alac/tagger.ts'
+import type { AppleTrackMetadata } from '@/modules/alac/types.ts'
 
 describe('Native Ripper Helpers', () => {
   it('sanitizes illegal characters from filenames', () => {

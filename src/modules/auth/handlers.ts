@@ -359,34 +359,35 @@ export function registerAuthHandlers(
       const data = query.dataStr
       if (!data) return
 
-    if (!service.isAdmin(query.user.id)) {
-      await query.answer({ text: 'Unauthorized.', alert: true })
-      return
-    }
+      if (!service.isAdmin(query.user.id)) {
+        await query.answer({ text: 'Unauthorized.', alert: true })
+        return
+      }
 
-    if (data === 'noop') {
-      await query.answer({})
-      return
-    }
+      if (data === 'noop') {
+        await query.answer({})
+        return
+      }
 
-    if (data === 'authclose') {
-      await query.answer({})
-      await tg
-        .deleteMessagesById(query.chat.id, [query.messageId])
-        .catch(() => null)
-      return
-    }
+      if (data === 'authclose') {
+        await query.answer({})
+        await tg
+          .deleteMessagesById(query.chat.id, [query.messageId])
+          .catch(() => null)
+        return
+      }
 
-    if (data.startsWith('authpage:')) {
-      const page = Number.parseInt(data.split(':')[1] || '1', 10)
-      await query.answer({})
-      await renderAuthListPage(
-        tg,
-        service,
-        query.chat.id,
-        query.messageId,
-        page,
-      )
-    }
-  })
+      if (data.startsWith('authpage:')) {
+        const page = Number.parseInt(data.split(':')[1] || '1', 10)
+        await query.answer({})
+        await renderAuthListPage(
+          tg,
+          service,
+          query.chat.id,
+          query.messageId,
+          page,
+        )
+      }
+    },
+  )
 }
