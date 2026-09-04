@@ -1,4 +1,8 @@
-import type { PgliteDatabase } from 'drizzle-orm/pglite'
+import { PGlite } from '@electric-sql/pglite'
+import {
+  drizzle as drizzlePglite,
+  type PgliteDatabase,
+} from 'drizzle-orm/pglite'
 import {
   drizzle as drizzlePostgresJs,
   type PostgresJsDatabase,
@@ -14,16 +18,25 @@ export type AppDatabase =
 
 export const isProduction = Boolean(env.DATABASE_URL)
 
-async function createDb(): Promise<AppDatabase> {
-  if (env.DATABASE_URL) {
-    const client = postgres(env.DATABASE_URL)
-    return drizzlePostgresJs(client, { schema })
-  }
+let _instance: AppDatabase | null = null
+export let pgliteClient: PGlite | null = null
 
-  const { PGlite } = await import('@electric-sql/pglite')
-  const { drizzle: drizzlePglite } = await import('drizzle-orm/pglite')
-  const client = new PGlite(env.DATABASE_DIR)
-  return drizzlePglite(client, { schema })
+function getOrCreateDb(): AppDatabase {
+  if (!_instance) {
+    if (env.DATABASE_URL) {
+      const client = postgres(env.DATABASE_URL)
+      _instance = drizzlePostgresJs(client, { schema })
+    } else {
+      pgliteClient = new PGlite(env.DATABASE_DIR)
+      _instance = drizzlePglite(pgliteClient, { schema })
+    }
+  }
+  return _instance
 }
 
-export const db: AppDatabase = await createDb()
+export const db: AppDatabase = new Proxy({} as AppDatabase, {
+  get(_target, prop, receiver) {
+    const instance = getOrCreateDb()
+    return Reflect.get(instance, prop, receiver)
+  },
+})

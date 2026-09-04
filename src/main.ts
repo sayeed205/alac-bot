@@ -3,6 +3,7 @@ import { Dispatcher, filters } from '@mtcute/dispatcher'
 
 import { runMigrations } from '@/db/migrate.ts'
 import { env } from '@/env.ts'
+import { registerAlacHandlers } from '@/modules/alac/index.ts'
 import { registerAuthHandlers } from '@/modules/auth/index.ts'
 
 await runMigrations()
@@ -16,6 +17,7 @@ const tg = new TelegramClient({
 const dp = Dispatcher.for(tg)
 
 registerAuthHandlers(dp, tg)
+registerAlacHandlers(dp, tg)
 
 dp.onNewMessage(filters.start, async (msg) => {
   await msg.answerText('Hello, world!')

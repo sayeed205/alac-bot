@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import type { PgliteDatabase } from 'drizzle-orm/pglite'
 import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js'
 
-import { db, isProduction } from '@/db/index.ts'
+import { db, isProduction, pgliteClient } from '@/db/index.ts'
 import type * as schema from '@/db/schema.ts'
 
 export async function runMigrations() {
@@ -23,6 +23,11 @@ export async function runMigrations() {
       migrationsFolder: './drizzle',
     })
   } else {
+    // Touch db to ensure pgliteClient is created
+    void db
+    if (pgliteClient) {
+      await pgliteClient.waitReady
+    }
     const { migrate } = await import('drizzle-orm/pglite/migrator')
     await migrate(db as PgliteDatabase<typeof schema>, {
       migrationsFolder: './drizzle',

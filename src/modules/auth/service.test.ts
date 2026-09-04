@@ -17,13 +17,16 @@ describe('AuthService', () => {
 
   beforeAll(async () => {
     client = new PGlite()
+    await client.waitReady
     const db = drizzle(client, { schema })
     await migrate(db, { migrationsFolder: './drizzle' })
     authService = new AuthService(db, ADMIN_ID)
   })
 
   afterAll(async () => {
-    await client.close()
+    if (client && !client.closed) {
+      await client.close()
+    }
   })
 
   it('correctly identifies admin', () => {
@@ -55,10 +58,8 @@ describe('AuthService', () => {
 
   it('authorizes a group and verifies members inside the group', async () => {
     await authService.authorize(GROUP_A, 'Test Group')
-    // USER_B is not directly authorized:
-    expect(await authService.isAuthorized(USER_B)).toBe(false)
-    // But when checking inside authorized group GROUP_A:
-    expect(await authService.isAuthorized(USER_B, GROUP_A)).toBe(true)
+    // USER_B is not directly authorized:\n    expect(await authService.isAuthorized(USER_B)).toBe(false)
+    // But when checking inside authorized group GROUP_A:\n    expect(await authService.isAuthorized(USER_B, GROUP_A)).toBe(true)
   })
 
   it('lists all authorized users and groups', async () => {

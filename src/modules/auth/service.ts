@@ -18,10 +18,18 @@ export interface IAuthService {
 }
 
 export class AuthService implements IAuthService {
+  private readonly _db?: AppDatabase
+
   constructor(
-    private readonly db: AppDatabase = defaultDb,
+    db?: AppDatabase,
     private readonly adminId: number = env.ADMIN_ID,
-  ) {}
+  ) {
+    this._db = db
+  }
+
+  private get db(): AppDatabase {
+    return this._db ?? defaultDb
+  }
 
   isAdmin(userId: number): boolean {
     return userId === this.adminId
