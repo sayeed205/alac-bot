@@ -19,6 +19,7 @@ import {
   alacService as defaultService,
   type IAlacService,
 } from '@/modules/alac/service.ts'
+import { formatStatsHtml } from '@/modules/alac/stats.ts'
 import { authService, type IAuthService } from '@/modules/auth/service.ts'
 import { debug, error, info, infoSpan } from '@/utils/logger.ts'
 import { formatByteProgress } from '@/utils/progress.ts'
@@ -35,6 +36,29 @@ export function registerAlacHandlers(
   queue: IRipQueue = defaultQueue,
   auth: IAuthService = authService,
 ) {
+  dp.onNewMessage(filters.command('stats'), async (msg) => {
+    using _statsSpan = infoSpan('stats_cmd', {
+      user_id: msg.sender.id,
+      chat_id: msg.chat.id,
+    }).enter()
+
+    const isAdmin = auth.isAdmin(msg.sender.id)
+    if (!isAdmin) {
+      debug('Non-admin attempted /stats command', { user_id: msg.sender.id })
+      await msg.replyText(
+        parseDynamicHtml('This command is restricted to the bot owner.'),
+      )
+      return
+    }
+
+    info('Generating analytics stats report for admin', {
+      user_id: msg.sender.id,
+    })
+
+    const stats = await service.getStats()
+    await msg.replyText(parseDynamicHtml(formatStatsHtml(stats)))
+  })
+
   dp.onNewMessage(filters.command(['alac', 'rerip']), async (msg) => {
     using _cmdSpan = infoSpan('alac_cmd', {
       user_id: msg.sender.id,

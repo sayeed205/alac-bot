@@ -98,6 +98,35 @@ describe('AlacService', () => {
     expect(true).toBe(true)
   })
 
+  it('calculates aggregated statistics with getStats', async () => {
+    await service.logRequest({
+      telegramId: 6252490183,
+      chatId: -100123456,
+      appleTrackId: '123456789',
+      isCacheHit: false,
+      durationMs: 15000,
+      status: 'completed',
+    })
+
+    await service.logRequest({
+      telegramId: 6252490183,
+      chatId: -100123456,
+      appleTrackId: '987654321',
+      isCacheHit: false,
+      durationMs: 5000,
+      status: 'failed',
+      errorReason: 'Stream timed out',
+    })
+
+    const stats = await service.getStats()
+    expect(stats.totalRequests).toBeGreaterThanOrEqual(3)
+    expect(stats.cacheHits).toBeGreaterThanOrEqual(1)
+    expect(stats.cacheMisses).toBeGreaterThanOrEqual(2)
+    expect(stats.totalFailedRequests).toBeGreaterThanOrEqual(1)
+    expect(stats.topTracks.length).toBeGreaterThanOrEqual(1)
+    expect(stats.topTracks[0]?.appleTrackId).toBe('123456789')
+  })
+
   it('deletes an existing track', async () => {
     const deleted = await service.deleteTrack('123456789')
     expect(deleted).toBe(true)
