@@ -71,7 +71,10 @@ export function registerRipCommand(ctx: CommandContext): void {
 
     if (parsed.isAlbum) {
       try {
-        const albumData = await fetchAlbumTracks(parsed.trackId)
+        const albumData = await fetchAlbumTracks(
+          parsed.trackId,
+          parsed.storefront,
+        )
         trackIds = albumData.tracks.map((t) => t.id)
         albumHeader = `Album: <b>${albumData.album.title}</b> by <b>${albumData.album.artist}</b> (${trackIds.length} tracks)`
       } catch (err: unknown) {
@@ -176,9 +179,13 @@ export function registerRipCommand(ctx: CommandContext): void {
             let ripResult: TrackRipResult | null = null
 
             try {
-              ripResult = await ripper.rip(trackId, async (status) => {
-                await updateStatus(status)
-              })
+              ripResult = await ripper.rip(
+                trackId,
+                async (status) => {
+                  await updateStatus(status)
+                },
+                parsed.storefront,
+              )
 
               await updateStatus('📤 <b>Uploading to Telegram...</b>', true)
               debug('Uploading track to dump channel', {

@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, mock } from 'bun:test'
 
-import type { Message, TelegramClient } from '@mtcute/bun'
-import { Dispatcher } from '@mtcute/dispatcher'
+import type { TelegramClient } from '@mtcute/bun'
+import { Dispatcher, type MessageContext } from '@mtcute/dispatcher'
 
 import { registerAuthCommand } from '@/modules/auth/commands/auth.ts'
 import { registerListCommand } from '@/modules/auth/commands/list.ts'
@@ -30,7 +30,7 @@ interface DispatcherInternal {
 
 describe('Auth Management Commands & Helpers', () => {
   let fakeTg: TelegramClient
-  let dp: Dispatcher<TelegramClient>
+  let dp: Dispatcher
   let mockAuthService: IAuthService
   let ctx: CommandContext
 
@@ -135,7 +135,7 @@ describe('Auth Management Commands & Helpers', () => {
         repliedTexts.push(str)
         return Promise.resolve({ id: 1 })
       }),
-    } as unknown as Message
+    } as unknown as MessageContext
 
     for (const h of handlers) {
       if (await h.check(msg)) {
@@ -216,7 +216,7 @@ describe('Auth Management Commands & Helpers', () => {
           Promise.resolve({
             sender: { id: 777, displayName: 'Target User', type: 'user' },
           }),
-      } as unknown as Message
+      } as unknown as MessageContext
       const targetReply = await resolveTarget(replyMsg, fakeTg)
       expect(targetReply?.id).toBe(777)
       expect(targetReply?.isUser).toBe(true)
@@ -225,7 +225,7 @@ describe('Auth Management Commands & Helpers', () => {
         text: '/auth 111',
         chat: { type: 'user', id: 1 },
         getReplyTo: () => Promise.resolve(null),
-      } as unknown as Message
+      } as unknown as MessageContext
       const targetNum = await resolveTarget(numArgMsg, fakeTg)
       expect(targetNum?.id).toBe(111)
 
@@ -233,7 +233,7 @@ describe('Auth Management Commands & Helpers', () => {
         text: '/auth @durov',
         chat: { type: 'user', id: 1 },
         getReplyTo: () => Promise.resolve(null),
-      } as unknown as Message
+      } as unknown as MessageContext
       const targetUser = await resolveTarget(userArgMsg, fakeTg)
       expect(targetUser?.id).toBe(111)
 
@@ -241,7 +241,7 @@ describe('Auth Management Commands & Helpers', () => {
         text: '/auth @nonexistent',
         chat: { type: 'user', id: 1 },
         getReplyTo: () => Promise.resolve(null),
-      } as unknown as Message
+      } as unknown as MessageContext
       const targetUnknown = await resolveTarget(unknownMsg, fakeTg)
       expect(targetUnknown).toBeNull()
 
@@ -253,7 +253,7 @@ describe('Auth Management Commands & Helpers', () => {
           displayName: 'Test Supergroup',
         },
         getReplyTo: () => Promise.resolve(null),
-      } as unknown as Message
+      } as unknown as MessageContext
       const targetGroup = await resolveTarget(groupMsg, fakeTg)
       expect(targetGroup?.id).toBe(-100987654)
       expect(targetGroup?.isUser).toBe(false)

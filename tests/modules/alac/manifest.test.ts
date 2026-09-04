@@ -5,6 +5,9 @@ import { getMirrorEndpoint } from '@/modules/alac/manifest.ts'
 
 describe('Mirror Manifest & Endpoint Resolution', () => {
   const originalFetch = globalThis.fetch
+  const setFetch = (fn: unknown) => {
+    globalThis.fetch = fn as typeof fetch
+  }
   const originalMirrorUrl = env.ALAC_MIRROR_URL
   const originalApiKey = env.ALAC_API_KEY
 
@@ -38,7 +41,7 @@ describe('Mirror Manifest & Endpoint Resolution', () => {
   })
 
   it('fetches manifest and verifies status successfully', async () => {
-    globalThis.fetch = async (input: RequestInfo | URL) => {
+    setFetch(async (input: RequestInfo | URL) => {
       const urlStr = String(input)
       if (urlStr.includes('/status')) {
         return new Response(
@@ -57,7 +60,7 @@ describe('Mirror Manifest & Endpoint Resolution', () => {
         }),
         { status: 200 },
       )
-    }
+    })
 
     const endpoint = await getMirrorEndpoint(true)
     expect(endpoint.mirrorUrl).toBe('https://mirror.alac.org')
@@ -68,9 +71,9 @@ describe('Mirror Manifest & Endpoint Resolution', () => {
   })
 
   it('throws error on manifest network timeout', async () => {
-    globalThis.fetch = async () => {
+    setFetch(async () => {
       throw new Error('Network timeout')
-    }
+    })
 
     expect(getMirrorEndpoint(true)).rejects.toThrow(
       'Mirror manifest lookup timed out',
@@ -78,7 +81,7 @@ describe('Mirror Manifest & Endpoint Resolution', () => {
   })
 
   it('throws error on manifest HTTP error', async () => {
-    globalThis.fetch = async () => new Response('Error', { status: 500 })
+    setFetch(async () => new Response('Error', { status: 500 }))
 
     expect(getMirrorEndpoint(true)).rejects.toThrow(
       'Failed to fetch mirror manifest (HTTP 500)',
@@ -86,8 +89,10 @@ describe('Mirror Manifest & Endpoint Resolution', () => {
   })
 
   it('throws error when manifest is missing apple mirror or key', async () => {
-    globalThis.fetch = async () =>
-      new Response(JSON.stringify({ empty: true }), { status: 200 })
+    setFetch(
+      async () =>
+        new Response(JSON.stringify({ empty: true }), { status: 200 }),
+    )
 
     expect(getMirrorEndpoint(true)).rejects.toThrow(
       'Mirror manifest returned empty apple endpoint or api key',
@@ -95,7 +100,7 @@ describe('Mirror Manifest & Endpoint Resolution', () => {
   })
 
   it('throws error when mirror status check times out', async () => {
-    globalThis.fetch = async (input: RequestInfo | URL) => {
+    setFetch(async (input: RequestInfo | URL) => {
       const urlStr = String(input)
       if (urlStr.includes('/status')) {
         throw new Error('Connection reset')
@@ -107,7 +112,7 @@ describe('Mirror Manifest & Endpoint Resolution', () => {
         }),
         { status: 200 },
       )
-    }
+    })
 
     expect(getMirrorEndpoint(true)).rejects.toThrow(
       'Mirror /status check timed out',
@@ -115,7 +120,7 @@ describe('Mirror Manifest & Endpoint Resolution', () => {
   })
 
   it('throws error when mirror status returns non-200', async () => {
-    globalThis.fetch = async (input: RequestInfo | URL) => {
+    setFetch(async (input: RequestInfo | URL) => {
       const urlStr = String(input)
       if (urlStr.includes('/status')) {
         return new Response('Offline', { status: 503 })
@@ -127,7 +132,7 @@ describe('Mirror Manifest & Endpoint Resolution', () => {
         }),
         { status: 200 },
       )
-    }
+    })
 
     expect(getMirrorEndpoint(true)).rejects.toThrow(
       'Mirror /status check failed (HTTP 503)',
@@ -135,7 +140,7 @@ describe('Mirror Manifest & Endpoint Resolution', () => {
   })
 
   it('throws error when lossless wrapper is offline or 0 instances available', async () => {
-    globalThis.fetch = async (input: RequestInfo | URL) => {
+    setFetch(async (input: RequestInfo | URL) => {
       const urlStr = String(input)
       if (urlStr.includes('/status')) {
         return new Response(
@@ -153,7 +158,7 @@ describe('Mirror Manifest & Endpoint Resolution', () => {
         }),
         { status: 200 },
       )
-    }
+    })
 
     expect(getMirrorEndpoint(true)).rejects.toThrow(
       'Lossless wrapper is currently offline on mirror',

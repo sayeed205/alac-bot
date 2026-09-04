@@ -26,7 +26,7 @@ interface DispatcherInternal {
 
 describe('ALAC Rip Command Handler', () => {
   let fakeTg: TelegramClient
-  let dp: Dispatcher<TelegramClient>
+  let dp: Dispatcher
   let mockAuth: IAuthService
   let mockService: IAlacService
   let mockQueue: IRipQueue
@@ -75,11 +75,12 @@ describe('ALAC Rip Command Handler', () => {
     }
 
     mockQueue = {
-      enqueue: mock(async (task: () => Promise<void>) => {
-        await task()
-      }),
+      enqueue: mock(async (task) =>
+        task(new AbortController().signal),
+      ) as unknown as IRipQueue['enqueue'],
       getPendingCount: mock(() => 0),
       isProcessing: mock(() => false),
+      clear: mock(() => {}),
     }
 
     mockRipper = {
@@ -209,7 +210,11 @@ describe('ALAC Rip Command Handler', () => {
     await dispatchMessage('/alac 12345')
 
     expect(mockQueue.enqueue).toHaveBeenCalled()
-    expect(mockRipper.rip).toHaveBeenCalledWith('12345', expect.any(Function))
+    expect(mockRipper.rip).toHaveBeenCalledWith(
+      '12345',
+      expect.any(Function),
+      undefined,
+    )
     expect(fakeTg.sendMedia).toHaveBeenCalled()
     expect(mockService.saveTrack).toHaveBeenCalled()
     expect(fakeTg.sendCopy).toHaveBeenCalled()
@@ -252,7 +257,7 @@ describe('ALAC Rip Command Handler', () => {
         )
       }
       return new Response('ok')
-    })
+    }) as unknown as typeof fetch
 
     try {
       registerRipCommand(ctx)

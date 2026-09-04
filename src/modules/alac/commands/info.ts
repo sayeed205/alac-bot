@@ -40,7 +40,7 @@ export function registerInfoCommand(ctx: CommandContext): void {
     const trackId = parsed.trackId
 
     try {
-      const meta = await fetchTrackMeta(trackId)
+      const meta = await fetchTrackMeta(trackId, parsed.storefront)
       const cached = await service.findCachedTrack(trackId)
 
       const title = html.escape(meta.title)

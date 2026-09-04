@@ -2,13 +2,14 @@ export interface ParsedAlacInput {
   trackId: string
   force: boolean
   isAlbum?: boolean
+  storefront?: string
 }
 
 const SONG_WITH_ALBUM_RE =
-  /music\.apple\.com\/(?:[a-z]{2}\/)?album\/(?:[^/]+\/)?\d+\?i=(\d+)/i
+  /music\.apple\.com\/(?:([a-z]{2})\/)?album\/(?:[^/]+\/)?\d+\?i=(\d+)/i
 const SONG_DIRECT_RE =
-  /music\.apple\.com\/(?:[a-z]{2}\/)?song\/(?:[^/]+\/)?(\d+)/i
-const ALBUM_RE = /music\.apple\.com\/(?:[a-z]{2}\/)?album\/(?:[^/]+\/)?(\d+)/i
+  /music\.apple\.com\/(?:([a-z]{2})\/)?song\/(?:[^/]+\/)?(\d+)/i
+const ALBUM_RE = /music\.apple\.com\/(?:([a-z]{2})\/)?album\/(?:[^/]+\/)?(\d+)/i
 const BARE_ID_RE = /^\d+$/
 
 export function parseAlacInput(
@@ -55,18 +56,33 @@ export function parseAlacInput(
   }
 
   const songWithAlbumMatch = candidate.match(SONG_WITH_ALBUM_RE)
-  if (songWithAlbumMatch?.[1]) {
-    return { trackId: songWithAlbumMatch[1], force, isAlbum: false }
+  if (songWithAlbumMatch?.[2]) {
+    return {
+      trackId: songWithAlbumMatch[2],
+      force,
+      isAlbum: false,
+      storefront: songWithAlbumMatch[1]?.toLowerCase(),
+    }
   }
 
   const songDirectMatch = candidate.match(SONG_DIRECT_RE)
-  if (songDirectMatch?.[1]) {
-    return { trackId: songDirectMatch[1], force, isAlbum: false }
+  if (songDirectMatch?.[2]) {
+    return {
+      trackId: songDirectMatch[2],
+      force,
+      isAlbum: false,
+      storefront: songDirectMatch[1]?.toLowerCase(),
+    }
   }
 
   const albumMatch = candidate.match(ALBUM_RE)
-  if (albumMatch?.[1]) {
-    return { trackId: albumMatch[1], force, isAlbum: true }
+  if (albumMatch?.[2]) {
+    return {
+      trackId: albumMatch[2],
+      force,
+      isAlbum: true,
+      storefront: albumMatch[1]?.toLowerCase(),
+    }
   }
 
   if (BARE_ID_RE.test(candidate)) {

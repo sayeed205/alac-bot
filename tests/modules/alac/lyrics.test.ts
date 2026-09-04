@@ -104,13 +104,16 @@ describe('Lyrics Ranking & Parser', () => {
 
   describe('fetchLyrics Provider Integration', () => {
     const originalFetch = globalThis.fetch
+    const setFetch = (fn: unknown) => {
+      globalThis.fetch = fn as typeof fetch
+    }
 
     afterEach(() => {
       globalThis.fetch = originalFetch
     })
 
     it('fetches and resolves best lyrics candidate across providers', async () => {
-      globalThis.fetch = async (input: RequestInfo | URL) => {
+      setFetch(async (input: RequestInfo | URL) => {
         const urlStr = String(input)
         if (urlStr.includes('paxsenix.org')) {
           return new Response(
@@ -129,7 +132,7 @@ describe('Lyrics Ranking & Parser', () => {
           )
         }
         return new Response('Not found', { status: 404 })
-      }
+      })
 
       const lyrics = await fetchLyrics('12345', {
         title: 'Song Title',
@@ -143,7 +146,7 @@ describe('Lyrics Ranking & Parser', () => {
     })
 
     it('falls back to LRCLIB when primary provider fails', async () => {
-      globalThis.fetch = async (input: RequestInfo | URL) => {
+      setFetch(async (input: RequestInfo | URL) => {
         const urlStr = String(input)
         if (urlStr.includes('lrclib.net/api/get')) {
           return new Response(
@@ -155,7 +158,7 @@ describe('Lyrics Ranking & Parser', () => {
           )
         }
         return new Response('Error', { status: 500 })
-      }
+      })
 
       const lyrics = await fetchLyrics('12345', {
         title: 'Song Title',
@@ -168,7 +171,7 @@ describe('Lyrics Ranking & Parser', () => {
     })
 
     it('returns null when all providers return empty or fail', async () => {
-      globalThis.fetch = async () => new Response('Not found', { status: 404 })
+      setFetch(async () => new Response('Not found', { status: 404 }))
 
       const lyrics = await fetchLyrics('99999', {
         title: 'Unknown',

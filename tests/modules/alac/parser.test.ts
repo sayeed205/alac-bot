@@ -3,7 +3,7 @@ import { describe, expect, it } from 'bun:test'
 import { parseAlacInput } from '@/modules/alac/parser.ts'
 
 describe('parseAlacInput', () => {
-  it('extracts track ID from standard album link with ?i= parameter', () => {
+  it('extracts track ID and storefront from standard album link with ?i= parameter', () => {
     const input =
       '/alac https://music.apple.com/us/album/shape-of-you/1193701079?i=1193701400'
     const res = parseAlacInput(input)
@@ -11,6 +11,7 @@ describe('parseAlacInput', () => {
       trackId: '1193701400',
       force: false,
       isAlbum: false,
+      storefront: 'us',
     })
   })
 
@@ -22,6 +23,7 @@ describe('parseAlacInput', () => {
       trackId: '1193701400',
       force: true,
       isAlbum: false,
+      storefront: 'us',
     })
   })
 
@@ -33,16 +35,18 @@ describe('parseAlacInput', () => {
       trackId: '1193701400',
       force: true,
       isAlbum: false,
+      storefront: 'us',
     })
   })
 
-  it('extracts track ID from direct /song/ link', () => {
+  it('extracts track ID from direct /song/ link with regional storefront', () => {
     const input = '/alac https://music.apple.com/in/song/tum-hi-ho/1122334455'
     const res = parseAlacInput(input)
     expect(res).toEqual({
       trackId: '1122334455',
       force: false,
       isAlbum: false,
+      storefront: 'in',
     })
   })
 
@@ -54,10 +58,11 @@ describe('parseAlacInput', () => {
       trackId: '1499378108',
       force: false,
       isAlbum: true,
+      storefront: 'us',
     })
   })
 
-  it('extracts bare track ID', () => {
+  it('extracts bare track ID without storefront', () => {
     const input = '/alac 1440841730'
     const res = parseAlacInput(input)
     expect(res).toEqual({
@@ -69,12 +74,13 @@ describe('parseAlacInput', () => {
 
   it('extracts from replied message if command has no arguments', () => {
     const replyText =
-      'Check this song https://music.apple.com/us/album/song/1000?i=2000 it is awesome'
+      'Check this song https://music.apple.com/jp/album/song/1000?i=2000 it is awesome'
     const res = parseAlacInput('/alac', replyText)
     expect(res).toEqual({
       trackId: '2000',
       force: false,
       isAlbum: false,
+      storefront: 'jp',
     })
   })
 
@@ -85,6 +91,7 @@ describe('parseAlacInput', () => {
       trackId: '2000',
       force: true,
       isAlbum: false,
+      storefront: 'us',
     })
   })
 

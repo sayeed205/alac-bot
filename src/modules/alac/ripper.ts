@@ -16,6 +16,7 @@ export interface ITrackRipper {
   rip(
     trackId: string,
     onProgress?: (status: string) => void,
+    storefront?: string,
   ): Promise<TrackRipResult>
 }
 
@@ -25,6 +26,7 @@ export class FakeTrackRipper implements ITrackRipper {
   async rip(
     trackId: string,
     onProgress?: (status: string) => void,
+    _storefront?: string,
   ): Promise<TrackRipResult> {
     onProgress?.('Downloading metadata...')
     await new Promise((r) => setTimeout(r, 10))
@@ -58,14 +60,15 @@ export class AlacTrackRipper implements ITrackRipper {
   async rip(
     trackId: string,
     onProgress?: (status: string) => void,
+    storefront?: string,
   ): Promise<TrackRipResult> {
-    using _ = debugSpan('ripper', { track_id: trackId }).enter()
+    using _ = debugSpan('ripper', { track_id: trackId, storefront }).enter()
     const ripStart = Date.now()
 
     await mkdir(this.outputDir, { recursive: true })
 
     onProgress?.('Fetching track metadata...')
-    const meta = await fetchTrackMeta(trackId)
+    const meta = await fetchTrackMeta(trackId, storefront)
 
     onProgress?.(`Connecting mirror for ${meta.artist} - ${meta.title}...`)
     const { mirrorUrl, apiKey } = await getMirrorEndpoint()

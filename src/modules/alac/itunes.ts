@@ -24,9 +24,14 @@ interface ItunesResult {
   artworkUrl100?: string
 }
 
-export async function fetchTrackMeta(
+function formatArtworkUrl(url?: string): string {
+  if (!url) return ''
+  return url.replace(/\d+x\d+bb/, '3000x3000bb')
+}
+
+async function doFetchTrackMeta(
   trackId: string,
-  storefront = 'us',
+  storefront: string,
 ): Promise<AppleTrackMetadata> {
   using _ = infoSpan('itunes_track', { track_id: trackId, storefront }).enter()
 
@@ -85,9 +90,29 @@ export async function fetchTrackMeta(
   return meta
 }
 
-export async function fetchAlbumTracks(
-  collectionId: string,
+export async function fetchTrackMeta(
+  trackId: string,
   storefront = 'us',
+): Promise<AppleTrackMetadata> {
+  const sf = (storefront || 'us').toLowerCase()
+  try {
+    return await doFetchTrackMeta(trackId, sf)
+  } catch (err) {
+    if (sf !== 'us') {
+      debug('Retrying track lookup on US storefront fallback', {
+        track_id: trackId,
+        original_storefront: sf,
+        error: err instanceof Error ? err.message : String(err),
+      })
+      return await doFetchTrackMeta(trackId, 'us')
+    }
+    throw err
+  }
+}
+
+async function doFetchAlbumTracks(
+  collectionId: string,
+  storefront: string,
 ): Promise<{ album: AppleTrackMetadata; tracks: AppleTrackMetadata[] }> {
   using _ = infoSpan('itunes_album', {
     collection_id: collectionId,
@@ -157,10 +182,7 @@ export async function fetchAlbumTracks(
         releaseDate: (collectionItem.releaseDate || '').slice(0, 10),
         duration: 0,
         explicit: collectionItem.collectionExplicitness === 'explicit',
-        artworkUrl: (collectionItem.artworkUrl100 || '').replace(
-          '100x100bb',
-          '1200x1200bb',
-        ),
+        artworkUrl: formatArtworkUrl(collectionItem.artworkUrl100),
       }
     : firstTrack
 
@@ -175,8 +197,28 @@ export async function fetchAlbumTracks(
   return { album: albumMeta, tracks }
 }
 
+export async function fetchAlbumTracks(
+  collectionId: string,
+  storefront = 'us',
+): Promise<{ album: AppleTrackMetadata; tracks: AppleTrackMetadata[] }> {
+  const sf = (storefront || 'us').toLowerCase()
+  try {
+    return await doFetchAlbumTracks(collectionId, sf)
+  } catch (err) {
+    if (sf !== 'us') {
+      debug('Retrying album lookup on US storefront fallback', {
+        collection_id: collectionId,
+        original_storefront: sf,
+        error: err instanceof Error ? err.message : String(err),
+      })
+      return await doFetchAlbumTracks(collectionId, 'us')
+    }
+    throw err
+  }
+}
+
 function mapItunesItem(item: ItunesResult): AppleTrackMetadata {
-  const artwork = (item.artworkUrl100 || '').replace('100x100bb', '1200x1200bb')
+  const artwork = formatArtworkUrl(item.artworkUrl100)
 
   return {
     id: String(item.trackId || ''),
