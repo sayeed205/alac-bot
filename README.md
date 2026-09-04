@@ -1,32 +1,198 @@
-# alac-bot
+# ALAC Bot
 
-mtcute-powered Telegram bot with Drizzle ORM and Biome.
+A high-performance Telegram bot for downloading Apple Music lossless (ALAC) audio tracks, albums, and playlists with synchronized lyrics, embedded high-resolution artwork, and smart channel caching.
 
-## Database Strategy
+Built with [Bun](https://bun.sh), [@mtcute/bun](https://mtcute.dev), and [Drizzle ORM](https://orm.drizzle.team).
 
-- **Local Development**: Uses embedded **PGlite** by default (runs PostgreSQL in-process, stored in `./bot-data/db`). Zero external server or Docker setup needed, exactly like SQLite, but fully PostgreSQL-compatible.
-- **Production**: Set `DATABASE_URL=postgres://user:password@host:5432/db` in `.env`. The bot automatically connects to PostgreSQL using the exact same schema and migrations.
+---
 
-## Getting Started
+## Features
+
+- **True Lossless Audio**: Streams native Apple Lossless Audio Codec (ALAC 16-bit / 24-bit up to 192kHz) directly from decryption mirrors.
+- **Instant Dump Channel Caching**: Every ripped track is indexed with full metadata and stored in a private Telegram dump channel. Cache hits deliver in under 200ms without consuming mirror bandwidth.
+- **Full Album & Playlist Support**:
+  - Individual track URLs or bare track IDs.
+  - Full album URLs (`https://music.apple.com/.../album/...`).
+  - Apple Music playlists (`https://music.apple.com/.../playlist/...` or `pl.xxx` / `pl.u-xxx`).
+  - Upload a `.txt` file containing multiple links for automated batch downloads.
+  - Multi-line commands with multiple URLs.
+- **Group Chat Friendly**: When triggered in a group chat, audio files are delivered directly to the user's private chat (DM) to eliminate spam, keeping only a live progress card in the group.
+- **Interactive Task Cancellation**:
+  - Live `[Cancel Download]` inline button attached to the progress card.
+  - `/cancel` command to abort the user's current running task.
+  - Permission-controlled: only the requester or a bot admin can cancel.
+- **Synced Lyrics Embedding**: Automatically prefetches and embeds word-by-word synced lyrics (TTML -> Enhanced LRC) or line-synced LRC from Apple Music and LRCLIB.
+- **High-Res Metadata & Artwork**: Tags every track using FFmpeg with embedded high-resolution album cover art, release date, genre, track/disc numbers, and explicit `[E]` flags.
+- **Interactive Catalog Search**: `/search <query>` searches both cached tracks and Apple Music's catalog with interactive inline button results.
+- **Access Control**: Granular user and group authorization system (`/auth`, `/revoke`, `/list`).
+- **Resilient Mirror Architecture**: Automatic mirror manifest resolution, health checks, 30s connection timeout, 45s streaming chunk inactivity reset, and circuit breakers against mirror outages.
+- **Database Backup & Restore**: Export and import compressed database snapshots (`.sql.gz`) directly via Telegram DM.
+
+---
+
+## Prerequisites
+
+- [Bun](https://bun.sh) (v1.2 or later)
+- [FFmpeg](https://ffmpeg.org) installed on system path (required for audio tagging and artwork embedding)
+- [PostgreSQL](https://www.postgresql.org/) database (with `pg_trgm` extension for fuzzy search)
+- **Telegram API Credentials**: `API_ID` & `API_HASH` from [my.telegram.org](https://my.telegram.org), plus a `BOT_TOKEN` from [@BotFather](https://t.me/BotFather)
+- **Telegram Dump Channel**: A private channel where the bot is added as an administrator (to store and cache audio files)
+
+---
+
+## Quick Start
+
+### 1. Clone & Install Dependencies
 
 ```bash
+git clone https://github.com/sayeed205/alac-bot.git
+cd alac-bot
 bun install
-cp .env.example .env
-# Edit .env with your Telegram credentials (API_ID, API_HASH, BOT_TOKEN)
-bun dev
 ```
 
-## Database Commands
+### 2. Configure Environment
 
-- `bun run db:migrate` - Run migrations against current environment (PGlite locally, or PostgreSQL if `DATABASE_URL` is set)
-- `bun run db:generate` - Generate new SQL migration files from `src/db/schema.ts`
-- `bun run db:push` - Push schema changes directly to the database
-- `bun run db:studio` - Launch Drizzle Studio interface
-
-## Linting & Formatting
+Copy the example configuration file:
 
 ```bash
-bun run lint      # Check formatting and lint rules
-bun run lint:fix  # Apply auto-fixes
-bun run format    # Format files
+cp .env.example .env
 ```
+
+Edit `.env` with your credentials:
+
+```env
+API_ID=1234567
+API_HASH=abcdef0123456789abcdef0123456789
+BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrSTUvwxYZ
+ADMIN_ID=123456789
+DUMP_CHANNEL_ID=-1001234567890
+
+# PostgreSQL Connection
+DATABASE_URL=postgresql://user:password@localhost:5432/alac_bot
+
+# Logging (trace | debug | info | warn | error | critical)
+LOG_LEVEL=info
+
+# (Optional) Static mirror override (defaults to dynamic manifest resolution)
+# ALAC_MIRROR_URL=https://custom-mirror.example.com
+# ALAC_API_KEY=ak_custom_api_key
+```
+
+### 3. Run Database Migrations
+
+```bash
+bun run db:migrate
+```
+
+### 4. Start the Bot
+
+```bash
+# Development mode (with file watching)
+bun dev
+
+# Production mode
+bun start
+```
+
+---
+
+## Environment Variables
+
+| Variable | Description | Default |
+| :--- | :--- | :--- |
+| `API_ID` | Telegram API ID from [my.telegram.org](https://my.telegram.org) | *Required* |
+| `API_HASH` | Telegram API Hash from [my.telegram.org](https://my.telegram.org) | *Required* |
+| `BOT_TOKEN` | Bot token from [@BotFather](https://t.me/BotFather) | *Required* |
+| `ADMIN_ID` | Telegram User ID of the bot owner | *Required* |
+| `DUMP_CHANNEL_ID` | Channel ID (`-100...`) used to store cached audio files | *Required* |
+| `DATABASE_URL` | PostgreSQL connection string | `postgresql://admin:password@localhost:5432/alac_bot` |
+| `LOG_LEVEL` | Tracing log level (`trace`, `debug`, `info`, `warn`, `error`) | `info` |
+| `ALAC_MIRROR_URL` | Optional static mirror URL override | Dynamic manifest |
+| `ALAC_API_KEY` | Optional static mirror API key override | Dynamic manifest |
+
+---
+
+## Command Reference
+
+### General Commands
+
+| Command | Description |
+| :--- | :--- |
+| `/alac <url\|id> [-f]` | Download Apple Music track, album, or playlist in lossless ALAC (`-f` forces re-rip for admins) |
+| `/rip`, `/batch`, `/dl`, `/download` | Aliases for `/alac` |
+| `/search <query>` | Search Apple Music catalog and cached library with interactive buttons |
+| `/info <url\|id>` | Show track metadata and cache availability |
+| `/cancel` | Cancel your current active download |
+| `/help` | Display usage instructions and available commands |
+
+> **Batch Tip**: You can upload a `.txt` document containing one Apple Music link per line with `/alac` or `/batch` as the caption to rip entire batches automatically.
+
+---
+
+### Admin Management Commands
+
+| Command | Description |
+| :--- | :--- |
+| `/auth [id\|username]` | Authorize a user or group to use the bot |
+| `/revoke [id\|username]` | Revoke access from a user or group |
+| `/list` | Show paginated list of authorized users and groups |
+| `/health` | Check live latency and mirror wrapper instance health |
+| `/stats` | View bot performance, queue metrics, and top requested tracks |
+| `/queue` | View active and pending download tasks in the sequential queue |
+| `/clean` | Clean up leftover temporary files in download scratch directory |
+| `/delete <id>` | Remove a track from cache and the dump channel |
+| `/index` | Re-index and synchronize existing tracks in the dump channel |
+| `/export` | Export a compressed PostgreSQL database backup (`.sql.gz`) via DM |
+| `/import` | Restore database by replying to a `.sql.gz` backup file |
+
+---
+
+## Testing & Code Quality
+
+The repository includes a test suite covering parsing, iTunes integration, playlist scraping, sequential queue handling, ripper timeouts, and database schema constraints.
+
+```bash
+# Run all tests
+bun test
+
+# Run linter and typecheck
+bun run lint
+
+# Auto-fix formatting and lint issues
+bun run lint:fix
+```
+
+---
+
+## Database Management
+
+Database migrations are powered by Drizzle ORM:
+
+```bash
+bun run db:generate   # Generate migration SQL files from schema
+bun run db:migrate    # Apply pending migrations to PostgreSQL
+bun run db:push       # Push schema changes directly (dev prototyping)
+bun run db:studio     # Launch Drizzle Studio web UI
+```
+
+---
+
+## Credits
+
+Special thanks and credit to the [applebruh](https://github.com/avikekkk/applebruh) project for inspiration and foundational research on Apple Music ALAC decryption and workflows.
+
+---
+
+## Disclaimer
+
+This software is strictly intended for **educational, experimental, and research purposes only**.
+
+- This project is **not affiliated with, associated with, authorized by, endorsed by, or in any way officially connected with Apple Inc.** or any of its subsidiaries or affiliates.
+- "Apple", "Apple Music", and "ALAC" are registered trademarks of Apple Inc.
+- Users are solely responsible for ensuring that their use of this software complies with all applicable local, national, and international laws, as well as the terms of service of any third-party platforms. The authors and maintainers assume no liability or responsibility for any misuse or violation of copyright or terms of service.
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
