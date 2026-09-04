@@ -1,7 +1,17 @@
+export type AlacTargetType = 'track' | 'album' | 'playlist'
+
+export interface ParsedTargetItem {
+  id: string
+  type: AlacTargetType
+  storefront?: string
+}
+
 export interface ParsedAlacInput {
+  items: ParsedTargetItem[]
   trackId: string
   force: boolean
   isAlbum?: boolean
+  isPlaylist?: boolean
   storefront?: string
 }
 
@@ -10,7 +20,88 @@ const SONG_WITH_ALBUM_RE =
 const SONG_DIRECT_RE =
   /music\.apple\.com\/(?:([a-z]{2})\/)?song\/(?:[^/]+\/)?(\d+)/i
 const ALBUM_RE = /music\.apple\.com\/(?:([a-z]{2})\/)?album\/(?:[^/]+\/)?(\d+)/i
+const PLAYLIST_RE =
+  /music\.apple\.com\/(?:([a-z]{2})\/)?playlist\/(?:[^/]+\/)?(pl\.(?:u-[a-zA-Z0-9]+|[a-zA-Z0-9]+))/i
 const BARE_ID_RE = /^\d+$/
+const BARE_PLAYLIST_ID_RE = /^(pl\.(?:u-[a-zA-Z0-9]+|[a-zA-Z0-9]+))$/i
+
+export function parseSingleItem(rawToken: string): ParsedTargetItem | null {
+  const token = rawToken.trim()
+  if (!token) return null
+
+  const playlistMatch = token.match(PLAYLIST_RE)
+  if (playlistMatch?.[2]) {
+    return {
+      id: playlistMatch[2],
+      type: 'playlist',
+      storefront: playlistMatch[1]?.toLowerCase(),
+    }
+  }
+
+  const barePlaylistMatch = token.match(BARE_PLAYLIST_ID_RE)
+  if (barePlaylistMatch?.[1]) {
+    return {
+      id: barePlaylistMatch[1],
+      type: 'playlist',
+    }
+  }
+
+  const songWithAlbumMatch = token.match(SONG_WITH_ALBUM_RE)
+  if (songWithAlbumMatch?.[2]) {
+    return {
+      id: songWithAlbumMatch[2],
+      type: 'track',
+      storefront: songWithAlbumMatch[1]?.toLowerCase(),
+    }
+  }
+
+  const songDirectMatch = token.match(SONG_DIRECT_RE)
+  if (songDirectMatch?.[2]) {
+    return {
+      id: songDirectMatch[2],
+      type: 'track',
+      storefront: songDirectMatch[1]?.toLowerCase(),
+    }
+  }
+
+  const albumMatch = token.match(ALBUM_RE)
+  if (albumMatch?.[2]) {
+    return {
+      id: albumMatch[2],
+      type: 'album',
+      storefront: albumMatch[1]?.toLowerCase(),
+    }
+  }
+
+  if (BARE_ID_RE.test(token)) {
+    return {
+      id: token,
+      type: 'track',
+    }
+  }
+
+  return null
+}
+
+export function extractBatchItems(content: string): ParsedTargetItem[] {
+  const lines = content.split(/[\r\n]+/)
+  const results: ParsedTargetItem[] = []
+  const seen = new Set<string>()
+
+  for (const line of lines) {
+    const tokens = line.trim().split(/\s+/)
+    for (const t of tokens) {
+      if (t.startsWith('#') || t.startsWith('//')) break
+      const item = parseSingleItem(t)
+      if (item && !seen.has(`${item.type}:${item.id}`)) {
+        seen.add(`${item.type}:${item.id}`)
+        results.push(item)
+      }
+    }
+  }
+
+  return results
+}
 
 export function parseAlacInput(
   rawText: string,
@@ -34,60 +125,46 @@ export function parseAlacInput(
     }
   }
 
-  let candidate = filteredTokens[0]
+  const items: ParsedTargetItem[] = []
+  const seen = new Set<string>()
 
-  if (!candidate && replyText) {
+  for (const tok of filteredTokens) {
+    const item = parseSingleItem(tok)
+    if (item && !seen.has(`${item.type}:${item.id}`)) {
+      seen.add(`${item.type}:${item.id}`)
+      items.push(item)
+    }
+  }
+
+  if (items.length === 0 && replyText) {
     const replyTokens = replyText.trim().split(/\s+/)
     for (const t of replyTokens) {
-      if (
-        SONG_WITH_ALBUM_RE.test(t) ||
-        SONG_DIRECT_RE.test(t) ||
-        ALBUM_RE.test(t) ||
-        BARE_ID_RE.test(t)
-      ) {
-        candidate = t
-        break
+      const item = parseSingleItem(t)
+      if (item && !seen.has(`${item.type}:${item.id}`)) {
+        seen.add(`${item.type}:${item.id}`)
+        items.push(item)
       }
     }
   }
 
-  if (!candidate) {
+  if (items.length === 0) {
     return null
   }
 
-  const songWithAlbumMatch = candidate.match(SONG_WITH_ALBUM_RE)
-  if (songWithAlbumMatch?.[2]) {
-    return {
-      trackId: songWithAlbumMatch[2],
-      force,
-      isAlbum: false,
-      storefront: songWithAlbumMatch[1]?.toLowerCase(),
-    }
+  const first = items[0]
+  if (!first) return null
+
+  const res: ParsedAlacInput = {
+    items,
+    trackId: first.id,
+    force,
+    isAlbum: first.type === 'album',
+    isPlaylist: first.type === 'playlist',
   }
 
-  const songDirectMatch = candidate.match(SONG_DIRECT_RE)
-  if (songDirectMatch?.[2]) {
-    return {
-      trackId: songDirectMatch[2],
-      force,
-      isAlbum: false,
-      storefront: songDirectMatch[1]?.toLowerCase(),
-    }
+  if (first.storefront) {
+    res.storefront = first.storefront
   }
 
-  const albumMatch = candidate.match(ALBUM_RE)
-  if (albumMatch?.[2]) {
-    return {
-      trackId: albumMatch[2],
-      force,
-      isAlbum: true,
-      storefront: albumMatch[1]?.toLowerCase(),
-    }
-  }
-
-  if (BARE_ID_RE.test(candidate)) {
-    return { trackId: candidate, force, isAlbum: false }
-  }
-
-  return null
+  return res
 }

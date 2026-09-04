@@ -11,8 +11,17 @@ interface CachedEndpoint {
 }
 
 let cached: CachedEndpoint | null = null
+let lastFailure: { time: number; error: string } | null = null
 
-export async function getMirrorEndpoint(forceRefresh = false): Promise<{
+export function clearMirrorCache(): void {
+  cached = null
+  lastFailure = null
+}
+
+export async function getMirrorEndpoint(
+  forceRefresh = false,
+  signal?: AbortSignal,
+): Promise<{
   mirrorUrl: string
   apiKey: string
 }> {
@@ -28,6 +37,16 @@ export async function getMirrorEndpoint(forceRefresh = false): Promise<{
   }
 
   const now = Date.now()
+
+  // Fast-fail if mirror failed recently and caller is not forcing a refresh
+  if (!forceRefresh && lastFailure && now - lastFailure.time < 30_000) {
+    debug('Using cached mirror failure (circuit breaker active)', {
+      elapsed_ms: now - lastFailure.time,
+      error: lastFailure.error,
+    })
+    throw new Error(lastFailure.error)
+  }
+
   if (!forceRefresh && cached && cached.expiresAt > now) {
     debug('Using cached mirror endpoint', {
       mirrorUrl: cached.mirrorUrl,
@@ -42,12 +61,16 @@ export async function getMirrorEndpoint(forceRefresh = false): Promise<{
   const fetchStart = Date.now()
   let resp: Response
   try {
+    const manifestSignal = signal
+      ? AbortSignal.any([signal, AbortSignal.timeout(8_000)])
+      : AbortSignal.timeout(8_000)
+
     resp = await fetch(manifestUrl, {
       headers: {
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/145.0.0.0',
       },
-      signal: AbortSignal.timeout(25_000),
+      signal: manifestSignal,
     })
   } catch (err: unknown) {
     const elapsed = Date.now() - fetchStart
@@ -55,14 +78,16 @@ export async function getMirrorEndpoint(forceRefresh = false): Promise<{
       elapsed_ms: elapsed,
       error: err instanceof Error ? err.message : String(err),
     })
-    throw new Error(
-      `Mirror manifest lookup timed out after ${elapsed}ms: ${err instanceof Error ? err.message : String(err)}`,
-    )
+    const errMsg = `Mirror manifest lookup timed out after ${elapsed}ms: ${err instanceof Error ? err.message : String(err)}`
+    lastFailure = { time: Date.now(), error: errMsg }
+    throw new Error(errMsg)
   }
 
   if (!resp.ok) {
     error('Mirror manifest HTTP error', { status: resp.status })
-    throw new Error(`Failed to fetch mirror manifest (HTTP ${resp.status})`)
+    const errMsg = `Failed to fetch mirror manifest (HTTP ${resp.status})`
+    lastFailure = { time: Date.now(), error: errMsg }
+    throw new Error(errMsg)
   }
 
   const data = (await resp.json()) as {
@@ -80,7 +105,9 @@ export async function getMirrorEndpoint(forceRefresh = false): Promise<{
 
   if (!mirror || !apiKey) {
     error('Mirror manifest missing endpoint or key')
-    throw new Error('Mirror manifest returned empty apple endpoint or api key')
+    const errMsg = 'Mirror manifest returned empty apple endpoint or api key'
+    lastFailure = { time: Date.now(), error: errMsg }
+    throw new Error(errMsg)
   }
 
   debug('Manifest fetched, verifying mirror health...', {
@@ -91,13 +118,17 @@ export async function getMirrorEndpoint(forceRefresh = false): Promise<{
   const statusStart = Date.now()
   let statusResp: Response
   try {
+    const statusSignal = signal
+      ? AbortSignal.any([signal, AbortSignal.timeout(8_000)])
+      : AbortSignal.timeout(8_000)
+
     statusResp = await fetch(`${mirror}/status`, {
       headers: {
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/145.0.0.0',
         'X-API-Key': apiKey,
       },
-      signal: AbortSignal.timeout(25_000),
+      signal: statusSignal,
     })
   } catch (err: unknown) {
     const elapsed = Date.now() - statusStart
@@ -106,14 +137,16 @@ export async function getMirrorEndpoint(forceRefresh = false): Promise<{
       elapsed_ms: elapsed,
       error: err instanceof Error ? err.message : String(err),
     })
-    throw new Error(
-      `Mirror /status check timed out after ${elapsed}ms: ${err instanceof Error ? err.message : String(err)}`,
-    )
+    const errMsg = `Mirror /status check timed out after ${elapsed}ms: ${err instanceof Error ? err.message : String(err)}`
+    lastFailure = { time: Date.now(), error: errMsg }
+    throw new Error(errMsg)
   }
 
   if (!statusResp.ok) {
     error('Mirror /status HTTP error', { mirror, status: statusResp.status })
-    throw new Error(`Mirror /status check failed (HTTP ${statusResp.status})`)
+    const errMsg = `Mirror /status check failed (HTTP ${statusResp.status})`
+    lastFailure = { time: Date.now(), error: errMsg }
+    throw new Error(errMsg)
   }
 
   const statusJson = (await statusResp.json()) as {
@@ -129,8 +162,13 @@ export async function getMirrorEndpoint(forceRefresh = false): Promise<{
       lossless_available: statusJson.wrapper_lossless_available,
       up_instances: upInstances.length,
     })
-    throw new Error('Lossless wrapper is currently offline on mirror')
+    const errMsg = 'Lossless wrapper is currently offline on mirror'
+    lastFailure = { time: Date.now(), error: errMsg }
+    throw new Error(errMsg)
   }
+
+  // Clear any previous failure
+  lastFailure = null
 
   cached = {
     mirrorUrl: mirror,

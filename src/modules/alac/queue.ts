@@ -1,6 +1,7 @@
 export interface EnqueueOptions {
   onPositionChange?: (position: number) => void
   onStart?: () => void
+  signal?: AbortSignal
 }
 
 interface QueuedItem<T> {
@@ -48,6 +49,11 @@ export class SequentialRipQueue implements IRipQueue {
     options?: EnqueueOptions,
   ): Promise<T> {
     return new Promise<T>((resolve, reject) => {
+      if (options?.signal?.aborted) {
+        reject(new Error('Job was aborted'))
+        return
+      }
+
       const controller = new AbortController()
       const item: QueuedItem<T> = {
         id: this.nextId++,
@@ -56,6 +62,22 @@ export class SequentialRipQueue implements IRipQueue {
         reject,
         controller,
         options,
+      }
+
+      const abortHandler = () => {
+        const idx = this.queue.findIndex((i) => i.id === item.id)
+        if (idx !== -1) {
+          this.queue.splice(idx, 1)
+          for (let i = idx; i < this.queue.length; i++) {
+            this.queue[i]?.options?.onPositionChange?.(i + 1)
+          }
+        }
+        item.controller.abort()
+        item.reject(new Error('Job was aborted'))
+      }
+
+      if (options?.signal) {
+        options.signal.addEventListener('abort', abortHandler, { once: true })
       }
 
       this.queue.push(item as QueuedItem<unknown>)

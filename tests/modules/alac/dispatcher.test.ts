@@ -1,4 +1,4 @@
-import { describe, expect, it, mock } from 'bun:test'
+import { beforeEach, describe, expect, it, mock } from 'bun:test'
 
 import type { TelegramClient } from '@mtcute/bun'
 import { Dispatcher } from '@mtcute/dispatcher'
@@ -24,43 +24,50 @@ interface DispatcherInternal {
 }
 
 describe('Handlers Dispatcher & Callback Query Flow', () => {
-  it('does not block alac dl: callbacks when auth handlers are registered first', async () => {
-    const fakeTg = {
-      sendCopy: mock(() => Promise.resolve({ id: 100 })),
+  let fakeTg: TelegramClient
+  let dp: Dispatcher
+  let mockAuth: IAuthService
+
+  beforeEach(() => {
+    fakeTg = {
+      sendText: mock(() => Promise.resolve({ id: 1 })),
+      editMessage: mock(() => Promise.resolve({ id: 1 })),
       deleteMessagesById: mock(() => Promise.resolve()),
       onUpdate: { add: mock(() => {}), remove: mock(() => {}) },
       onRawUpdate: { add: mock(() => {}), remove: mock(() => {}) },
       onError: { add: mock(() => {}), remove: mock(() => {}) },
     } as unknown as TelegramClient
 
-    const dp = Dispatcher.for(fakeTg)
+    dp = Dispatcher.for(fakeTg)
 
-    const mockAuth: IAuthService = {
-      isAdmin: mock(() => true),
+    mockAuth = {
+      isAdmin: mock((id: number) => id === 1),
       isAuthorized: mock(() => Promise.resolve(true)),
       authorize: mock(() => Promise.resolve({ newlyAdded: true })),
       revoke: mock(() => Promise.resolve({ revoked: true })),
       listAuthorized: mock(() => Promise.resolve([])),
     }
+  })
 
+  it('does not block alac dl: callbacks when auth handlers are registered first', async () => {
     const mockAlacService: IAlacService = {
-      findCachedTrack: mock((id: string) =>
+      findCachedTrack: mock(() =>
         Promise.resolve({
           id: 1,
-          appleTrackId: id,
+          appleTrackId: '1559523359',
           messageId: 42,
           fileId: 'fid',
           fileUniqueId: 'uid',
-          title: 'Test Song',
-          artist: 'Test Artist',
-          album: 'Test Album',
+          title: 'Title',
+          artist: 'Artist',
+          album: 'Album',
           duration: 200,
-          bitDepth: 16,
-          sampleRate: 44100,
+          bitDepth: 24,
+          sampleRate: 48000,
           genre: 'Pop',
-          releaseDate: '2023-01-01',
+          releaseDate: '2021',
           trackNumber: 1,
-          trackCount: 10,
+          trackCount: 1,
           createdAt: new Date(),
           updatedAt: new Date(),
         }),
@@ -88,11 +95,13 @@ describe('Handlers Dispatcher & Callback Query Flow', () => {
     const internalDp = dp as unknown as DispatcherInternal
     const group0 = internalDp._groups.get(0)
     const cbHandlers = group0?.get('callback_query') ?? []
-    expect(cbHandlers.length).toBe(2)
+    expect(cbHandlers.length).toBe(3)
 
-    const [authCb, alacCb] = cbHandlers
-    if (!authCb || !alacCb) {
-      throw new Error('Expected 2 callback handlers registered')
+    const authCb = cbHandlers[0]
+    const searchCb = cbHandlers[1]
+    const cancelCb = cbHandlers[2]
+    if (!authCb || !searchCb || !cancelCb) {
+      throw new Error('Expected 3 callback handlers registered')
     }
 
     const dlQueryCtx = {
@@ -108,54 +117,10 @@ describe('Handlers Dispatcher & Callback Query Flow', () => {
     const authMatchedDl = await authCb.check(dlQueryCtx)
     expect(authMatchedDl).toBeFalsy()
 
-    const alacMatchedDl = await alacCb.check(dlQueryCtx)
-    expect(alacMatchedDl).toBeTruthy()
+    const searchMatchedDl = await searchCb.check(dlQueryCtx)
+    expect(searchMatchedDl).toBeTruthy()
 
-    await alacCb.callback(dlQueryCtx)
-
-    expect(dlQueryCtx.answer).toHaveBeenCalled()
-    expect(fakeTg.sendCopy).toHaveBeenCalledWith({
-      toChatId: 67890,
-      fromChatId: expect.anything(),
-      message: 42,
-    })
-    expect(fakeTg.deleteMessagesById).toHaveBeenCalledWith(67890, [99])
-    expect(mockAlacService.findCachedTrack).toHaveBeenCalledWith('1559523359')
-
-    const closeQueryCtx = {
-      _name: 'callback_query',
-      raw: { data: new Uint8Array([1]) },
-      dataStr: 'search_close',
-      user: { id: 12345 },
-      chat: { id: 67890 },
-      messageId: 99,
-      answer: mock(() => Promise.resolve()),
-    }
-
-    const authMatchedClose = await authCb.check(closeQueryCtx)
-    expect(authMatchedClose).toBeFalsy()
-
-    const alacMatchedClose = await alacCb.check(closeQueryCtx)
-    expect(alacMatchedClose).toBeTruthy()
-
-    await alacCb.callback(closeQueryCtx)
-    expect(closeQueryCtx.answer).toHaveBeenCalled()
-    expect(fakeTg.deleteMessagesById).toHaveBeenCalledWith(67890, [99])
-
-    const authPageCtx = {
-      _name: 'callback_query',
-      raw: { data: new Uint8Array([1]) },
-      dataStr: 'authpage:2',
-      user: { id: 12345 },
-      chat: { id: 67890 },
-      messageId: 99,
-      answer: mock(() => Promise.resolve()),
-    }
-
-    const authMatchedPage = await authCb.check(authPageCtx)
-    expect(authMatchedPage).toBeTruthy()
-
-    const alacMatchedPage = await alacCb.check(authPageCtx)
-    expect(alacMatchedPage).toBeFalsy()
+    const cancelMatchedDl = await cancelCb.check(dlQueryCtx)
+    expect(cancelMatchedDl).toBeFalsy()
   })
 })

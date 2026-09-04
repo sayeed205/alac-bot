@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 
 import { env } from '@/env.ts'
-import { getMirrorEndpoint } from '@/modules/alac/manifest.ts'
+import { clearMirrorCache, getMirrorEndpoint } from '@/modules/alac/manifest.ts'
 
 describe('Mirror Manifest & Endpoint Resolution', () => {
   const originalFetch = globalThis.fetch
@@ -12,11 +12,13 @@ describe('Mirror Manifest & Endpoint Resolution', () => {
   const originalApiKey = env.ALAC_API_KEY
 
   beforeEach(() => {
+    clearMirrorCache()
     delete (env as Record<string, unknown>).ALAC_MIRROR_URL
     delete (env as Record<string, unknown>).ALAC_API_KEY
   })
 
   afterEach(() => {
+    clearMirrorCache()
     globalThis.fetch = originalFetch
     if (originalMirrorUrl !== undefined) {
       ;(env as Record<string, unknown>).ALAC_MIRROR_URL = originalMirrorUrl
@@ -123,7 +125,7 @@ describe('Mirror Manifest & Endpoint Resolution', () => {
     setFetch(async (input: RequestInfo | URL) => {
       const urlStr = String(input)
       if (urlStr.includes('/status')) {
-        return new Response('Offline', { status: 503 })
+        return new Response('Unavailable', { status: 503 })
       }
       return new Response(
         JSON.stringify({
@@ -163,5 +165,24 @@ describe('Mirror Manifest & Endpoint Resolution', () => {
     expect(getMirrorEndpoint(true)).rejects.toThrow(
       'Lossless wrapper is currently offline on mirror',
     )
+  })
+
+  it('fast-fails consecutive requests when circuit breaker is active', async () => {
+    let callCount = 0
+    setFetch(async () => {
+      callCount++
+      throw new Error('Connection timeout')
+    })
+
+    await expect(getMirrorEndpoint(false)).rejects.toThrow(
+      'Mirror manifest lookup timed out',
+    )
+    expect(callCount).toBe(1)
+
+    // Second call should fast-fail from circuit breaker without calling fetch again
+    await expect(getMirrorEndpoint(false)).rejects.toThrow(
+      'Mirror manifest lookup timed out',
+    )
+    expect(callCount).toBe(1)
   })
 })

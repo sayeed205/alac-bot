@@ -1,12 +1,19 @@
 import { existsSync, unlinkSync } from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 
-import { html } from '@mtcute/bun'
+import { BotKeyboard, html } from '@mtcute/bun'
 import { filters } from '@mtcute/dispatcher'
 
 import { env } from '@/env.ts'
 import { formatDumpCaption } from '@/modules/alac/indexer.ts'
 import { fetchAlbumTracks } from '@/modules/alac/itunes.ts'
-import { parseAlacInput } from '@/modules/alac/parser.ts'
+import {
+  extractBatchItems,
+  type ParsedTargetItem,
+  parseAlacInput,
+} from '@/modules/alac/parser.ts'
+import { fetchPlaylistTracks } from '@/modules/alac/playlist.ts'
 import type { TrackRipResult } from '@/modules/alac/ripper.ts'
 import { debug, debugSpan, error, info, infoSpan } from '@/utils/logger.ts'
 import { formatByteProgress, renderProgressBar } from '@/utils/progress.ts'
@@ -14,424 +21,781 @@ import { formatByteProgress, renderProgressBar } from '@/utils/progress.ts'
 import type { CommandContext } from './types.ts'
 import { parseDynamicHtml } from './types.ts'
 
+interface ResolvedTrackItem {
+  id: string
+  title?: string
+  artist?: string
+  storefront?: string
+}
+
+export interface ActiveRipJob {
+  id: string
+  chatId: number
+  userId: number
+  jobHeader: string
+  totalTracks: number
+  statusMsgId: number
+  controller: AbortController
+  isCancelled: boolean
+  cancelledBy?: string
+  cachedCount: number
+  rippedCount: number
+  failedCount: number
+  completed: boolean
+}
+
+export const activeJobs = new Map<string, ActiveRipJob>()
+
 export function registerRipCommand(ctx: CommandContext): void {
   const { dp, tg, service, ripper, queue, auth } = ctx
 
-  dp.onNewMessage(filters.command(['alac', 'rerip']), async (msg) => {
-    using _cmdSpan = infoSpan('alac').enter()
+  dp.onNewMessage(
+    filters.command(['alac', 'rip', 'batch', 'dl', 'download', 'rerip']),
+    async (msg) => {
+      using _cmdSpan = infoSpan('alac').enter()
 
-    const isAuthed = await auth.isAuthorized(msg.sender.id, msg.chat.id)
-    if (!isAuthed) {
-      debug('Unauthorized user attempted alac command', {
-        user_id: msg.sender.id,
-      })
-      return
-    }
-
-    const commandText = msg.text.trim().split(/\s+/)[0]?.toLowerCase()
-    const isRerip = commandText?.includes('rerip')
-
-    const replyMsg = await msg.getReplyTo().catch(() => null)
-    const parsed = parseAlacInput(msg.text, replyMsg?.text)
-    if (!parsed) {
-      debug('Invalid alac input received', { text: msg.text })
-      await msg.replyText(
-        parseDynamicHtml(
-          '🎵 <b>Apple Music Lossless Ripper</b><br/><br/>' +
-            '<blockquote><b>Usage:</b><br/>' +
-            '• <code>/alac &lt;apple_music_link | track_id&gt;</code><br/>' +
-            '• Reply to an Apple Music link with <code>/alac</code><br/>' +
-            '• <code>/alac &lt;link&gt; -f</code> <i>(force re-rip)</i></blockquote>',
-        ),
-      )
-      return
-    }
-
-    const isAdmin = auth.isAdmin(msg.sender.id)
-    const isForce = parsed.force || isRerip
-
-    if (isForce && !isAdmin) {
-      debug('Non-admin requested force re-rip', { user_id: msg.sender.id })
-      await msg.replyText(
-        parseDynamicHtml(
-          '🔒 <b>Access Restricted:</b> Force re-rip is restricted to the bot owner.',
-        ),
-      )
-      return
-    }
-
-    info('Rip request', {
-      target: parsed.trackId,
-      type: parsed.isAlbum ? 'album' : 'track',
-      force: isForce,
-    })
-
-    let trackIds: string[] = [parsed.trackId]
-    let albumHeader = ''
-
-    if (parsed.isAlbum) {
-      try {
-        const albumData = await fetchAlbumTracks(
-          parsed.trackId,
-          parsed.storefront,
-        )
-        trackIds = albumData.tracks.map((t) => t.id)
-        albumHeader = `<b>${html.escape(albumData.album.title)}</b> by <b>${html.escape(albumData.album.artist)}</b> (${trackIds.length} tracks)`
-      } catch (err: unknown) {
-        const msgText = err instanceof Error ? err.message : String(err)
-        error('Failed to resolve album tracks', {
-          album_id: parsed.trackId,
-          error: msgText,
+      const isAuthed = await auth.isAuthorized(msg.sender.id, msg.chat.id)
+      if (!isAuthed) {
+        debug('Unauthorized user attempted alac command', {
+          user_id: msg.sender.id,
         })
-        await msg.replyText(
-          parseDynamicHtml(`Failed to fetch album tracks: ${msgText}`),
-        )
         return
       }
-    }
 
-    const isAlbum = Boolean(parsed.isAlbum)
-    let albumStatusMsgId: number | null = null
-    let completedTracksCount = 0
-    const failedTracks: { trackId: string; error: string }[] = []
-    const albumStartTime = Date.now()
+      const commandText = msg.text.trim().split(/\s+/)[0]?.toLowerCase()
+      const isRerip = commandText?.includes('rerip')
 
-    if (isAlbum) {
-      const initStatus = await msg.replyText(
-        parseDynamicHtml(
-          `💿 <b>Album:</b> ${albumHeader}<br/>` +
-            `<b>Progress:</b> <code>[░░░░░░░░░░] 0/${trackIds.length} (0%)</code><br/>` +
-            `<b>Status:</b> ⏳ Initializing queue...`,
-        ),
-      )
-      albumStatusMsgId = initStatus.id
-    }
+      const replyMsg = await msg.getReplyTo().catch(() => null)
 
-    const cachedTracksMap = !isForce
-      ? await service.findCachedTracks(trackIds)
-      : new Map()
+      // Check for .txt document attachment on command or replied message
+      let documentContent: string | null = null
+      const docMedia =
+        msg.media?.type === 'document'
+          ? msg.media
+          : replyMsg?.media?.type === 'document'
+            ? replyMsg.media
+            : null
 
-    for (let index = 0; index < trackIds.length; index++) {
-      const trackId = trackIds[index]
-      if (!trackId) continue
-
-      using _trackSpan = debugSpan('track_job', {
-        track_id: trackId,
-      }).enter()
-
-      const trackPrefix =
-        !isAlbum && trackIds.length > 1
-          ? `[${index + 1}/${trackIds.length}] `
-          : ''
-
-      const startTime = Date.now()
-
-      if (!isForce) {
-        const cached = cachedTracksMap.get(trackId)
-        if (cached) {
+      if (docMedia && 'fileName' in docMedia) {
+        const fileName = (docMedia.fileName || '').toLowerCase()
+        const mimeType = (docMedia.mimeType || '').toLowerCase()
+        if (fileName.endsWith('.txt') || mimeType === 'text/plain') {
+          const tmpFile = path.join(
+            os.tmpdir(),
+            `batch_${Date.now()}_${Math.random().toString(36).slice(2)}.txt`,
+          )
           try {
-            await tg.sendCopy({
-              toChatId: msg.chat.id,
-              fromChatId: env.DUMP_CHANNEL_ID,
-              message: cached.messageId,
-              replyTo: msg.id,
-            })
-
-            const durationMs = Date.now() - startTime
-            info('Cache hit: delivered', {
-              track_id: trackId,
-              time: `${durationMs}ms`,
-            })
-
-            await service.logRequest({
-              telegramId: msg.sender.id,
-              chatId: msg.chat.id,
-              appleTrackId: trackId,
-              isCacheHit: true,
-              durationMs,
-              status: 'completed',
-            })
-
-            completedTracksCount++
-            if (isAlbum && albumStatusMsgId) {
-              const percent = Math.round(
-                (completedTracksCount / trackIds.length) * 100,
-              )
-              const bar = renderProgressBar(
-                completedTracksCount,
-                trackIds.length,
-                10,
-              )
-              await tg
-                .editMessage({
-                  chatId: msg.chat.id,
-                  message: albumStatusMsgId,
-                  text: parseDynamicHtml(
-                    `💿 <b>Album:</b> ${albumHeader}<br/>` +
-                      `<b>Progress:</b> <code>${bar} ${completedTracksCount}/${trackIds.length} (${percent}%)</code><br/>` +
-                      `<b>Status:</b> ⚡ Delivered track ${index + 1} from cache`,
-                  ),
-                })
-                .catch(() => null)
-            }
-            continue
+            await tg.downloadToFile(tmpFile, docMedia)
+            documentContent = await Bun.file(tmpFile).text()
           } catch (err) {
-            debug('Cached message delivery failed, falling back to rip', {
-              track_id: trackId,
+            debug('Failed to download batch text document', {
               error: String(err),
             })
-            // Remove broken cache entry so future requests re-rip cleanly
-            await service.deleteTrack(trackId).catch(() => null)
+          } finally {
+            if (existsSync(tmpFile)) {
+              try {
+                unlinkSync(tmpFile)
+              } catch {}
+            }
           }
         }
       }
 
-      debug('Queueing rip job', { track_id: trackId })
-      let statusMsg: { id: number } | null = null
-      if (!isAlbum) {
-        statusMsg = await msg.replyText(
-          parseDynamicHtml(`${trackPrefix}Queued (Position #1)`),
-        )
+      let parsedItems: ParsedTargetItem[] = []
+      let isForce = isRerip
+      let singleStorefront: string | undefined
+
+      if (documentContent) {
+        parsedItems = extractBatchItems(documentContent)
+        const textTokens = msg.text.trim().split(/\s+/)
+        if (textTokens.includes('-f') || textTokens.includes('--force')) {
+          isForce = true
+        }
+      } else {
+        const parsed = parseAlacInput(msg.text, replyMsg?.text)
+        if (parsed) {
+          parsedItems = parsed.items
+          isForce = isForce || parsed.force
+          singleStorefront = parsed.storefront
+        }
       }
 
-      let lastUpdate = 0
-      let lastText = ''
+      if (parsedItems.length === 0) {
+        debug('Invalid alac input received', { text: msg.text })
+        await msg.replyText(
+          parseDynamicHtml(
+            '🎵 <b>Apple Music Lossless Ripper</b><br/><br/>' +
+              '<blockquote><b>Supported Inputs:</b><br/>' +
+              '• <b>Track:</b> <code>/alac &lt;link | id&gt;</code><br/>' +
+              '• <b>Album:</b> <code>/alac &lt;album_link&gt;</code><br/>' +
+              '• <b>Playlist:</b> <code>/alac &lt;playlist_link&gt;</code><br/>' +
+              '• <b>Batch:</b> Send multiple links or attach a <code>.txt</code> file<br/>' +
+              '• <b>Aliases:</b> <code>/rip</code>, <code>/batch</code>, <code>/dl</code>, <code>/download</code><br/>' +
+              '• <b>Cancel:</b> <code>/cancel</code> or tap the Cancel button on any active download<br/>' +
+              '• <b>Options:</b> <code>-f</code> <i>(force re-rip)</i></blockquote>',
+          ),
+        )
+        return
+      }
 
-      const updateStatus = async (text: string, force = false) => {
-        let formatted: string
-        let targetMsgId: number
+      const isAdmin = auth.isAdmin(msg.sender.id)
+      if (isForce && !isAdmin) {
+        debug('Non-admin requested force re-rip', { user_id: msg.sender.id })
+        await msg.replyText(
+          parseDynamicHtml(
+            '🔒 <b>Access Restricted:</b> Force re-rip is restricted to the bot owner.',
+          ),
+        )
+        return
+      }
 
-        if (isAlbum && albumStatusMsgId) {
-          const percent = Math.round(
-            (completedTracksCount / trackIds.length) * 100,
+      const isGroup = msg.chat.id !== msg.sender.id
+      let deliveryChatId = msg.chat.id
+
+      // In group chats, verify user has started the bot in DM so files can be sent privately
+      if (isGroup) {
+        try {
+          await tg.sendText(
+            msg.sender.id,
+            parseDynamicHtml(
+              `📥 <b>Download Queued:</b><br/>Tracks requested in <b>${html.escape(msg.chat.displayName || 'the group')}</b> will be delivered here!`,
+            ),
+            { silent: true },
           )
-          const bar = renderProgressBar(
-            completedTracksCount,
-            trackIds.length,
-            10,
+          deliveryChatId = msg.sender.id
+        } catch (_err) {
+          debug('Cannot send to user DM, prompting to start bot in private', {
+            user_id: msg.sender.id,
+          })
+          const me = await tg.getMe().catch(() => null)
+          const botUsername = me?.username || 'alac_bot'
+          const keyboard = BotKeyboard.inline([
+            [
+              BotKeyboard.url(
+                '👉 Start Bot in DM',
+                `https://t.me/${botUsername}?start=start`,
+              ),
+            ],
+          ])
+
+          await msg.replyText(
+            parseDynamicHtml(
+              '⚠️ <b>Direct Message Required</b><br/><br/>' +
+                'To keep this group clean, all audio files are sent directly to your private DM.<br/>' +
+                'Please click the button below to start the bot in DM, then send your request again!',
+            ),
+            { replyMarkup: keyboard },
           )
-          formatted =
-            `💿 <b>Album:</b> ${albumHeader}<br/>` +
-            `<b>Progress:</b> <code>${bar} ${completedTracksCount}/${trackIds.length} (${percent}%)</code><br/>` +
-            `<b>Current [${index + 1}/${trackIds.length}]:</b> ${text}`
-          targetMsgId = albumStatusMsgId
-        } else if (statusMsg) {
-          formatted = `${trackPrefix}${text}`
-          targetMsgId = statusMsg.id
-        } else {
           return
         }
+      }
+
+      // Resolve all items (tracks, albums, playlists) into track IDs
+      const resolvingStatus = await msg.replyText(
+        parseDynamicHtml('🔍 <b>Resolving tracks from Apple Music...</b>'),
+      )
+
+      const jobId = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`
+      const jobController = new AbortController()
+
+      const currentJob: ActiveRipJob = {
+        id: jobId,
+        chatId: msg.chat.id,
+        userId: msg.sender.id,
+        jobHeader: '',
+        totalTracks: 0,
+        statusMsgId: resolvingStatus.id,
+        controller: jobController,
+        isCancelled: false,
+        cachedCount: 0,
+        rippedCount: 0,
+        failedCount: 0,
+        completed: false,
+      }
+      activeJobs.set(jobId, currentJob)
+
+      const tracksToProcess: ResolvedTrackItem[] = []
+      const seenTrackIds = new Set<string>()
+      let jobHeader = ''
+      const failedItems: string[] = []
+
+      for (const item of parsedItems) {
+        if (currentJob.isCancelled || jobController.signal.aborted) break
+
+        try {
+          if (item.type === 'album') {
+            const albumData = await fetchAlbumTracks(
+              item.id,
+              item.storefront || singleStorefront,
+            )
+            if (!jobHeader) {
+              jobHeader = `Album: <b>${html.escape(albumData.album.title)}</b> by <b>${html.escape(albumData.album.artist)}</b>`
+            }
+            for (const t of albumData.tracks) {
+              if (!seenTrackIds.has(t.id)) {
+                seenTrackIds.add(t.id)
+                tracksToProcess.push({
+                  id: t.id,
+                  title: t.title,
+                  artist: t.artist,
+                  storefront: item.storefront || singleStorefront,
+                })
+              }
+            }
+          } else if (item.type === 'playlist') {
+            const playlistData = await fetchPlaylistTracks(
+              item.id,
+              item.storefront || singleStorefront,
+            )
+            if (!jobHeader) {
+              jobHeader = `Playlist: <b>${html.escape(playlistData.title)}</b>${playlistData.curatorName ? ` (${html.escape(playlistData.curatorName)})` : ''}`
+            }
+            for (const t of playlistData.tracks) {
+              if (!seenTrackIds.has(t.id)) {
+                seenTrackIds.add(t.id)
+                tracksToProcess.push({
+                  id: t.id,
+                  title: t.title,
+                  artist: t.artist,
+                  storefront: item.storefront || singleStorefront,
+                })
+              }
+            }
+          } else {
+            // Single track
+            if (!seenTrackIds.has(item.id)) {
+              seenTrackIds.add(item.id)
+              tracksToProcess.push({
+                id: item.id,
+                storefront: item.storefront || singleStorefront,
+              })
+            }
+          }
+        } catch (err: unknown) {
+          const errMsg = err instanceof Error ? err.message : String(err)
+          failedItems.push(`${item.type} ${item.id}: ${errMsg}`)
+          error('Failed to resolve target item', {
+            type: item.type,
+            id: item.id,
+            error: errMsg,
+          })
+        }
+      }
+
+      if (currentJob.isCancelled || jobController.signal.aborted) {
+        activeJobs.delete(jobId)
+        return
+      }
+
+      if (tracksToProcess.length === 0) {
+        activeJobs.delete(jobId)
+        const errorDetail =
+          failedItems.length > 0
+            ? `<br/><code>${html.escape(failedItems.join('\n'))}</code>`
+            : ''
+        await tg
+          .editMessage({
+            chatId: msg.chat.id,
+            message: resolvingStatus.id,
+            text: parseDynamicHtml(
+              `⚠️ <b>Failed to resolve any tracks:</b>${errorDetail}`,
+            ),
+          })
+          .catch(() => null)
+        return
+      }
+
+      const isMultiTrack = tracksToProcess.length > 1
+      if (!jobHeader) {
+        jobHeader = isMultiTrack
+          ? `Batch: <b>${tracksToProcess.length} tracks</b>`
+          : `Track ID: <code>${tracksToProcess[0]?.id}</code>`
+      }
+
+      currentJob.jobHeader = jobHeader
+      currentJob.totalTracks = tracksToProcess.length
+
+      info('Rip job queued', {
+        jobId,
+        tracksCount: tracksToProcess.length,
+        force: isForce,
+        isGroup,
+        deliveryChatId,
+      })
+
+      const statusMsgId = resolvingStatus.id
+      let cachedCount = 0
+      let rippedCount = 0
+      const failedTracks: { id: string; error: string }[] = []
+      const jobStartTime = Date.now()
+      let lastStatusUpdate = 0
+      let lastStatusText = ''
+
+      const cancelKeyboard = BotKeyboard.inline([
+        [BotKeyboard.callback('❌ Cancel Download', `cancel:${jobId}`)],
+      ])
+
+      const updateProgress = async (currentStatus: string, force = false) => {
+        if (currentJob.isCancelled || jobController.signal.aborted) return
+
+        const total = tracksToProcess.length
+        const completed = cachedCount + rippedCount + failedTracks.length
+        const percent = Math.min(100, Math.round((completed / total) * 100))
+        const bar = renderProgressBar(completed, total, 10)
+
+        const formatted =
+          `📋 <b>${jobHeader}</b><br/>` +
+          `<b>Progress:</b> <code>${bar} ${completed}/${total} (${percent}%)</code><br/>` +
+          `<b>Status:</b> ⚡ ${cachedCount} cached • 🎵 ${rippedCount} ripped${failedTracks.length > 0 ? ` • ⚠️ ${failedTracks.length} failed` : ''}<br/>` +
+          `<b>Current:</b> ${currentStatus}` +
+          (isGroup ? '<br/><i>Files delivered to your private DM 📩</i>' : '')
 
         const now = Date.now()
-        if (formatted === lastText) return
-        if (!force && now - lastUpdate < 1200) return
-        lastUpdate = now
-        lastText = formatted
+        if (formatted === lastStatusText) return
+        if (!force && now - lastStatusUpdate < 1500) return
+        lastStatusUpdate = now
+        lastStatusText = formatted
 
         await tg
           .editMessage({
             chatId: msg.chat.id,
-            message: targetMsgId,
+            message: statusMsgId,
             text: parseDynamicHtml(formatted),
+            replyMarkup: cancelKeyboard,
           })
           .catch(() => null)
       }
 
-      try {
-        await queue.enqueue(
-          async () => {
-            await updateStatus('Connecting to Apple Music server...', true)
+      await updateProgress('Checking local cache...', true)
 
-            let ripResult: TrackRipResult | null = null
+      const allTrackIds = tracksToProcess.map((t) => t.id)
+      const cachedTracksMap = !isForce
+        ? await service.findCachedTracks(allTrackIds)
+        : new Map()
 
+      for (let index = 0; index < tracksToProcess.length; index++) {
+        if (currentJob.isCancelled || jobController.signal.aborted) {
+          break
+        }
+
+        const item = tracksToProcess[index]
+        if (!item) continue
+        const trackId = item.id
+
+        using _trackSpan = debugSpan('track_job', { track_id: trackId }).enter()
+        const startTime = Date.now()
+
+        if (!isForce) {
+          const cached = cachedTracksMap.get(trackId)
+          if (cached) {
             try {
-              ripResult = await ripper.rip(
-                trackId,
-                async (status) => {
-                  await updateStatus(status)
-                },
-                parsed.storefront,
-              )
-
-              await updateStatus('📤 <b>Uploading to Telegram...</b>', true)
-              debug('Uploading track to dump channel', {
-                track_id: trackId,
-                file: ripResult.filePath,
-              })
-
-              const caption = formatDumpCaption({
-                appleTrackId: trackId,
-                title: ripResult.title,
-                artist: ripResult.artist,
-                album: ripResult.album,
-                duration: ripResult.duration,
-                bitDepth: ripResult.bitDepth,
-                sampleRate: ripResult.sampleRate,
-                genre: ripResult.genre,
-                releaseDate: ripResult.releaseDate,
-                trackNumber: ripResult.trackNumber,
-                trackCount: ripResult.trackCount,
-              })
-
-              const dumpMsg = await tg.sendMedia(
-                env.DUMP_CHANNEL_ID,
-                {
-                  type: 'audio',
-                  file: Bun.file(ripResult.filePath),
-                  title: ripResult.title,
-                  performer: ripResult.artist,
-                  duration: ripResult.duration,
-                  caption,
-                },
-                {
-                  progressCallback: (uploaded, total) => {
-                    if (total > 0) {
-                      const progressText = formatByteProgress(
-                        uploaded,
-                        total,
-                        10,
-                      )
-                      updateStatus(
-                        `📤 <b>Uploading to Telegram:</b><br/><code>${progressText}</code>`,
-                      )
-                    }
-                  },
-                },
-              )
-
-              let fileId = ''
-              let fileUniqueId = ''
-              if (dumpMsg.media && dumpMsg.media.type === 'audio') {
-                fileId = dumpMsg.media.fileId
-                fileUniqueId = dumpMsg.media.uniqueFileId
-              }
-
-              await service.saveTrack({
-                appleTrackId: trackId,
-                messageId: dumpMsg.id,
-                fileId,
-                fileUniqueId,
-                title: ripResult.title,
-                artist: ripResult.artist,
-                album: ripResult.album,
-                duration: ripResult.duration,
-                bitDepth: ripResult.bitDepth,
-                sampleRate: ripResult.sampleRate,
-                genre: ripResult.genre,
-                releaseDate: ripResult.releaseDate,
-                trackNumber: ripResult.trackNumber,
-                trackCount: ripResult.trackCount,
-              })
-
               await tg.sendCopy({
-                toChatId: msg.chat.id,
+                toChatId: deliveryChatId,
                 fromChatId: env.DUMP_CHANNEL_ID,
-                message: dumpMsg.id,
-                replyTo: msg.id,
+                message: cached.messageId,
+                ...(deliveryChatId === msg.chat.id ? { replyTo: msg.id } : {}),
+                silent: isMultiTrack,
               })
 
-              if (!isAlbum && statusMsg) {
-                await tg
-                  .deleteMessagesById(msg.chat.id, [statusMsg.id])
-                  .catch(() => null)
-              }
-
-              completedTracksCount++
-              const totalDurationMs = Date.now() - startTime
-              info('Track completed', {
-                track: `${ripResult.artist} - ${ripResult.title}`,
-                time: `${(totalDurationMs / 1000).toFixed(1)}s`,
+              const durationMs = Date.now() - startTime
+              info('Cache hit: delivered', {
+                track_id: trackId,
+                time: `${durationMs}ms`,
               })
 
               await service.logRequest({
                 telegramId: msg.sender.id,
                 chatId: msg.chat.id,
                 appleTrackId: trackId,
-                isCacheHit: false,
-                durationMs: totalDurationMs,
+                isCacheHit: true,
+                durationMs,
                 status: 'completed',
               })
-            } finally {
-              if (ripResult && existsSync(ripResult.filePath)) {
-                try {
-                  unlinkSync(ripResult.filePath)
-                } catch {}
-              }
+
+              cachedCount++
+              currentJob.cachedCount = cachedCount
+              await updateProgress(`⚡ Cache hit delivered: ${trackId}`)
+              continue
+            } catch (copyErr) {
+              debug('Cache forward failed, falling back to ripper', {
+                track_id: trackId,
+                error: String(copyErr),
+              })
             }
-          },
-          {
-            onPositionChange: (pos) => {
-              debug('Queue position changed', { track_id: trackId, pos })
-              updateStatus(
-                `⏳ <b>In Queue:</b> Position <code>#${pos}</code>`,
-                true,
-              )
-            },
-            onStart: () => {
-              debug('Queue job starting execution', { track_id: trackId })
-              updateStatus('Connecting to Apple Music server...', true)
-            },
-          },
-        )
-      } catch (err: unknown) {
-        const errorMsg =
-          err instanceof Error ? err.message : 'Unknown error during ripping'
-        const totalDurationMs = Date.now() - startTime
-
-        error('Rip job failed', {
-          track_id: trackId,
-          duration_ms: totalDurationMs,
-          error: errorMsg,
-          stack: err instanceof Error ? err.stack : undefined,
-        })
-
-        if (isAlbum) {
-          failedTracks.push({ trackId, error: errorMsg })
-          await updateStatus(
-            `⚠️ Track ${index + 1} failed: ${html.escape(errorMsg)}`,
-            true,
-          )
-        } else if (statusMsg) {
-          const escapedError = html.escape(errorMsg)
-          const failText = `${trackPrefix}❌ <b>Failed:</b> <code>${escapedError}</code>`
-          await tg
-            .editMessage({
-              chatId: msg.chat.id,
-              message: statusMsg.id,
-              text: parseDynamicHtml(failText),
-            })
-            .catch(() => null)
+          }
         }
 
-        await service.logRequest({
-          telegramId: msg.sender.id,
-          chatId: msg.chat.id,
-          appleTrackId: trackId,
-          isCacheHit: false,
-          durationMs: totalDurationMs,
-          status: 'failed',
-          errorReason: errorMsg,
-        })
-      }
-    }
+        // Rip via queue
+        try {
+          await queue.enqueue(
+            async (taskSignal) => {
+              if (currentJob.isCancelled || taskSignal.aborted) {
+                throw new Error('Download was cancelled')
+              }
 
-    if (isAlbum && albumStatusMsgId) {
-      const totalElapsedSec = Math.round((Date.now() - albumStartTime) / 1000)
-      const failedText =
-        failedTracks.length > 0
-          ? `<br/>⚠️ <i>Failed tracks (${failedTracks.length}):</i> ${failedTracks.map((f) => `<code>${f.trackId}</code>`).join(', ')}`
-          : ''
-      const completionText =
-        `✅ <b>Album Completed:</b> ${albumHeader}<br/>` +
-        `Delivered <b>${completedTracksCount}/${trackIds.length}</b> tracks in ${totalElapsedSec}s.${failedText}`
+              await updateProgress(
+                `Connecting mirror for track #${index + 1}...`,
+                true,
+              )
+
+              let ripResult: TrackRipResult | null = null
+
+              try {
+                ripResult = await ripper.rip(
+                  trackId,
+                  async (status) => {
+                    await updateProgress(status)
+                  },
+                  item.storefront,
+                  taskSignal,
+                )
+
+                if (currentJob.isCancelled || taskSignal.aborted) {
+                  throw new Error('Download was cancelled')
+                }
+
+                await updateProgress('📤 <b>Uploading to Telegram...</b>', true)
+                debug('Uploading track to dump channel', {
+                  track_id: trackId,
+                  file: ripResult.filePath,
+                })
+
+                const caption = formatDumpCaption({
+                  appleTrackId: trackId,
+                  title: ripResult.title,
+                  artist: ripResult.artist,
+                  album: ripResult.album,
+                  duration: ripResult.duration,
+                  bitDepth: ripResult.bitDepth,
+                  sampleRate: ripResult.sampleRate,
+                  genre: ripResult.genre,
+                  releaseDate: ripResult.releaseDate,
+                  trackNumber: ripResult.trackNumber,
+                  trackCount: ripResult.trackCount,
+                })
+
+                const dumpMsg = await tg.sendMedia(
+                  env.DUMP_CHANNEL_ID,
+                  {
+                    type: 'audio',
+                    file: Bun.file(ripResult.filePath),
+                    title: ripResult.title,
+                    performer: ripResult.artist,
+                    duration: ripResult.duration,
+                    caption,
+                  },
+                  {
+                    progressCallback: (uploaded, total) => {
+                      if (total > 0) {
+                        const progressText = formatByteProgress(
+                          uploaded,
+                          total,
+                          10,
+                        )
+                        updateProgress(
+                          `📤 <b>Uploading:</b> <code>${progressText}</code>`,
+                        )
+                      }
+                    },
+                  },
+                )
+
+                if (currentJob.isCancelled || taskSignal.aborted) {
+                  throw new Error('Download was cancelled')
+                }
+
+                let fileId = ''
+                let fileUniqueId = ''
+                if (dumpMsg.media && dumpMsg.media.type === 'audio') {
+                  fileId = dumpMsg.media.fileId
+                  fileUniqueId = dumpMsg.media.uniqueFileId
+                }
+
+                await service.saveTrack({
+                  appleTrackId: trackId,
+                  messageId: dumpMsg.id,
+                  fileId,
+                  fileUniqueId,
+                  title: ripResult.title,
+                  artist: ripResult.artist,
+                  album: ripResult.album,
+                  duration: ripResult.duration,
+                  bitDepth: ripResult.bitDepth,
+                  sampleRate: ripResult.sampleRate,
+                  genre: ripResult.genre,
+                  releaseDate: ripResult.releaseDate,
+                  trackNumber: ripResult.trackNumber,
+                  trackCount: ripResult.trackCount,
+                })
+
+                await tg.sendCopy({
+                  toChatId: deliveryChatId,
+                  fromChatId: env.DUMP_CHANNEL_ID,
+                  message: dumpMsg.id,
+                  ...(deliveryChatId === msg.chat.id
+                    ? { replyTo: msg.id }
+                    : {}),
+                  silent: isMultiTrack,
+                })
+
+                rippedCount++
+                currentJob.rippedCount = rippedCount
+                const totalDurationMs = Date.now() - startTime
+                info('Track completed', {
+                  track: `${ripResult.artist} - ${ripResult.title}`,
+                  time: `${(totalDurationMs / 1000).toFixed(1)}s`,
+                })
+
+                await service.logRequest({
+                  telegramId: msg.sender.id,
+                  chatId: msg.chat.id,
+                  appleTrackId: trackId,
+                  isCacheHit: false,
+                  durationMs: totalDurationMs,
+                  status: 'completed',
+                })
+              } finally {
+                if (ripResult && existsSync(ripResult.filePath)) {
+                  try {
+                    unlinkSync(ripResult.filePath)
+                  } catch {}
+                }
+              }
+            },
+            {
+              signal: jobController.signal,
+              onPositionChange: (pos) => {
+                debug('Queue position changed', { track_id: trackId, pos })
+                updateProgress(
+                  `⏳ <b>In Queue:</b> Position <code>#${pos}</code>`,
+                  true,
+                )
+              },
+              onStart: () => {
+                debug('Track rip started by queue worker', {
+                  track_id: trackId,
+                })
+              },
+            },
+          )
+        } catch (err: unknown) {
+          if (currentJob.isCancelled || jobController.signal.aborted) {
+            break
+          }
+
+          const errMsg = err instanceof Error ? err.message : String(err)
+          failedTracks.push({ id: trackId, error: errMsg })
+          currentJob.failedCount = failedTracks.length
+          error('Rip job failed', {
+            track_id: trackId,
+            duration_ms: Date.now() - startTime,
+            error: errMsg,
+            stack: err instanceof Error ? err.stack : undefined,
+          })
+
+          await service.logRequest({
+            telegramId: msg.sender.id,
+            chatId: msg.chat.id,
+            appleTrackId: trackId,
+            isCacheHit: false,
+            durationMs: Date.now() - startTime,
+            status: 'failed',
+            errorReason: errMsg,
+          })
+
+          await updateProgress(`⚠️ Track failed: ${trackId}`)
+
+          // Circuit breaker: If the mirror server is down or unreachable, abort remaining batch
+          const isMirrorDown =
+            errMsg.includes('Mirror /status check timed out') ||
+            errMsg.includes('Mirror health check failed') ||
+            errMsg.includes('Lossless wrapper is currently offline') ||
+            errMsg.includes('Mirror manifest lookup timed out') ||
+            errMsg.includes('Mirror service is currently offline') ||
+            errMsg.includes('Failed to connect to mirror stream')
+
+          if (isMirrorDown) {
+            failedTracks.push({
+              id: 'Remaining tracks',
+              error:
+                'Mirror service offline / unreachable (stopped remaining batch)',
+            })
+            error(
+              'Lossless mirror appears to be down, aborting remaining batch to prevent repeated timeouts',
+              { track_id: trackId, error: errMsg },
+            )
+            break
+          }
+        }
+      }
+
+      currentJob.completed = true
+      activeJobs.delete(jobId)
+
+      if (currentJob.isCancelled) {
+        return
+      }
+
+      // Final completion card (no cancel button)
+      const totalElapsedSec = ((Date.now() - jobStartTime) / 1000).toFixed(1)
+      const totalTracks = tracksToProcess.length
+
+      let summaryHtml =
+        `✅ <b>Download Complete!</b><br/><br/>` +
+        `<blockquote>• <b>Target:</b> ${jobHeader}<br/>` +
+        `• <b>Total Tracks:</b> <code>${totalTracks}</code><br/>` +
+        `• <b>Delivered:</b> ⚡ <code>${cachedCount}</code> cached • 🎵 <code>${rippedCount}</code> ripped<br/>` +
+        (failedTracks.length > 0
+          ? `• <b>Failed:</b> ⚠️ <code>${failedTracks.length}</code><br/>`
+          : '') +
+        `• <b>Time Elapsed:</b> <code>${totalElapsedSec}s</code></blockquote>`
+
+      if (isGroup) {
+        summaryHtml +=
+          '<br/>📩 <i>All songs have been delivered to your private DM!</i>'
+      }
+
+      if (failedTracks.length > 0) {
+        summaryHtml += '<br/><br/><b>Issues / Failures:</b><br/>'
+        for (const f of failedTracks.slice(0, 5)) {
+          summaryHtml += `• <code>${f.id}</code>: ${html.escape(f.error)}<br/>`
+        }
+        if (failedTracks.length > 5) {
+          summaryHtml += `<i>...and ${failedTracks.length - 5} more</i>`
+        }
+      }
 
       await tg
         .editMessage({
           chatId: msg.chat.id,
-          message: albumStatusMsgId,
-          text: parseDynamicHtml(completionText),
+          message: statusMsgId,
+          text: parseDynamicHtml(summaryHtml),
         })
         .catch(() => null)
+    },
+  )
+
+  // Interactive Cancel button callback query handler
+  dp.onCallbackQuery(filters.startsWith('cancel:'), async (query) => {
+    const jobId = query.dataStr?.replace('cancel:', '').trim()
+    if (!jobId) return
+
+    const job = activeJobs.get(jobId)
+    if (!job || job.completed) {
+      await query.answer({
+        text: '⚠️ This download has already completed or expired.',
+      })
+      return
     }
+
+    const callerId = query.user.id
+    const isAdmin = auth.isAdmin(callerId)
+    const isOwner = callerId === job.userId
+
+    if (!isAdmin && !isOwner) {
+      await query.answer({
+        text: '⛔ Only the person who requested this download or an admin can cancel it.',
+        alert: true,
+      })
+      return
+    }
+
+    const cancellerName = query.user.displayName || (isAdmin ? 'Admin' : 'User')
+    job.isCancelled = true
+    job.cancelledBy = cancellerName
+    job.controller.abort()
+    activeJobs.delete(jobId)
+
+    await query.answer({ text: '🛑 Download cancelled.' })
+
+    const processed = job.cachedCount + job.rippedCount
+    const cancelledHtml =
+      `🛑 <b>Download Cancelled</b><br/><br/>` +
+      `<blockquote>• <b>Target:</b> ${job.jobHeader || 'Download'}<br/>` +
+      `• <b>Cancelled by:</b> <b>${html.escape(cancellerName)}</b><br/>` +
+      `• <b>Progress when cancelled:</b> <code>${processed}/${job.totalTracks} tracks delivered</code></blockquote>`
+
+    await tg
+      .editMessage({
+        chatId: job.chatId,
+        message: job.statusMsgId,
+        text: parseDynamicHtml(cancelledHtml),
+      })
+      .catch(() => null)
+  })
+
+  // /cancel command handler
+  dp.onNewMessage(filters.command('cancel'), async (msg) => {
+    using _ = infoSpan('cancel').enter()
+
+    const isAuthed = await auth.isAuthorized(msg.sender.id, msg.chat.id)
+    if (!isAuthed) return
+
+    const callerId = msg.sender.id
+    const isAdmin = auth.isAdmin(callerId)
+
+    const replyMsg = await msg.getReplyTo().catch(() => null)
+    let targetJob: ActiveRipJob | undefined
+
+    if (replyMsg) {
+      for (const j of activeJobs.values()) {
+        if (j.chatId === msg.chat.id && j.statusMsgId === replyMsg.id) {
+          targetJob = j
+          break
+        }
+      }
+    }
+
+    if (!targetJob) {
+      // Find the latest active job in this chat that caller owns (or any job if admin)
+      const candidates = Array.from(activeJobs.values()).filter(
+        (j) => j.chatId === msg.chat.id && (j.userId === callerId || isAdmin),
+      )
+      targetJob = candidates[candidates.length - 1]
+    }
+
+    if (!targetJob) {
+      await msg.replyText(
+        parseDynamicHtml(
+          'ℹ️ <b>No active downloads found</b> to cancel in this chat.',
+        ),
+      )
+      return
+    }
+
+    const isOwner = callerId === targetJob.userId
+    if (!isAdmin && !isOwner) {
+      await msg.replyText(
+        parseDynamicHtml(
+          '⛔ <b>Access Restricted:</b> Only the requester or an admin can cancel this download.',
+        ),
+      )
+      return
+    }
+
+    const cancellerName = msg.sender.displayName || (isAdmin ? 'Admin' : 'User')
+    targetJob.isCancelled = true
+    targetJob.cancelledBy = cancellerName
+    targetJob.controller.abort()
+    activeJobs.delete(targetJob.id)
+
+    const processed = targetJob.cachedCount + targetJob.rippedCount
+    const cancelledHtml =
+      `🛑 <b>Download Cancelled</b><br/><br/>` +
+      `<blockquote>• <b>Target:</b> ${targetJob.jobHeader || 'Download'}<br/>` +
+      `• <b>Cancelled by:</b> <b>${html.escape(cancellerName)}</b><br/>` +
+      `• <b>Progress when cancelled:</b> <code>${processed}/${targetJob.totalTracks} tracks delivered</code></blockquote>`
+
+    await tg
+      .editMessage({
+        chatId: targetJob.chatId,
+        message: targetJob.statusMsgId,
+        text: parseDynamicHtml(cancelledHtml),
+      })
+      .catch(() => null)
+
+    await msg.replyText(
+      parseDynamicHtml('🛑 <b>Download has been cancelled.</b>'),
+    )
   })
 }
