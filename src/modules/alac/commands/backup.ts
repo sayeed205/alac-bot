@@ -5,9 +5,10 @@ import path from 'node:path'
 import { filters } from '@mtcute/dispatcher'
 
 import { dbDumpService as defaultDumpService } from '@/db/dump.ts'
-import { debug } from '@/utils/logger.ts'
+import { debug, infoSpan } from '@/utils/logger.ts'
 
-import { type CommandContext, parseDynamicHtml } from './types.ts'
+import type { CommandContext } from './types.ts'
+import { parseDynamicHtml } from './types.ts'
 
 export function registerExportCommand(ctx: CommandContext): void {
   const { dp, tg, auth } = ctx
@@ -28,7 +29,7 @@ export function registerExportCommand(ctx: CommandContext): void {
 
     const statusMsg = await tg.sendText(
       msg.chat.id,
-      '📦 Generating database export...',
+      parseDynamicHtml('📦 <i>Generating database export...</i>'),
       { replyTo: msg.id },
     )
 
@@ -82,7 +83,9 @@ export function registerImportCommand(ctx: CommandContext): void {
     if (reply?.media?.type !== 'document') {
       await tg.sendText(
         msg.chat.id,
-        '⚠️ Please reply to a valid <code>.sql.gz</code> database dump document with <code>/import</code> to restore.',
+        parseDynamicHtml(
+          '⚠️ Please reply to a valid <code>.sql.gz</code> database dump document with <code>/import</code> to restore.',
+        ),
         { replyTo: msg.id },
       )
       return
@@ -98,7 +101,9 @@ export function registerImportCommand(ctx: CommandContext): void {
     if (!fileName.endsWith('.sql.gz') && !fileName.endsWith('.gz')) {
       await tg.sendText(
         msg.chat.id,
-        '⚠️ The replied file must be a <code>.sql.gz</code> database dump.',
+        parseDynamicHtml(
+          '⚠️ The replied file must be a <code>.sql.gz</code> database dump.',
+        ),
         { replyTo: msg.id },
       )
       return
@@ -106,7 +111,7 @@ export function registerImportCommand(ctx: CommandContext): void {
 
     const statusMsg = await tg.sendText(
       msg.chat.id,
-      '⏳ Downloading and restoring database dump...',
+      parseDynamicHtml('⏳ <i>Downloading and restoring database dump...</i>'),
       { replyTo: msg.id },
     )
     const tmpFile = path.join(os.tmpdir(), `import_${Date.now()}.sql.gz`)
@@ -147,6 +152,7 @@ export function registerImportCommand(ctx: CommandContext): void {
 }
 
 export function registerBackupCommands(ctx: CommandContext): void {
+  using _ = infoSpan('backup_commands').enter()
   registerExportCommand(ctx)
   registerImportCommand(ctx)
 }

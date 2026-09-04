@@ -26,6 +26,7 @@ import { registerInfoCommand } from './info.ts'
 import { registerQueueCommand } from './queue.ts'
 import { registerRipCommand } from './rip.ts'
 import { registerSearchCommand } from './search.ts'
+import { registerSpecCommand } from './spec.ts'
 import { registerStatsCommand } from './stats.ts'
 import type { CommandContext } from './types.ts'
 
@@ -73,5 +74,6 @@ export function registerAlacCommands(
   registerIndexCommand(ctx)
   registerSearchCommand(ctx)
   registerRipCommand(ctx)
+  registerSpecCommand(ctx)
   registerBackupCommands(ctx)
 }
