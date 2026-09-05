@@ -14,6 +14,8 @@ const r = z
     ALAC_API_KEY: z.string().optional(),
     ALAC_WRAPPER_URL: z.string().default('http://127.0.0.1:12340'),
     ALAC_WRAPPER_API_KEY: z.string().optional(),
+    ALAC_MAX_RETRIES: z.coerce.number().default(3),
+    ALAC_RETRY_BASE_MS: z.coerce.number().default(2000),
     LOG_LEVEL: z
       .enum(['trace', 'debug', 'info', 'warn', 'error', 'critical'])
       .default('info'),

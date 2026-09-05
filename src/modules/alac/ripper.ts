@@ -2,7 +2,7 @@ import { mkdir, unlink } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { env } from '@/env.ts'
-import { debug, debugSpan } from '@/utils/logger.ts'
+import { debug, debugSpan, warn } from '@/utils/logger.ts'
 import { formatByteProgress } from '@/utils/progress.ts'
 
 import { fetchTrackMeta } from './itunes.ts'
@@ -21,6 +21,39 @@ export interface ITrackRipper {
     storefront?: string,
     signal?: AbortSignal,
   ): Promise<TrackRipResult>
+}
+
+/**
+ * Abortable delay that resolves after `ms` or rejects immediately if `signal` is aborted.
+ */
+export function abortableSleep(
+  ms: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error('Download was cancelled'))
+      return
+    }
+
+    let timer: ReturnType<typeof setTimeout> | null = null
+
+    const onAbort = () => {
+      if (timer) clearTimeout(timer)
+      reject(new Error('Download was cancelled'))
+    }
+
+    if (signal) {
+      signal.addEventListener('abort', onAbort, { once: true })
+    }
+
+    timer = setTimeout(() => {
+      if (signal) {
+        signal.removeEventListener('abort', onAbort)
+      }
+      resolve()
+    }, ms)
+  })
 }
 
 export class FakeTrackRipper implements ITrackRipper {
@@ -61,13 +94,75 @@ export class FakeTrackRipper implements ITrackRipper {
 }
 
 export class AlacTrackRipper implements ITrackRipper {
-  private readonly outputDir: string
+  protected readonly outputDir: string
+  protected readonly maxRetries: number
+  protected readonly baseDelayMs: number
 
-  constructor(outputDir?: string) {
+  constructor(
+    outputDir?: string,
+    maxRetries = env.ALAC_MAX_RETRIES,
+    baseDelayMs = env.ALAC_RETRY_BASE_MS,
+  ) {
     this.outputDir = outputDir || join(process.cwd(), 'bot-data', 'downloads')
+    this.maxRetries = maxRetries
+    this.baseDelayMs = baseDelayMs
   }
 
   async rip(
+    trackId: string,
+    onProgress?: (status: string) => void,
+    storefront?: string,
+    signal?: AbortSignal,
+  ): Promise<TrackRipResult> {
+    let attempt = 0
+
+    while (true) {
+      if (signal?.aborted) {
+        throw new Error('Download was cancelled')
+      }
+
+      try {
+        return await this.ripOnce(trackId, onProgress, storefront, signal)
+      } catch (err: unknown) {
+        if (
+          signal?.aborted ||
+          (err instanceof Error && err.message === 'Download was cancelled')
+        ) {
+          throw err
+        }
+
+        if (attempt >= this.maxRetries) {
+          throw err
+        }
+
+        attempt++
+
+        const rawDelay = this.baseDelayMs * 2 ** (attempt - 1)
+        const jitterFactor = 0.8 + Math.random() * 0.4
+        const delayMs = Math.round(rawDelay * jitterFactor)
+
+        const errMsg = err instanceof Error ? err.message : String(err)
+        const waitSec = (delayMs / 1000).toFixed(1)
+
+        onProgress?.(
+          `⚠️ Rip failed, retrying (attempt ${attempt}/${this.maxRetries}) in ${waitSec}s: ${errMsg}`,
+        )
+        warn(
+          `Track rip failed, retrying (${attempt}/${this.maxRetries}) in ${delayMs}ms`,
+          {
+            track_id: trackId,
+            attempt,
+            max_retries: this.maxRetries,
+            error: errMsg,
+          },
+        )
+
+        await abortableSleep(delayMs, signal)
+      }
+    }
+  }
+
+  protected async ripOnce(
     trackId: string,
     onProgress?: (status: string) => void,
     storefront?: string,
