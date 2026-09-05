@@ -33,6 +33,7 @@ describe('SettingsService', () => {
     expect(settings.rippingMode).toBe('live')
     expect(settings.albumRipEnabled).toBe(true)
     expect(settings.playlistRipEnabled).toBe(true)
+    expect(settings.artistRipEnabled).toBe(true)
     expect(settings.txtRipEnabled).toBe(true)
     expect(settings.multiLinkRipEnabled).toBe(true)
     expect(settings.maxCollectionTracks).toBe(50)
@@ -54,7 +55,7 @@ describe('SettingsService', () => {
     expect(service.getRippingMode()).toBe('live')
   })
 
-  it('toggles album and playlist settings', async () => {
+  it('toggles album, playlist, and artist settings', async () => {
     expect(service.isAlbumRipEnabled()).toBe(true)
     const albumRes = await service.toggleAlbumRip()
     expect(albumRes).toBe(false)
@@ -64,6 +65,11 @@ describe('SettingsService', () => {
     const playlistRes = await service.togglePlaylistRip()
     expect(playlistRes).toBe(false)
     expect(service.isPlaylistRipEnabled()).toBe(false)
+
+    expect(service.isArtistRipEnabled()).toBe(true)
+    const artistRes = await service.toggleArtistRip()
+    expect(artistRes).toBe(false)
+    expect(service.isArtistRipEnabled()).toBe(false)
   })
 
   it('toggles txt and multi-link settings', async () => {
@@ -89,6 +95,7 @@ describe('SettingsService', () => {
   it('persists settings to database and restores them on init', async () => {
     await service.setSetting('rippingMode', 'cache_only')
     await service.setSetting('albumRipEnabled', false)
+    await service.setSetting('artistRipEnabled', false)
     await service.setSetting('txtRipEnabled', false)
     await service.setSetting('multiLinkRipEnabled', false)
     await service.setSetting('maxCollectionTracks', 25)
@@ -100,6 +107,7 @@ describe('SettingsService', () => {
     expect(settings.rippingMode).toBe('cache_only')
     expect(settings.albumRipEnabled).toBe(false)
     expect(settings.playlistRipEnabled).toBe(true)
+    expect(settings.artistRipEnabled).toBe(false)
     expect(settings.txtRipEnabled).toBe(false)
     expect(settings.multiLinkRipEnabled).toBe(false)
     expect(settings.maxCollectionTracks).toBe(25)
@@ -110,6 +118,7 @@ describe('SettingsService', () => {
       await service.setSetting('rippingMode', 'paused')
       await service.setSetting('albumRipEnabled', false)
       await service.setSetting('playlistRipEnabled', false)
+      await service.setSetting('artistRipEnabled', false)
       await service.setSetting('txtRipEnabled', false)
       await service.setSetting('multiLinkRipEnabled', false)
 
@@ -117,6 +126,7 @@ describe('SettingsService', () => {
       expect(service.canServeCache(true)).toBe(true)
       expect(service.canRipAlbum(true)).toBe(true)
       expect(service.canRipPlaylist(true)).toBe(true)
+      expect(service.canRipArtist(true)).toBe(true)
       expect(service.canRipTxt(true)).toBe(true)
       expect(service.canRipMultiLink(true)).toBe(true)
     })
@@ -147,6 +157,12 @@ describe('SettingsService', () => {
 
       await service.setSetting('playlistRipEnabled', true)
       expect(service.canRipPlaylist(false)).toBe(true)
+
+      await service.setSetting('artistRipEnabled', false)
+      expect(service.canRipArtist(false)).toBe(false)
+
+      await service.setSetting('artistRipEnabled', true)
+      expect(service.canRipArtist(false)).toBe(true)
     })
 
     it('enforces txt and multi-link restrictions for non-admin', async () => {

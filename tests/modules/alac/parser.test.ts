@@ -13,6 +13,7 @@ describe('parseAlacInput', () => {
       force: false,
       isAlbum: false,
       isPlaylist: false,
+      isArtist: false,
       storefront: 'us',
     })
   })
@@ -27,6 +28,7 @@ describe('parseAlacInput', () => {
       force: true,
       isAlbum: false,
       isPlaylist: false,
+      isArtist: false,
       storefront: 'us',
     })
   })
@@ -41,6 +43,7 @@ describe('parseAlacInput', () => {
       force: true,
       isAlbum: false,
       isPlaylist: false,
+      isArtist: false,
       storefront: 'us',
     })
   })
@@ -54,6 +57,7 @@ describe('parseAlacInput', () => {
       force: false,
       isAlbum: false,
       isPlaylist: false,
+      isArtist: false,
       storefront: 'in',
     })
   })
@@ -68,6 +72,7 @@ describe('parseAlacInput', () => {
       force: false,
       isAlbum: true,
       isPlaylist: false,
+      isArtist: false,
       storefront: 'us',
     })
   })
@@ -88,7 +93,47 @@ describe('parseAlacInput', () => {
       force: false,
       isAlbum: false,
       isPlaylist: true,
+      isArtist: false,
       storefront: 'us',
+    })
+  })
+
+  it('extracts artist ID from Apple Music artist link', () => {
+    const input =
+      '/alac https://music.apple.com/us/artist/taylor-swift/159260351'
+    const res = parseAlacInput(input)
+    expect(res).toEqual({
+      items: [
+        {
+          id: '159260351',
+          type: 'artist',
+          storefront: 'us',
+        },
+      ],
+      trackId: '159260351',
+      force: false,
+      isAlbum: false,
+      isPlaylist: false,
+      isArtist: true,
+      storefront: 'us',
+    })
+  })
+
+  it('extracts bare artist ID with artist: prefix', () => {
+    const input = '/alac artist:159260351'
+    const res = parseAlacInput(input)
+    expect(res).toEqual({
+      items: [
+        {
+          id: '159260351',
+          type: 'artist',
+        },
+      ],
+      trackId: '159260351',
+      force: false,
+      isAlbum: false,
+      isPlaylist: false,
+      isArtist: true,
     })
   })
 
@@ -97,11 +142,14 @@ describe('parseAlacInput', () => {
       '/batch https://music.apple.com/playlist/chill-vibes/pl.u-76oNke3FvPyK8r'
     const res = parseAlacInput(input)
     expect(res).toEqual({
-      items: [{ id: 'pl.u-76oNke3FvPyK8r', type: 'playlist' }],
+      items: [
+        { id: 'pl.u-76oNke3FvPyK8r', type: 'playlist', storefront: undefined },
+      ],
       trackId: 'pl.u-76oNke3FvPyK8r',
       force: false,
       isAlbum: false,
       isPlaylist: true,
+      isArtist: false,
     })
   })
 
@@ -114,6 +162,7 @@ describe('parseAlacInput', () => {
       force: false,
       isAlbum: false,
       isPlaylist: false,
+      isArtist: false,
     })
   })
 
@@ -126,6 +175,7 @@ describe('parseAlacInput', () => {
       force: false,
       isAlbum: false,
       isPlaylist: true,
+      isArtist: false,
     })
   })
 
@@ -156,6 +206,7 @@ describe('parseAlacInput', () => {
       force: false,
       isAlbum: false,
       isPlaylist: false,
+      isArtist: false,
       storefront: 'jp',
     })
   })
@@ -169,6 +220,7 @@ describe('parseAlacInput', () => {
       force: true,
       isAlbum: false,
       isPlaylist: false,
+      isArtist: false,
       storefront: 'us',
     })
   })
@@ -188,6 +240,9 @@ https://music.apple.com/us/album/shape-of-you/1193701079?i=1193701400
 // Album link
 https://music.apple.com/us/album/blinding-lights/1499378108
 
+# Artist link
+https://music.apple.com/us/artist/taylor-swift/159260351
+
 # Playlist
 https://music.apple.com/us/playlist/todays-hits/pl.f4d106fed2bd41149aaacabb233eb5eb
 1440841730
@@ -196,6 +251,7 @@ https://music.apple.com/us/playlist/todays-hits/pl.f4d106fed2bd41149aaacabb233eb
     expect(items).toEqual([
       { id: '1193701400', type: 'track', storefront: 'us' },
       { id: '1499378108', type: 'album', storefront: 'us' },
+      { id: '159260351', type: 'artist', storefront: 'us' },
       {
         id: 'pl.f4d106fed2bd41149aaacabb233eb5eb',
         type: 'playlist',

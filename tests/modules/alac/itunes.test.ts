@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'bun:test'
 
 import {
   fetchAlbumTracks,
+  fetchArtistTracks,
   fetchTrackMeta,
   searchItunesCatalog,
 } from '@/modules/alac/itunes.ts'
@@ -283,6 +284,147 @@ describe('iTunes API Service', () => {
 
       expect(fetchAlbumTracks('12345')).rejects.toThrow(
         'iTunes album lookup timed out',
+      )
+    })
+  })
+
+  describe('fetchArtistTracks', () => {
+    it('resolves artist name, albums, and tracks with deduplication', async () => {
+      setFetch(async (input: RequestInfo | URL) => {
+        const urlStr = String(input)
+        if (urlStr.includes('entity=album')) {
+          return new Response(
+            JSON.stringify({
+              results: [
+                {
+                  wrapperType: 'artist',
+                  artistId: 159260351,
+                  artistName: 'Taylor Swift',
+                },
+                {
+                  wrapperType: 'collection',
+                  collectionId: 1001,
+                  collectionName: 'Album 1',
+                },
+                {
+                  wrapperType: 'collection',
+                  collectionId: 1002,
+                  collectionName: 'Album 2',
+                },
+              ],
+            }),
+            { status: 200 },
+          )
+        }
+
+        if (urlStr.includes('entity=song')) {
+          // Batched collection lookup
+          return new Response(
+            JSON.stringify({
+              results: [
+                {
+                  wrapperType: 'track',
+                  kind: 'song',
+                  trackId: 5001,
+                  trackName: 'Song A',
+                  artistName: 'Taylor Swift',
+                  collectionName: 'Album 1',
+                },
+                {
+                  wrapperType: 'track',
+                  kind: 'song',
+                  trackId: 5002,
+                  trackName: 'Song B',
+                  artistName: 'Taylor Swift',
+                  collectionName: 'Album 1',
+                },
+                {
+                  wrapperType: 'track',
+                  kind: 'song',
+                  trackId: 5001, // duplicate track across albums
+                  trackName: 'Song A',
+                  artistName: 'Taylor Swift',
+                  collectionName: 'Album 2',
+                },
+                {
+                  wrapperType: 'track',
+                  kind: 'song',
+                  trackId: 5003,
+                  trackName: 'Song C',
+                  artistName: 'Taylor Swift',
+                  collectionName: 'Album 2',
+                },
+              ],
+            }),
+            { status: 200 },
+          )
+        }
+
+        return new Response(JSON.stringify({ results: [] }), { status: 200 })
+      })
+
+      const artistData = await fetchArtistTracks('159260351', 'us')
+      expect(artistData.artistId).toBe('159260351')
+      expect(artistData.artistName).toBe('Taylor Swift')
+      // Deduplicated 5001, 5002, 5003 -> 3 unique tracks
+      expect(artistData.tracks.length).toBe(3)
+      expect(artistData.tracks.map((t) => t.id)).toEqual([
+        '5001',
+        '5002',
+        '5003',
+      ])
+    })
+
+    it('falls back to direct song lookup when artist has no album collections', async () => {
+      setFetch(async (input: RequestInfo | URL) => {
+        const urlStr = String(input)
+        if (urlStr.includes('entity=album')) {
+          return new Response(
+            JSON.stringify({
+              results: [
+                {
+                  wrapperType: 'artist',
+                  artistId: 777,
+                  artistName: 'Indie Artist',
+                },
+              ],
+            }),
+            { status: 200 },
+          )
+        }
+        if (urlStr.includes('entity=song')) {
+          return new Response(
+            JSON.stringify({
+              results: [
+                {
+                  wrapperType: 'track',
+                  kind: 'song',
+                  trackId: 9001,
+                  trackName: 'Single 1',
+                  artistName: 'Indie Artist',
+                },
+              ],
+            }),
+            { status: 200 },
+          )
+        }
+        return new Response(JSON.stringify({ results: [] }), { status: 200 })
+      })
+
+      const artistData = await fetchArtistTracks('777')
+      expect(artistData.artistName).toBe('Indie Artist')
+      expect(artistData.tracks.length).toBe(1)
+      expect(artistData.tracks[0]?.title).toBe('Single 1')
+    })
+
+    it('throws error when artist is not found in catalog', async () => {
+      setFetch(
+        async () =>
+          new Response(JSON.stringify({ results: [] }), { status: 200 }),
+      )
+
+      expect(fetchArtistTracks('99999')).rejects.toThrow(
+        'iTunes found no tracks for artist 99999',
       )
     })
   })

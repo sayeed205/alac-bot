@@ -7,7 +7,7 @@ import { filters } from '@mtcute/dispatcher'
 
 import { env } from '@/env.ts'
 import { formatDumpCaption } from '@/modules/alac/indexer.ts'
-import { fetchAlbumTracks } from '@/modules/alac/itunes.ts'
+import { fetchAlbumTracks, fetchArtistTracks } from '@/modules/alac/itunes.ts'
 import {
   extractBatchItems,
   type ParsedTargetItem,
@@ -144,7 +144,7 @@ export function registerRipCommand(ctx: CommandContext): void {
 
       if (documentContent) {
         parsedItems = extractBatchItems(documentContent)
-        const textTokens = msg.text.trim().split(/\s+/)
+        const textTokens = msg.text.trim().split(/\\s+/)
         if (textTokens.includes('-f') || textTokens.includes('--force')) {
           isForce = true
         }
@@ -167,6 +167,7 @@ export function registerRipCommand(ctx: CommandContext): void {
                 '• <b>Track:</b> <code>/cache &lt;link | id&gt;</code><br/>' +
                 '• <b>Album:</b> <code>/cache &lt;album_link&gt;</code><br/>' +
                 '• <b>Playlist:</b> <code>/cache &lt;playlist_link&gt;</code><br/>' +
+                '• <b>Artist:</b> <code>/cache &lt;artist_link&gt;</code><br/>' +
                 '• <b>Batch:</b> Send multiple links or attach a <code>.txt</code> file<br/>' +
                 '• <b>Alias:</b> <code>/dump</code><br/>' +
                 '• <b>Options:</b> <code>-f</code> <i>(force re-rip even if cached)</i><br/>' +
@@ -181,6 +182,7 @@ export function registerRipCommand(ctx: CommandContext): void {
                 '• <b>Track:</b> <code>/alac &lt;link | id&gt;</code><br/>' +
                 '• <b>Album:</b> <code>/alac &lt;album_link&gt;</code><br/>' +
                 '• <b>Playlist:</b> <code>/alac &lt;playlist_link&gt;</code><br/>' +
+                '• <b>Artist:</b> <code>/alac &lt;artist_link&gt;</code><br/>' +
                 '• <b>Batch:</b> Send multiple links or attach a <code>.txt</code> file<br/>' +
                 '• <b>Aliases:</b> <code>/rip</code>, <code>/batch</code>, <code>/dl</code>, <code>/download</code><br/>' +
                 '• <b>Cancel:</b> <code>/cancel</code> or tap the Cancel button on any active download<br/>' +
@@ -234,6 +236,20 @@ export function registerRipCommand(ctx: CommandContext): void {
             parseDynamicHtml(
               '⚠️ <b>Playlist ripping is currently disabled by admin.</b><br/>' +
                 'Please request individual tracks instead.',
+            ),
+          )
+          return
+        }
+
+        const hasArtist = parsedItems.some((item) => item.type === 'artist')
+        if (hasArtist && !settings.canRipArtist(isAdmin)) {
+          debug('Artist ripping disabled by admin', {
+            user_id: msg.sender.id,
+          })
+          await msg.replyText(
+            parseDynamicHtml(
+              '⚠️ <b>Artist ripping is currently disabled by admin.</b><br/>' +
+                'Please request individual tracks or albums instead.',
             ),
           )
           return
@@ -311,7 +327,7 @@ export function registerRipCommand(ctx: CommandContext): void {
         }
       }
 
-      // Resolve all items (tracks, albums, playlists) into track IDs
+      // Resolve all items (tracks, albums, playlists, artists) into track IDs
       const resolvingStatus = await msg.replyText(
         parseDynamicHtml('🔍 <b>Resolving tracks from Apple Music...</b>'),
       )
@@ -372,6 +388,25 @@ export function registerRipCommand(ctx: CommandContext): void {
               jobHeader = `Playlist: <b>${html.escape(playlistData.title)}</b>${playlistData.curatorName ? ` (${html.escape(playlistData.curatorName)})` : ''}`
             }
             for (const t of playlistData.tracks) {
+              if (!seenTrackIds.has(t.id)) {
+                seenTrackIds.add(t.id)
+                tracksToProcess.push({
+                  id: t.id,
+                  title: t.title,
+                  artist: t.artist,
+                  storefront: item.storefront || singleStorefront,
+                })
+              }
+            }
+          } else if (item.type === 'artist') {
+            const artistData = await fetchArtistTracks(
+              item.id,
+              item.storefront || singleStorefront,
+            )
+            if (!jobHeader) {
+              jobHeader = `Artist: <b>${html.escape(artistData.artistName)}</b> (Discography)`
+            }
+            for (const t of artistData.tracks) {
               if (!seenTrackIds.has(t.id)) {
                 seenTrackIds.add(t.id)
                 tracksToProcess.push({
@@ -886,7 +921,7 @@ export function registerRipCommand(ctx: CommandContext): void {
       const totalElapsedSec = ((Date.now() - jobStartTime) / 1000).toFixed(1)
       const totalTracks = tracksToProcess.length
 
-      let summaryHtml = ''
+      let summaryHtml: string
       if (isCacheOnly) {
         summaryHtml =
           `✅ <b>Caching Complete!</b><br/><br/>` +

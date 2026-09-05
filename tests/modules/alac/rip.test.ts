@@ -129,6 +129,7 @@ describe('ALAC Rip Command Handler', () => {
       rippingMode: 'live',
       albumRipEnabled: true,
       playlistRipEnabled: true,
+      artistRipEnabled: true,
       txtRipEnabled: true,
       multiLinkRipEnabled: true,
       maxCollectionTracks: 50,
@@ -140,6 +141,7 @@ describe('ALAC Rip Command Handler', () => {
       getRippingMode: mock(() => mockSettings.rippingMode),
       isAlbumRipEnabled: mock(() => mockSettings.albumRipEnabled),
       isPlaylistRipEnabled: mock(() => mockSettings.playlistRipEnabled),
+      isArtistRipEnabled: mock(() => mockSettings.artistRipEnabled),
       getMaxCollectionTracks: mock(() => mockSettings.maxCollectionTracks),
       canRipLive: mock(
         (isAdmin: boolean) => isAdmin || mockSettings.rippingMode === 'live',
@@ -152,6 +154,9 @@ describe('ALAC Rip Command Handler', () => {
       ),
       canRipPlaylist: mock(
         (isAdmin: boolean) => isAdmin || mockSettings.playlistRipEnabled,
+      ),
+      canRipArtist: mock(
+        (isAdmin: boolean) => isAdmin || mockSettings.artistRipEnabled,
       ),
       isTxtRipEnabled: mock(() => mockSettings.txtRipEnabled),
       isMultiLinkRipEnabled: mock(() => mockSettings.multiLinkRipEnabled),
@@ -168,6 +173,7 @@ describe('ALAC Rip Command Handler', () => {
       cycleRippingMode: mock(async () => 'live' as RippingMode),
       toggleAlbumRip: mock(async () => true),
       togglePlaylistRip: mock(async () => true),
+      toggleArtistRip: mock(async () => true),
       toggleTxtRip: mock(async () => true),
       toggleMultiLinkRip: mock(async () => true),
       setMaxCollectionTracks: mock(async (n) => n),
@@ -421,6 +427,70 @@ describe('ALAC Rip Command Handler', () => {
       registerRipCommand(ctx)
       await dispatchMessage(
         '/alac https://music.apple.com/us/album/test/123456',
+      )
+
+      expect(mockRipper.rip).toHaveBeenCalledTimes(2)
+      expect(mockService.saveTrack).toHaveBeenCalledTimes(2)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('handles artist links and rips discography tracks', async () => {
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+      const urlStr = String(input)
+      if (urlStr.includes('entity=album')) {
+        return new Response(
+          JSON.stringify({
+            results: [
+              {
+                wrapperType: 'artist',
+                artistId: 55555,
+                artistName: 'Test Artist',
+              },
+              {
+                wrapperType: 'collection',
+                collectionId: 10101,
+                collectionName: 'Album A',
+              },
+            ],
+          }),
+          { status: 200 },
+        )
+      }
+      if (urlStr.includes('entity=song')) {
+        return new Response(
+          JSON.stringify({
+            results: [
+              {
+                wrapperType: 'track',
+                trackId: 11,
+                trackName: 'Artist Track 1',
+                artistName: 'Test Artist',
+                collectionName: 'Album A',
+                trackTimeMillis: 180000,
+              },
+              {
+                wrapperType: 'track',
+                trackId: 12,
+                trackName: 'Artist Track 2',
+                artistName: 'Test Artist',
+                collectionName: 'Album A',
+                trackTimeMillis: 200000,
+              },
+            ],
+          }),
+          { status: 200 },
+        )
+      }
+      return new Response('ok')
+    }) as unknown as typeof fetch
+
+    try {
+      registerRipCommand(ctx)
+      await dispatchMessage(
+        '/alac https://music.apple.com/us/artist/test-artist/55555',
       )
 
       expect(mockRipper.rip).toHaveBeenCalledTimes(2)
@@ -882,6 +952,30 @@ describe('ALAC Rip Command Handler', () => {
       expect(repliedTexts[0]).toContain(
         'Playlist ripping is currently disabled',
       )
+    })
+
+    it('blocks non-admin from ripping artists when artistRipEnabled is false', async () => {
+      mockSettings.artistRipEnabled = false
+      registerRipCommand(ctx)
+
+      const { repliedTexts } = await dispatchMessage(
+        '/alac https://music.apple.com/us/artist/test/12345',
+        999,
+      )
+      expect(repliedTexts.length).toBe(1)
+      expect(repliedTexts[0]).toContain('Artist ripping is currently disabled')
+    })
+
+    it('allows admin to rip artists when artistRipEnabled is false', async () => {
+      mockSettings.artistRipEnabled = false
+      registerRipCommand(ctx)
+
+      const { repliedTexts } = await dispatchMessage(
+        '/alac https://music.apple.com/us/artist/test/12345',
+        1,
+      )
+      expect(repliedTexts.length).toBe(1)
+      expect(repliedTexts[0]).toContain('Resolving tracks from Apple Music')
     })
 
     it('rejects single uncached track in cache_only mode for non-admin', async () => {

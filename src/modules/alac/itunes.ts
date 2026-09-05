@@ -217,6 +217,187 @@ export async function fetchAlbumTracks(
   }
 }
 
+async function doFetchArtistTracks(
+  artistId: string,
+  storefront: string,
+): Promise<{
+  artistId: string
+  artistName: string
+  tracks: AppleTrackMetadata[]
+}> {
+  using _ = infoSpan('itunes_artist', {
+    artist_id: artistId,
+    storefront,
+  }).enter()
+
+  const url = `https://itunes.apple.com/lookup?id=${encodeURIComponent(artistId)}&entity=album&limit=200&country=${encodeURIComponent(storefront)}`
+  debug('Querying iTunes API for artist discography...', { url })
+
+  const start = Date.now()
+  let resp: Response
+  try {
+    resp = await fetch(url, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/145.0.0.0',
+      },
+      signal: AbortSignal.timeout(30_000),
+    })
+  } catch (err: unknown) {
+    const elapsed = Date.now() - start
+    error('iTunes artist lookup timed out / network error', {
+      artist_id: artistId,
+      elapsed_ms: elapsed,
+      error: err instanceof Error ? err.message : String(err),
+    })
+    throw new Error(
+      `iTunes artist lookup timed out after ${elapsed}ms: ${err instanceof Error ? err.message : String(err)}`,
+    )
+  }
+
+  if (!resp.ok) {
+    error('iTunes artist lookup HTTP failure', {
+      artist_id: artistId,
+      status: resp.status,
+    })
+    throw new Error(`iTunes artist lookup failed (HTTP ${resp.status})`)
+  }
+
+  const data = (await resp.json()) as { results?: ItunesResult[] }
+  const results = data.results || []
+
+  const artistItem = results.find((r) => r.wrapperType === 'artist')
+  const collectionItems = results.filter((r) => r.wrapperType === 'collection')
+
+  let artistName = artistItem?.artistName || ''
+
+  const allTracks: AppleTrackMetadata[] = []
+  const seenTrackIds = new Set<string>()
+
+  if (collectionItems.length > 0) {
+    const collectionIds = collectionItems
+      .map((c) => c.collectionId)
+      .filter((id): id is number => typeof id === 'number')
+
+    const chunkSize = 25
+    for (let i = 0; i < collectionIds.length; i += chunkSize) {
+      const chunk = collectionIds.slice(i, i + chunkSize)
+      const batchUrl = `https://itunes.apple.com/lookup?id=${chunk.join(',')}&entity=song&country=${encodeURIComponent(storefront)}`
+
+      try {
+        const batchResp = await fetch(batchUrl, {
+          headers: {
+            'User-Agent':
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/145.0.0.0',
+          },
+          signal: AbortSignal.timeout(20_000),
+        })
+
+        if (batchResp.ok) {
+          const batchData = (await batchResp.json()) as {
+            results?: ItunesResult[]
+          }
+          const batchResults = batchData.results || []
+
+          for (const item of batchResults) {
+            if (item.wrapperType === 'track' || item.kind === 'song') {
+              const trackId = String(item.trackId || '')
+              if (trackId && !seenTrackIds.has(trackId)) {
+                seenTrackIds.add(trackId)
+                allTracks.push(mapItunesItem(item))
+              }
+            }
+          }
+        }
+      } catch (batchErr: unknown) {
+        debug('Error fetching artist collection batch, continuing...', {
+          error: String(batchErr),
+        })
+      }
+    }
+  }
+
+  // If no tracks were resolved via collections, fall back to entity=song directly on artist
+  if (allTracks.length === 0) {
+    const songsUrl = `https://itunes.apple.com/lookup?id=${encodeURIComponent(artistId)}&entity=song&limit=200&country=${encodeURIComponent(storefront)}`
+    try {
+      const songResp = await fetch(songsUrl, {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/145.0.0.0',
+        },
+        signal: AbortSignal.timeout(20_000),
+      })
+      if (songResp.ok) {
+        const songData = (await songResp.json()) as {
+          results?: ItunesResult[]
+        }
+        const songResults = songData.results || []
+        if (!artistName) {
+          artistName =
+            songResults.find((r) => r.wrapperType === 'artist')?.artistName ||
+            ''
+        }
+        for (const item of songResults) {
+          if (item.wrapperType === 'track' || item.kind === 'song') {
+            const trackId = String(item.trackId || '')
+            if (trackId && !seenTrackIds.has(trackId)) {
+              seenTrackIds.add(trackId)
+              allTracks.push(mapItunesItem(item))
+            }
+          }
+        }
+      }
+    } catch {}
+  }
+
+  if (allTracks.length === 0) {
+    error('No tracks found for artist', { artist_id: artistId })
+    throw new Error(`iTunes found no tracks for artist ${artistId}`)
+  }
+
+  if (!artistName && allTracks[0]) {
+    artistName = allTracks[0].artist
+  }
+
+  info('iTunes artist discography resolved', {
+    artist_id: artistId,
+    artist: artistName,
+    track_count: allTracks.length,
+    elapsed_ms: Date.now() - start,
+  })
+
+  return {
+    artistId,
+    artistName: artistName || 'Unknown Artist',
+    tracks: allTracks,
+  }
+}
+
+export async function fetchArtistTracks(
+  artistId: string,
+  storefront = 'us',
+): Promise<{
+  artistId: string
+  artistName: string
+  tracks: AppleTrackMetadata[]
+}> {
+  const sf = (storefront || 'us').toLowerCase()
+  try {
+    return await doFetchArtistTracks(artistId, sf)
+  } catch (err) {
+    if (sf !== 'us') {
+      debug('Retrying artist lookup on US storefront fallback', {
+        artist_id: artistId,
+        original_storefront: sf,
+        error: err instanceof Error ? err.message : String(err),
+      })
+      return await doFetchArtistTracks(artistId, 'us')
+    }
+    throw err
+  }
+}
+
 async function doSearchItunesCatalog(
   term: string,
   limit: number,

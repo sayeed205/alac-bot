@@ -41,6 +41,7 @@ describe('Settings Commands & Callbacks', () => {
       rippingMode: 'live',
       albumRipEnabled: true,
       playlistRipEnabled: true,
+      artistRipEnabled: true,
       txtRipEnabled: true,
       multiLinkRipEnabled: true,
       maxCollectionTracks: 50,
@@ -52,6 +53,7 @@ describe('Settings Commands & Callbacks', () => {
       getRippingMode: mock(() => mockSettings.rippingMode),
       isAlbumRipEnabled: mock(() => mockSettings.albumRipEnabled),
       isPlaylistRipEnabled: mock(() => mockSettings.playlistRipEnabled),
+      isArtistRipEnabled: mock(() => mockSettings.artistRipEnabled),
       isTxtRipEnabled: mock(() => mockSettings.txtRipEnabled),
       isMultiLinkRipEnabled: mock(() => mockSettings.multiLinkRipEnabled),
       getMaxCollectionTracks: mock(() => mockSettings.maxCollectionTracks),
@@ -66,6 +68,9 @@ describe('Settings Commands & Callbacks', () => {
       ),
       canRipPlaylist: mock(
         (isAdmin: boolean) => isAdmin || mockSettings.playlistRipEnabled,
+      ),
+      canRipArtist: mock(
+        (isAdmin: boolean) => isAdmin || mockSettings.artistRipEnabled,
       ),
       canRipTxt: mock(
         (isAdmin: boolean) => isAdmin || mockSettings.txtRipEnabled,
@@ -92,6 +97,10 @@ describe('Settings Commands & Callbacks', () => {
       togglePlaylistRip: mock(async () => {
         mockSettings.playlistRipEnabled = !mockSettings.playlistRipEnabled
         return mockSettings.playlistRipEnabled
+      }),
+      toggleArtistRip: mock(async () => {
+        mockSettings.artistRipEnabled = !mockSettings.artistRipEnabled
+        return mockSettings.artistRipEnabled
       }),
       toggleTxtRip: mock(async () => {
         mockSettings.txtRipEnabled = !mockSettings.txtRipEnabled
@@ -225,6 +234,15 @@ describe('Settings Commands & Callbacks', () => {
       expect(msg.answerText).toHaveBeenCalled()
     })
 
+    it('handles /settings artist <val> subcommand', async () => {
+      const msg = await triggerMessage('/settings artist off', ADMIN_ID)
+      expect(mockSettingsService.setSetting).toHaveBeenCalledWith(
+        'artistRipEnabled',
+        false,
+      )
+      expect(msg.answerText).toHaveBeenCalled()
+    })
+
     it('handles /settings txt <val> subcommand', async () => {
       const msg = await triggerMessage('/settings txt off', ADMIN_ID)
       expect(mockSettingsService.setSetting).toHaveBeenCalledWith(
@@ -289,6 +307,16 @@ describe('Settings Commands & Callbacks', () => {
         ADMIN_ID,
       )
       expect(mockSettingsService.togglePlaylistRip).toHaveBeenCalled()
+      expect(fakeQuery.answer).toHaveBeenCalled()
+      expect(fakeTg.editMessage).toHaveBeenCalled()
+    })
+
+    it('toggles artist on settings:artist callback', async () => {
+      const { fakeQuery } = await triggerCallbackQuery(
+        'settings:artist',
+        ADMIN_ID,
+      )
+      expect(mockSettingsService.toggleArtistRip).toHaveBeenCalled()
       expect(fakeQuery.answer).toHaveBeenCalled()
       expect(fakeTg.editMessage).toHaveBeenCalled()
     })

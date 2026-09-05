@@ -14,6 +14,7 @@ export interface ISettingsService {
   getRippingMode(): RippingMode
   isAlbumRipEnabled(): boolean
   isPlaylistRipEnabled(): boolean
+  isArtistRipEnabled(): boolean
   isTxtRipEnabled(): boolean
   isMultiLinkRipEnabled(): boolean
   getMaxCollectionTracks(): number
@@ -21,6 +22,7 @@ export interface ISettingsService {
   canServeCache(isAdmin: boolean): boolean
   canRipAlbum(isAdmin: boolean): boolean
   canRipPlaylist(isAdmin: boolean): boolean
+  canRipArtist(isAdmin: boolean): boolean
   canRipTxt(isAdmin: boolean): boolean
   canRipMultiLink(isAdmin: boolean): boolean
   setSetting<K extends keyof BotSettings>(
@@ -30,6 +32,7 @@ export interface ISettingsService {
   cycleRippingMode(): Promise<RippingMode>
   toggleAlbumRip(): Promise<boolean>
   togglePlaylistRip(): Promise<boolean>
+  toggleArtistRip(): Promise<boolean>
   toggleTxtRip(): Promise<boolean>
   toggleMultiLinkRip(): Promise<boolean>
   setMaxCollectionTracks(limit: number): Promise<number>
@@ -62,6 +65,8 @@ export class SettingsService implements ISettingsService {
           dbSettings.albumRipEnabled = Boolean(row.value)
         } else if (row.key === 'playlist_rip_enabled') {
           dbSettings.playlistRipEnabled = Boolean(row.value)
+        } else if (row.key === 'artist_rip_enabled') {
+          dbSettings.artistRipEnabled = Boolean(row.value)
         } else if (row.key === 'txt_rip_enabled') {
           dbSettings.txtRipEnabled = Boolean(row.value)
         } else if (row.key === 'multi_link_rip_enabled') {
@@ -103,6 +108,10 @@ export class SettingsService implements ISettingsService {
     return this._cachedSettings.playlistRipEnabled
   }
 
+  isArtistRipEnabled(): boolean {
+    return this._cachedSettings.artistRipEnabled
+  }
+
   isTxtRipEnabled(): boolean {
     return this._cachedSettings.txtRipEnabled
   }
@@ -135,6 +144,11 @@ export class SettingsService implements ISettingsService {
     return this._cachedSettings.playlistRipEnabled
   }
 
+  canRipArtist(isAdmin: boolean): boolean {
+    if (isAdmin) return true
+    return this._cachedSettings.artistRipEnabled
+  }
+
   canRipTxt(isAdmin: boolean): boolean {
     if (isAdmin) return true
     return this._cachedSettings.txtRipEnabled
@@ -153,6 +167,7 @@ export class SettingsService implements ISettingsService {
       rippingMode: 'ripping_mode',
       albumRipEnabled: 'album_rip_enabled',
       playlistRipEnabled: 'playlist_rip_enabled',
+      artistRipEnabled: 'artist_rip_enabled',
       txtRipEnabled: 'txt_rip_enabled',
       multiLinkRipEnabled: 'multi_link_rip_enabled',
       maxCollectionTracks: 'max_collection_tracks',
@@ -212,6 +227,12 @@ export class SettingsService implements ISettingsService {
   async togglePlaylistRip(): Promise<boolean> {
     const next = !this._cachedSettings.playlistRipEnabled
     await this.setSetting('playlistRipEnabled', next)
+    return next
+  }
+
+  async toggleArtistRip(): Promise<boolean> {
+    const next = !this._cachedSettings.artistRipEnabled
+    await this.setSetting('artistRipEnabled', next)
     return next
   }
 

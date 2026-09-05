@@ -41,6 +41,10 @@ export function buildSettingsKeyboard(settings: BotSettings) {
         settings.playlistRipEnabled ? 'Playlists: 🟢 ON' : 'Playlists: 🔴 OFF',
         'settings:playlist',
       ),
+      BotKeyboard.callback(
+        settings.artistRipEnabled ? 'Artists: 🟢 ON' : 'Artists: 🔴 OFF',
+        'settings:artist',
+      ),
     ],
     [
       BotKeyboard.callback(
@@ -81,6 +85,7 @@ export function renderSettingsText(settings: BotSettings): string {
     `• <b>Engine Mode:</b> ${modeDescriptions[settings.rippingMode]}<br/>` +
     `• <b>Album Ripping:</b> ${settings.albumRipEnabled ? '🟢 Enabled' : '🔴 Disabled'}<br/>` +
     `• <b>Playlist Ripping:</b> ${settings.playlistRipEnabled ? '🟢 Enabled' : '🔴 Disabled'}<br/>` +
+    `• <b>Artist Ripping:</b> ${settings.artistRipEnabled ? '🟢 Enabled' : '🔴 Disabled'}<br/>` +
     `• <b>.TXT File Ripping:</b> ${settings.txtRipEnabled ? '🟢 Enabled' : '🔴 Disabled'}<br/>` +
     `• <b>Multi-Link Ripping:</b> ${settings.multiLinkRipEnabled ? '🟢 Enabled' : '🔴 Disabled'}<br/>` +
     `• <b>Max Collection Limit:</b> <code>${limitText}</code><br/><br/>` +
@@ -204,6 +209,17 @@ export function registerSettingsCommands(
         return
       }
 
+      if (subCommand === 'artist') {
+        const val = rawValue === 'on' || rawValue === 'true' || rawValue === '1'
+        await service.setSetting('artistRipEnabled', val)
+        await msg.answerText(
+          parseDynamicHtml(
+            `Artist ripping set to: <b>${val ? 'ON' : 'OFF'}</b>`,
+          ),
+        )
+        return
+      }
+
       if (subCommand === 'txt' || subCommand === 'batch_txt') {
         const val = rawValue === 'on' || rawValue === 'true' || rawValue === '1'
         await service.setSetting('txtRipEnabled', val)
@@ -301,6 +317,15 @@ export function registerSettingsCommands(
       const enabled = await service.togglePlaylistRip()
       await query.answer({
         text: `Playlist ripping: ${enabled ? 'ON' : 'OFF'}`,
+      })
+      await renderSettingsMessage(tg, service, query.chat.id, query.messageId)
+      return
+    }
+
+    if (data === 'settings:artist') {
+      const enabled = await service.toggleArtistRip()
+      await query.answer({
+        text: `Artist ripping: ${enabled ? 'ON' : 'OFF'}`,
       })
       await renderSettingsMessage(tg, service, query.chat.id, query.messageId)
       return

@@ -11,6 +11,7 @@ export interface BotSettings {
   rippingMode: RippingMode
   albumRipEnabled: boolean
   playlistRipEnabled: boolean
+  artistRipEnabled: boolean
   txtRipEnabled: boolean
   multiLinkRipEnabled: boolean
   maxCollectionTracks: number
@@ -20,6 +21,7 @@ export const DEFAULT_SETTINGS: BotSettings = {
   rippingMode: 'live',
   albumRipEnabled: true,
   playlistRipEnabled: true,
+  artistRipEnabled: true,
   txtRipEnabled: true,
   multiLinkRipEnabled: true,
   maxCollectionTracks: 50,

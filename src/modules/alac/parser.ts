@@ -1,4 +1,4 @@
-export type AlacTargetType = 'track' | 'album' | 'playlist'
+export type AlacTargetType = 'track' | 'album' | 'playlist' | 'artist'
 
 export interface ParsedTargetItem {
   id: string
@@ -12,6 +12,7 @@ export interface ParsedAlacInput {
   force: boolean
   isAlbum?: boolean
   isPlaylist?: boolean
+  isArtist?: boolean
   storefront?: string
 }
 
@@ -22,8 +23,11 @@ const SONG_DIRECT_RE =
 const ALBUM_RE = /music\.apple\.com\/(?:([a-z]{2})\/)?album\/(?:[^/]+\/)?(\d+)/i
 const PLAYLIST_RE =
   /music\.apple\.com\/(?:([a-z]{2})\/)?playlist\/(?:[^/]+\/)?(pl\.(?:u-[a-zA-Z0-9]+|[a-zA-Z0-9]+))/i
+const ARTIST_RE =
+  /(?:music|itunes)\.apple\.com\/(?:([a-z]{2})\/)?artist\/(?:[^/]+\/)?(\d+)/i
 const BARE_ID_RE = /^\d+$/
 const BARE_PLAYLIST_ID_RE = /^(pl\.(?:u-[a-zA-Z0-9]+|[a-zA-Z0-9]+))$/i
+const BARE_ARTIST_ID_RE = /^artist[:/](\d+)$/i
 
 export function parseSingleItem(rawToken: string): ParsedTargetItem | null {
   const token = rawToken.trim()
@@ -43,6 +47,23 @@ export function parseSingleItem(rawToken: string): ParsedTargetItem | null {
     return {
       id: barePlaylistMatch[1],
       type: 'playlist',
+    }
+  }
+
+  const artistMatch = token.match(ARTIST_RE)
+  if (artistMatch?.[2]) {
+    return {
+      id: artistMatch[2],
+      type: 'artist',
+      storefront: artistMatch[1]?.toLowerCase(),
+    }
+  }
+
+  const bareArtistMatch = token.match(BARE_ARTIST_ID_RE)
+  if (bareArtistMatch?.[1]) {
+    return {
+      id: bareArtistMatch[1],
+      type: 'artist',
     }
   }
 
@@ -160,6 +181,7 @@ export function parseAlacInput(
     force,
     isAlbum: first.type === 'album',
     isPlaylist: first.type === 'playlist',
+    isArtist: first.type === 'artist',
   }
 
   if (first.storefront) {
