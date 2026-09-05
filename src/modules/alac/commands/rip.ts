@@ -2,7 +2,7 @@ import { existsSync, unlinkSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { BotKeyboard, html } from '@mtcute/bun'
+import { BotKeyboard, html, type Message } from '@mtcute/bun'
 import { filters } from '@mtcute/dispatcher'
 
 import { env } from '@/env.ts'
@@ -14,9 +14,16 @@ import {
   parseAlacInput,
 } from '@/modules/alac/parser.ts'
 import { fetchPlaylistTracks } from '@/modules/alac/playlist.ts'
-import type { TrackRipResult } from '@/modules/alac/ripper.ts'
+import { abortableSleep, type TrackRipResult } from '@/modules/alac/ripper.ts'
 import { settingsService as defaultSettingsService } from '@/modules/settings/service.ts'
-import { debug, debugSpan, error, info, infoSpan } from '@/utils/logger.ts'
+import {
+  debug,
+  debugSpan,
+  error,
+  info,
+  infoSpan,
+  warn,
+} from '@/utils/logger.ts'
 import { formatByteProgress, renderProgressBar } from '@/utils/progress.ts'
 
 import type { CommandContext } from './types.ts'
@@ -50,6 +57,7 @@ export const activeJobs = new Map<string, ActiveRipJob>()
 export function registerRipCommand(ctx: CommandContext): void {
   const { dp, tg, service, ripper, queue, auth } = ctx
   const settings = ctx.settings ?? defaultSettingsService
+  const uploadRetryBaseMs = ctx.uploadRetryBaseMs ?? env.ALAC_RETRY_BASE_MS
 
   dp.onNewMessage(
     filters.command([
@@ -660,31 +668,81 @@ export function registerRipCommand(ctx: CommandContext): void {
                   trackCount: ripResult.trackCount,
                 })
 
-                const dumpMsg = await tg.sendMedia(
-                  env.DUMP_CHANNEL_ID,
-                  {
-                    type: 'audio',
-                    file: Bun.file(ripResult.filePath),
-                    title: ripResult.title,
-                    performer: ripResult.artist,
-                    duration: ripResult.duration,
-                    caption,
-                  },
-                  {
-                    progressCallback: (uploaded, total) => {
-                      if (total > 0) {
-                        const progressText = formatByteProgress(
-                          uploaded,
-                          total,
-                          10,
-                        )
-                        updateProgress(
-                          `📤 <b>Uploading:</b> <code>${progressText}</code>`,
-                        )
-                      }
-                    },
-                  },
-                )
+                let dumpMsg: Message | null = null
+                let uploadAttempt = 0
+                const maxUploadRetries = env.ALAC_MAX_RETRIES
+
+                while (true) {
+                  if (currentJob.isCancelled || taskSignal.aborted) {
+                    throw new Error('Download was cancelled')
+                  }
+
+                  try {
+                    dumpMsg = await tg.sendMedia(
+                      env.DUMP_CHANNEL_ID,
+                      {
+                        type: 'audio',
+                        file: Bun.file(ripResult.filePath),
+                        title: ripResult.title,
+                        performer: ripResult.artist,
+                        duration: ripResult.duration,
+                        caption,
+                      },
+                      {
+                        progressCallback: (uploaded, total) => {
+                          if (total > 0) {
+                            const progressText = formatByteProgress(
+                              uploaded,
+                              total,
+                              10,
+                            )
+                            updateProgress(
+                              `📤 <b>Uploading:</b> <code>${progressText}</code>`,
+                            )
+                          }
+                        },
+                      },
+                    )
+                    break
+                  } catch (uploadErr: unknown) {
+                    if (
+                      currentJob.isCancelled ||
+                      taskSignal.aborted ||
+                      (uploadErr instanceof Error &&
+                        uploadErr.message === 'Download was cancelled')
+                    ) {
+                      throw uploadErr
+                    }
+
+                    if (uploadAttempt >= maxUploadRetries) {
+                      throw uploadErr
+                    }
+
+                    uploadAttempt++
+                    const rawDelay =
+                      uploadRetryBaseMs * 2 ** (uploadAttempt - 1)
+                    const jitterFactor = 0.8 + Math.random() * 0.4
+                    const delayMs = Math.round(rawDelay * jitterFactor)
+                    const errMsg =
+                      uploadErr instanceof Error
+                        ? uploadErr.message
+                        : String(uploadErr)
+                    const waitSec = (delayMs / 1000).toFixed(1)
+
+                    await updateProgress(
+                      `⚠️ <b>Upload failed, retrying (${uploadAttempt}/${maxUploadRetries}) in ${waitSec}s:</b> <code>${html.escape(errMsg)}</code>`,
+                    )
+                    warn('Track upload to dump failed, retrying', {
+                      track_id: trackId,
+                      attempt: uploadAttempt,
+                      max_retries: maxUploadRetries,
+                      delay_ms: delayMs,
+                      error: errMsg,
+                    })
+
+                    await abortableSleep(delayMs, taskSignal)
+                  }
+                }
 
                 if (currentJob.isCancelled || taskSignal.aborted) {
                   throw new Error('Download was cancelled')

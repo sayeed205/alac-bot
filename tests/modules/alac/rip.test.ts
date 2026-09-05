@@ -181,6 +181,7 @@ describe('ALAC Rip Command Handler', () => {
       ripper: mockRipper,
       auth: mockAuth,
       settings: mockSettingsService,
+      uploadRetryBaseMs: 5,
     }
   })
 
@@ -1145,6 +1146,62 @@ describe('ALAC Rip Command Handler', () => {
 
       expect(mockRipper.rip).toHaveBeenCalled()
       expect(fakeTg.sendCopy).not.toHaveBeenCalled()
+    })
+  })
+  describe('Upload Retries & Error Handling', () => {
+    it('retries upload on transient mtcute/network error and succeeds on retry', async () => {
+      let attempts = 0
+      fakeTg.sendMedia = mock(() => {
+        attempts++
+        if (attempts === 1) {
+          return Promise.reject(
+            new Error(
+              'Unexpected EOS (there were only 370 parts, but expected 370)',
+            ),
+          )
+        }
+        return Promise.resolve({
+          id: 500,
+          media: {
+            type: 'audio',
+            fileId: 'uploaded_file_id',
+            uniqueFileId: 'uploaded_unique_id',
+          },
+        })
+      }) as unknown as TelegramClient['sendMedia']
+
+      registerRipCommand(ctx)
+      await dispatchMessage('/alac 12345')
+
+      // Ripped once from Apple Music, but uploaded twice to Telegram!
+      expect(mockRipper.rip).toHaveBeenCalledTimes(1)
+      expect(fakeTg.sendMedia).toHaveBeenCalledTimes(2)
+      expect(mockService.saveTrack).toHaveBeenCalled()
+      expect(fakeTg.sendCopy).toHaveBeenCalled()
+    })
+
+    it('marks track as failed when all upload retries are exhausted', async () => {
+      fakeTg.sendMedia = mock(() =>
+        Promise.reject(
+          new Error(
+            'Unexpected EOS (there were only 370 parts, but expected 370)',
+          ),
+        ),
+      ) as unknown as TelegramClient['sendMedia']
+
+      registerRipCommand(ctx)
+      await dispatchMessage('/alac 12345')
+
+      // env.ALAC_MAX_RETRIES is 3 -> initial attempt + 3 retries = 4 calls to sendMedia
+      expect(mockRipper.rip).toHaveBeenCalledTimes(1)
+      expect(fakeTg.sendMedia).toHaveBeenCalledTimes(4)
+      expect(mockService.saveTrack).not.toHaveBeenCalled()
+      expect(mockService.logRequest).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: 'failed',
+          errorReason: expect.stringContaining('Unexpected EOS'),
+        }),
+      )
     })
   })
 })

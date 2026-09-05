@@ -25,4 +25,5 @@ export interface CommandContext {
   auth: IAuthService
   dumpService?: IDbDumpService
   settings?: ISettingsService
+  uploadRetryBaseMs?: number
 }
