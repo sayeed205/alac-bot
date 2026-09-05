@@ -1,13 +1,10 @@
 import type { TelegramClient } from '@mtcute/bun'
 import { html } from '@mtcute/bun'
 
+import type { FormattedString } from '@/utils/html.ts'
+import { parseDynamicHtml } from '@/utils/html.ts'
+
 import type { IAlacService } from './service.ts'
-
-export type FormattedString = ReturnType<typeof html>
-
-function parseDynamicHtml(content: string): FormattedString {
-  return html([content] as unknown as TemplateStringsArray)
-}
 
 export interface DumpCaptionMetadata {
   appleTrackId: string

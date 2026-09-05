@@ -1,4 +1,9 @@
 import { BotKeyboard, html, type TelegramClient } from '@mtcute/bun'
+
+import { parseDynamicHtml } from '@/utils/html.ts'
+
+export { parseDynamicHtml }
+
 import type { Dispatcher, MessageContext } from '@mtcute/dispatcher'
 
 import type { IAuthService } from '@/modules/auth/service.ts'
@@ -16,10 +21,6 @@ export interface CommandContext {
 }
 
 export const PAGE_SIZE = 20
-
-export function parseDynamicHtml(content: string) {
-  return html([content] as unknown as TemplateStringsArray)
-}
 
 export function buildPaginationKeyboard(page: number, totalPages: number) {
   if (totalPages <= 1) {

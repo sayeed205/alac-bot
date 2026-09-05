@@ -25,6 +25,7 @@ import {
   warn,
 } from '@/utils/logger.ts'
 import { formatByteProgress, renderProgressBar } from '@/utils/progress.ts'
+import { editMessageSafe, sendTextSafe } from '@/utils/telegram.ts'
 
 import type { CommandContext } from './types.ts'
 import { parseDynamicHtml } from './types.ts'
@@ -449,15 +450,25 @@ export function registerRipCommand(ctx: CommandContext): void {
           failedItems.length > 0
             ? `<br/><code>${html.escape(failedItems.join('\n'))}</code>`
             : ''
-        await tg
-          .editMessage({
+        const resText = parseDynamicHtml(
+          `⚠️ <b>Failed to resolve any tracks:</b>${errorDetail}`,
+        )
+        const resEdited = await editMessageSafe(tg, {
+          chatId: msg.chat.id,
+          message: resolvingStatus.id,
+          text: resText,
+          block: true,
+          maxWaitSec: 10,
+        })
+        if (!resEdited) {
+          await sendTextSafe(tg, {
             chatId: msg.chat.id,
-            message: resolvingStatus.id,
-            text: parseDynamicHtml(
-              `⚠️ <b>Failed to resolve any tracks:</b>${errorDetail}`,
-            ),
+            text: resText,
+            params: { replyTo: msg.id },
+            block: true,
+            maxWaitSec: 10,
           })
-          .catch(() => null)
+        }
         return
       }
 
@@ -506,13 +517,20 @@ export function registerRipCommand(ctx: CommandContext): void {
       const jobStartTime = Date.now()
       let lastStatusUpdate = 0
       let lastStatusText = ''
+      let isEditing = false
+      let isEditBlocked = false
 
       const cancelKeyboard = BotKeyboard.inline([
         [BotKeyboard.callback('❌ Cancel Download', `cancel:${jobId}`)],
       ])
 
-      const updateProgress = async (currentStatus: string, force = false) => {
-        if (currentJob.isCancelled || jobController.signal.aborted) return
+      const updateProgress = async (currentStatus: string, _force = false) => {
+        if (
+          currentJob.isCancelled ||
+          jobController.signal.aborted ||
+          isEditBlocked
+        )
+          return
 
         const total = tracksToProcess.length
         const completed =
@@ -543,19 +561,29 @@ export function registerRipCommand(ctx: CommandContext): void {
             : '')
 
         const now = Date.now()
+        if (isEditing) return
+        const minInterval = lastStatusUpdate === 0 ? 0 : 10000
+        if (now - lastStatusUpdate < minInterval) return
         if (formatted === lastStatusText) return
-        if (!force && now - lastStatusUpdate < 1500) return
+
+        isEditing = true
         lastStatusUpdate = now
         lastStatusText = formatted
 
-        await tg
-          .editMessage({
+        try {
+          const edited = await editMessageSafe(tg, {
             chatId: msg.chat.id,
             message: statusMsgId,
             text: parseDynamicHtml(formatted),
             replyMarkup: cancelKeyboard,
+            block: false,
           })
-          .catch(() => null)
+          if (!edited) {
+            isEditBlocked = true
+          }
+        } finally {
+          isEditing = false
+        }
       }
 
       await updateProgress('Checking local cache...', true)
@@ -573,16 +601,26 @@ export function registerRipCommand(ctx: CommandContext): void {
         !cachedTracksMap.has(tracksToProcess[0]?.id)
       ) {
         activeJobs.delete(jobId)
-        await tg
-          .editMessage({
+        const maintText = parseDynamicHtml(
+          '⚠️ <b>Live ripping is currently disabled for maintenance.</b><br/>' +
+            'This track is not yet in the local cache. Only cached tracks can be played right now.',
+        )
+        const maintEdited = await editMessageSafe(tg, {
+          chatId: msg.chat.id,
+          message: resolvingStatus.id,
+          text: maintText,
+          block: true,
+          maxWaitSec: 10,
+        })
+        if (!maintEdited) {
+          await sendTextSafe(tg, {
             chatId: msg.chat.id,
-            message: resolvingStatus.id,
-            text: parseDynamicHtml(
-              '⚠️ <b>Live ripping is currently disabled for maintenance.</b><br/>' +
-                'This track is not yet in the local cache. Only cached tracks can be played right now.',
-            ),
+            text: maintText,
+            params: { replyTo: msg.id },
+            block: true,
+            maxWaitSec: 10,
           })
-          .catch(() => null)
+        }
         return
       }
 
@@ -978,13 +1016,26 @@ export function registerRipCommand(ctx: CommandContext): void {
         }
       }
 
-      await tg
-        .editMessage({
+      let summaryEdited = false
+      if (!isEditBlocked) {
+        summaryEdited = await editMessageSafe(tg, {
           chatId: msg.chat.id,
           message: statusMsgId,
           text: parseDynamicHtml(summaryHtml),
+          block: true,
+          maxWaitSec: 10,
         })
-        .catch(() => null)
+      }
+
+      if (!summaryEdited) {
+        await sendTextSafe(tg, {
+          chatId: msg.chat.id,
+          text: parseDynamicHtml(summaryHtml),
+          params: { replyTo: msg.id },
+          block: true,
+          maxWaitSec: 10,
+        })
+      }
     },
   )
 
@@ -1025,13 +1076,21 @@ export function registerRipCommand(ctx: CommandContext): void {
       `• <b>Cancelled by:</b> <b>${html.escape(cancellerName)}</b><br/>` +
       `• <b>Progress when cancelled:</b> <code>${processed}/${targetJob.totalTracks} tracks processed</code></blockquote>`
 
-    await tg
-      .editMessage({
+    const cancelEdited = await editMessageSafe(tg, {
+      chatId: targetJob.chatId,
+      message: targetJob.statusMsgId,
+      text: parseDynamicHtml(cancelledHtml),
+      block: true,
+      maxWaitSec: 5,
+    })
+    if (!cancelEdited) {
+      await sendTextSafe(tg, {
         chatId: targetJob.chatId,
-        message: targetJob.statusMsgId,
         text: parseDynamicHtml(cancelledHtml),
+        block: true,
+        maxWaitSec: 5,
       })
-      .catch(() => null)
+    }
   })
 
   // Interactive Cancel button callback query handler
@@ -1074,12 +1133,20 @@ export function registerRipCommand(ctx: CommandContext): void {
       `• <b>Cancelled by:</b> <b>${html.escape(cancellerName)}</b><br/>` +
       `• <b>Progress when cancelled:</b> <code>${processed}/${job.totalTracks} tracks processed</code></blockquote>`
 
-    await tg
-      .editMessage({
+    const cancelEdited = await editMessageSafe(tg, {
+      chatId: job.chatId,
+      message: job.statusMsgId,
+      text: parseDynamicHtml(cancelledHtml),
+      block: true,
+      maxWaitSec: 5,
+    })
+    if (!cancelEdited) {
+      await sendTextSafe(tg, {
         chatId: job.chatId,
-        message: job.statusMsgId,
         text: parseDynamicHtml(cancelledHtml),
+        block: true,
+        maxWaitSec: 5,
       })
-      .catch(() => null)
+    }
   })
 }

@@ -1298,4 +1298,25 @@ describe('ALAC Rip Command Handler', () => {
       )
     })
   })
+
+  describe('Telegram Edit & Flood Wait Fallback', () => {
+    it('falls back to sendText when editMessage fails with FLOOD_WAIT', async () => {
+      fakeTg.editMessage = mock(() =>
+        Promise.reject(new Error('FLOOD_WAIT_41184')),
+      ) as unknown as TelegramClient['editMessage']
+
+      registerRipCommand(ctx)
+      await dispatchMessage('/alac 12345')
+
+      expect(fakeTg.sendText).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          text: expect.stringContaining('Download Complete'),
+        }),
+        expect.objectContaining({
+          replyTo: expect.anything(),
+        }),
+      )
+    })
+  })
 })

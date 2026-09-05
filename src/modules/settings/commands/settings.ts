@@ -1,4 +1,4 @@
-import { BotKeyboard, html, type TelegramClient } from '@mtcute/bun'
+import { BotKeyboard, type TelegramClient } from '@mtcute/bun'
 import { type Dispatcher, filters } from '@mtcute/dispatcher'
 
 import { authService, type IAuthService } from '@/modules/auth/service.ts'
@@ -10,10 +10,7 @@ import type {
   BotSettings,
   SettingsCommandContext,
 } from '@/modules/settings/types.ts'
-
-function parseDynamicHtml(content: string) {
-  return html([content] as unknown as TemplateStringsArray)
-}
+import { parseDynamicHtml } from '@/utils/html.ts'
 
 export function buildSettingsKeyboard(settings: BotSettings) {
   const modeLabels = {
