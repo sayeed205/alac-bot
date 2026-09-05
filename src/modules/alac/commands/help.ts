@@ -41,6 +41,7 @@ export function registerHelpCommand(ctx: CommandContext): void {
       helpText +=
         '<br/><br/><blockquote><b>Admin Commands:</b><br/>' +
         '• <code>/settings</code> — Bot operational settings & ripping toggles<br/>' +
+        '• <code>/cache &lt;link&gt;</code> — Pre-cache/seed tracks directly into dump channel without sending audio (alias: <code>/dump</code>)<br/>' +
         '• <code>/alac &lt;link&gt; -f</code> or <code>/rerip</code> — Force re-rip, bypassing cache<br/>' +
         '• <code>/delete &lt;track_id&gt;</code> — Delete track from DB & dump channel<br/>' +
         '• <code>/auth &lt;user_id | reply&gt;</code> — Whitelist user<br/>' +

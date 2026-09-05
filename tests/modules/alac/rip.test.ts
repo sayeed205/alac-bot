@@ -995,4 +995,156 @@ describe('ALAC Rip Command Handler', () => {
       expect(repliedTexts[0]).toContain('Resolving tracks from Apple Music')
     })
   })
+
+  describe('Admin /cache and /dump Command', () => {
+    it('blocks non-admin from using /cache', async () => {
+      registerRipCommand(ctx)
+      const { repliedTexts } = await dispatchMessage('/cache 12345', 999)
+      expect(repliedTexts.length).toBe(1)
+      expect(repliedTexts[0]).toContain(
+        'Caching directly to dump channel is restricted to the bot owner',
+      )
+      expect(mockRipper.rip).not.toHaveBeenCalled()
+      expect(fakeTg.sendCopy).not.toHaveBeenCalled()
+    })
+
+    it('shows admin cacher usage guide on empty /cache', async () => {
+      registerRipCommand(ctx)
+      const { repliedTexts } = await dispatchMessage('/cache', 1)
+      expect(repliedTexts.length).toBe(1)
+      expect(repliedTexts[0]).toContain('Apple Music Lossless Cacher (Admin)')
+      expect(repliedTexts[0]).toContain('/dump')
+    })
+
+    it('admin rips, uploads to dump channel, saves to DB, but does NOT send copy to chat', async () => {
+      registerRipCommand(ctx)
+      await dispatchMessage('/cache 12345', 1)
+
+      expect(mockQueue.enqueue).toHaveBeenCalled()
+      expect(mockRipper.rip).toHaveBeenCalledWith(
+        '12345',
+        expect.any(Function),
+        undefined,
+        expect.anything(),
+      )
+      expect(fakeTg.sendMedia).toHaveBeenCalled()
+      expect(mockService.saveTrack).toHaveBeenCalled()
+      expect(fakeTg.sendCopy).not.toHaveBeenCalled()
+      expect(mockService.logRequest).toHaveBeenCalled()
+      expect(fakeTg.editMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          text: expect.objectContaining({
+            text: expect.stringContaining('Caching Complete!'),
+          }),
+        }),
+      )
+    })
+
+    it('skips ripping and does not send copy when track is already cached', async () => {
+      mockService.findCachedTracks = mock(() =>
+        Promise.resolve(
+          new Map([
+            [
+              '12345',
+              {
+                id: 1,
+                appleTrackId: '12345',
+                messageId: 77,
+                fileId: 'fid',
+                fileUniqueId: 'uid',
+                title: 'Cached Track',
+                artist: 'Artist',
+                album: 'Album',
+                duration: 200,
+                bitDepth: 24,
+                sampleRate: 48000,
+                genre: 'Pop',
+                releaseDate: '2021',
+                trackNumber: 1,
+                trackCount: 1,
+                createdAt: new Date(),
+                updatedAt: new Date(),
+              },
+            ],
+          ]),
+        ),
+      )
+
+      registerRipCommand(ctx)
+      await dispatchMessage('/cache 12345', 1)
+
+      expect(mockRipper.rip).not.toHaveBeenCalled()
+      expect(fakeTg.sendCopy).not.toHaveBeenCalled()
+      expect(fakeTg.editMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          text: expect.objectContaining({
+            text: expect.stringContaining('1 already cached'),
+          }),
+        }),
+      )
+    })
+
+    it('supports /dump alias with identical behavior', async () => {
+      registerRipCommand(ctx)
+      await dispatchMessage('/dump 12345', 1)
+
+      expect(mockQueue.enqueue).toHaveBeenCalled()
+      expect(mockRipper.rip).toHaveBeenCalledWith(
+        '12345',
+        expect.any(Function),
+        undefined,
+        expect.anything(),
+      )
+      expect(fakeTg.sendMedia).toHaveBeenCalled()
+      expect(mockService.saveTrack).toHaveBeenCalled()
+      expect(fakeTg.sendCopy).not.toHaveBeenCalled()
+    })
+
+    it('allows caching from group chat without requiring DM verification', async () => {
+      registerRipCommand(ctx)
+      await dispatchMessage('/cache 12345', 1, 'supergroup')
+
+      // Should NOT send DM verification text
+      expect(fakeTg.sendText).not.toHaveBeenCalled()
+      expect(fakeTg.sendCopy).not.toHaveBeenCalled()
+      expect(mockRipper.rip).toHaveBeenCalled()
+    })
+
+    it('allows admin to force re-rip on cached track with -f', async () => {
+      mockService.findCachedTracks = mock(() =>
+        Promise.resolve(
+          new Map([
+            [
+              '12345',
+              {
+                id: 1,
+                appleTrackId: '12345',
+                messageId: 77,
+                fileId: 'fid',
+                fileUniqueId: 'uid',
+                title: 'Cached Track',
+                artist: 'Artist',
+                album: 'Album',
+                duration: 200,
+                bitDepth: 24,
+                sampleRate: 48000,
+                genre: 'Pop',
+                releaseDate: '2021',
+                trackNumber: 1,
+                trackCount: 1,
+                createdAt: new Date(),
+                updatedAt: new Date(),
+              },
+            ],
+          ]),
+        ),
+      )
+
+      registerRipCommand(ctx)
+      await dispatchMessage('/cache 12345 -f', 1)
+
+      expect(mockRipper.rip).toHaveBeenCalled()
+      expect(fakeTg.sendCopy).not.toHaveBeenCalled()
+    })
+  })
 })

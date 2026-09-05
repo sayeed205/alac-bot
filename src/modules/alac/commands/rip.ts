@@ -52,7 +52,16 @@ export function registerRipCommand(ctx: CommandContext): void {
   const settings = ctx.settings ?? defaultSettingsService
 
   dp.onNewMessage(
-    filters.command(['alac', 'rip', 'batch', 'dl', 'download', 'rerip']),
+    filters.command([
+      'alac',
+      'rip',
+      'batch',
+      'dl',
+      'download',
+      'rerip',
+      'cache',
+      'dump',
+    ]),
     async (msg) => {
       using _cmdSpan = infoSpan('alac').enter()
 
@@ -64,8 +73,26 @@ export function registerRipCommand(ctx: CommandContext): void {
         return
       }
 
-      const commandText = msg.text.trim().split(/\s+/)[0]?.toLowerCase()
+      const commandText = msg.text
+        .trim()
+        .split(/\s+/)[0]
+        ?.toLowerCase()
+        .replace(/^\//, '')
       const isRerip = commandText?.includes('rerip')
+      const isCacheOnly = commandText === 'cache' || commandText === 'dump'
+
+      const isAdmin = auth.isAdmin(msg.sender.id)
+      if (isCacheOnly && !isAdmin) {
+        debug('Non-admin requested cache/dump command', {
+          user_id: msg.sender.id,
+        })
+        await msg.replyText(
+          parseDynamicHtml(
+            '🔒 <b>Access Restricted:</b> Caching directly to dump channel is restricted to the bot owner.',
+          ),
+        )
+        return
+      }
 
       const replyMsg = await msg.getReplyTo().catch(() => null)
 
@@ -124,23 +151,38 @@ export function registerRipCommand(ctx: CommandContext): void {
 
       if (parsedItems.length === 0) {
         debug('Invalid alac input received', { text: msg.text })
-        await msg.replyText(
-          parseDynamicHtml(
-            '🎵 <b>Apple Music Lossless Ripper</b><br/><br/>' +
-              '<blockquote><b>Supported Inputs:</b><br/>' +
-              '• <b>Track:</b> <code>/alac &lt;link | id&gt;</code><br/>' +
-              '• <b>Album:</b> <code>/alac &lt;album_link&gt;</code><br/>' +
-              '• <b>Playlist:</b> <code>/alac &lt;playlist_link&gt;</code><br/>' +
-              '• <b>Batch:</b> Send multiple links or attach a <code>.txt</code> file<br/>' +
-              '• <b>Aliases:</b> <code>/rip</code>, <code>/batch</code>, <code>/dl</code>, <code>/download</code><br/>' +
-              '• <b>Cancel:</b> <code>/cancel</code> or tap the Cancel button on any active download<br/>' +
-              '• <b>Options:</b> <code>-f</code> <i>(force re-rip)</i></blockquote>',
-          ),
-        )
+        if (isCacheOnly) {
+          await msg.replyText(
+            parseDynamicHtml(
+              '💾 <b>Apple Music Lossless Cacher (Admin)</b><br/><br/>' +
+                '<blockquote><b>Usage:</b><br/>' +
+                '• <b>Track:</b> <code>/cache &lt;link | id&gt;</code><br/>' +
+                '• <b>Album:</b> <code>/cache &lt;album_link&gt;</code><br/>' +
+                '• <b>Playlist:</b> <code>/cache &lt;playlist_link&gt;</code><br/>' +
+                '• <b>Batch:</b> Send multiple links or attach a <code>.txt</code> file<br/>' +
+                '• <b>Alias:</b> <code>/dump</code><br/>' +
+                '• <b>Options:</b> <code>-f</code> <i>(force re-rip even if cached)</i><br/>' +
+                '<i>Rips and seeds lossless audio directly into dump channel and database without sending files to chat.</i></blockquote>',
+            ),
+          )
+        } else {
+          await msg.replyText(
+            parseDynamicHtml(
+              '🎵 <b>Apple Music Lossless Ripper</b><br/><br/>' +
+                '<blockquote><b>Supported Inputs:</b><br/>' +
+                '• <b>Track:</b> <code>/alac &lt;link | id&gt;</code><br/>' +
+                '• <b>Album:</b> <code>/alac &lt;album_link&gt;</code><br/>' +
+                '• <b>Playlist:</b> <code>/alac &lt;playlist_link&gt;</code><br/>' +
+                '• <b>Batch:</b> Send multiple links or attach a <code>.txt</code> file<br/>' +
+                '• <b>Aliases:</b> <code>/rip</code>, <code>/batch</code>, <code>/dl</code>, <code>/download</code><br/>' +
+                '• <b>Cancel:</b> <code>/cancel</code> or tap the Cancel button on any active download<br/>' +
+                '• <b>Options:</b> <code>-f</code> <i>(force re-rip)</i></blockquote>',
+            ),
+          )
+        }
         return
       }
 
-      const isAdmin = auth.isAdmin(msg.sender.id)
       if (isForce && !isAdmin) {
         debug('Non-admin requested force re-rip', { user_id: msg.sender.id })
         await msg.replyText(
@@ -224,7 +266,7 @@ export function registerRipCommand(ctx: CommandContext): void {
       let deliveryChatId = msg.chat.id
 
       // In group chats, verify user has started the bot in DM so files can be sent privately
-      if (isGroup) {
+      if (isGroup && !isCacheOnly) {
         try {
           await tg.sendText(
             msg.sender.id,
@@ -390,20 +432,27 @@ export function registerRipCommand(ctx: CommandContext): void {
 
       const isMultiTrack = tracksToProcess.length > 1
       if (!jobHeader) {
-        jobHeader = isMultiTrack
-          ? `Batch: <b>${tracksToProcess.length} tracks</b>`
-          : `Track ID: <code>${tracksToProcess[0]?.id}</code>`
+        if (isCacheOnly) {
+          jobHeader = isMultiTrack
+            ? `Batch Cache: <b>${tracksToProcess.length} tracks</b>`
+            : `Track Cache: <code>${tracksToProcess[0]?.id}</code>`
+        } else {
+          jobHeader = isMultiTrack
+            ? `Batch: <b>${tracksToProcess.length} tracks</b>`
+            : `Track ID: <code>${tracksToProcess[0]?.id}</code>`
+        }
       }
 
       currentJob.jobHeader = jobHeader
       currentJob.totalTracks = tracksToProcess.length
 
-      info('Rip job queued', {
+      info(isCacheOnly ? 'Cache job queued' : 'Rip job queued', {
         jobId,
         tracksCount: tracksToProcess.length,
         force: isForce,
         isGroup,
-        deliveryChatId,
+        isCacheOnly,
+        deliveryChatId: isCacheOnly ? 'dump_only' : deliveryChatId,
       })
 
       const statusMsgId = resolvingStatus.id
@@ -431,10 +480,14 @@ export function registerRipCommand(ctx: CommandContext): void {
         const percent = Math.min(100, Math.round((completed / total) * 100))
         const bar = renderProgressBar(completed, total, 10)
 
+        const statusLine = isCacheOnly
+          ? `<b>Status:</b> ⚡ ${cachedCount} cached • 🎵 ${rippedCount} seeded`
+          : `<b>Status:</b> ⚡ ${cachedCount} cached • 🎵 ${rippedCount} ripped`
+
         const formatted =
-          `📋 <b>${jobHeader}</b><br/>` +
+          `${isCacheOnly ? '💾' : '📋'} <b>${jobHeader}</b><br/>` +
           `<b>Progress:</b> <code>${bar} ${completed}/${total} (${percent}%)</code><br/>` +
-          `<b>Status:</b> ⚡ ${cachedCount} cached • 🎵 ${rippedCount} ripped` +
+          `${statusLine}` +
           (skippedUncachedTracks.length > 0
             ? ` • 🟡 ${skippedUncachedTracks.length} skipped`
             : '') +
@@ -442,7 +495,9 @@ export function registerRipCommand(ctx: CommandContext): void {
             ? ` • ⚠️ ${failedTracks.length} failed`
             : '') +
           `<br/><b>Current:</b> ${currentStatus}` +
-          (isGroup ? '<br/><i>Files delivered to your private DM 📩</i>' : '')
+          (isGroup && !isCacheOnly
+            ? '<br/><i>Files delivered to your private DM 📩</i>'
+            : '')
 
         const now = Date.now()
         if (formatted === lastStatusText) return
@@ -503,6 +558,13 @@ export function registerRipCommand(ctx: CommandContext): void {
         if (!isForce) {
           const cached = cachedTracksMap.get(trackId)
           if (cached) {
+            if (isCacheOnly) {
+              cachedCount++
+              currentJob.cachedCount = cachedCount
+              await updateProgress(`⚡ Already cached: ${trackId}`)
+              continue
+            }
+
             try {
               await tg.sendCopy({
                 toChatId: deliveryChatId,
@@ -652,20 +714,22 @@ export function registerRipCommand(ctx: CommandContext): void {
                   trackCount: ripResult.trackCount,
                 })
 
-                await tg.sendCopy({
-                  toChatId: deliveryChatId,
-                  fromChatId: env.DUMP_CHANNEL_ID,
-                  message: dumpMsg.id,
-                  ...(deliveryChatId === msg.chat.id
-                    ? { replyTo: msg.id }
-                    : {}),
-                  silent: isMultiTrack,
-                })
+                if (!isCacheOnly) {
+                  await tg.sendCopy({
+                    toChatId: deliveryChatId,
+                    fromChatId: env.DUMP_CHANNEL_ID,
+                    message: dumpMsg.id,
+                    ...(deliveryChatId === msg.chat.id
+                      ? { replyTo: msg.id }
+                      : {}),
+                    silent: isMultiTrack,
+                  })
+                }
 
                 rippedCount++
                 currentJob.rippedCount = rippedCount
                 const totalDurationMs = Date.now() - startTime
-                info('Track completed', {
+                info(isCacheOnly ? 'Track cached to dump' : 'Track completed', {
                   track: `${ripResult.artist} - ${ripResult.title}`,
                   time: `${(totalDurationMs / 1000).toFixed(1)}s`,
                 })
@@ -765,7 +829,18 @@ export function registerRipCommand(ctx: CommandContext): void {
       const totalTracks = tracksToProcess.length
 
       let summaryHtml = ''
-      if (
+      if (isCacheOnly) {
+        summaryHtml =
+          `✅ <b>Caching Complete!</b><br/><br/>` +
+          `<blockquote>• <b>Target:</b> ${jobHeader}<br/>` +
+          `• <b>Total Tracks:</b> <code>${totalTracks}</code><br/>` +
+          `• <b>Seeded to Dump:</b> 🎵 <code>${rippedCount}</code> new • ⚡ <code>${cachedCount}</code> already cached<br/>` +
+          (failedTracks.length > 0
+            ? `• <b>Failed:</b> ⚠️ <code>${failedTracks.length}</code><br/>`
+            : '') +
+          `• <b>Time Elapsed:</b> <code>${totalElapsedSec}s</code><br/>` +
+          `• <b>Destination:</b> Dump Channel & Database</blockquote>`
+      } else if (
         cachedCount === 0 &&
         rippedCount === 0 &&
         skippedUncachedTracks.length > 0
@@ -795,7 +870,7 @@ export function registerRipCommand(ctx: CommandContext): void {
         summaryHtml += `<br/>ℹ️ <i>Queue was capped to ${maxCollectionLimit} tracks (settings limit).</i>`
       }
 
-      if (isGroup) {
+      if (isGroup && !isCacheOnly) {
         summaryHtml +=
           '<br/>📩 <i>All songs have been delivered to your private DM!</i>'
       }
@@ -855,7 +930,7 @@ export function registerRipCommand(ctx: CommandContext): void {
       `🛑 <b>Download Cancelled</b><br/><br/>` +
       `<blockquote>• <b>Target:</b> ${targetJob.jobHeader || 'Download'}<br/>` +
       `• <b>Cancelled by:</b> <b>${html.escape(cancellerName)}</b><br/>` +
-      `• <b>Progress when cancelled:</b> <code>${processed}/${targetJob.totalTracks} tracks delivered</code></blockquote>`
+      `• <b>Progress when cancelled:</b> <code>${processed}/${targetJob.totalTracks} tracks processed</code></blockquote>`
 
     await tg
       .editMessage({
@@ -904,7 +979,7 @@ export function registerRipCommand(ctx: CommandContext): void {
       `🛑 <b>Download Cancelled</b><br/><br/>` +
       `<blockquote>• <b>Target:</b> ${job.jobHeader || 'Download'}<br/>` +
       `• <b>Cancelled by:</b> <b>${html.escape(cancellerName)}</b><br/>` +
-      `• <b>Progress when cancelled:</b> <code>${processed}/${job.totalTracks} tracks delivered</code></blockquote>`
+      `• <b>Progress when cancelled:</b> <code>${processed}/${job.totalTracks} tracks processed</code></blockquote>`
 
     await tg
       .editMessage({
