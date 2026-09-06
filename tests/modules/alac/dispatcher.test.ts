@@ -95,7 +95,7 @@ describe('Handlers Dispatcher & Callback Query Flow', () => {
     const internalDp = dp as unknown as DispatcherInternal
     const group0 = internalDp._groups.get(0)
     const cbHandlers = group0?.get('callback_query') ?? []
-    expect(cbHandlers.length).toBe(3)
+    expect(cbHandlers.length).toBe(4)
 
     const authCb = cbHandlers[0]
     const searchCb = cbHandlers[1]
