@@ -43,15 +43,13 @@ export async function connectAudioStreamWithWrapper(
         mirrorUrl: primaryMirror.mirrorUrl,
       })
 
-      const source = await fetchStreamEndpoint({
+      return await fetchStreamEndpoint({
         streamUrl: `${primaryMirror.mirrorUrl.replace(/\/+$/, '')}/api/stream/${trackId}`,
         apiKey: primaryMirror.apiKey,
         sourceName: `primary mirror (${new URL(primaryMirror.mirrorUrl).hostname})`,
         signal,
         timeoutMs: 30_000,
       })
-
-      return source
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       errors.push(`Primary mirror failed: ${msg}`)
@@ -88,15 +86,13 @@ export async function connectAudioStreamWithWrapper(
         throw new Error('Download was cancelled')
       }
 
-      const source = await fetchStreamEndpoint({
+      return await fetchStreamEndpoint({
         streamUrl: candidateUrl,
         apiKey: wrapperApiKey,
         sourceName: `wrapper (${cleanWrapper})`,
         signal,
         timeoutMs: 30_000,
       })
-
-      return source
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       errors.push(`Wrapper endpoint [${candidateUrl}] failed: ${msg}`)

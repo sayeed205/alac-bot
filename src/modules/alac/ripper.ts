@@ -17,9 +17,14 @@ export type { TrackRipResult }
 export interface ITrackRipper {
   rip(
     trackId: string,
-    onProgress?: (status: string) => void,
+    onProgress?: (
+      status: string,
+      downloadedBytes?: number,
+      totalBytes?: number,
+    ) => void,
     storefront?: string,
     signal?: AbortSignal,
+    outputDir?: string,
   ): Promise<TrackRipResult>
 }
 
@@ -61,9 +66,14 @@ export class FakeTrackRipper implements ITrackRipper {
 
   async rip(
     trackId: string,
-    onProgress?: (status: string) => void,
+    onProgress?: (
+      status: string,
+      downloadedBytes?: number,
+      totalBytes?: number,
+    ) => void,
     _storefront?: string,
     signal?: AbortSignal,
+    _outputDir?: string,
   ): Promise<TrackRipResult> {
     if (signal?.aborted) {
       throw new Error('Download was cancelled')
@@ -110,9 +120,14 @@ export class AlacTrackRipper implements ITrackRipper {
 
   async rip(
     trackId: string,
-    onProgress?: (status: string) => void,
+    onProgress?: (
+      status: string,
+      downloadedBytes?: number,
+      totalBytes?: number,
+    ) => void,
     storefront?: string,
     signal?: AbortSignal,
+    outputDir?: string,
   ): Promise<TrackRipResult> {
     let attempt = 0
 
@@ -122,7 +137,13 @@ export class AlacTrackRipper implements ITrackRipper {
       }
 
       try {
-        return await this.ripOnce(trackId, onProgress, storefront, signal)
+        return await this.ripOnce(
+          trackId,
+          onProgress,
+          storefront,
+          signal,
+          outputDir,
+        )
       } catch (err: unknown) {
         if (
           signal?.aborted ||
@@ -164,9 +185,14 @@ export class AlacTrackRipper implements ITrackRipper {
 
   protected async ripOnce(
     trackId: string,
-    onProgress?: (status: string) => void,
+    onProgress?: (
+      status: string,
+      downloadedBytes?: number,
+      totalBytes?: number,
+    ) => void,
     storefront?: string,
     signal?: AbortSignal,
+    outputDir?: string,
   ): Promise<TrackRipResult> {
     using _ = debugSpan('ripper', { track_id: trackId, storefront }).enter()
     const ripStart = Date.now()
@@ -175,7 +201,8 @@ export class AlacTrackRipper implements ITrackRipper {
       throw new Error('Download was cancelled')
     }
 
-    await mkdir(this.outputDir, { recursive: true })
+    const targetDir = outputDir || this.outputDir
+    await mkdir(targetDir, { recursive: true })
 
     onProgress?.('Fetching track metadata...')
     const meta = await fetchTrackMeta(trackId, storefront)
@@ -337,7 +364,11 @@ export class AlacTrackRipper implements ITrackRipper {
             downloadedBytes,
             contentLength > 0 ? contentLength : 0,
           )
-          onProgress(`Downloading lossless audio: ${progressStr}`)
+          onProgress(
+            `Downloading lossless audio: ${progressStr}`,
+            downloadedBytes,
+            contentLength > 0 ? contentLength : 0,
+          )
         }
       }
 

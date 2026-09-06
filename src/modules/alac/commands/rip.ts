@@ -1,10 +1,12 @@
-import { existsSync, unlinkSync } from 'node:fs'
+import { existsSync, rmSync, unlinkSync } from 'node:fs'
+import { mkdir } from 'node:fs/promises'
 import os from 'node:os'
-import path from 'node:path'
+import path, { join } from 'node:path'
 
 import { BotKeyboard, html, type Message } from '@mtcute/bun'
 import { filters } from '@mtcute/dispatcher'
 
+import type { Track } from '@/db/schema.ts'
 import { env } from '@/env.ts'
 import { formatDumpCaption } from '@/modules/alac/indexer.ts'
 import { fetchAlbumTracks, fetchArtistTracks } from '@/modules/alac/itunes.ts'
@@ -16,6 +18,7 @@ import {
 import { fetchPlaylistTracks } from '@/modules/alac/playlist.ts'
 import { abortableSleep, type TrackRipResult } from '@/modules/alac/ripper.ts'
 import { settingsService as defaultSettingsService } from '@/modules/settings/service.ts'
+import { BoundedChannel } from '@/utils/channel.ts'
 import {
   debug,
   debugSpan,
@@ -24,7 +27,7 @@ import {
   infoSpan,
   warn,
 } from '@/utils/logger.ts'
-import { formatByteProgress, renderProgressBar } from '@/utils/progress.ts'
+import { formatMbProgress, renderProgressBar } from '@/utils/progress.ts'
 import { editMessageSafe, sendTextSafe } from '@/utils/telegram.ts'
 
 import type { CommandContext } from './types.ts'
@@ -35,6 +38,21 @@ interface ResolvedTrackItem {
   title?: string
   artist?: string
   storefront?: string
+}
+
+interface PipelineItem {
+  index: number
+  item: ResolvedTrackItem
+  status:
+    | { type: 'cached'; cached: Track }
+    | { type: 'skipped'; reason: string }
+    | { type: 'ready'; ripResult: TrackRipResult; startTime: number }
+    | {
+        type: 'failed'
+        error: string
+        isMirrorDown?: boolean
+        startTime: number
+      }
 }
 
 export interface ActiveRipJob {
@@ -524,7 +542,13 @@ export function registerRipCommand(ctx: CommandContext): void {
         [BotKeyboard.callback('❌ Cancel Download', `cancel:${jobId}`)],
       ])
 
-      const updateProgress = async (currentStatus: string, _force = false) => {
+      let activeDownloadText = ''
+      let activeUploadText = ''
+
+      const updateProgress = async (
+        activityOverride?: string,
+        force = false,
+      ) => {
         if (
           currentJob.isCancelled ||
           jobController.signal.aborted ||
@@ -545,6 +569,17 @@ export function registerRipCommand(ctx: CommandContext): void {
           ? `<b>Status:</b> ⚡ ${cachedCount} cached • 🎵 ${rippedCount} seeded`
           : `<b>Status:</b> ⚡ ${cachedCount} cached • 🎵 ${rippedCount} ripped`
 
+        let activityText = ''
+        if (activeDownloadText && activeUploadText) {
+          activityText = `<br/>${activeDownloadText}<br/>${activeUploadText}`
+        } else if (activeDownloadText) {
+          activityText = `<br/>${activeDownloadText}`
+        } else if (activeUploadText) {
+          activityText = `<br/>${activeUploadText}`
+        } else if (activityOverride) {
+          activityText = `<br/><b>Current:</b> ${activityOverride}`
+        }
+
         const formatted =
           `${isCacheOnly ? '💾' : '📋'} <b>${jobHeader}</b><br/>` +
           `<b>Progress:</b> <code>${bar} ${completed}/${total} (${percent}%)</code><br/>` +
@@ -555,7 +590,7 @@ export function registerRipCommand(ctx: CommandContext): void {
           (failedTracks.length > 0
             ? ` • ⚠️ ${failedTracks.length} failed`
             : '') +
-          `<br/><b>Current:</b> ${currentStatus}` +
+          activityText +
           (isGroup && !isCacheOnly
             ? '<br/><i>Files delivered to your private DM 📩</i>'
             : '')
@@ -563,7 +598,7 @@ export function registerRipCommand(ctx: CommandContext): void {
         const now = Date.now()
         if (isEditing) return
         const minInterval = lastStatusUpdate === 0 ? 0 : 10000
-        if (now - lastStatusUpdate < minInterval) return
+        if (!force && now - lastStatusUpdate < minInterval) return
         if (formatted === lastStatusText) return
 
         isEditing = true
@@ -624,104 +659,266 @@ export function registerRipCommand(ctx: CommandContext): void {
         return
       }
 
-      for (let index = 0; index < tracksToProcess.length; index++) {
-        if (currentJob.isCancelled || jobController.signal.aborted) {
-          break
-        }
+      const jobTempDir = join(os.tmpdir(), `alac_job_${jobId}`)
+      await mkdir(jobTempDir, { recursive: true })
 
-        const item = tracksToProcess[index]
-        if (!item) continue
-        const trackId = item.id
+      const channel = new BoundedChannel<PipelineItem>(2, jobController.signal)
 
-        using _trackSpan = debugSpan('track_job', { track_id: trackId }).enter()
-        const startTime = Date.now()
+      const downloadTask = async () => {
+        try {
+          for (let index = 0; index < tracksToProcess.length; index++) {
+            if (currentJob.isCancelled || jobController.signal.aborted) {
+              break
+            }
 
-        if (!isForce) {
-          const cached = cachedTracksMap.get(trackId)
-          if (cached) {
-            if (isCacheOnly) {
-              cachedCount++
-              currentJob.cachedCount = cachedCount
-              await updateProgress(`⚡ Already cached: ${trackId}`)
+            const item = tracksToProcess[index]
+            if (!item) continue
+            const trackId = item.id
+
+            if (!isForce) {
+              const cached = cachedTracksMap.get(trackId)
+              if (cached) {
+                await channel.push({
+                  index,
+                  item,
+                  status: { type: 'cached', cached },
+                })
+                continue
+              }
+            }
+
+            if (!isLiveRippingAllowed) {
+              await channel.push({
+                index,
+                item,
+                status: {
+                  type: 'skipped',
+                  reason: 'uncached in cache-only mode',
+                },
+              })
               continue
             }
 
+            const itemTitle = item.title
+              ? `${item.artist || 'Unknown'} - ${item.title}`
+              : `Track #${index + 1}`
+            const startTime = Date.now()
+
             try {
-              await tg.sendCopy({
-                toChatId: deliveryChatId,
-                fromChatId: env.DUMP_CHANNEL_ID,
-                message: cached.messageId,
-                ...(deliveryChatId === msg.chat.id ? { replyTo: msg.id } : {}),
-                silent: isMultiTrack,
+              const ripResult = await queue.enqueue(
+                async (taskSignal) => {
+                  if (currentJob.isCancelled || taskSignal.aborted) {
+                    throw new Error('Download was cancelled')
+                  }
+
+                  activeDownloadText = `📥 <b>Downloading:</b> ${html.escape(itemTitle)}`
+                  await updateProgress()
+
+                  return await ripper.rip(
+                    trackId,
+                    (status, downloadedBytes, totalBytes) => {
+                      if (
+                        downloadedBytes !== undefined &&
+                        totalBytes !== undefined &&
+                        totalBytes > 0
+                      ) {
+                        const mbProgress = formatMbProgress(
+                          downloadedBytes,
+                          totalBytes,
+                        )
+                        activeDownloadText = `📥 <b>Downloading:</b> ${html.escape(itemTitle)} <code>[${mbProgress}]</code>`
+                      } else if (status.includes('Tagging')) {
+                        activeDownloadText = `🏷️ <b>Tagging:</b> ${html.escape(itemTitle)}`
+                      } else {
+                        activeDownloadText = `📥 <b>Downloading:</b> ${html.escape(itemTitle)}`
+                      }
+                      updateProgress().catch(() => {})
+                    },
+                    item.storefront,
+                    taskSignal,
+                  )
+                },
+                {
+                  signal: jobController.signal,
+                  onPositionChange: (pos) => {
+                    activeDownloadText = `⏳ <b>In Queue:</b> Position <code>#${pos}</code> (${html.escape(itemTitle)})`
+                    updateProgress().catch(() => {})
+                  },
+                  onStart: () => {
+                    debug('Track rip started by queue worker', {
+                      track_id: trackId,
+                    })
+                  },
+                },
+              )
+
+              activeDownloadText = ''
+              await channel.push({
+                index,
+                item,
+                status: { type: 'ready', ripResult, startTime },
+              })
+            } catch (err: unknown) {
+              activeDownloadText = ''
+              if (currentJob.isCancelled || jobController.signal.aborted) {
+                break
+              }
+
+              const errMsg = err instanceof Error ? err.message : String(err)
+              const isMirrorDown =
+                errMsg.includes('Mirror /status check timed out') ||
+                errMsg.includes('Mirror health check failed') ||
+                errMsg.includes('Lossless wrapper is currently offline') ||
+                errMsg.includes('Mirror manifest lookup timed out') ||
+                errMsg.includes('Mirror service is currently offline') ||
+                errMsg.includes('Failed to connect to mirror stream')
+
+              await channel.push({
+                index,
+                item,
+                status: {
+                  type: 'failed',
+                  error: errMsg,
+                  isMirrorDown,
+                  startTime,
+                },
               })
 
-              const durationMs = Date.now() - startTime
-              info('Cache hit: delivered', {
+              if (isMirrorDown) {
+                break
+              }
+            }
+          }
+        } finally {
+          activeDownloadText = ''
+          channel.close()
+        }
+      }
+
+      const uploadTask = async () => {
+        try {
+          while (true) {
+            if (currentJob.isCancelled || jobController.signal.aborted) {
+              break
+            }
+
+            const pipelineItem = await channel.pull()
+            if (!pipelineItem) {
+              break
+            }
+
+            const { index, item, status } = pipelineItem
+            const trackId = item.id
+            const itemTitle = item.title
+              ? `${item.artist || 'Unknown'} - ${item.title}`
+              : `Track #${index + 1}`
+
+            using _trackSpan = debugSpan('track_job', {
+              track_id: trackId,
+            }).enter()
+
+            if (status.type === 'cached') {
+              const { cached } = status
+              if (isCacheOnly) {
+                cachedCount++
+                currentJob.cachedCount = cachedCount
+                await updateProgress()
+                continue
+              }
+
+              try {
+                await tg.sendCopy({
+                  toChatId: deliveryChatId,
+                  fromChatId: env.DUMP_CHANNEL_ID,
+                  message: cached.messageId,
+                  ...(deliveryChatId === msg.chat.id
+                    ? { replyTo: msg.id }
+                    : {}),
+                  silent: isMultiTrack,
+                })
+
+                info('Cache hit: delivered', {
+                  track_id: trackId,
+                  time: '0ms',
+                })
+
+                await service.logRequest({
+                  telegramId: msg.sender.id,
+                  chatId: msg.chat.id,
+                  appleTrackId: trackId,
+                  isCacheHit: true,
+                  durationMs: 0,
+                  status: 'completed',
+                })
+
+                cachedCount++
+                currentJob.cachedCount = cachedCount
+                await updateProgress()
+                continue
+              } catch (copyErr) {
+                debug('Cache forward failed, falling back to ripper', {
+                  track_id: trackId,
+                  error: String(copyErr),
+                })
+                failedTracks.push({
+                  id: trackId,
+                  error: 'Failed to deliver cached copy',
+                })
+                currentJob.failedCount = failedTracks.length
+                await updateProgress()
+                continue
+              }
+            }
+
+            if (status.type === 'skipped') {
+              skippedUncachedTracks.push(trackId)
+              await updateProgress()
+              continue
+            }
+
+            if (status.type === 'failed') {
+              failedTracks.push({ id: trackId, error: status.error })
+              currentJob.failedCount = failedTracks.length
+              error('Rip job failed', {
                 track_id: trackId,
-                time: `${durationMs}ms`,
+                duration_ms: Date.now() - status.startTime,
+                error: status.error,
               })
 
               await service.logRequest({
                 telegramId: msg.sender.id,
                 chatId: msg.chat.id,
                 appleTrackId: trackId,
-                isCacheHit: true,
-                durationMs,
-                status: 'completed',
+                isCacheHit: false,
+                durationMs: Date.now() - status.startTime,
+                status: 'failed',
+                errorReason: status.error,
               })
 
-              cachedCount++
-              currentJob.cachedCount = cachedCount
-              await updateProgress(`⚡ Cache hit delivered: ${trackId}`)
-              continue
-            } catch (copyErr) {
-              debug('Cache forward failed, falling back to ripper', {
-                track_id: trackId,
-                error: String(copyErr),
-              })
-            }
-          }
-        }
+              await updateProgress()
 
-        // Check if live ripping is disallowed (cache-only mode)
-        if (!isLiveRippingAllowed) {
-          skippedUncachedTracks.push(trackId)
-          await updateProgress(
-            `🟡 Skipped (uncached in cache-only mode): ${trackId}`,
-          )
-          continue
-        }
-
-        // Rip via queue
-        try {
-          await queue.enqueue(
-            async (taskSignal) => {
-              if (currentJob.isCancelled || taskSignal.aborted) {
-                throw new Error('Download was cancelled')
-              }
-
-              await updateProgress(
-                `Connecting mirror for track #${index + 1}...`,
-                true,
-              )
-
-              let ripResult: TrackRipResult | null = null
-
-              try {
-                ripResult = await ripper.rip(
-                  trackId,
-                  async (status) => {
-                    await updateProgress(status)
-                  },
-                  item.storefront,
-                  taskSignal,
+              if (status.isMirrorDown) {
+                failedTracks.push({
+                  id: 'Remaining tracks',
+                  error:
+                    'Mirror service offline / unreachable (stopped remaining batch)',
+                })
+                error(
+                  'Lossless mirror appears to be down, aborting remaining batch to prevent repeated timeouts',
+                  { track_id: trackId, error: status.error },
                 )
+                jobController.abort()
+                break
+              }
+              continue
+            }
 
-                if (currentJob.isCancelled || taskSignal.aborted) {
-                  throw new Error('Download was cancelled')
-                }
+            if (status.type === 'ready') {
+              const { ripResult, startTime } = status
+              try {
+                activeUploadText = `📤 <b>Uploading:</b> ${html.escape(itemTitle)}`
+                await updateProgress()
 
-                await updateProgress('📤 <b>Uploading to Telegram...</b>', true)
                 debug('Uploading track to dump channel', {
                   track_id: trackId,
                   file: ripResult.filePath,
@@ -746,7 +943,7 @@ export function registerRipCommand(ctx: CommandContext): void {
                 const maxUploadRetries = env.ALAC_MAX_RETRIES
 
                 while (true) {
-                  if (currentJob.isCancelled || taskSignal.aborted) {
+                  if (currentJob.isCancelled || jobController.signal.aborted) {
                     throw new Error('Download was cancelled')
                   }
 
@@ -764,14 +961,9 @@ export function registerRipCommand(ctx: CommandContext): void {
                       {
                         progressCallback: (uploaded, total) => {
                           if (total > 0) {
-                            const progressText = formatByteProgress(
-                              uploaded,
-                              total,
-                              10,
-                            )
-                            updateProgress(
-                              `📤 <b>Uploading:</b> <code>${progressText}</code>`,
-                            )
+                            const mbProgress = formatMbProgress(uploaded, total)
+                            activeUploadText = `📤 <b>Uploading:</b> ${html.escape(itemTitle)} <code>[${mbProgress}]</code>`
+                            updateProgress().catch(() => {})
                           }
                         },
                       },
@@ -780,7 +972,7 @@ export function registerRipCommand(ctx: CommandContext): void {
                   } catch (uploadErr: unknown) {
                     if (
                       currentJob.isCancelled ||
-                      taskSignal.aborted ||
+                      jobController.signal.aborted ||
                       (uploadErr instanceof Error &&
                         uploadErr.message === 'Download was cancelled')
                     ) {
@@ -800,11 +992,7 @@ export function registerRipCommand(ctx: CommandContext): void {
                       uploadErr instanceof Error
                         ? uploadErr.message
                         : String(uploadErr)
-                    const waitSec = (delayMs / 1000).toFixed(1)
 
-                    await updateProgress(
-                      `⚠️ <b>Upload failed, retrying (${uploadAttempt}/${maxUploadRetries}) in ${waitSec}s:</b> <code>${html.escape(errMsg)}</code>`,
-                    )
                     warn('Track upload to dump failed, retrying', {
                       track_id: trackId,
                       attempt: uploadAttempt,
@@ -813,11 +1001,11 @@ export function registerRipCommand(ctx: CommandContext): void {
                       error: errMsg,
                     })
 
-                    await abortableSleep(delayMs, taskSignal)
+                    await abortableSleep(delayMs, jobController.signal)
                   }
                 }
 
-                if (currentJob.isCancelled || taskSignal.aborted) {
+                if (currentJob.isCancelled || jobController.signal.aborted) {
                   throw new Error('Download was cancelled')
                 }
 
@@ -873,78 +1061,67 @@ export function registerRipCommand(ctx: CommandContext): void {
                   durationMs: totalDurationMs,
                   status: 'completed',
                 })
+              } catch (err: unknown) {
+                if (currentJob.isCancelled || jobController.signal.aborted) {
+                  break
+                }
+                const errMsg = err instanceof Error ? err.message : String(err)
+                failedTracks.push({ id: trackId, error: errMsg })
+                currentJob.failedCount = failedTracks.length
+                error('Track upload failed', {
+                  track_id: trackId,
+                  error: errMsg,
+                })
+                await service.logRequest({
+                  telegramId: msg.sender.id,
+                  chatId: msg.chat.id,
+                  appleTrackId: trackId,
+                  isCacheHit: false,
+                  durationMs: Date.now() - startTime,
+                  status: 'failed',
+                  errorReason: errMsg,
+                })
               } finally {
-                if (ripResult && existsSync(ripResult.filePath)) {
+                activeUploadText = ''
+                if (existsSync(ripResult.filePath)) {
                   try {
                     unlinkSync(ripResult.filePath)
                   } catch {}
                 }
+                await updateProgress()
               }
-            },
-            {
-              signal: jobController.signal,
-              onPositionChange: (pos) => {
-                debug('Queue position changed', { track_id: trackId, pos })
-                updateProgress(
-                  `⏳ <b>In Queue:</b> Position <code>#${pos}</code>`,
-                  true,
-                )
-              },
-              onStart: () => {
-                debug('Track rip started by queue worker', {
-                  track_id: trackId,
-                })
-              },
-            },
-          )
-        } catch (err: unknown) {
-          if (currentJob.isCancelled || jobController.signal.aborted) {
-            break
+            }
           }
-
-          const errMsg = err instanceof Error ? err.message : String(err)
-          failedTracks.push({ id: trackId, error: errMsg })
-          currentJob.failedCount = failedTracks.length
-          error('Rip job failed', {
-            track_id: trackId,
-            duration_ms: Date.now() - startTime,
-            error: errMsg,
-            stack: err instanceof Error ? err.stack : undefined,
-          })
-
-          await service.logRequest({
-            telegramId: msg.sender.id,
-            chatId: msg.chat.id,
-            appleTrackId: trackId,
-            isCacheHit: false,
-            durationMs: Date.now() - startTime,
-            status: 'failed',
-            errorReason: errMsg,
-          })
-
-          await updateProgress(`⚠️ Track failed: ${trackId}`)
-
-          // Circuit breaker: If the mirror server is down or unreachable, abort remaining batch
-          const isMirrorDown =
-            errMsg.includes('Mirror /status check timed out') ||
-            errMsg.includes('Mirror health check failed') ||
-            errMsg.includes('Lossless wrapper is currently offline') ||
-            errMsg.includes('Mirror manifest lookup timed out') ||
-            errMsg.includes('Mirror service is currently offline') ||
-            errMsg.includes('Failed to connect to mirror stream')
-
-          if (isMirrorDown) {
-            failedTracks.push({
-              id: 'Remaining tracks',
-              error:
-                'Mirror service offline / unreachable (stopped remaining batch)',
-            })
-            error(
-              'Lossless mirror appears to be down, aborting remaining batch to prevent repeated timeouts',
-              { track_id: trackId, error: errMsg },
-            )
-            break
+        } catch (err) {
+          if (
+            currentJob.isCancelled ||
+            jobController.signal.aborted ||
+            (err instanceof Error && err.message === 'Download was cancelled')
+          ) {
+            return
           }
+          throw err
+        }
+      }
+
+      try {
+        await Promise.all([downloadTask(), uploadTask()])
+      } finally {
+        const remaining = channel.drain()
+        for (const item of remaining) {
+          if (
+            item.status.type === 'ready' &&
+            existsSync(item.status.ripResult.filePath)
+          ) {
+            try {
+              unlinkSync(item.status.ripResult.filePath)
+            } catch {}
+          }
+        }
+        if (existsSync(jobTempDir)) {
+          try {
+            rmSync(jobTempDir, { recursive: true, force: true })
+          } catch {}
         }
       }
 

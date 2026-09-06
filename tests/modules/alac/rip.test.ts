@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import type { Message, TelegramClient } from '@mtcute/bun'
 import { Dispatcher } from '@mtcute/dispatcher'
 
+import { env } from '@/env.ts'
 import { activeJobs, registerRipCommand } from '@/modules/alac/commands/rip.ts'
 import type { CommandContext } from '@/modules/alac/commands/types.ts'
 import type { IRipQueue } from '@/modules/alac/queue.ts'
@@ -1286,9 +1287,8 @@ describe('ALAC Rip Command Handler', () => {
       registerRipCommand(ctx)
       await dispatchMessage('/alac 12345')
 
-      // env.ALAC_MAX_RETRIES is 3 -> initial attempt + 3 retries = 4 calls to sendMedia
       expect(mockRipper.rip).toHaveBeenCalledTimes(1)
-      expect(fakeTg.sendMedia).toHaveBeenCalledTimes(4)
+      expect(fakeTg.sendMedia).toHaveBeenCalledTimes(env.ALAC_MAX_RETRIES + 1)
       expect(mockService.saveTrack).not.toHaveBeenCalled()
       expect(mockService.logRequest).toHaveBeenCalledWith(
         expect.objectContaining({

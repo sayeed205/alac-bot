@@ -21,6 +21,22 @@ export function renderProgressBar(
 }
 
 /**
+ * Formats MB progress as "x.x/y.y MB" without progress bar.
+ * Example: "14.5/29.0 MB"
+ */
+export function formatMbProgress(
+  currentBytes: number,
+  totalBytes: number,
+): string {
+  const currentMb = (currentBytes / (1024 * 1024)).toFixed(1)
+  if (totalBytes > 0) {
+    const totalMb = (totalBytes / (1024 * 1024)).toFixed(1)
+    return `${currentMb}/${totalMb} MB`
+  }
+  return `${currentMb} MB`
+}
+
+/**
  * Formats a byte progress string with progress bar.
  * Example:
  * "[██████░░░░░░] 50% (14.5 / 29.0 MB)"

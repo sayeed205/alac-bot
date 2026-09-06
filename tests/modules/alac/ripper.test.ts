@@ -96,7 +96,7 @@ describe('abortableSleep', () => {
   it('rejects immediately if signal is already aborted', async () => {
     const controller = new AbortController()
     controller.abort()
-    await expect(abortableSleep(1000, controller.signal)).rejects.toThrow(
+    expect(abortableSleep(1000, controller.signal)).rejects.toThrow(
       'Download was cancelled',
     )
   })
@@ -105,7 +105,7 @@ describe('abortableSleep', () => {
     const controller = new AbortController()
     const sleepPromise = abortableSleep(5000, controller.signal)
     setTimeout(() => controller.abort(), 20)
-    await expect(sleepPromise).rejects.toThrow('Download was cancelled')
+    expect(sleepPromise).rejects.toThrow('Download was cancelled')
   })
 })
 
@@ -164,7 +164,7 @@ describe('AlacTrackRipper Retry with Exponential Backoff', () => {
       throw new Error('Persistent mirror 503 error')
     }
 
-    await expect(
+    expect(
       ripper.rip('99999', (msg) => {
         progressMessages.push(msg)
       }),
@@ -182,7 +182,7 @@ describe('AlacTrackRipper Retry with Exponential Backoff', () => {
     const controller = new AbortController()
     controller.abort()
 
-    await expect(
+    expect(
       ripper.rip('12345', undefined, undefined, controller.signal),
     ).rejects.toThrow('Download was cancelled')
 
@@ -210,7 +210,7 @@ describe('AlacTrackRipper Retry with Exponential Backoff', () => {
     }, 50)
 
     const start = Date.now()
-    await expect(ripPromise).rejects.toThrow('Download was cancelled')
+    expect(ripPromise).rejects.toThrow('Download was cancelled')
     expect(Date.now() - start).toBeLessThan(500) // Did not wait full 5s
     expect(ripper.attempts).toBe(1)
   })

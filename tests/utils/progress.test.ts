@@ -3,6 +3,7 @@ import { describe, expect, it } from 'bun:test'
 import {
   formatByteProgress,
   formatBytes,
+  formatMbProgress,
   renderProgressBar,
 } from '@/utils/progress.ts'
 
@@ -33,6 +34,13 @@ describe('Progress Bar Utility', () => {
     const total = 30 * 1024 * 1024
     const formatted = formatByteProgress(current, total, 10)
     expect(formatted).toBe('[█████░░░░░] 50% (15.0/30.0 MB)')
+  })
+
+  it('formats MB progress without progress bar', () => {
+    const current = 18.2 * 1024 * 1024
+    const total = 45.1 * 1024 * 1024
+    expect(formatMbProgress(current, total)).toBe('18.2/45.1 MB')
+    expect(formatMbProgress(current, 0)).toBe('18.2 MB')
   })
 
   it('formats bytes correctly', () => {

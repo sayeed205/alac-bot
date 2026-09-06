@@ -125,7 +125,7 @@ describe('connectAudioStreamWithWrapper', () => {
     }) as unknown as typeof fetch
 
     try {
-      await expect(
+      expect(
         connectAudioStreamWithWrapper({
           trackId: '12345',
           primaryMirror: {
