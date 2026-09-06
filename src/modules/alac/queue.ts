@@ -71,9 +71,11 @@ export class SequentialRipQueue implements IRipQueue {
           for (let i = idx; i < this.queue.length; i++) {
             this.queue[i]?.options?.onPositionChange?.(i + 1)
           }
+          item.controller.abort()
+          item.reject(new Error('Job was aborted'))
+        } else if (this.activeItem?.id === item.id) {
+          item.controller.abort()
         }
-        item.controller.abort()
-        item.reject(new Error('Job was aborted'))
       }
 
       if (options?.signal) {

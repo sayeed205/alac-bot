@@ -338,6 +338,7 @@ export function registerSearchCommand(ctx: CommandContext): void {
                     caption,
                   },
                   {
+                    silent: true,
                     progressCallback: (uploaded, total) => {
                       if (total > 0) {
                         const progressText = formatByteProgress(

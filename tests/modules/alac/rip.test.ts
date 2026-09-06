@@ -7,7 +7,7 @@ import { Dispatcher } from '@mtcute/dispatcher'
 import { env } from '@/env.ts'
 import { activeJobs, registerRipCommand } from '@/modules/alac/commands/rip.ts'
 import type { CommandContext } from '@/modules/alac/commands/types.ts'
-import type { IRipQueue } from '@/modules/alac/queue.ts'
+import { type IRipQueue, SequentialRipQueue } from '@/modules/alac/queue.ts'
 import type { ITrackRipper } from '@/modules/alac/ripper.ts'
 import type { IAlacService } from '@/modules/alac/service.ts'
 import type { IAuthService } from '@/modules/auth/service.ts'
@@ -340,7 +340,13 @@ describe('ALAC Rip Command Handler', () => {
       undefined,
       expect.anything(),
     )
-    expect(fakeTg.sendMedia).toHaveBeenCalled()
+    expect(fakeTg.sendMedia).toHaveBeenCalledWith(
+      env.DUMP_CHANNEL_ID,
+      expect.any(Object),
+      expect.objectContaining({
+        silent: true,
+      }),
+    )
     expect(mockService.saveTrack).toHaveBeenCalled()
     expect(fakeTg.sendCopy).toHaveBeenCalled()
     expect(fakeTg.sendCopy).toHaveBeenCalledWith(
@@ -1317,6 +1323,136 @@ describe('ALAC Rip Command Handler', () => {
           replyTo: expect.anything(),
         }),
       )
+    })
+  })
+
+  describe('Job-Level Queue Sequencing', () => {
+    it('executes multiple albums sequentially without interleaving tracks or uploads', async () => {
+      const realQueue = new SequentialRipQueue()
+      ctx.queue = realQueue
+
+      const events: string[] = []
+
+      mockRipper.rip = mock(async (id: string) => {
+        events.push(`rip_start_${id}`)
+        await new Promise((r) => setTimeout(r, 20))
+        const dummyFile = `/tmp/test_track_rip_${id}.m4a`
+        fs.writeFileSync(dummyFile, 'dummy audio data')
+        events.push(`rip_end_${id}`)
+        return {
+          filePath: dummyFile,
+          title: `Song ${id}`,
+          artist: 'Artist',
+          album: 'Album',
+          duration: 200,
+          bitDepth: 24,
+          sampleRate: 48000,
+          codec: 'alac',
+          genre: 'Pop',
+          releaseDate: '2023',
+          trackNumber: 1,
+          trackCount: 1,
+        }
+      })
+
+      fakeTg.sendMedia = mock(
+        async (_chat: unknown, media: { title?: string }) => {
+          const title = media.title || 'unknown'
+          events.push(`upload_start_${title}`)
+          await new Promise((r) => setTimeout(r, 10))
+          events.push(`upload_end_${title}`)
+          return {
+            id: 500,
+            media: {
+              type: 'audio',
+              fileId: `file_${title}`,
+              uniqueFileId: `unique_${title}`,
+            },
+          }
+        },
+      ) as unknown as TelegramClient['sendMedia']
+
+      registerRipCommand(ctx)
+
+      const originalFetch = globalThis.fetch
+      globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+        const urlStr = String(input)
+        if (urlStr.includes('111111')) {
+          return new Response(
+            JSON.stringify({
+              results: [
+                {
+                  wrapperType: 'collection',
+                  collectionName: 'Album 1',
+                  artistName: 'Artist 1',
+                },
+                {
+                  wrapperType: 'track',
+                  trackId: 1001,
+                  trackName: 'Song 1',
+                  artistName: 'Artist 1',
+                  trackTimeMillis: 180000,
+                },
+                {
+                  wrapperType: 'track',
+                  trackId: 1002,
+                  trackName: 'Song 2',
+                  artistName: 'Artist 1',
+                  trackTimeMillis: 180000,
+                },
+              ],
+            }),
+            { status: 200 },
+          )
+        }
+        if (urlStr.includes('222222')) {
+          return new Response(
+            JSON.stringify({
+              results: [
+                {
+                  wrapperType: 'collection',
+                  collectionName: 'Album 2',
+                  artistName: 'Artist 2',
+                },
+                {
+                  wrapperType: 'track',
+                  trackId: 2001,
+                  trackName: 'Song 3',
+                  artistName: 'Artist 2',
+                  trackTimeMillis: 180000,
+                },
+              ],
+            }),
+            { status: 200 },
+          )
+        }
+        return new Response('ok')
+      }) as unknown as typeof fetch
+
+      try {
+        const job1Promise = dispatchMessage(
+          '/alac https://music.apple.com/us/album/album-1/111111',
+        )
+        await new Promise((r) => setTimeout(r, 10))
+        const job2Promise = dispatchMessage(
+          '/alac https://music.apple.com/us/album/album-2/222222',
+        )
+
+        await Promise.all([job1Promise, job2Promise])
+
+        const rip1001Index = events.indexOf('rip_start_1001')
+        const upload1002Index = events.indexOf('upload_end_Song 1002')
+        const rip2001Index = events.indexOf('rip_start_2001')
+
+        expect(rip1001Index).toBeGreaterThan(-1)
+        expect(upload1002Index).toBeGreaterThan(-1)
+        expect(rip2001Index).toBeGreaterThan(-1)
+
+        // Song 2001 from Album 2 MUST NOT start until Song 1002 from Album 1 finishes uploading!
+        expect(rip2001Index).toBeGreaterThan(upload1002Index)
+      } finally {
+        globalThis.fetch = originalFetch
+      }
     })
   })
 })
