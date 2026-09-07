@@ -1,0 +1,18 @@
+[package]
+name = "engine"
+description = "Pure ALAC domain logic: URL parsing, catalog lookup, streaming, tagging, lyrics. No Telegram, no DB."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+indexmap.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }

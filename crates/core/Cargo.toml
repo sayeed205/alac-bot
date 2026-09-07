@@ -1,8 +1,0 @@
-[package]
-name = "core"
-description = "Pure ALAC domain logic: URL parsing, catalog, streaming, tagging, lyrics. No Telegram, no DB."
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[dependencies]

@@ -1,0 +1,829 @@
+//! iTunes catalog client. Exact port of `src/modules/alac/catalog/catalog.service.ts`.
+//!
+//! Parity notes (verified against the TS source):
+//! - Errors are plain messages (TS `new Error(msg)`); the message IS the
+//!   interface — it surfaces to users through the rip pipeline.
+//! - TS quirk: the track HTTP-failure message omits the context word
+//!   (`iTunes lookup failed (HTTP N)`) while its timeout message and the
+//!   album/artist messages include it.
+//! - Transport throws (timeout and network alike) produce the
+//!   `iTunes <ctx> lookup timed out after Xms: <msg>` message.
+//! - Storefront fallback: primary → `us` (if different) → every regional
+//!   except the original. First success cached under the ORIGINAL key.
+//!   All fail → the ORIGINAL primary error is rethrown.
+//! - User-agent differs per endpoint family: Chrome UA everywhere except
+//!   charts (`Mozilla/5.0`).
+//! - Spans use `.instrument()` (not entered guards) so futures stay `Send`
+//!   for later tokio spawn in the bot crate.
+
+mod cache;
+mod transport;
+
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+use cache::Cache;
+use serde::Deserialize;
+use tracing::{debug, error, info, info_span};
+pub use transport::{
+    ReqwestTransport, Transport, TransportError, CHARTS_USER_AGENT, ITUNES_USER_AGENT,
+};
+
+use crate::types::{AlbumTracks, ArtistTracks, ChartAlbum, TrackMeta};
+
+/// Regional storefronts tried after `us` in the fallback chain, in order.
+pub const REGIONAL_STOREFRONTS: [&str; 7] = ["jp", "gb", "in", "ca", "de", "fr", "au"];
+
+const TRACK_TIMEOUT: Duration = Duration::from_secs(15);
+const ALBUM_TIMEOUT: Duration = Duration::from_secs(25);
+const ARTIST_TIMEOUT: Duration = Duration::from_secs(30);
+const ARTIST_BATCH_TIMEOUT: Duration = Duration::from_secs(20);
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(15);
+const CHARTS_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Every catalog failure. `Message` carries exact TS error text.
+#[derive(Debug, thiserror::Error)]
+pub enum CatalogError {
+    /// A TS `new Error(...)` string, verbatim.
+    #[error("{0}")]
+    Message(String),
+    /// Raw transport throw the TS oracle lets propagate (charts endpoint).
+    #[error("transport error: {0}")]
+    Transport(#[from] TransportError),
+    /// JSON body failed to parse; TS propagates these raw.
+    #[error("bad JSON: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+/// iTunes lookup API raw result item. Every field optional; camelCase names.
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct ItunesRawItem {
+    wrapper_type: Option<String>,
+    kind: Option<String>,
+    track_id: Option<i64>,
+    collection_id: Option<i64>,
+    artist_id: Option<i64>,
+    track_name: Option<String>,
+    collection_name: Option<String>,
+    artist_name: Option<String>,
+    primary_genre_name: Option<String>,
+    release_date: Option<String>,
+    track_number: Option<i64>,
+    track_count: Option<i64>,
+    disc_number: Option<i64>,
+    disc_count: Option<i64>,
+    track_time_millis: Option<i64>,
+    track_explicitness: Option<String>,
+    collection_explicitness: Option<String>,
+    artwork_url_100: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct ItunesResponse {
+    results: Vec<ItunesRawItem>,
+}
+
+/// Apple RSS charts feed item.
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct ChartsRawAlbum {
+    id: String,
+    name: String,
+    artist_name: String,
+    url: String,
+    artwork_url_100: Option<String>,
+    release_date: Option<String>,
+    genres: Vec<ChartsGenre>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct ChartsGenre {
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct ChartsFeed {
+    results: Option<Vec<ChartsRawAlbum>>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct ChartsResponse {
+    feed: Option<ChartsFeed>,
+}
+
+/// Replace the first `\d+x\d+bb` artwork size with 3000x3000bb.
+fn format_artwork_url(url: Option<&str>) -> String {
+    let Some(url) = url else {
+        return String::new();
+    };
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"\d+x\d+bb").expect("artwork size regex"));
+    re.replace(url, "3000x3000bb").into_owned()
+}
+
+/// Map a raw iTunes item to [`TrackMeta`] exactly as the TS oracle does.
+/// Note: TS `String(x || '')` maps `0` → `''` (JS falsy), so ids of `0`
+/// become empty strings here too.
+fn map_itunes_item(item: &ItunesRawItem) -> TrackMeta {
+    TrackMeta {
+        id: item
+            .track_id
+            .filter(|id| *id != 0)
+            .map_or_else(String::new, |id| id.to_string()),
+        title: item.track_name.clone().unwrap_or_default(),
+        artist: item.artist_name.clone().unwrap_or_default(),
+        album: item.collection_name.clone().unwrap_or_default(),
+        album_artist: item.artist_name.clone().unwrap_or_default(),
+        genre: item.primary_genre_name.clone(),
+        release_date: item
+            .release_date
+            .as_deref()
+            .unwrap_or("")
+            .chars()
+            .take(10)
+            .collect(),
+        composer: None,
+        track_number: item.track_number,
+        track_count: item.track_count,
+        disc_number: item.disc_number,
+        disc_count: item.disc_count,
+        duration_secs: (item.track_time_millis.unwrap_or(0) as f64 / 1000.0).round() as i64,
+        explicit: item.track_explicitness.as_deref() == Some("explicit"),
+        artwork_url: format_artwork_url(item.artwork_url_100.as_deref()),
+    }
+}
+
+fn is_track_item(item: &ItunesRawItem) -> bool {
+    item.wrapper_type.as_deref() == Some("track") || item.kind.as_deref() == Some("song")
+}
+
+fn normalize_storefront(storefront: &str) -> String {
+    let sf = storefront.to_lowercase();
+    if sf.is_empty() {
+        "us".to_owned()
+    } else {
+        sf
+    }
+}
+
+/// URL-encode a query component (percent-encoding, unreserved chars kept) —
+/// equivalent to JS `encodeURIComponent` for our inputs.
+fn urlencode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+/// Storefront fallback chain shared by track/album/artist lookups, inlined
+/// around a concrete fetch method call to avoid closure-HRTB gymnastics:
+/// cache-check → fetch on requested sf → (if sf != us) fetch on us →
+/// fetch on each regional sf except the original. First success is cached
+/// under the ORIGINAL key; all-fail rethrows the ORIGINAL error.
+macro_rules! with_fallback {
+    ($self:ident, $key:expr, $sf:expr, $ctx:literal, $method:ident($($arg:expr),* $(,)?)) => {{
+        if let Some(value) = $self.get_cached(&$key).and_then(|cached| R::from_value(&cached)) {
+            return Ok(value);
+        }
+        let sf = normalize_storefront($sf);
+        match $self.$method($($arg,)* &sf).await {
+            Ok(value) => {
+                $self.set_cached(&$key, value.clone().into_value());
+                Ok(value)
+            }
+            Err(original) => {
+                if sf != "us" {
+                    debug!(fallback_storefront = "us", context = $ctx, "retrying lookup on US storefront");
+                    if let Ok(value) = $self.$method($($arg,)* "us").await {
+                        $self.set_cached(&$key, value.clone().into_value());
+                        return Ok(value);
+                    }
+                }
+                for fallback in REGIONAL_STOREFRONTS {
+                    if fallback == sf {
+                        continue;
+                    }
+                    debug!(fallback_storefront = fallback, context = $ctx, "retrying lookup on regional storefront");
+                    if let Ok(value) = $self.$method($($arg,)* fallback).await {
+                        $self.set_cached(&$key, value.clone().into_value());
+                        return Ok(value);
+                    }
+                }
+                Err(original)
+            }
+        }
+    }};
+}
+
+/// Cached payloads — each cache key stores one of these shapes.
+#[derive(Clone)]
+enum CacheValue {
+    Track(TrackMeta),
+    Album(AlbumTracks),
+    Artist(ArtistTracks),
+    Search(Vec<TrackMeta>),
+    Charts(Vec<ChartAlbum>),
+}
+
+/// Bridge between typed lookup results and the untyped cache slot.
+trait CachedValue: Clone {
+    fn from_value(cached: &CacheValue) -> Option<Self>;
+    fn into_value(self) -> CacheValue;
+}
+
+impl CachedValue for TrackMeta {
+    fn from_value(cached: &CacheValue) -> Option<Self> {
+        match cached {
+            CacheValue::Track(v) => Some(v.clone()),
+            _ => None,
+        }
+    }
+    fn into_value(self) -> CacheValue {
+        CacheValue::Track(self)
+    }
+}
+
+impl CachedValue for AlbumTracks {
+    fn from_value(cached: &CacheValue) -> Option<Self> {
+        match cached {
+            CacheValue::Album(v) => Some(v.clone()),
+            _ => None,
+        }
+    }
+    fn into_value(self) -> CacheValue {
+        CacheValue::Album(self)
+    }
+}
+
+impl CachedValue for ArtistTracks {
+    fn from_value(cached: &CacheValue) -> Option<Self> {
+        match cached {
+            CacheValue::Artist(v) => Some(v.clone()),
+            _ => None,
+        }
+    }
+    fn into_value(self) -> CacheValue {
+        CacheValue::Artist(self)
+    }
+}
+
+/// Catalog client over any transport, with TTL cache and storefront fallback.
+pub struct Catalog<T: Transport> {
+    transport: T,
+    cache: Mutex<Cache<CacheValue>>,
+    #[allow(dead_code)] // parity with the TS constructor surface (capacity())
+    max_cache: usize,
+}
+
+impl<T: Transport> Catalog<T> {
+    pub fn new(transport: T) -> Self {
+        Self::with_limits(transport, 500, Duration::from_secs(10 * 60))
+    }
+
+    pub fn with_limits(transport: T, max_cache: usize, ttl: Duration) -> Self {
+        Self {
+            transport,
+            cache: Mutex::new(Cache::new(max_cache, ttl)),
+            max_cache,
+        }
+    }
+
+    /// Cache capacity, exposed for parity with the TS constructor params.
+    pub fn capacity(&self) -> usize {
+        self.max_cache
+    }
+
+    pub fn clear_cache(&self) {
+        self.cache.lock().expect("cache mutex poisoned").clear();
+    }
+
+    /// Shared handle to the transport — lets tests observe served URLs.
+    pub fn transport(&self) -> &T {
+        &self.transport
+    }
+
+    fn get_cached(&self, key: &str) -> Option<CacheValue> {
+        self.cache
+            .lock()
+            .expect("cache mutex poisoned")
+            .get(key, Instant::now())
+    }
+
+    fn set_cached(&self, key: &str, value: CacheValue) {
+        self.cache
+            .lock()
+            .expect("cache mutex poisoned")
+            .set(key, value, Instant::now());
+    }
+
+    /// Parse a body's `results` array; serde errors propagate (TS parity:
+    /// every `resp.json()` sits outside the try/catch).
+    fn parse_results(body: &str) -> Result<Vec<ItunesRawItem>, CatalogError> {
+        let data: ItunesResponse = serde_json::from_str(body)?;
+        Ok(data.results)
+    }
+
+    /// GET an iTunes URL and map failures to the TS oracle's exact messages.
+    /// `timeout_ctx` rides in the timeout message; `http_prefix` is the
+    /// verbatim HTTP-failure prefix (track's omits the context word — TS quirk).
+    async fn fetch_itunes_body(
+        &self,
+        url: &str,
+        timeout: Duration,
+        timeout_ctx: &'static str,
+        http_prefix: &'static str,
+    ) -> Result<String, CatalogError> {
+        match self.transport.get(url, ITUNES_USER_AGENT, timeout).await {
+            Ok(body) => Ok(body),
+            Err(TransportError::Fetch { elapsed_ms, source }) => {
+                error!(elapsed_ms, error = %source, "iTunes lookup timed out / network error");
+                Err(CatalogError::Message(format!(
+                    "iTunes {timeout_ctx} lookup timed out after {elapsed_ms}ms: {source}"
+                )))
+            }
+            Err(TransportError::Status { status }) => {
+                error!(status, "iTunes lookup HTTP failure");
+                Err(CatalogError::Message(format!(
+                    "{http_prefix} failed (HTTP {status})"
+                )))
+            }
+        }
+    }
+
+    async fn do_fetch_track_meta(
+        &self,
+        track_id: &str,
+        sf: &str,
+    ) -> Result<TrackMeta, CatalogError> {
+        info_span!("itunes_track", track_id, storefront = sf)
+            .in_scope(|| debug!("Querying iTunes API for track..."));
+        let url = format!(
+            "https://itunes.apple.com/lookup?id={}&country={}",
+            urlencode(track_id),
+            urlencode(sf)
+        );
+        let start = Instant::now();
+
+        let body = self
+            .fetch_itunes_body(&url, TRACK_TIMEOUT, "track", "iTunes lookup")
+            .await?;
+        let results = Self::parse_results(&body)?;
+
+        let track_item = results
+            .iter()
+            .find(|r| is_track_item(r) || r.track_id.is_some_and(|id| id.to_string() == track_id));
+        let Some(track_item) = track_item else {
+            error!(track_id, "Track not found in iTunes response");
+            return Err(CatalogError::Message(format!(
+                "iTunes found no song matching track ID {track_id}"
+            )));
+        };
+
+        let mut meta = map_itunes_item(track_item);
+        meta.id = track_item
+            .track_id
+            .filter(|id| *id != 0) // JS falsy: `String(0 || trackId)` → trackId
+            .map_or_else(|| track_id.to_owned(), |id| id.to_string());
+
+        info!(
+            track_id,
+            artist = %meta.artist,
+            title = %meta.title,
+            duration = meta.duration_secs,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "iTunes metadata resolved"
+        );
+        Ok(meta)
+    }
+
+    /// Fetch a single track's metadata with storefront fallback.
+    pub async fn fetch_track_meta(
+        &self,
+        track_id: &str,
+        storefront: &str,
+    ) -> Result<TrackMeta, CatalogError> {
+        let sf = normalize_storefront(storefront);
+        let cache_key = format!("track:{sf}:{track_id}");
+        type R = TrackMeta;
+        with_fallback!(
+            self,
+            cache_key,
+            storefront,
+            "track",
+            do_fetch_track_meta(track_id)
+        )
+    }
+
+    async fn do_fetch_album_tracks(
+        &self,
+        collection_id: &str,
+        sf: &str,
+    ) -> Result<AlbumTracks, CatalogError> {
+        info_span!("itunes_album", collection_id, storefront = sf)
+            .in_scope(|| debug!("Querying iTunes API for album collection..."));
+        let url = format!(
+            "https://itunes.apple.com/lookup?id={}&entity=song&country={}",
+            urlencode(collection_id),
+            urlencode(sf)
+        );
+        let start = Instant::now();
+
+        let body = self
+            .fetch_itunes_body(&url, ALBUM_TIMEOUT, "album", "iTunes album lookup")
+            .await?;
+        let results = Self::parse_results(&body)?;
+
+        let collection_item = results
+            .iter()
+            .find(|r| r.wrapper_type.as_deref() == Some("collection"));
+        let tracks: Vec<TrackMeta> = results
+            .iter()
+            .filter(|r| is_track_item(r))
+            .map(map_itunes_item)
+            .collect();
+
+        if tracks.is_empty() {
+            error!(collection_id, "No tracks found for collection");
+            return Err(CatalogError::Message(format!(
+                "iTunes found no tracks for collection {collection_id}"
+            )));
+        }
+        let first_track = tracks.first().expect("checked non-empty").clone();
+
+        let album_meta = match collection_item {
+            Some(c) => TrackMeta {
+                id: c
+                    .collection_id
+                    .filter(|id| *id != 0) // JS falsy: `String(0 || '')` → ''
+                    .map_or_else(|| collection_id.to_owned(), |id| id.to_string()),
+                title: c.collection_name.clone().unwrap_or_default(),
+                artist: c.artist_name.clone().unwrap_or_default(),
+                album: c.collection_name.clone().unwrap_or_default(),
+                album_artist: c.artist_name.clone().unwrap_or_default(),
+                genre: c.primary_genre_name.clone(),
+                release_date: c
+                    .release_date
+                    .as_deref()
+                    .unwrap_or("")
+                    .chars()
+                    .take(10)
+                    .collect(),
+                composer: None,
+                track_number: None,
+                track_count: None,
+                disc_number: None,
+                disc_count: None,
+                duration_secs: 0,
+                explicit: c.collection_explicitness.as_deref() == Some("explicit"),
+                artwork_url: format_artwork_url(c.artwork_url_100.as_deref()),
+            },
+            None => first_track,
+        };
+
+        info!(
+            collection_id,
+            album = %album_meta.album,
+            artist = %album_meta.artist,
+            track_count = tracks.len(),
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "iTunes album collection resolved"
+        );
+        Ok(AlbumTracks {
+            album: album_meta,
+            tracks,
+        })
+    }
+
+    /// Fetch an album's tracks with storefront fallback.
+    pub async fn fetch_album_tracks(
+        &self,
+        collection_id: &str,
+        storefront: &str,
+    ) -> Result<AlbumTracks, CatalogError> {
+        let sf = normalize_storefront(storefront);
+        let cache_key = format!("album:{sf}:{collection_id}");
+        type R = AlbumTracks;
+        with_fallback!(
+            self,
+            cache_key,
+            storefront,
+            "album",
+            do_fetch_album_tracks(collection_id)
+        )
+    }
+
+    async fn do_fetch_artist_tracks(
+        &self,
+        artist_id: &str,
+        sf: &str,
+    ) -> Result<ArtistTracks, CatalogError> {
+        info_span!("itunes_artist", artist_id, storefront = sf)
+            .in_scope(|| debug!("Querying iTunes API for artist discography..."));
+        let discog_url = format!(
+            "https://itunes.apple.com/lookup?id={}&entity=album&limit=200&country={}",
+            urlencode(artist_id),
+            urlencode(sf)
+        );
+        let start = Instant::now();
+
+        let body = self
+            .fetch_itunes_body(
+                &discog_url,
+                ARTIST_TIMEOUT,
+                "artist",
+                "iTunes artist lookup",
+            )
+            .await?;
+        let results = Self::parse_results(&body)?;
+
+        let artist_item = results
+            .iter()
+            .find(|r| r.wrapper_type.as_deref() == Some("artist"));
+        let mut artist_name = artist_item
+            .and_then(|r| r.artist_name.clone())
+            .unwrap_or_default();
+
+        let mut all_tracks: Vec<TrackMeta> = Vec::new();
+        let mut seen_track_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        let collection_ids: Vec<i64> = results
+            .iter()
+            .filter(|r| r.wrapper_type.as_deref() == Some("collection"))
+            .filter_map(|r| r.collection_id)
+            .collect();
+
+        if !collection_ids.is_empty() {
+            for chunk in collection_ids.chunks(25) {
+                let ids = chunk
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let url = format!(
+                    "https://itunes.apple.com/lookup?id={ids}&entity=song&country={}",
+                    urlencode(sf)
+                );
+                // TS parity: batch failures (transport, HTTP, JSON) are all
+                // swallowed with a debug log and the loop continues.
+                match self
+                    .transport
+                    .get(&url, ITUNES_USER_AGENT, ARTIST_BATCH_TIMEOUT)
+                    .await
+                {
+                    Ok(body) => {
+                        if let Ok(batch) = Self::parse_results(&body) {
+                            for item in &batch {
+                                if is_track_item(item) {
+                                    let track_id =
+                                        item.track_id.map_or_else(String::new, |id| id.to_string());
+                                    if !track_id.is_empty() && seen_track_ids.insert(track_id) {
+                                        all_tracks.push(map_itunes_item(item));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        debug!(error = %err, "Error fetching artist collection batch, continuing...");
+                    }
+                }
+            }
+        }
+
+        if all_tracks.is_empty() {
+            // Fallback: direct song lookup for the artist (all failures ignored).
+            let songs_url = format!(
+                "https://itunes.apple.com/lookup?id={}&entity=song&limit=200&country={}",
+                urlencode(artist_id),
+                urlencode(sf)
+            );
+            if let Ok(body) = self
+                .transport
+                .get(&songs_url, ITUNES_USER_AGENT, ARTIST_BATCH_TIMEOUT)
+                .await
+            {
+                if let Ok(song_results) = Self::parse_results(&body) {
+                    if artist_name.is_empty() {
+                        artist_name = song_results
+                            .iter()
+                            .find(|r| r.wrapper_type.as_deref() == Some("artist"))
+                            .and_then(|r| r.artist_name.clone())
+                            .unwrap_or_default();
+                    }
+                    for item in &song_results {
+                        if is_track_item(item) {
+                            let track_id =
+                                item.track_id.map_or_else(String::new, |id| id.to_string());
+                            if !track_id.is_empty() && seen_track_ids.insert(track_id) {
+                                all_tracks.push(map_itunes_item(item));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if all_tracks.is_empty() {
+            error!(artist_id, "No tracks found for artist");
+            return Err(CatalogError::Message(format!(
+                "iTunes found no tracks for artist {artist_id}"
+            )));
+        }
+
+        if artist_name.is_empty() {
+            artist_name = all_tracks[0].artist.clone();
+        }
+
+        info!(
+            artist_id,
+            artist = %artist_name,
+            track_count = all_tracks.len(),
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "iTunes artist discography resolved"
+        );
+        Ok(ArtistTracks {
+            artist_id: artist_id.to_owned(),
+            artist_name: if artist_name.is_empty() {
+                "Unknown Artist".to_owned()
+            } else {
+                artist_name
+            },
+            tracks: all_tracks,
+        })
+    }
+
+    /// Fetch an artist's tracks with storefront fallback.
+    pub async fn fetch_artist_tracks(
+        &self,
+        artist_id: &str,
+        storefront: &str,
+    ) -> Result<ArtistTracks, CatalogError> {
+        let sf = normalize_storefront(storefront);
+        let cache_key = format!("artist:{sf}:{artist_id}");
+        type R = ArtistTracks;
+        with_fallback!(
+            self,
+            cache_key,
+            storefront,
+            "artist",
+            do_fetch_artist_tracks(artist_id)
+        )
+    }
+
+    /// One search attempt. Transport/HTTP failures → `[]`; JSON parse errors
+    /// propagate (TS parity — `resp.json()` sits outside the try/catch).
+    async fn do_search_catalog(
+        &self,
+        term: &str,
+        limit: i64,
+        sf: &str,
+    ) -> Result<Vec<TrackMeta>, CatalogError> {
+        info_span!("itunes_search", term, limit, storefront = sf)
+            .in_scope(|| debug!("Querying iTunes search API..."));
+        let url = format!(
+            "https://itunes.apple.com/search?term={}&entity=song&limit={}&country={}",
+            urlencode(term),
+            urlencode(&limit.to_string()),
+            urlencode(sf)
+        );
+
+        let body = match self
+            .transport
+            .get(&url, ITUNES_USER_AGENT, SEARCH_TIMEOUT)
+            .await
+        {
+            Ok(body) => body,
+            Err(TransportError::Fetch { elapsed_ms, source }) => {
+                error!(term, elapsed_ms, error = %source, "iTunes search timed out / network error");
+                return Ok(Vec::new());
+            }
+            Err(TransportError::Status { status }) => {
+                error!(term, status, "iTunes search HTTP failure");
+                return Ok(Vec::new());
+            }
+        };
+
+        let tracks: Vec<TrackMeta> = Self::parse_results(&body)?
+            .iter()
+            .filter(|r| is_track_item(r))
+            .map(map_itunes_item)
+            .collect();
+        info!(term, matches = tracks.len(), "iTunes search resolved");
+        Ok(tracks)
+    }
+
+    /// Search the catalog. Never errors on transport/HTTP failures —
+    /// degrades to an empty list; empty results trigger storefront
+    /// fallbacks. The final (possibly empty) result is cached.
+    pub async fn search_catalog(
+        &self,
+        term: &str,
+        limit: i64,
+        storefront: &str,
+    ) -> Result<Vec<TrackMeta>, CatalogError> {
+        let sf = normalize_storefront(storefront);
+        let clean_term = term.trim().to_lowercase();
+        let cache_key = format!("search:{sf}:{limit}:{clean_term}");
+
+        if let Some(CacheValue::Search(tracks)) = self.get_cached(&cache_key) {
+            return Ok(tracks);
+        }
+
+        let mut results = self.do_search_catalog(term, limit, &sf).await?;
+        if results.is_empty() && sf != "us" {
+            debug!(original_storefront = %sf, "Retrying catalog search on US storefront fallback");
+            results = self.do_search_catalog(term, limit, "us").await?;
+        }
+
+        if results.is_empty() {
+            for fallback in REGIONAL_STOREFRONTS {
+                if fallback == sf {
+                    continue;
+                }
+                results = self.do_search_catalog(term, limit, fallback).await?;
+                if !results.is_empty() {
+                    break;
+                }
+            }
+        }
+
+        self.set_cached(&cache_key, CacheValue::Search(results.clone()));
+        Ok(results)
+    }
+
+    /// Fetch Apple Music charts albums for a storefront. TS has no
+    /// try/catch here: transport throws propagate raw, `!ok` becomes the
+    /// charts HTTP message, JSON errors propagate.
+    pub async fn fetch_charts_albums(
+        &self,
+        storefront: &str,
+        limit: i64,
+    ) -> Result<Vec<ChartAlbum>, CatalogError> {
+        let sf = normalize_storefront(storefront);
+        let cache_key = format!("charts:{sf}:{limit}");
+
+        if let Some(CacheValue::Charts(albums)) = self.get_cached(&cache_key) {
+            return Ok(albums);
+        }
+
+        let url = format!(
+            "https://rss.marketingtools.apple.com/api/v2/{}/music/most-played/{}/albums.json",
+            urlencode(&sf),
+            urlencode(&limit.to_string())
+        );
+
+        let body = match self
+            .transport
+            .get(&url, CHARTS_USER_AGENT, CHARTS_TIMEOUT)
+            .await
+        {
+            Ok(body) => body,
+            Err(TransportError::Status { status }) => {
+                return Err(CatalogError::Message(format!(
+                    "Failed to fetch Apple Music charts (HTTP {status})"
+                )));
+            }
+            // TS: fetch() throw propagates raw (no try/catch on this path).
+            Err(err) => return Err(err.into()),
+        };
+
+        let data: ChartsResponse = serde_json::from_str(&body)?;
+        let raw = data.feed.and_then(|feed| feed.results).unwrap_or_default();
+
+        let albums: Vec<ChartAlbum> = raw
+            .into_iter()
+            .map(|r| ChartAlbum {
+                id: r.id,
+                title: r.name,
+                artist: r.artist_name,
+                url: r.url,
+                artwork_url: r
+                    .artwork_url_100
+                    .as_deref()
+                    .map(|u| format_artwork_url(Some(u))),
+                release_date: r.release_date,
+                genre: r.genres.first().and_then(|g| g.name.clone()),
+            })
+            .collect();
+
+        self.set_cached(&cache_key, CacheValue::Charts(albums.clone()));
+        Ok(albums)
+    }
+}
+
+/// Production catalog handle shared across handlers/worker tasks.
+pub type SharedCatalog = Arc<Catalog<ReqwestTransport>>;
