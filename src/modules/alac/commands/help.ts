@@ -23,6 +23,7 @@ export function registerHelpCommand(ctx: CommandContext): void {
       '• <code>/batch &lt;links...&gt;</code> — Download multiple links or attach a <code>.txt</code> file<br/>' +
       '• <code>/cancel</code> — Cancel an active download task<br/>' +
       '• <code>/spec</code> — Reply to audio file to generate frequency spectrogram<br/>' +
+      '• <code>/report</code> — Reply to song to report corruption or issues to admin<br/>' +
       '• <code>/search &lt;query&gt;</code> — Search cached tracks for instant download<br/>' +
       '• <code>/info &lt;link | id&gt;</code> — Inspect track details & check cache status<br/>' +
       '• <code>/queue</code> — Check active & pending rip jobs<br/>' +
@@ -32,6 +33,7 @@ export function registerHelpCommand(ctx: CommandContext): void {
       '• <b>Aliases:</b> <code>/rip</code>, <code>/batch</code>, <code>/dl</code>, <code>/download</code><br/>' +
       '• <b>Cancel Download:</b> Tap <code>❌ Cancel Download</code> button on the progress card or use <code>/cancel</code>.<br/>' +
       '• <b>Spectrogram:</b> Reply to any audio file with <code>/spec</code> or <code>/spectogram</code> to visually verify uncompressed lossless quality.<br/>' +
+      '• <b>Reporting Issues:</b> Reply to any corrupt or cut-off track with <code>/report</code> to notify the admin for a re-rip.<br/>' +
       '• <b>Group Chats:</b> Audio files are delivered to your private DM to keep the chat clean!<br/>' +
       '• <b>Playlists:</b> Paste any Apple Music playlist link to download all songs.<br/>' +
       '• <b>Batch Files:</b> Send or reply to a <code>.txt</code> file containing links with <code>/alac</code>.<br/>' +

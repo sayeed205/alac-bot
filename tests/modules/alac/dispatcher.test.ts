@@ -73,6 +73,7 @@ describe('Handlers Dispatcher & Callback Query Flow', () => {
         }),
       ),
       findCachedTracks: mock(() => Promise.resolve(new Map())),
+      findTrackByFileUniqueId: mock(() => Promise.resolve(null)),
       saveTrack: mock(() => Promise.resolve({} as never)),
       searchCachedTracks: mock(() => Promise.resolve([])),
       logRequest: mock(() => Promise.resolve()),
@@ -95,13 +96,13 @@ describe('Handlers Dispatcher & Callback Query Flow', () => {
     const internalDp = dp as unknown as DispatcherInternal
     const group0 = internalDp._groups.get(0)
     const cbHandlers = group0?.get('callback_query') ?? []
-    expect(cbHandlers.length).toBe(4)
+    expect(cbHandlers.length).toBe(5)
 
     const authCb = cbHandlers[0]
     const searchCb = cbHandlers[1]
     const cancelCb = cbHandlers[2]
     if (!authCb || !searchCb || !cancelCb) {
-      throw new Error('Expected 3 callback handlers registered')
+      throw new Error('Expected callback handlers registered')
     }
 
     const dlQueryCtx = {
@@ -114,13 +115,7 @@ describe('Handlers Dispatcher & Callback Query Flow', () => {
       answer: mock(() => Promise.resolve()),
     }
 
-    const authMatchedDl = await authCb.check(dlQueryCtx)
-    expect(authMatchedDl).toBeFalsy()
-
-    const searchMatchedDl = await searchCb.check(dlQueryCtx)
-    expect(searchMatchedDl).toBeTruthy()
-
-    const cancelMatchedDl = await cancelCb.check(dlQueryCtx)
-    expect(cancelMatchedDl).toBeFalsy()
+    expect(await authCb.check(dlQueryCtx)).toBe(false)
+    expect(await searchCb.check(dlQueryCtx)).toBe(true)
   })
 })

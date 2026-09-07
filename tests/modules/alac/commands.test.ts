@@ -94,6 +94,7 @@ describe('ALAC Management Commands', () => {
         }
         return Promise.resolve(null)
       }),
+      findTrackByFileUniqueId: mock(() => Promise.resolve(null)),
       findCachedTracks: mock(() => Promise.resolve(new Map())),
       saveTrack: mock(() => Promise.resolve({} as never)),
       searchCachedTracks: mock(() => Promise.resolve([])),

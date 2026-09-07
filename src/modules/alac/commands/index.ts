@@ -25,6 +25,7 @@ import { registerIndexCommand } from './index_cmd.ts'
 import { registerInfoCommand } from './info.ts'
 import { registerQueueCommand } from './queue.ts'
 import { registerRandomCommand } from './random.ts'
+import { registerReportCommand } from './report.ts'
 import { registerRipCommand } from './rip.ts'
 import { registerSearchCommand } from './search.ts'
 import { registerSpecCommand } from './spec.ts'
@@ -77,5 +78,6 @@ export function registerAlacCommands(
   registerRipCommand(ctx)
   registerRandomCommand(ctx)
   registerSpecCommand(ctx)
+  registerReportCommand(ctx)
   registerBackupCommands(ctx)
 }

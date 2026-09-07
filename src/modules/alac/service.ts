@@ -50,6 +50,7 @@ export interface AlacStats {
 export interface IAlacService {
   findCachedTrack(appleTrackId: string): Promise<Track | null>
   findCachedTracks(appleTrackIds: string[]): Promise<Map<string, Track>>
+  findTrackByFileUniqueId(fileUniqueId: string): Promise<Track | null>
   searchCachedTracks(query: string, limit?: number): Promise<Track[]>
   saveTrack(input: SaveTrackInput): Promise<Track>
   deleteTrack(appleTrackId: string): Promise<boolean>
@@ -77,6 +78,20 @@ export class AlacService implements IAlacService {
       .select()
       .from(tracks)
       .where(eq(tracks.appleTrackId, appleTrackId))
+      .limit(1)
+
+    return track ?? null
+  }
+
+  async findTrackByFileUniqueId(fileUniqueId: string): Promise<Track | null> {
+    using _ = debugSpan('db_find_track_by_file_unique_id', {
+      fileUniqueId,
+    }).enter()
+
+    const [track] = await this.db
+      .select()
+      .from(tracks)
+      .where(eq(tracks.fileUniqueId, fileUniqueId))
       .limit(1)
 
     return track ?? null

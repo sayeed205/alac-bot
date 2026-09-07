@@ -75,6 +75,7 @@ describe('ALAC Rip Command Handler', () => {
 
     mockService = {
       findCachedTrack: mock(() => Promise.resolve(null)),
+      findTrackByFileUniqueId: mock(() => Promise.resolve(null)),
       findCachedTracks: mock(() => Promise.resolve(new Map())),
       saveTrack: mock(() => Promise.resolve({} as never)),
       searchCachedTracks: mock(() => Promise.resolve([])),
