@@ -333,7 +333,12 @@ describe('ALAC Rip Command Handler', () => {
     registerRipCommand(ctx)
     await dispatchMessage('/alac 12345')
 
-    expect(fakeTg.sendCopy).toHaveBeenCalled()
+    expect(fakeTg.sendCopy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toChatId: 1,
+        caption: { text: '' },
+      }),
+    )
     expect(mockService.logRequest).toHaveBeenCalled()
     expect(mockRipper.rip).not.toHaveBeenCalled()
   })
@@ -361,6 +366,7 @@ describe('ALAC Rip Command Handler', () => {
     expect(fakeTg.sendCopy).toHaveBeenCalledWith(
       expect.objectContaining({
         toChatId: 1,
+        caption: { text: '' },
       }),
     )
     expect(mockService.logRequest).toHaveBeenCalled()
@@ -380,6 +386,7 @@ describe('ALAC Rip Command Handler', () => {
     expect(fakeTg.sendCopy).toHaveBeenCalledWith(
       expect.objectContaining({
         toChatId: 42,
+        caption: { text: '' },
       }),
     )
   })
@@ -1566,10 +1573,10 @@ describe('ALAC Rip Command Handler', () => {
         expect(mockRipper.rip).not.toHaveBeenCalled()
         expect(fakeTg.sendCopy).toHaveBeenCalledTimes(2)
         expect(fakeTg.sendCopy).toHaveBeenCalledWith(
-          expect.objectContaining({ message: 501 }),
+          expect.objectContaining({ message: 501, caption: { text: '' } }),
         )
         expect(fakeTg.sendCopy).toHaveBeenCalledWith(
-          expect.objectContaining({ message: 502 }),
+          expect.objectContaining({ message: 502, caption: { text: '' } }),
         )
         expect(fakeTg.editMessage).toHaveBeenCalledWith(
           expect.objectContaining({

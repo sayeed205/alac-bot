@@ -510,7 +510,11 @@ describe('ALAC Management Commands', () => {
         expect.any(Function),
       )
       expect(mockService.saveTrack).toHaveBeenCalled()
-      expect(fakeTg.sendCopy).toHaveBeenCalled()
+      expect(fakeTg.sendCopy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          caption: { text: '' },
+        }),
+      )
       expect(fakeTg.deleteMessagesById).toHaveBeenCalledWith(100, [101, 42])
     })
 
@@ -520,7 +524,11 @@ describe('ALAC Management Commands', () => {
       expect(answeredTexts).toContain(
         '⚡ Delivering lossless track from cache!',
       )
-      expect(fakeTg.sendCopy).toHaveBeenCalled()
+      expect(fakeTg.sendCopy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          caption: { text: '' },
+        }),
+      )
     })
   })
 })

@@ -192,6 +192,7 @@ export function registerSearchCommand(ctx: CommandContext): void {
             toChatId: chatId,
             fromChatId: env.DUMP_CHANNEL_ID,
             message: cached.messageId,
+            caption: { text: '' },
           })
 
           await tg
@@ -255,6 +256,7 @@ export function registerSearchCommand(ctx: CommandContext): void {
             toChatId: chatId,
             fromChatId: env.DUMP_CHANNEL_ID,
             message: cached.messageId,
+            caption: { text: '' },
           })
           await tg
             .deleteMessagesById(chatId, [query.messageId])
@@ -382,6 +384,7 @@ export function registerSearchCommand(ctx: CommandContext): void {
                   toChatId: chatId,
                   fromChatId: env.DUMP_CHANNEL_ID,
                   message: dumpMsg.id,
+                  caption: { text: '' },
                 })
 
                 await tg

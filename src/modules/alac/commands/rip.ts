@@ -966,6 +966,7 @@ export async function executeRipPipeline(
               toChatId: deliveryChatId,
               fromChatId: env.DUMP_CHANNEL_ID,
               message: cached.messageId,
+              caption: { text: '' },
               ...(deliveryChatId === chatId
                 ? { replyTo: replyToMessageId }
                 : {}),
@@ -1389,6 +1390,7 @@ export async function executeRipPipeline(
                       toChatId: deliveryChatId,
                       fromChatId: env.DUMP_CHANNEL_ID,
                       message: dumpMsg.id,
+                      caption: { text: '' },
                       ...(deliveryChatId === chatId
                         ? { replyTo: replyToMessageId }
                         : {}),
