@@ -1468,4 +1468,263 @@ describe('ALAC Rip Command Handler', () => {
       }
     })
   })
+  describe('Pre-Queue Cache Filter & Instant Cached Track Delivery', () => {
+    it('bypasses the rip queue completely and sends copies immediately when all requested tracks are cached', async () => {
+      mockService.findCachedTracks = mock(() =>
+        Promise.resolve(
+          new Map([
+            [
+              '1001',
+              {
+                id: 1,
+                appleTrackId: '1001',
+                messageId: 501,
+                fileId: 'fid1',
+                fileUniqueId: 'uid1',
+                title: 'Cached Song 1',
+                artist: 'Artist 1',
+                album: 'Album 1',
+                duration: 200,
+                bitDepth: 24,
+                sampleRate: 48000,
+                genre: 'Pop',
+                releaseDate: '2023',
+                trackNumber: 1,
+                trackCount: 2,
+                createdAt: new Date(),
+                updatedAt: new Date(),
+              },
+            ],
+            [
+              '1002',
+              {
+                id: 2,
+                appleTrackId: '1002',
+                messageId: 502,
+                fileId: 'fid2',
+                fileUniqueId: 'uid2',
+                title: 'Cached Song 2',
+                artist: 'Artist 1',
+                album: 'Album 1',
+                duration: 200,
+                bitDepth: 24,
+                sampleRate: 48000,
+                genre: 'Pop',
+                releaseDate: '2023',
+                trackNumber: 2,
+                trackCount: 2,
+                createdAt: new Date(),
+                updatedAt: new Date(),
+              },
+            ],
+          ]),
+        ),
+      )
+
+      const originalFetch = globalThis.fetch
+      globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+        const urlStr = String(input)
+        if (urlStr.includes('111111')) {
+          return new Response(
+            JSON.stringify({
+              results: [
+                {
+                  wrapperType: 'collection',
+                  collectionName: 'Album 1',
+                  artistName: 'Artist 1',
+                },
+                {
+                  wrapperType: 'track',
+                  trackId: 1001,
+                  trackName: 'Cached Song 1',
+                  artistName: 'Artist 1',
+                  trackTimeMillis: 200000,
+                },
+                {
+                  wrapperType: 'track',
+                  trackId: 1002,
+                  trackName: 'Cached Song 2',
+                  artistName: 'Artist 1',
+                  trackTimeMillis: 200000,
+                },
+              ],
+            }),
+            { status: 200 },
+          )
+        }
+        return new Response('ok')
+      }) as unknown as typeof fetch
+
+      try {
+        registerRipCommand(ctx)
+        await dispatchMessage(
+          '/alac https://music.apple.com/us/album/album-1/111111',
+        )
+
+        // Queue must NOT be touched when all tracks are cached
+        expect(mockQueue.enqueue).not.toHaveBeenCalled()
+        expect(mockRipper.rip).not.toHaveBeenCalled()
+        expect(fakeTg.sendCopy).toHaveBeenCalledTimes(2)
+        expect(fakeTg.sendCopy).toHaveBeenCalledWith(
+          expect.objectContaining({ message: 501 }),
+        )
+        expect(fakeTg.sendCopy).toHaveBeenCalledWith(
+          expect.objectContaining({ message: 502 }),
+        )
+        expect(fakeTg.editMessage).toHaveBeenCalledWith(
+          expect.objectContaining({
+            text: expect.objectContaining({
+              text: expect.stringContaining('⚡ 2 cached • 🎵 0 ripped'),
+            }),
+          }),
+        )
+      } finally {
+        globalThis.fetch = originalFetch
+      }
+    })
+
+    it('delivers cached tracks immediately and enqueues ONLY uncached tracks for ripping in a mixed album', async () => {
+      mockService.findCachedTracks = mock(() =>
+        Promise.resolve(
+          new Map([
+            [
+              '1001',
+              {
+                id: 1,
+                appleTrackId: '1001',
+                messageId: 501,
+                fileId: 'fid1',
+                fileUniqueId: 'uid1',
+                title: 'Cached Song 1',
+                artist: 'Artist 1',
+                album: 'Album 1',
+                duration: 200,
+                bitDepth: 24,
+                sampleRate: 48000,
+                genre: 'Pop',
+                releaseDate: '2023',
+                trackNumber: 1,
+                trackCount: 2,
+                createdAt: new Date(),
+                updatedAt: new Date(),
+              },
+            ],
+          ]),
+        ),
+      )
+
+      const originalFetch = globalThis.fetch
+      globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+        const urlStr = String(input)
+        if (urlStr.includes('111111')) {
+          return new Response(
+            JSON.stringify({
+              results: [
+                {
+                  wrapperType: 'collection',
+                  collectionName: 'Album 1',
+                  artistName: 'Artist 1',
+                },
+                {
+                  wrapperType: 'track',
+                  trackId: 1001,
+                  trackName: 'Cached Song 1',
+                  artistName: 'Artist 1',
+                  trackTimeMillis: 200000,
+                },
+                {
+                  wrapperType: 'track',
+                  trackId: 1002,
+                  trackName: 'Uncached Song 2',
+                  artistName: 'Artist 1',
+                  trackTimeMillis: 200000,
+                },
+              ],
+            }),
+            { status: 200 },
+          )
+        }
+        return new Response('ok')
+      }) as unknown as typeof fetch
+
+      try {
+        registerRipCommand(ctx)
+        await dispatchMessage(
+          '/alac https://music.apple.com/us/album/album-1/111111',
+        )
+
+        // Cached track 1001 must be copied immediately
+        expect(fakeTg.sendCopy).toHaveBeenCalledWith(
+          expect.objectContaining({ message: 501 }),
+        )
+
+        // Only uncached track 1002 must be enqueued and ripped
+        expect(mockQueue.enqueue).toHaveBeenCalled()
+        expect(mockRipper.rip).toHaveBeenCalledTimes(1)
+        expect(mockRipper.rip).toHaveBeenCalledWith(
+          '1002',
+          expect.any(Function),
+          'us',
+          expect.anything(),
+        )
+
+        expect(fakeTg.editMessage).toHaveBeenCalledWith(
+          expect.objectContaining({
+            text: expect.objectContaining({
+              text: expect.stringContaining('⚡ 1 cached • 🎵 1 ripped'),
+            }),
+          }),
+        )
+      } finally {
+        globalThis.fetch = originalFetch
+      }
+    })
+
+    it('deletes old dump message and database record BEFORE entering queue when admin requests force re-rip (-f)', async () => {
+      mockService.findCachedTracks = mock(() =>
+        Promise.resolve(
+          new Map([
+            [
+              '12345',
+              {
+                id: 1,
+                appleTrackId: '12345',
+                messageId: 888,
+                fileId: 'fid888',
+                fileUniqueId: 'uid888',
+                title: 'Old Cached Song',
+                artist: 'Old Artist',
+                album: 'Old Album',
+                duration: 200,
+                bitDepth: 24,
+                sampleRate: 48000,
+                genre: 'Pop',
+                releaseDate: '2023',
+                trackNumber: 1,
+                trackCount: 1,
+                createdAt: new Date(),
+                updatedAt: new Date(),
+              },
+            ],
+          ]),
+        ),
+      )
+
+      registerRipCommand(ctx)
+      await dispatchMessage('/alac 12345 -f', 1)
+
+      expect(fakeTg.deleteMessagesById).toHaveBeenCalledWith(
+        env.DUMP_CHANNEL_ID,
+        [888],
+      )
+      expect(mockService.deleteTrack).toHaveBeenCalledWith('12345')
+      expect(mockQueue.enqueue).toHaveBeenCalled()
+      expect(mockRipper.rip).toHaveBeenCalledWith(
+        '12345',
+        expect.any(Function),
+        undefined,
+        expect.anything(),
+      )
+    })
+  })
 })

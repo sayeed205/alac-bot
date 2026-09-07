@@ -73,13 +73,16 @@ describe('Random Album Command & Explorer (/random)', () => {
 
     mockService = {
       findCachedTrack: mock(() => Promise.resolve(null)),
+      findCachedTracks: mock(() => Promise.resolve(new Map())),
       findTrackByFileUniqueId: mock(() => Promise.resolve(null)),
       saveCachedTrack: mock(() => Promise.resolve(null as never)),
+      saveTrack: mock(() => Promise.resolve(null as never)),
       getStats: mock(() =>
         Promise.resolve({ totalTracks: 0, totalSize: 0, cacheHits: 0 }),
       ),
       searchTracks: mock(() => Promise.resolve([])),
       recordSearchQuery: mock(() => Promise.resolve()),
+      logRequest: mock(() => Promise.resolve()),
     } as unknown as IAlacService
 
     mockQueue = {

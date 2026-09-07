@@ -6,7 +6,6 @@ import path, { join } from 'node:path'
 import { BotKeyboard, html, type Message } from '@mtcute/bun'
 import { filters, type MessageContext } from '@mtcute/dispatcher'
 
-import type { Track } from '@/db/schema.ts'
 import { env } from '@/env.ts'
 import { formatDumpCaption } from '@/modules/alac/indexer.ts'
 import { fetchAlbumTracks, fetchArtistTracks } from '@/modules/alac/itunes.ts'
@@ -45,8 +44,6 @@ interface PipelineItem {
   index: number
   item: ResolvedTrackItem
   status:
-    | { type: 'cached'; cached: Track }
-    | { type: 'skipped'; reason: string }
     | { type: 'ready'; ripResult: TrackRipResult; startTime: number }
     | {
         type: 'failed'
@@ -802,6 +799,252 @@ export async function executeRipPipeline(
     }
   }
 
+  const sendFinalSummary = async () => {
+    if (currentJob.isCancelled) {
+      return
+    }
+
+    const totalElapsedSec = ((Date.now() - jobStartTime) / 1000).toFixed(1)
+    const totalTracks = tracksToProcess.length
+
+    let summaryHtml: string
+    if (isCacheOnly) {
+      summaryHtml =
+        `✅ <b>Caching Complete!</b><br/><br/>` +
+        `<blockquote>• <b>Target:</b> ${jobHeader}<br/>` +
+        `• <b>Total Tracks:</b> <code>${totalTracks}</code><br/>` +
+        `• <b>Seeded to Dump:</b> 🎵 <code>${rippedCount}</code> new • ⚡ <code>${cachedCount}</code> already cached<br/>` +
+        (failedTracks.length > 0
+          ? `• <b>Failed:</b> ⚠️ <code>${failedTracks.length}</code><br/>`
+          : '') +
+        `• <b>Time Elapsed:</b> <code>${totalElapsedSec}s</code><br/>` +
+        `• <b>Destination:</b> Dump Channel & Database</blockquote>`
+    } else if (
+      cachedCount === 0 &&
+      rippedCount === 0 &&
+      skippedUncachedTracks.length > 0
+    ) {
+      summaryHtml =
+        '⚠️ <b>No Cached Tracks Available</b><br/><br/>' +
+        `<blockquote>• <b>Target:</b> ${jobHeader}<br/>` +
+        `• <b>Total Requested:</b> <code>${totalTracks}</code><br/>` +
+        `• <b>Skipped (Uncached):</b> 🟡 <code>${skippedUncachedTracks.length}</code><br/>` +
+        '• <b>Note:</b> Live ripping is currently disabled for maintenance.</blockquote>'
+    } else {
+      summaryHtml =
+        `✅ <b>Download Complete!</b><br/><br/>` +
+        `<blockquote>• <b>Target:</b> ${jobHeader}<br/>` +
+        `• <b>Total Tracks:</b> <code>${totalTracks}</code><br/>` +
+        `• <b>Delivered:</b> ⚡ <code>${cachedCount}</code> cached • 🎵 <code>${rippedCount}</code> ripped<br/>` +
+        (skippedUncachedTracks.length > 0
+          ? `• <b>Skipped (Uncached):</b> 🟡 <code>${skippedUncachedTracks.length}</code><br/>`
+          : '') +
+        (failedTracks.length > 0
+          ? `• <b>Failed:</b> ⚠️ <code>${failedTracks.length}</code><br/>`
+          : '') +
+        `• <b>Time Elapsed:</b> <code>${totalElapsedSec}s</code></blockquote>`
+    }
+
+    if (cappedCount > 0) {
+      summaryHtml += `<br/>ℹ️ <i>Queue was capped to ${maxCollectionLimit} tracks (settings limit).</i>`
+    }
+
+    if (isGroup && !isCacheOnly) {
+      summaryHtml +=
+        '<br/>📩 <i>All songs have been delivered to your private DM!</i>'
+    }
+
+    if (failedTracks.length > 0) {
+      summaryHtml += '<br/><br/><b>Issues / Failures:</b><br/>'
+      for (const f of failedTracks.slice(0, 5)) {
+        summaryHtml += `• <code>${f.id}</code>: ${html.escape(f.error)}<br/>`
+      }
+      if (failedTracks.length > 5) {
+        summaryHtml += `<i>...and ${failedTracks.length - 5} more</i>`
+      }
+    }
+
+    let summaryEdited = false
+    if (!isEditBlocked) {
+      summaryEdited = await editMessageSafe(tg, {
+        chatId: chatId,
+        message: statusMsgId,
+        text: parseDynamicHtml(summaryHtml),
+        block: true,
+        maxWaitSec: 10,
+      })
+    }
+
+    if (!summaryEdited) {
+      await sendTextSafe(tg, {
+        chatId: chatId,
+        text: parseDynamicHtml(summaryHtml),
+        params: { replyTo: replyToMessageId },
+        block: true,
+        maxWaitSec: 10,
+      })
+    }
+  }
+
+  const allTrackIds = tracksToProcess.map((t) => t.id)
+  let itemsToRip: ResolvedTrackItem[] = []
+
+  if (isForce) {
+    // Force re-rip: delete existing cache and dump messages first prior to queueing
+    const existingTracksMap = await service.findCachedTracks(allTrackIds)
+    const oldMsgIds = [...existingTracksMap.values()]
+      .map((t) => t.messageId)
+      .filter((id): id is number => typeof id === 'number' && id > 0)
+
+    if (oldMsgIds.length > 0) {
+      debug('Deleting old dump messages on force re-rip prior to queue', {
+        count: oldMsgIds.length,
+        old_message_ids: oldMsgIds,
+      })
+      await tg
+        .deleteMessagesById(env.DUMP_CHANNEL_ID, oldMsgIds)
+        .catch((err) => {
+          warn('Failed to delete old dump messages on force re-rip', {
+            error: String(err),
+          })
+        })
+    }
+
+    for (const trackId of existingTracksMap.keys()) {
+      await service.deleteTrack(trackId).catch((err) => {
+        warn('Failed to delete track from DB on force re-rip', {
+          track_id: trackId,
+          error: String(err),
+        })
+      })
+    }
+
+    itemsToRip = [...tracksToProcess]
+  } else {
+    // Normal rip/cache: check cache immediately before queue
+    await updateProgress('Checking local cache...', true)
+    const existingTracksMap = await service.findCachedTracks(allTrackIds)
+    const cachedItems: ResolvedTrackItem[] = []
+    const uncachedItems: ResolvedTrackItem[] = []
+
+    for (const item of tracksToProcess) {
+      if (existingTracksMap.has(item.id)) {
+        cachedItems.push(item)
+      } else {
+        uncachedItems.push(item)
+      }
+    }
+
+    // Deliver / record cached tracks immediately without waiting in queue
+    if (cachedItems.length > 0) {
+      for (const item of cachedItems) {
+        if (currentJob.isCancelled || jobController.signal.aborted) {
+          break
+        }
+
+        const cached = existingTracksMap.get(item.id)
+        if (!cached) continue
+
+        if (isCacheOnly) {
+          cachedCount++
+          currentJob.cachedCount = cachedCount
+          info('Track already cached in dump channel', { track_id: item.id })
+          await updateProgress('Recognized cached tracks...', true)
+        } else {
+          try {
+            await tg.sendCopy({
+              toChatId: deliveryChatId,
+              fromChatId: env.DUMP_CHANNEL_ID,
+              message: cached.messageId,
+              ...(deliveryChatId === chatId
+                ? { replyTo: replyToMessageId }
+                : {}),
+              silent: isMultiTrack,
+            })
+
+            info('Cache hit: delivered', {
+              track_id: item.id,
+              time: '0ms',
+            })
+
+            await service.logRequest({
+              telegramId: userId,
+              chatId: chatId,
+              appleTrackId: item.id,
+              isCacheHit: true,
+              durationMs: 0,
+              status: 'completed',
+            })
+
+            cachedCount++
+            currentJob.cachedCount = cachedCount
+            await updateProgress('Delivered cached track...', true)
+          } catch (copyErr) {
+            debug('Cache forward failed, treating as uncached', {
+              track_id: item.id,
+              error: String(copyErr),
+            })
+            // If the message is missing from dump channel, fall back to ripping fresh
+            uncachedItems.push(item)
+          }
+        }
+      }
+    }
+
+    // If all requested tracks were delivered/cached, finish immediately!
+    if (uncachedItems.length === 0 || currentJob.isCancelled) {
+      await sendFinalSummary()
+      currentJob.completed = true
+      activeJobs.delete(jobId)
+      return
+    }
+
+    // Uncached tracks remain. Check live ripping permissions:
+    const isLiveRippingAllowed = settings.canRipLive(isAdmin)
+    if (!isLiveRippingAllowed) {
+      if (tracksToProcess.length === 1) {
+        const maintText = parseDynamicHtml(
+          '⚠️ <b>Live ripping is currently disabled for maintenance.</b><br/>' +
+            'This track is not yet in the local cache. Only cached tracks can be played right now.',
+        )
+        const maintEdited = await editMessageSafe(tg, {
+          chatId: chatId,
+          message: resolvingStatus.id,
+          text: maintText,
+          block: true,
+          maxWaitSec: 10,
+        })
+        if (!maintEdited) {
+          await sendTextSafe(tg, {
+            chatId: chatId,
+            text: maintText,
+            params: { replyTo: replyToMessageId },
+            block: true,
+            maxWaitSec: 10,
+          })
+        }
+        currentJob.completed = true
+        activeJobs.delete(jobId)
+        return
+      }
+
+      // Multi-track: skip uncached tracks and send summary of cached ones
+      skippedUncachedTracks.push(...uncachedItems.map((t) => t.id))
+      await sendFinalSummary()
+      currentJob.completed = true
+      activeJobs.delete(jobId)
+      return
+    }
+
+    itemsToRip = uncachedItems
+  }
+
+  const queueStatusPrefix = cachedCount > 0 ? `⚡ ${cachedCount} cached • ` : ''
+  await updateProgress(
+    `${queueStatusPrefix}⏳ ${itemsToRip.length} track${itemsToRip.length === 1 ? '' : 's'} waiting in queue...`,
+    true,
+  )
+
   try {
     await queue.enqueue(
       async (taskSignal) => {
@@ -810,42 +1053,6 @@ export async function executeRipPipeline(
           jobController.signal.aborted ||
           taskSignal.aborted
         ) {
-          return
-        }
-
-        await updateProgress('Checking local cache...', true)
-
-        const isLiveRippingAllowed = settings.canRipLive(isAdmin)
-        const allTrackIds = tracksToProcess.map((t) => t.id)
-        const existingTracksMap = await service.findCachedTracks(allTrackIds)
-        const cachedTracksMap = !isForce ? existingTracksMap : new Map()
-
-        // In cache-only mode for a single track: reject early if not cached
-        if (
-          !isLiveRippingAllowed &&
-          tracksToProcess.length === 1 &&
-          !cachedTracksMap.has(tracksToProcess[0]?.id)
-        ) {
-          const maintText = parseDynamicHtml(
-            '⚠️ <b>Live ripping is currently disabled for maintenance.</b><br/>' +
-              'This track is not yet in the local cache. Only cached tracks can be played right now.',
-          )
-          const maintEdited = await editMessageSafe(tg, {
-            chatId: chatId,
-            message: resolvingStatus.id,
-            text: maintText,
-            block: true,
-            maxWaitSec: 10,
-          })
-          if (!maintEdited) {
-            await sendTextSafe(tg, {
-              chatId: chatId,
-              text: maintText,
-              params: { replyTo: replyToMessageId },
-              block: true,
-              maxWaitSec: 10,
-            })
-          }
           return
         }
 
@@ -859,38 +1066,18 @@ export async function executeRipPipeline(
 
         const downloadTask = async () => {
           try {
-            for (let index = 0; index < tracksToProcess.length; index++) {
-              if (currentJob.isCancelled || jobController.signal.aborted) {
+            for (let index = 0; index < itemsToRip.length; index++) {
+              if (
+                currentJob.isCancelled ||
+                jobController.signal.aborted ||
+                taskSignal.aborted
+              ) {
                 break
               }
 
-              const item = tracksToProcess[index]
+              const item = itemsToRip[index]
               if (!item) continue
               const trackId = item.id
-
-              if (!isForce) {
-                const cached = cachedTracksMap.get(trackId)
-                if (cached) {
-                  await channel.push({
-                    index,
-                    item,
-                    status: { type: 'cached', cached },
-                  })
-                  continue
-                }
-              }
-
-              if (!isLiveRippingAllowed) {
-                await channel.push({
-                  index,
-                  item,
-                  status: {
-                    type: 'skipped',
-                    reason: 'uncached in cache-only mode',
-                  },
-                })
-                continue
-              }
 
               const itemTitle = item.title
                 ? `${item.artist || 'Unknown'} - ${item.title}`
@@ -1001,65 +1188,6 @@ export async function executeRipPipeline(
               using _trackSpan = debugSpan('track_job', {
                 track_id: trackId,
               }).enter()
-
-              if (status.type === 'cached') {
-                const { cached } = status
-                if (isCacheOnly) {
-                  cachedCount++
-                  currentJob.cachedCount = cachedCount
-                  await updateProgress()
-                  continue
-                }
-
-                try {
-                  await tg.sendCopy({
-                    toChatId: deliveryChatId,
-                    fromChatId: env.DUMP_CHANNEL_ID,
-                    message: cached.messageId,
-                    ...(deliveryChatId === chatId
-                      ? { replyTo: replyToMessageId }
-                      : {}),
-                    silent: isMultiTrack,
-                  })
-
-                  info('Cache hit: delivered', {
-                    track_id: trackId,
-                    time: '0ms',
-                  })
-
-                  await service.logRequest({
-                    telegramId: userId,
-                    chatId: chatId,
-                    appleTrackId: trackId,
-                    isCacheHit: true,
-                    durationMs: 0,
-                    status: 'completed',
-                  })
-
-                  cachedCount++
-                  currentJob.cachedCount = cachedCount
-                  await updateProgress()
-                  continue
-                } catch (copyErr) {
-                  debug('Cache forward failed, falling back to ripper', {
-                    track_id: trackId,
-                    error: String(copyErr),
-                  })
-                  failedTracks.push({
-                    id: trackId,
-                    error: 'Failed to deliver cached copy',
-                  })
-                  currentJob.failedCount = failedTracks.length
-                  await updateProgress()
-                  continue
-                }
-              }
-
-              if (status.type === 'skipped') {
-                skippedUncachedTracks.push(trackId)
-                await updateProgress()
-                continue
-              }
 
               if (status.type === 'failed') {
                 failedTracks.push({ id: trackId, error: status.error })
@@ -1222,34 +1350,6 @@ export async function executeRipPipeline(
                     fileUniqueId = dumpMsg.media.uniqueFileId
                   }
 
-                  // If force re-ripping an existing track, delete the old message from the dump channel
-                  const existingTrack = existingTracksMap.get(trackId)
-                  if (
-                    isForce &&
-                    existingTrack?.messageId &&
-                    existingTrack.messageId !== dumpMsg.id
-                  ) {
-                    debug('Deleting old dump message on force re-rip', {
-                      track_id: trackId,
-                      old_message_id: existingTrack.messageId,
-                      new_message_id: dumpMsg.id,
-                    })
-                    await tg
-                      .deleteMessagesById(env.DUMP_CHANNEL_ID, [
-                        existingTrack.messageId,
-                      ])
-                      .catch((err) => {
-                        warn(
-                          'Failed to delete old dump message on force re-rip',
-                          {
-                            track_id: trackId,
-                            old_message_id: existingTrack.messageId,
-                            error: String(err),
-                          },
-                        )
-                      })
-                  }
-
                   await service.saveTrack({
                     appleTrackId: trackId,
                     messageId: dumpMsg.id,
@@ -1367,93 +1467,16 @@ export async function executeRipPipeline(
           return
         }
 
-        // Final completion card (no cancel button)
-        const totalElapsedSec = ((Date.now() - jobStartTime) / 1000).toFixed(1)
-        const totalTracks = tracksToProcess.length
-
-        let summaryHtml: string
-        if (isCacheOnly) {
-          summaryHtml =
-            `✅ <b>Caching Complete!</b><br/><br/>` +
-            `<blockquote>• <b>Target:</b> ${jobHeader}<br/>` +
-            `• <b>Total Tracks:</b> <code>${totalTracks}</code><br/>` +
-            `• <b>Seeded to Dump:</b> 🎵 <code>${rippedCount}</code> new • ⚡ <code>${cachedCount}</code> already cached<br/>` +
-            (failedTracks.length > 0
-              ? `• <b>Failed:</b> ⚠️ <code>${failedTracks.length}</code><br/>`
-              : '') +
-            `• <b>Time Elapsed:</b> <code>${totalElapsedSec}s</code><br/>` +
-            `• <b>Destination:</b> Dump Channel & Database</blockquote>`
-        } else if (
-          cachedCount === 0 &&
-          rippedCount === 0 &&
-          skippedUncachedTracks.length > 0
-        ) {
-          summaryHtml =
-            '⚠️ <b>No Cached Tracks Available</b><br/><br/>' +
-            `<blockquote>• <b>Target:</b> ${jobHeader}<br/>` +
-            `• <b>Total Requested:</b> <code>${totalTracks}</code><br/>` +
-            `• <b>Skipped (Uncached):</b> 🟡 <code>${skippedUncachedTracks.length}</code><br/>` +
-            '• <b>Note:</b> Live ripping is currently disabled for maintenance.</blockquote>'
-        } else {
-          summaryHtml =
-            `✅ <b>Download Complete!</b><br/><br/>` +
-            `<blockquote>• <b>Target:</b> ${jobHeader}<br/>` +
-            `• <b>Total Tracks:</b> <code>${totalTracks}</code><br/>` +
-            `• <b>Delivered:</b> ⚡ <code>${cachedCount}</code> cached • 🎵 <code>${rippedCount}</code> ripped<br/>` +
-            (skippedUncachedTracks.length > 0
-              ? `• <b>Skipped (Uncached):</b> 🟡 <code>${skippedUncachedTracks.length}</code><br/>`
-              : '') +
-            (failedTracks.length > 0
-              ? `• <b>Failed:</b> ⚠️ <code>${failedTracks.length}</code><br/>`
-              : '') +
-            `• <b>Time Elapsed:</b> <code>${totalElapsedSec}s</code></blockquote>`
-        }
-
-        if (cappedCount > 0) {
-          summaryHtml += `<br/>ℹ️ <i>Queue was capped to ${maxCollectionLimit} tracks (settings limit).</i>`
-        }
-
-        if (isGroup && !isCacheOnly) {
-          summaryHtml +=
-            '<br/>📩 <i>All songs have been delivered to your private DM!</i>'
-        }
-
-        if (failedTracks.length > 0) {
-          summaryHtml += '<br/><br/><b>Issues / Failures:</b><br/>'
-          for (const f of failedTracks.slice(0, 5)) {
-            summaryHtml += `• <code>${f.id}</code>: ${html.escape(f.error)}<br/>`
-          }
-          if (failedTracks.length > 5) {
-            summaryHtml += `<i>...and ${failedTracks.length - 5} more</i>`
-          }
-        }
-
-        let summaryEdited = false
-        if (!isEditBlocked) {
-          summaryEdited = await editMessageSafe(tg, {
-            chatId: chatId,
-            message: statusMsgId,
-            text: parseDynamicHtml(summaryHtml),
-            block: true,
-            maxWaitSec: 10,
-          })
-        }
-
-        if (!summaryEdited) {
-          await sendTextSafe(tg, {
-            chatId: chatId,
-            text: parseDynamicHtml(summaryHtml),
-            params: { replyTo: replyToMessageId },
-            block: true,
-            maxWaitSec: 10,
-          })
-        }
+        await sendFinalSummary()
       },
       {
         signal: jobController.signal,
         onPositionChange: (pos) => {
           currentJob.queuePosition = pos
-          updateProgress(`⏳ In Queue: Position #${pos}`, true).catch(() => {})
+          const prefix = cachedCount > 0 ? `⚡ ${cachedCount} cached • ` : ''
+          updateProgress(`${prefix}⏳ In Queue: Position #${pos}`, true).catch(
+            () => {},
+          )
         },
         onStart: () => {
           currentJob.queuePosition = 0
