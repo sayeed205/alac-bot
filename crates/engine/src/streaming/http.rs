@@ -46,6 +46,7 @@ pub struct StreamHttpResponse {
     pub codec: Option<String>,
     pub bit_depth: Option<String>,
     pub sample_rate: Option<String>,
+    pub content_length: Option<u64>,
     pub body: Option<ByteStream>,
 }
 
@@ -210,6 +211,10 @@ impl StreamHttp for ReqwestHttp {
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
         let status = response.status().as_u16();
+        let content_length = headers
+            .get("content-length")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse().ok());
         let body = Some(Box::pin(
             response
                 .bytes_stream()
@@ -220,6 +225,7 @@ impl StreamHttp for ReqwestHttp {
             codec,
             bit_depth,
             sample_rate,
+            content_length,
             body,
         })
     }

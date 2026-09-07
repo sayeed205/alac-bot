@@ -73,6 +73,23 @@ pub struct ArtistTracks {
     pub tracks: Vec<TrackMeta>,
 }
 
+/// Result of a completed single-track rip (parity with TS TrackRipResult).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackRipResult {
+    pub file_path: String,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub duration: i64,
+    pub bit_depth: u32,
+    pub sample_rate: u32,
+    pub codec: String,
+    pub genre: String,
+    pub release_date: String,
+    pub track_number: i64,
+    pub track_count: i64,
+}
+
 /// A charts album entry from the Apple RSS feed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChartAlbum {

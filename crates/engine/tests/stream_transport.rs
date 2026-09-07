@@ -14,6 +14,7 @@ struct Route {
     codec: Option<String>,
     bit_depth: Option<String>,
     sample_rate: Option<String>,
+    content_length: Option<u64>,
     error: Option<StreamHttpError>,
 }
 
@@ -62,6 +63,7 @@ impl StreamHttp for FakeHttp {
             codec: route.codec.clone(),
             bit_depth: route.bit_depth.clone(),
             sample_rate: route.sample_rate.clone(),
+            content_length: route.content_length,
             body,
         })
     }
@@ -74,6 +76,7 @@ fn ok() -> Route {
         codec: None,
         bit_depth: None,
         sample_rate: None,
+        content_length: None,
         error: None,
     }
 }
@@ -124,6 +127,33 @@ async fn primary_success_uses_exact_url_and_hostname_and_records_success() {
         transport.http().calls.lock().unwrap().as_slice(),
         ["https://primary.example:123/api/stream/42"]
     );
+    assert_eq!(source.content_length, None, "absent header → None");
+}
+
+#[tokio::test]
+async fn primary_success_carries_content_length() {
+    let http = FakeHttp::new();
+    let mut route = ok();
+    route.content_length = Some(29_000_000);
+    http.route("primary.example:123/api", route);
+    let transport = StreamTransport::new(http);
+    let policy = FakePolicy::default();
+    let source = transport
+        .connect_audio_stream(ConnectStreamOptions {
+            track_id: "42".into(),
+            primary_mirror: Some(primary()),
+            wrapper_url: None,
+            wrapper_api_key: None,
+            signal: None,
+            on_progress: None,
+            mirror_policy: Some(&policy),
+        })
+        .await
+        .unwrap();
+    assert_eq!(source.content_length, Some(29_000_000));
+    assert_eq!(source.sample_rate, 96_000);
+    assert_eq!(source.bit_depth, 24);
+    assert_eq!(source.codec, "alac");
 }
 
 #[tokio::test]

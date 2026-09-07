@@ -42,6 +42,9 @@ pub struct AudioStreamSource {
     pub codec: String,
     pub bit_depth: u32,
     pub sample_rate: u32,
+    /// Response `content-length`; `None` or `Some(0)` mean "unknown" for
+    /// progress totals (TS: `Number(header || 0)`, `> 0 ? : 0`).
+    pub content_length: Option<u64>,
 }
 
 impl fmt::Debug for AudioStreamSource {
@@ -52,6 +55,7 @@ impl fmt::Debug for AudioStreamSource {
             .field("codec", &self.codec)
             .field("bit_depth", &self.bit_depth)
             .field("sample_rate", &self.sample_rate)
+            .field("content_length", &self.content_length)
             .finish_non_exhaustive()
     }
 }
@@ -145,6 +149,7 @@ impl<H: StreamHttp> StreamTransport<H> {
             codec: response.codec.unwrap_or_else(|| "alac".to_owned()),
             bit_depth,
             sample_rate,
+            content_length: response.content_length,
         })
     }
 
