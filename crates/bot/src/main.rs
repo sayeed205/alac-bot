@@ -1,0 +1,145 @@
+use std::sync::Arc;
+
+use anyhow::{anyhow, Context, Result};
+use bot::{handlers, BotState};
+use ferogram::{filters::Dispatcher, Client};
+use tokio::signal;
+use tracing::info;
+use tracing_subscriber::EnvFilter;
+
+#[derive(Debug)]
+struct Env {
+    api_id: i32,
+    api_hash: String,
+    bot_token: String,
+    admin_id: i64,
+    dump_channel_id: i64,
+    database_url: String,
+    log_level: String,
+}
+
+fn required(name: &str, invalid: &mut Vec<String>) -> String {
+    match std::env::var(name) {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => {
+            invalid.push(name.to_owned());
+            String::new()
+        }
+    }
+}
+
+fn parse<T: std::str::FromStr>(name: &str, value: String, invalid: &mut Vec<String>) -> Option<T> {
+    match value.parse() {
+        Ok(parsed) => Some(parsed),
+        Err(_) => {
+            invalid.push(name.to_owned());
+            None
+        }
+    }
+}
+
+fn load_env() -> Env {
+    let _ = dotenvy::from_filename(".env");
+    let mut invalid = Vec::new();
+    let api_id =
+        parse("API_ID", required("API_ID", &mut invalid), &mut invalid).unwrap_or_default();
+    let api_hash = required("API_HASH", &mut invalid);
+    let bot_token = required("BOT_TOKEN", &mut invalid);
+    let admin_id =
+        parse("ADMIN_ID", required("ADMIN_ID", &mut invalid), &mut invalid).unwrap_or_default();
+    let dump_channel_id = parse(
+        "DUMP_CHANNEL_ID",
+        required("DUMP_CHANNEL_ID", &mut invalid),
+        &mut invalid,
+    )
+    .unwrap_or_default();
+    let database_url = required("DATABASE_URL", &mut invalid);
+    let log_level = std::env::var("LOG_LEVEL").unwrap_or_else(|_| "info".to_owned());
+    if !invalid.is_empty() {
+        panic!("missing or invalid environment variables: {invalid:?}");
+    }
+    Env {
+        api_id,
+        api_hash,
+        bot_token,
+        admin_id,
+        dump_channel_id,
+        database_url,
+        log_level,
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let env = load_env();
+    let level = if env.log_level.eq_ignore_ascii_case("critical") {
+        "error"
+    } else {
+        &env.log_level
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new(level))
+        .init();
+
+    info!("Running database migrations...");
+    let database = welds::connections::postgres::connect(&env.database_url)
+        .await
+        .context("connect to PostgreSQL")?;
+    db::migrate(&database)
+        .await
+        .map_err(|e| anyhow!(e))
+        .context("run database migrations")?;
+    info!("Migrations completed successfully!");
+    let auth = db::Auth::new(database, env.admin_id);
+
+    let (client, shutdown) = Client::builder()
+        .api_id(env.api_id)
+        // The builder takes ownership of the hash (the source API does not
+        // implement Into<String> for &String), so clone this small value.
+        .api_hash(env.api_hash.clone())
+        .session("bot-data/session")
+        .catch_up(true)
+        .connect()
+        .await
+        .context("connect to Telegram")?;
+    client
+        .bot_sign_in(&env.bot_token)
+        .await
+        .context("sign in bot")?;
+    client
+        .save_session()
+        .await
+        .context("save Telegram session")?;
+    let me = client.get_me().await.context("get bot identity")?;
+    info!(username = ?me.username, bot_id = me.id, dump_channel = env.dump_channel_id, "Bot started successfully");
+
+    let state = Arc::new(BotState {
+        client: client.clone(),
+        auth,
+    });
+    let mut dispatcher = Dispatcher::new();
+    handlers::register(&mut dispatcher, state);
+    let dispatcher = Arc::new(dispatcher);
+    let mut updates = client.stream_updates();
+    #[cfg(unix)]
+    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+        .context("install SIGTERM handler")?;
+    #[cfg(unix)]
+    let sigterm_signal = async { sigterm.recv().await };
+    #[cfg(not(unix))]
+    let sigterm_signal = std::future::pending::<Option<()>>();
+    tokio::select! {
+        _ = async {
+            while let Some(update) = updates.next().await {
+                let dispatcher = Arc::clone(&dispatcher);
+                tokio::spawn(async move { dispatcher.dispatch(update).await; });
+            }
+        } => {},
+        _ = signal::ctrl_c() => {},
+        _ = sigterm_signal => {},
+        _ = shutdown.cancelled() => {},
+    }
+    info!("Shutting down bot...");
+    shutdown.cancel();
+    Ok(())
+}

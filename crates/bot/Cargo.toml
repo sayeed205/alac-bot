@@ -1,0 +1,20 @@
+[package]
+name = "bot"
+description = "Telegram bot binary: ferogram handlers, command flows, delivery."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "bot"
+path = "src/main.rs"
+
+[dependencies]
+db = { path = "../db" }
+ferogram.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+dotenvy.workspace = true
+welds.workspace = true

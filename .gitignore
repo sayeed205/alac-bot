@@ -9,3 +9,7 @@ dist/
 .env
 client.*
 *.session*
+
+# Rust (migration branch)
+/target
+/bot-data/
