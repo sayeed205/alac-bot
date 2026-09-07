@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
-use ferogram::tl;
-use ferogram::{filters, filters::Dispatcher, InputMessage, PeerRef};
+use ferogram::{filters, filters::Dispatcher, tl, InputMessage, PeerRef};
 
 use crate::{
     html::{escape, parse_dynamic_html},

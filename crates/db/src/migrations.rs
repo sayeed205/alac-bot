@@ -1,5 +1,4 @@
-use welds::errors::Result;
-use welds::migrations::prelude::*;
+use welds::{errors::Result, migrations::prelude::*};
 
 /// The complete schema represented by the three Drizzle migrations.
 pub const SQL: &str = r#"

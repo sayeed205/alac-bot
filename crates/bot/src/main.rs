@@ -69,17 +69,27 @@ fn load_env() -> Env {
     }
 }
 
+fn init_tracing(log_level: &str) {
+    // Our crates honor LOG_LEVEL (default info); external crates are pinned
+    // to warn so their internal chatter (ferogram session/connection logs,
+    // sqlx, etc.) stays quiet unless something is actually wrong.
+    let level = if log_level.eq_ignore_ascii_case("critical") {
+        "error"
+    } else {
+        log_level
+    };
+    let filter = format!("warn,bot={level},db={level},core={level}");
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter)),
+        )
+        .init();
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let env = load_env();
-    let level = if env.log_level.eq_ignore_ascii_case("critical") {
-        "error"
-    } else {
-        &env.log_level
-    };
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(level))
-        .init();
+    init_tracing(&env.log_level);
 
     info!("Running database migrations...");
     let database = welds::connections::postgres::connect(&env.database_url)

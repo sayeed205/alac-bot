@@ -6,8 +6,10 @@ mod start;
 
 use std::sync::Arc;
 
-use ferogram::filters::{self, Dispatcher};
-use ferogram::update::CallbackQuery;
+use ferogram::{
+    filters::{self, Dispatcher},
+    update::CallbackQuery,
+};
 
 use crate::BotState;
 
