@@ -816,9 +816,8 @@ export async function executeRipPipeline(
 
         const isLiveRippingAllowed = settings.canRipLive(isAdmin)
         const allTrackIds = tracksToProcess.map((t) => t.id)
-        const cachedTracksMap = !isForce
-          ? await service.findCachedTracks(allTrackIds)
-          : new Map()
+        const existingTracksMap = await service.findCachedTracks(allTrackIds)
+        const cachedTracksMap = !isForce ? existingTracksMap : new Map()
 
         // In cache-only mode for a single track: reject early if not cached
         if (
@@ -1206,6 +1205,34 @@ export async function executeRipPipeline(
                   if (dumpMsg.media && dumpMsg.media.type === 'audio') {
                     fileId = dumpMsg.media.fileId
                     fileUniqueId = dumpMsg.media.uniqueFileId
+                  }
+
+                  // If force re-ripping an existing track, delete the old message from the dump channel
+                  const existingTrack = existingTracksMap.get(trackId)
+                  if (
+                    isForce &&
+                    existingTrack?.messageId &&
+                    existingTrack.messageId !== dumpMsg.id
+                  ) {
+                    debug('Deleting old dump message on force re-rip', {
+                      track_id: trackId,
+                      old_message_id: existingTrack.messageId,
+                      new_message_id: dumpMsg.id,
+                    })
+                    await tg
+                      .deleteMessagesById(env.DUMP_CHANNEL_ID, [
+                        existingTrack.messageId,
+                      ])
+                      .catch((err) => {
+                        warn(
+                          'Failed to delete old dump message on force re-rip',
+                          {
+                            track_id: trackId,
+                            old_message_id: existingTrack.messageId,
+                            error: String(err),
+                          },
+                        )
+                      })
                   }
 
                   await service.saveTrack({

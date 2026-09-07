@@ -1247,6 +1247,10 @@ describe('ALAC Rip Command Handler', () => {
 
       expect(mockRipper.rip).toHaveBeenCalled()
       expect(fakeTg.sendCopy).not.toHaveBeenCalled()
+      expect(fakeTg.deleteMessagesById).toHaveBeenCalledWith(
+        env.DUMP_CHANNEL_ID,
+        [77],
+      )
     })
   })
   describe('Upload Retries & Error Handling', () => {
