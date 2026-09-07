@@ -73,7 +73,7 @@ describe('connectAudioStreamWithWrapper', () => {
           apiKey: 'test-key',
         },
         wrapperUrl: 'http://127.0.0.1:12340',
-        onProgress: (s) => statusUpdates.push(s),
+        onProgress: (s: string) => statusUpdates.push(s),
       })
 
       expect(wrapperHit).toBe(true)

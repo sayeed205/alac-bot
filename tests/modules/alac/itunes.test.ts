@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, it } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 
+import { catalogService } from '@/modules/alac/catalog/index.ts'
 import {
   fetchAlbumTracks,
   fetchArtistTracks,
@@ -13,6 +14,10 @@ describe('iTunes API Service', () => {
   const setFetch = (fn: unknown) => {
     globalThis.fetch = fn as typeof fetch
   }
+
+  beforeEach(() => {
+    catalogService.clearCache()
+  })
 
   afterEach(() => {
     globalThis.fetch = originalFetch

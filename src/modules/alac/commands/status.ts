@@ -1,6 +1,7 @@
 import { BotKeyboard, html } from '@mtcute/bun'
 import { filters } from '@mtcute/dispatcher'
 
+import { ripOrchestrator } from '@/modules/alac/orchestrator/index.ts'
 import { infoSpan } from '@/utils/logger.ts'
 import { renderProgressBar } from '@/utils/progress.ts'
 import { editMessageSafe } from '@/utils/telegram.ts'
@@ -247,11 +248,14 @@ export function registerStatusCommand(ctx: CommandContext): void {
           return
         }
 
-        job.isCancelled = true
-        job.cancelledBy =
+        const canceller =
           cq.user.displayName ||
           (cq.user.username ? `@${cq.user.username}` : `User ${cq.user.id}`)
+
+        job.isCancelled = true
+        job.cancelledBy = canceller
         job.controller.abort()
+        ripOrchestrator.cancelJob(jobId, canceller)
 
         await cq.answer({ text: '🛑 Download cancelled.' })
 

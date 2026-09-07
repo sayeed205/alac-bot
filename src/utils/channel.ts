@@ -96,6 +96,14 @@ export class BoundedChannel<T> {
     })
   }
 
+  async *[Symbol.asyncIterator](): AsyncIterator<T> {
+    while (true) {
+      const item = await this.pull()
+      if (item === undefined) break
+      yield item
+    }
+  }
+
   close(): void {
     this.isClosed = true
     while (this.waitingReaders.length > 0) {

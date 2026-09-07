@@ -14,10 +14,11 @@ export interface DumpCaptionMetadata {
   duration: number
   bitDepth: number
   sampleRate: number
-  genre: string
-  releaseDate: string
-  trackNumber: number
-  trackCount: number
+  codec?: string
+  genre?: string
+  releaseDate?: string
+  trackNumber?: number
+  trackCount?: number
 }
 
 const DUMP_PAYLOAD_REGEX = /(\{[\s\S]*?"id"\s*:\s*"[^"]+"[\s\S]*?\})/s
@@ -43,9 +44,9 @@ export interface ParsedDumpMetadata {
 export function formatDumpCaption(meta: DumpCaptionMetadata): FormattedString {
   const parts: string[] = []
   parts.push(
-    `🎵 <b>${html.escape(meta.title)}</b> — ${html.escape(meta.artist)}`,
+    `🎵 <b>${html.escape(meta.title || '')}</b> — ${html.escape(meta.artist || '')}`,
   )
-  parts.push(`💽 ${html.escape(meta.album)}`)
+  parts.push(`💽 ${html.escape(meta.album || '')}`)
 
   const m = Math.floor(meta.duration / 60)
   const s = String(meta.duration % 60).padStart(2, '0')
@@ -66,10 +67,10 @@ export function formatDumpCaption(meta: DumpCaptionMetadata): FormattedString {
     dur: meta.duration,
     bit: meta.bitDepth,
     hz: meta.sampleRate,
-    genre: meta.genre,
-    date: meta.releaseDate,
-    trk: meta.trackNumber,
-    cnt: meta.trackCount,
+    genre: meta.genre || 'Music',
+    date: meta.releaseDate || '',
+    trk: meta.trackNumber ?? 1,
+    cnt: meta.trackCount ?? 1,
   }
 
   const payloadJson = JSON.stringify(payload, null, 2)
@@ -80,11 +81,11 @@ export function formatDumpCaption(meta: DumpCaptionMetadata): FormattedString {
   const quoteLines: string[] = [
     '<b>Track Specs & Metadata:</b>',
     `• Quality: <b>ALAC ${meta.bitDepth}-bit / ${(meta.sampleRate / 1000).toFixed(1)} kHz</b>`,
-    `• Album: <b>${html.escape(meta.album)}</b>`,
-    `• Track: <b>${meta.trackNumber}/${meta.trackCount}</b>`,
-    `• Genre: <b>${html.escape(meta.genre)}</b>`,
-    `• Release Date: <b>${html.escape(meta.releaseDate)}</b>`,
-    `• Apple Track ID: <b>${html.escape(meta.appleTrackId)}</b>`,
+    `• Album: <b>${html.escape(meta.album || '')}</b>`,
+    `• Track: <b>${meta.trackNumber ?? 1}/${meta.trackCount ?? 1}</b>`,
+    `• Genre: <b>${html.escape(meta.genre || 'Music')}</b>`,
+    `• Release Date: <b>${html.escape(meta.releaseDate || '')}</b>`,
+    `• Apple Track ID: <b>${html.escape(meta.appleTrackId || '')}</b>`,
     '',
     payloadJson,
   ]

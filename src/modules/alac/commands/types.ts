@@ -8,6 +8,11 @@ import type { FormattedString } from '@/utils/html.ts'
 import { parseDynamicHtml } from '@/utils/html.ts'
 
 import type { IRipQueue } from '../queue.ts'
+import type {
+  IRequestLogRepository,
+  IStatsRepository,
+  ITrackRepository,
+} from '../repositories/index.ts'
 import type { ITrackRipper } from '../ripper.ts'
 import type { IAlacService } from '../service.ts'
 
@@ -18,6 +23,9 @@ export interface CommandContext {
   dp: Dispatcher
   tg: TelegramClient
   service: IAlacService
+  tracks?: ITrackRepository
+  requestLogs?: IRequestLogRepository
+  stats?: IStatsRepository
   ripper: ITrackRipper
   queue: IRipQueue
   auth: IAuthService
