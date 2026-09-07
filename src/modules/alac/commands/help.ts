@@ -1,16 +1,13 @@
 import { filters } from '@mtcute/dispatcher'
 
-import { infoSpan } from '@/utils/logger.ts'
+import { parseDynamicHtml } from '@/utils/html.ts'
 
 import type { CommandContext } from './types.ts'
-import { parseDynamicHtml } from './types.ts'
 
 export function registerHelpCommand(ctx: CommandContext): void {
   const { dp, auth } = ctx
 
-  dp.onNewMessage(filters.command(['help', 'start']), async (msg) => {
-    using _ = infoSpan('help').enter()
-
+  dp.onNewMessage(filters.command('help'), async (msg) => {
     const isAuthed = await auth.isAuthorized(msg.sender.id, msg.chat.id)
     if (!isAuthed) return
 
@@ -43,6 +40,7 @@ export function registerHelpCommand(ctx: CommandContext): void {
       helpText +=
         '<br/><br/><blockquote><b>Admin Commands:</b><br/>' +
         '• <code>/settings</code> — Bot operational settings & ripping toggles<br/>' +
+        '• <code>/dumpnew &lt;days&gt;</code> — Auto-dump new releases from Apple Music (alias: <code>/autodump</code>)<br/>' +
         '• <code>/cache &lt;link&gt;</code> — Pre-cache/seed tracks directly into dump channel without sending audio (alias: <code>/dump</code>)<br/>' +
         '• <code>/random</code> — Interactive random album discovery & dump<br/>' +
         '• <code>/alac &lt;link&gt; -f</code> or <code>/rerip</code> — Force re-rip, bypassing cache<br/>' +

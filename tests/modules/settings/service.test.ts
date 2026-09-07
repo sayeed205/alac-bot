@@ -37,6 +37,8 @@ describe('SettingsService', () => {
     expect(settings.txtRipEnabled).toBe(true)
     expect(settings.multiLinkRipEnabled).toBe(true)
     expect(settings.maxCollectionTracks).toBe(50)
+    expect(settings.autoDumpEnabled).toBe(true)
+    expect(settings.autoDumpStorefronts).toEqual(['us'])
   })
 
   it('cycles ripping mode correctly', async () => {
@@ -84,6 +86,23 @@ describe('SettingsService', () => {
     expect(service.isMultiLinkRipEnabled()).toBe(false)
   })
 
+  it('toggles auto-dump and configures storefronts', async () => {
+    expect(service.isAutoDumpEnabled()).toBe(true)
+    const toggleRes = await service.toggleAutoDump()
+    expect(toggleRes).toBe(false)
+    expect(service.isAutoDumpEnabled()).toBe(false)
+
+    const added = await service.addAutoDumpStorefront('jp')
+    expect(added).toContain('jp')
+    expect(added).toContain('us')
+
+    const removed = await service.removeAutoDumpStorefront('us')
+    expect(removed).toEqual(['jp'])
+
+    const custom = await service.setAutoDumpStorefronts(['in', 'gb'])
+    expect(custom).toEqual(['in', 'gb'])
+  })
+
   it('updates max collection tracks and clamps negative numbers', async () => {
     await service.setMaxCollectionTracks(100)
     expect(service.getMaxCollectionTracks()).toBe(100)
@@ -99,6 +118,8 @@ describe('SettingsService', () => {
     await service.setSetting('txtRipEnabled', false)
     await service.setSetting('multiLinkRipEnabled', false)
     await service.setSetting('maxCollectionTracks', 25)
+    await service.setSetting('autoDumpEnabled', false)
+    await service.setSetting('autoDumpStorefronts', ['jp', 'in'])
 
     const freshService = new SettingsService(db)
     await freshService.init()
@@ -111,6 +132,8 @@ describe('SettingsService', () => {
     expect(settings.txtRipEnabled).toBe(false)
     expect(settings.multiLinkRipEnabled).toBe(false)
     expect(settings.maxCollectionTracks).toBe(25)
+    expect(settings.autoDumpEnabled).toBe(false)
+    expect(settings.autoDumpStorefronts).toEqual(['jp', 'in'])
   })
 
   describe('Permission & Bypass Checks', () => {

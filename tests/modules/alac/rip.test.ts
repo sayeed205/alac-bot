@@ -135,6 +135,8 @@ describe('ALAC Rip Command Handler', () => {
       txtRipEnabled: true,
       multiLinkRipEnabled: true,
       maxCollectionTracks: 50,
+      autoDumpEnabled: true,
+      autoDumpStorefronts: ['us'],
     }
 
     mockSettingsService = {
@@ -179,6 +181,12 @@ describe('ALAC Rip Command Handler', () => {
       toggleTxtRip: mock(async () => true),
       toggleMultiLinkRip: mock(async () => true),
       setMaxCollectionTracks: mock(async (n) => n),
+      isAutoDumpEnabled: mock(() => mockSettings.autoDumpEnabled),
+      getAutoDumpStorefronts: mock(() => [...mockSettings.autoDumpStorefronts]),
+      toggleAutoDump: mock(async () => true),
+      addAutoDumpStorefront: mock(async () => ['us']),
+      removeAutoDumpStorefront: mock(async () => ['us']),
+      setAutoDumpStorefronts: mock(async (sfs) => sfs),
     }
 
     ctx = {

@@ -104,8 +104,28 @@ export async function fetchTrackMeta(
         original_storefront: sf,
         error: err instanceof Error ? err.message : String(err),
       })
-      return await doFetchTrackMeta(trackId, 'us')
+      try {
+        return await doFetchTrackMeta(trackId, 'us')
+      } catch {
+        // Fall through to regional fallbacks
+      }
     }
+
+    const regionalFallbacks = ['jp', 'gb', 'in', 'ca', 'de', 'fr', 'au'].filter(
+      (s) => s !== sf && s !== 'us',
+    )
+    for (const fallbackSf of regionalFallbacks) {
+      try {
+        debug('Retrying track lookup on regional storefront fallback', {
+          track_id: trackId,
+          fallback_storefront: fallbackSf,
+        })
+        return await doFetchTrackMeta(trackId, fallbackSf)
+      } catch {
+        // Try next storefront
+      }
+    }
+
     throw err
   }
 }

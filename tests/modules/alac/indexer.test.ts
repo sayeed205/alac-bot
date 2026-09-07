@@ -36,12 +36,8 @@ describe('Dump Channel Indexer & Metadata Tagging', () => {
         e._ === 'messageEntityBlockquote' && e.collapsed === true,
     )
     expect(blockquote).toBeDefined()
-
-    const pre = caption.entities?.find(
-      (e: { _: string; language?: string }) =>
-        e._ === 'messageEntityPre' && e.language === 'json',
-    )
-    expect(pre).toBeDefined()
+    // Verify JSON payload is contained within caption text
+    expect(caption.text).toContain('"id": "1559523359"')
   })
 
   it('correctly parses dump caption with valid metadata payload', () => {

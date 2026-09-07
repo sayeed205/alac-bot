@@ -19,6 +19,7 @@ import { fetchPlaylistTracks } from '@/modules/alac/playlist.ts'
 import { abortableSleep, type TrackRipResult } from '@/modules/alac/ripper.ts'
 import { settingsService as defaultSettingsService } from '@/modules/settings/service.ts'
 import { BoundedChannel } from '@/utils/channel.ts'
+import type { FormattedString } from '@/utils/html.ts'
 import {
   debug,
   debugSpan,
@@ -1122,6 +1123,7 @@ export async function executeRipPipeline(
                     trackCount: ripResult.trackCount,
                   })
 
+                  let currentCaption: FormattedString | string = caption
                   let dumpMsg: Message | null = null
                   let uploadAttempt = 0
                   const maxUploadRetries = env.ALAC_MAX_RETRIES
@@ -1143,7 +1145,7 @@ export async function executeRipPipeline(
                           title: ripResult.title,
                           performer: ripResult.artist,
                           duration: ripResult.duration,
-                          caption,
+                          caption: currentCaption,
                         },
                         {
                           silent: true,
@@ -1168,6 +1170,19 @@ export async function executeRipPipeline(
                           uploadErr.message === 'Download was cancelled')
                       ) {
                         throw uploadErr
+                      }
+
+                      if (
+                        uploadErr instanceof Error &&
+                        uploadErr.message.includes('ENTITY_BOUNDS_INVALID') &&
+                        typeof currentCaption !== 'string'
+                      ) {
+                        warn(
+                          'Dump upload encountered ENTITY_BOUNDS_INVALID, retrying with plain text caption',
+                          { track_id: trackId },
+                        )
+                        currentCaption = caption.text
+                        continue
                       }
 
                       if (uploadAttempt >= maxUploadRetries) {

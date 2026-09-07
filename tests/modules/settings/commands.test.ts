@@ -45,6 +45,8 @@ describe('Settings Commands & Callbacks', () => {
       txtRipEnabled: true,
       multiLinkRipEnabled: true,
       maxCollectionTracks: 50,
+      autoDumpEnabled: true,
+      autoDumpStorefronts: ['us'],
     }
 
     mockSettingsService = {
@@ -57,6 +59,8 @@ describe('Settings Commands & Callbacks', () => {
       isTxtRipEnabled: mock(() => mockSettings.txtRipEnabled),
       isMultiLinkRipEnabled: mock(() => mockSettings.multiLinkRipEnabled),
       getMaxCollectionTracks: mock(() => mockSettings.maxCollectionTracks),
+      isAutoDumpEnabled: mock(() => mockSettings.autoDumpEnabled),
+      getAutoDumpStorefronts: mock(() => [...mockSettings.autoDumpStorefronts]),
       canRipLive: mock(
         (isAdmin: boolean) => isAdmin || mockSettings.rippingMode === 'live',
       ),
@@ -113,6 +117,23 @@ describe('Settings Commands & Callbacks', () => {
       setMaxCollectionTracks: mock(async (num: number) => {
         mockSettings.maxCollectionTracks = Math.max(0, num)
         return mockSettings.maxCollectionTracks
+      }),
+      toggleAutoDump: mock(async () => {
+        mockSettings.autoDumpEnabled = !mockSettings.autoDumpEnabled
+        return mockSettings.autoDumpEnabled
+      }),
+      addAutoDumpStorefront: mock(async (sf: string) => {
+        mockSettings.autoDumpStorefronts.push(sf.toLowerCase())
+        return mockSettings.autoDumpStorefronts
+      }),
+      removeAutoDumpStorefront: mock(async (sf: string) => {
+        mockSettings.autoDumpStorefronts =
+          mockSettings.autoDumpStorefronts.filter((s) => s !== sf.toLowerCase())
+        return mockSettings.autoDumpStorefronts
+      }),
+      setAutoDumpStorefronts: mock(async (sfs: string[]) => {
+        mockSettings.autoDumpStorefronts = [...sfs]
+        return mockSettings.autoDumpStorefronts
       }),
     }
 
@@ -261,6 +282,23 @@ describe('Settings Commands & Callbacks', () => {
       expect(msg.answerText).toHaveBeenCalled()
     })
 
+    it('handles /settings autodump <val> subcommand', async () => {
+      const msg = await triggerMessage('/settings autodump off', ADMIN_ID)
+      expect(mockSettingsService.setSetting).toHaveBeenCalledWith(
+        'autoDumpEnabled',
+        false,
+      )
+      expect(msg.answerText).toHaveBeenCalled()
+    })
+
+    it('handles /settings storefronts add subcommand', async () => {
+      const msg = await triggerMessage('/settings storefronts add jp', ADMIN_ID)
+      expect(mockSettingsService.addAutoDumpStorefront).toHaveBeenCalledWith(
+        'jp',
+      )
+      expect(msg.answerText).toHaveBeenCalled()
+    })
+
     it('handles /settings limit <val> subcommand', async () => {
       const msg = await triggerMessage('/settings limit 100', ADMIN_ID)
       expect(mockSettingsService.setMaxCollectionTracks).toHaveBeenCalledWith(
@@ -334,6 +372,16 @@ describe('Settings Commands & Callbacks', () => {
         ADMIN_ID,
       )
       expect(mockSettingsService.toggleMultiLinkRip).toHaveBeenCalled()
+      expect(fakeQuery.answer).toHaveBeenCalled()
+      expect(fakeTg.editMessage).toHaveBeenCalled()
+    })
+
+    it('toggles autodump on settings:autodump callback', async () => {
+      const { fakeQuery } = await triggerCallbackQuery(
+        'settings:autodump',
+        ADMIN_ID,
+      )
+      expect(mockSettingsService.toggleAutoDump).toHaveBeenCalled()
       expect(fakeQuery.answer).toHaveBeenCalled()
       expect(fakeTg.editMessage).toHaveBeenCalled()
     })

@@ -72,15 +72,21 @@ export function formatDumpCaption(meta: DumpCaptionMetadata): FormattedString {
     cnt: meta.trackCount,
   }
 
+  const payloadJson = JSON.stringify(payload, null, 2)
+    .split('\n')
+    .map((line) => html.escape(line))
+    .join('<br/>')
+
   const quoteLines: string[] = [
     '<b>Track Specs & Metadata:</b>',
-    `• Quality: <code>ALAC ${meta.bitDepth}-bit / ${(meta.sampleRate / 1000).toFixed(1)} kHz</code>`,
+    `• Quality: <b>ALAC ${meta.bitDepth}-bit / ${(meta.sampleRate / 1000).toFixed(1)} kHz</b>`,
     `• Album: <b>${html.escape(meta.album)}</b>`,
-    `• Track: <code>${meta.trackNumber}/${meta.trackCount}</code>`,
-    `• Genre: <code>${html.escape(meta.genre)}</code>`,
-    `• Release Date: <code>${html.escape(meta.releaseDate)}</code>`,
-    `• Apple Track ID: <code>${html.escape(meta.appleTrackId)}</code>`,
-    `<pre language="json">${JSON.stringify(payload, null, 2)}</pre>`,
+    `• Track: <b>${meta.trackNumber}/${meta.trackCount}</b>`,
+    `• Genre: <b>${html.escape(meta.genre)}</b>`,
+    `• Release Date: <b>${html.escape(meta.releaseDate)}</b>`,
+    `• Apple Track ID: <b>${html.escape(meta.appleTrackId)}</b>`,
+    '',
+    payloadJson,
   ]
 
   parts.push(`<blockquote expandable>${quoteLines.join('<br/>')}</blockquote>`)
@@ -153,6 +159,7 @@ export async function indexDumpChannel(
   await tg.deleteMessagesById(dumpChannelId, [maxId]).catch(() => null)
 
   const BATCH_SIZE = 100
+  // Iterate backwards from maxId - 1 down to 1
   for (let end = maxId - 1; end >= 1; end -= BATCH_SIZE) {
     const start = Math.max(1, end - BATCH_SIZE + 1)
     const batchIds: number[] = []
@@ -164,6 +171,7 @@ export async function indexDumpChannel(
 
     for (const message of messages) {
       if (!message) {
+        // Message was deleted or doesn't exist
         continue
       }
 

@@ -16,6 +16,7 @@ import {
   type ISettingsService,
 } from '@/modules/settings/service.ts'
 
+import { registerAutoDumpCommand, startAutoDumpScheduler } from './autodump.ts'
 import { registerBackupCommands } from './backup.ts'
 import { registerCleanCommand } from './clean.ts'
 import { registerDeleteCommand } from './delete.ts'
@@ -32,6 +33,7 @@ import { registerSpecCommand } from './spec.ts'
 import { registerStatsCommand } from './stats.ts'
 import type { CommandContext } from './types.ts'
 
+export * from './autodump.ts'
 export * from './types.ts'
 
 export function registerAlacCommands(ctx: CommandContext): void
@@ -80,4 +82,6 @@ export function registerAlacCommands(
   registerSpecCommand(ctx)
   registerReportCommand(ctx)
   registerBackupCommands(ctx)
+  registerAutoDumpCommand(ctx)
+  startAutoDumpScheduler(ctx)
 }

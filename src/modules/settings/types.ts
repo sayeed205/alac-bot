@@ -15,6 +15,8 @@ export interface BotSettings {
   txtRipEnabled: boolean
   multiLinkRipEnabled: boolean
   maxCollectionTracks: number
+  autoDumpEnabled: boolean
+  autoDumpStorefronts: string[]
 }
 
 export const DEFAULT_SETTINGS: BotSettings = {
@@ -25,6 +27,8 @@ export const DEFAULT_SETTINGS: BotSettings = {
   txtRipEnabled: true,
   multiLinkRipEnabled: true,
   maxCollectionTracks: 50,
+  autoDumpEnabled: true,
+  autoDumpStorefronts: ['us'],
 }
 
 export interface SettingsCommandContext {

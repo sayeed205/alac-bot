@@ -18,6 +18,8 @@ export interface ISettingsService {
   isTxtRipEnabled(): boolean
   isMultiLinkRipEnabled(): boolean
   getMaxCollectionTracks(): number
+  isAutoDumpEnabled(): boolean
+  getAutoDumpStorefronts(): string[]
   canRipLive(isAdmin: boolean): boolean
   canServeCache(isAdmin: boolean): boolean
   canRipAlbum(isAdmin: boolean): boolean
@@ -36,6 +38,10 @@ export interface ISettingsService {
   toggleTxtRip(): Promise<boolean>
   toggleMultiLinkRip(): Promise<boolean>
   setMaxCollectionTracks(limit: number): Promise<number>
+  toggleAutoDump(): Promise<boolean>
+  addAutoDumpStorefront(sf: string): Promise<string[]>
+  removeAutoDumpStorefront(sf: string): Promise<string[]>
+  setAutoDumpStorefronts(sfs: string[]): Promise<string[]>
 }
 
 export class SettingsService implements ISettingsService {
@@ -75,6 +81,17 @@ export class SettingsService implements ISettingsService {
           const num = Number(row.value)
           if (!Number.isNaN(num) && num >= 0) {
             dbSettings.maxCollectionTracks = num
+          }
+        } else if (row.key === 'auto_dump_enabled') {
+          dbSettings.autoDumpEnabled = Boolean(row.value)
+        } else if (row.key === 'auto_dump_storefronts') {
+          if (Array.isArray(row.value)) {
+            const list = (row.value as unknown[])
+              .map((s) => String(s).toLowerCase().trim())
+              .filter(Boolean)
+            if (list.length > 0) {
+              dbSettings.autoDumpStorefronts = list
+            }
           }
         }
       }
@@ -124,6 +141,14 @@ export class SettingsService implements ISettingsService {
     return this._cachedSettings.maxCollectionTracks
   }
 
+  isAutoDumpEnabled(): boolean {
+    return this._cachedSettings.autoDumpEnabled
+  }
+
+  getAutoDumpStorefronts(): string[] {
+    return [...this._cachedSettings.autoDumpStorefronts]
+  }
+
   canRipLive(isAdmin: boolean): boolean {
     if (isAdmin) return true
     return this._cachedSettings.rippingMode === 'live'
@@ -171,6 +196,8 @@ export class SettingsService implements ISettingsService {
       txtRipEnabled: 'txt_rip_enabled',
       multiLinkRipEnabled: 'multi_link_rip_enabled',
       maxCollectionTracks: 'max_collection_tracks',
+      autoDumpEnabled: 'auto_dump_enabled',
+      autoDumpStorefronts: 'auto_dump_storefronts',
     }
 
     const dbKey = dbKeyMap[key]
@@ -252,6 +279,41 @@ export class SettingsService implements ISettingsService {
     const validLimit = Math.max(0, limit)
     await this.setSetting('maxCollectionTracks', validLimit)
     return validLimit
+  }
+
+  async toggleAutoDump(): Promise<boolean> {
+    const next = !this._cachedSettings.autoDumpEnabled
+    await this.setSetting('autoDumpEnabled', next)
+    return next
+  }
+
+  async addAutoDumpStorefront(sf: string): Promise<string[]> {
+    const clean = sf.toLowerCase().trim()
+    if (!clean) return this.getAutoDumpStorefronts()
+    const set = new Set(this._cachedSettings.autoDumpStorefronts)
+    set.add(clean)
+    const next = Array.from(set)
+    await this.setSetting('autoDumpStorefronts', next)
+    return next
+  }
+
+  async removeAutoDumpStorefront(sf: string): Promise<string[]> {
+    const clean = sf.toLowerCase().trim()
+    const filtered = this._cachedSettings.autoDumpStorefronts.filter(
+      (s) => s !== clean,
+    )
+    const next = filtered.length > 0 ? filtered : ['us']
+    await this.setSetting('autoDumpStorefronts', next)
+    return next
+  }
+
+  async setAutoDumpStorefronts(sfs: string[]): Promise<string[]> {
+    const cleaned = Array.from(
+      new Set(sfs.map((s) => s.toLowerCase().trim()).filter(Boolean)),
+    )
+    const next = cleaned.length > 0 ? cleaned : ['us']
+    await this.setSetting('autoDumpStorefronts', next)
+    return next
   }
 }
 

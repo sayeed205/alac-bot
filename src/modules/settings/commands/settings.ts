@@ -12,6 +12,17 @@ import type {
 } from '@/modules/settings/types.ts'
 import { parseDynamicHtml } from '@/utils/html.ts'
 
+export const POPULAR_STOREFRONTS = [
+  'us',
+  'gb',
+  'jp',
+  'in',
+  'ca',
+  'au',
+  'de',
+  'fr',
+]
+
 export function buildSettingsKeyboard(settings: BotSettings) {
   const modeLabels = {
     live: 'Mode: 🟢 Live Ripping',
@@ -55,12 +66,46 @@ export function buildSettingsKeyboard(settings: BotSettings) {
         'settings:multilink',
       ),
     ],
+    [
+      BotKeyboard.callback(
+        settings.autoDumpEnabled ? 'Auto-Dump: 🟢 ON' : 'Auto-Dump: 🔴 OFF',
+        'settings:autodump',
+      ),
+      BotKeyboard.callback(
+        `🌐 Storefronts (${settings.autoDumpStorefronts.length})`,
+        'settings:sf_menu',
+      ),
+    ],
     limitButtons,
     [
       BotKeyboard.callback('🔄 Refresh', 'settings:refresh'),
       BotKeyboard.callback('❌ Close', 'settings:close'),
     ],
   ])
+}
+
+export function buildStorefrontsKeyboard(settings: BotSettings) {
+  const currentSfs = new Set(
+    settings.autoDumpStorefronts.map((s) => s.toLowerCase()),
+  )
+  const buttons: ReturnType<typeof BotKeyboard.callback>[][] = []
+
+  // 4 buttons per row
+  for (let i = 0; i < POPULAR_STOREFRONTS.length; i += 4) {
+    const row = POPULAR_STOREFRONTS.slice(i, i + 4).map((sf) => {
+      const active = currentSfs.has(sf)
+      const label = active ? `✅ ${sf.toUpperCase()}` : sf.toUpperCase()
+      return BotKeyboard.callback(label, `settings:sf:toggle:${sf}`)
+    })
+    buttons.push(row)
+  }
+
+  buttons.push([
+    BotKeyboard.callback('🔙 Back to Settings', 'settings:refresh'),
+    BotKeyboard.callback('❌ Close', 'settings:close'),
+  ])
+
+  return BotKeyboard.inline(buttons)
 }
 
 export function renderSettingsText(settings: BotSettings): string {
@@ -77,6 +122,10 @@ export function renderSettingsText(settings: BotSettings): string {
       ? 'Unlimited'
       : `${settings.maxCollectionTracks} tracks`
 
+  const sfList = settings.autoDumpStorefronts
+    .map((s) => s.toUpperCase())
+    .join(', ')
+
   return (
     '⚙️ <b>Bot Settings & Operation Controls</b><br/><br/>' +
     `• <b>Engine Mode:</b> ${modeDescriptions[settings.rippingMode]}<br/>` +
@@ -85,8 +134,23 @@ export function renderSettingsText(settings: BotSettings): string {
     `• <b>Artist Ripping:</b> ${settings.artistRipEnabled ? '🟢 Enabled' : '🔴 Disabled'}<br/>` +
     `• <b>.TXT File Ripping:</b> ${settings.txtRipEnabled ? '🟢 Enabled' : '🔴 Disabled'}<br/>` +
     `• <b>Multi-Link Ripping:</b> ${settings.multiLinkRipEnabled ? '🟢 Enabled' : '🔴 Disabled'}<br/>` +
+    `• <b>Auto-Dump New Music:</b> ${settings.autoDumpEnabled ? '🟢 Enabled (Daily)' : '🔴 Disabled'}<br/>` +
+    `• <b>Auto-Dump Storefronts:</b> <code>${sfList}</code><br/>` +
     `• <b>Max Collection Limit:</b> <code>${limitText}</code><br/><br/>` +
     '<blockquote>💡 <i>Tap buttons below to toggle. Owner requests always bypass these limits.</i></blockquote>'
+  )
+}
+
+export function renderStorefrontsText(settings: BotSettings): string {
+  const sfList = settings.autoDumpStorefronts
+    .map((s) => s.toUpperCase())
+    .join(', ')
+
+  return (
+    '🌐 <b>Auto-Dump Storefront Configuration</b><br/><br/>' +
+    `• <b>Active Storefronts:</b> <code>${sfList}</code><br/><br/>` +
+    'Tap a country below to toggle it on or off for the daily new music auto-dump.<br/>' +
+    '<i>You can also use:</i> <code>/settings storefronts add &lt;code&gt;</code>'
   )
 }
 
@@ -125,6 +189,26 @@ export async function renderSettingsMessage(
       replyTo: replyToMessageId,
     })
   }
+}
+
+export async function renderStorefrontsMessage(
+  tg: TelegramClient,
+  service: ISettingsService,
+  chatId: number,
+  messageId: number,
+) {
+  const currentSettings = service.getSettings()
+  const text = parseDynamicHtml(renderStorefrontsText(currentSettings))
+  const keyboard = buildStorefrontsKeyboard(currentSettings)
+
+  await tg
+    .editMessage({
+      chatId,
+      message: messageId,
+      text,
+      replyMarkup: keyboard,
+    })
+    .catch(() => null)
 }
 
 export function registerSettingsCommands(ctx: SettingsCommandContext): void
@@ -222,17 +306,13 @@ export function registerSettingsCommands(
         await service.setSetting('txtRipEnabled', val)
         await msg.answerText(
           parseDynamicHtml(
-            `.TXT file ripping set to: <b>${val ? 'ON' : 'OFF'}</b>`,
+            `.TXT batch ripping set to: <b>${val ? 'ON' : 'OFF'}</b>`,
           ),
         )
         return
       }
 
-      if (
-        subCommand === 'multilink' ||
-        subCommand === 'multi_link' ||
-        subCommand === 'multi'
-      ) {
+      if (subCommand === 'multilink' || subCommand === 'multi_link') {
         const val = rawValue === 'on' || rawValue === 'true' || rawValue === '1'
         await service.setSetting('multiLinkRipEnabled', val)
         await msg.answerText(
@@ -243,20 +323,86 @@ export function registerSettingsCommands(
         return
       }
 
-      if (subCommand === 'limit' || subCommand === 'max_collection') {
-        const limit = Number.parseInt(rawValue ?? '50', 10)
-        if (!Number.isNaN(limit) && limit >= 0) {
-          await service.setMaxCollectionTracks(limit)
+      if (subCommand === 'autodump' || subCommand === 'auto_dump') {
+        const val = rawValue === 'on' || rawValue === 'true' || rawValue === '1'
+        await service.setSetting('autoDumpEnabled', val)
+        await msg.answerText(
+          parseDynamicHtml(
+            `Auto-dump new music set to: <b>${val ? 'ON' : 'OFF'}</b>`,
+          ),
+        )
+        return
+      }
+
+      if (
+        subCommand === 'storefronts' ||
+        subCommand === 'storefront' ||
+        subCommand === 'sf'
+      ) {
+        const action = rawValue
+        const targetSf = textParts[3]?.toLowerCase()
+
+        if (action === 'add' && targetSf) {
+          const list = await service.addAutoDumpStorefront(targetSf)
           await msg.answerText(
             parseDynamicHtml(
-              `Collection limit set to: <b>${limit === 0 ? 'Unlimited' : limit}</b>`,
+              `Added <b>${targetSf.toUpperCase()}</b>. Storefronts: <code>${list.map((s) => s.toUpperCase()).join(', ')}</code>`,
+            ),
+          )
+          return
+        }
+
+        if (
+          (action === 'remove' || action === 'rm' || action === 'del') &&
+          targetSf
+        ) {
+          const list = await service.removeAutoDumpStorefront(targetSf)
+          await msg.answerText(
+            parseDynamicHtml(
+              `Removed <b>${targetSf.toUpperCase()}</b>. Storefronts: <code>${list.map((s) => s.toUpperCase()).join(', ')}</code>`,
+            ),
+          )
+          return
+        }
+
+        if (action === 'set' && targetSf) {
+          const targets = textParts
+            .slice(3)
+            .join(',')
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+          const list = await service.setAutoDumpStorefronts(targets)
+          await msg.answerText(
+            parseDynamicHtml(
+              `Storefronts set to: <code>${list.map((s) => s.toUpperCase()).join(', ')}</code>`,
+            ),
+          )
+          return
+        }
+
+        await msg.answerText(
+          parseDynamicHtml(
+            'Usage: <code>/settings storefronts &lt;add|rm|set&gt; &lt;code&gt;</code>',
+          ),
+        )
+        return
+      }
+
+      if (subCommand === 'limit') {
+        const num = Number.parseInt(rawValue, 10)
+        if (!Number.isNaN(num) && num >= 0) {
+          const updated = await service.setMaxCollectionTracks(num)
+          await msg.answerText(
+            parseDynamicHtml(
+              `Max collection limit set to: <b>${updated === 0 ? 'Unlimited' : updated}</b>`,
             ),
           )
           return
         }
         await msg.answerText(
           parseDynamicHtml(
-            'Usage: <code>/settings limit &lt;number&gt;</code> (0 for unlimited)',
+            'Usage: <code>/settings limit &lt;number (0 for unlimited)&gt;</code>',
           ),
         )
         return
@@ -266,6 +412,7 @@ export function registerSettingsCommands(
     await renderSettingsMessage(tg, service, msg.chat.id, undefined, msg.id)
   })
 
+  // Callback query handling for settings menu
   dp.onCallbackQuery(filters.startsWith('settings:'), async (query) => {
     const data = query.dataStr
     if (!data) return
@@ -286,6 +433,38 @@ export function registerSettingsCommands(
     if (data === 'settings:refresh') {
       await query.answer({ text: 'Settings refreshed' })
       await renderSettingsMessage(tg, service, query.chat.id, query.messageId)
+      return
+    }
+
+    if (data === 'settings:sf_menu') {
+      await query.answer({})
+      await renderStorefrontsMessage(
+        tg,
+        service,
+        query.chat.id,
+        query.messageId,
+      )
+      return
+    }
+
+    if (data.startsWith('settings:sf:toggle:')) {
+      const sf = data.split(':')[3]?.toLowerCase()
+      if (sf) {
+        const current = service.getAutoDumpStorefronts()
+        if (current.includes(sf)) {
+          await service.removeAutoDumpStorefront(sf)
+          await query.answer({ text: `Removed ${sf.toUpperCase()}` })
+        } else {
+          await service.addAutoDumpStorefront(sf)
+          await query.answer({ text: `Added ${sf.toUpperCase()}` })
+        }
+        await renderStorefrontsMessage(
+          tg,
+          service,
+          query.chat.id,
+          query.messageId,
+        )
+      }
       return
     }
 
@@ -341,6 +520,15 @@ export function registerSettingsCommands(
       const enabled = await service.toggleMultiLinkRip()
       await query.answer({
         text: `Multi-link ripping: ${enabled ? 'ON' : 'OFF'}`,
+      })
+      await renderSettingsMessage(tg, service, query.chat.id, query.messageId)
+      return
+    }
+
+    if (data === 'settings:autodump') {
+      const enabled = await service.toggleAutoDump()
+      await query.answer({
+        text: `Auto-dump: ${enabled ? 'ON' : 'OFF'}`,
       })
       await renderSettingsMessage(tg, service, query.chat.id, query.messageId)
       return
