@@ -24,6 +24,7 @@ export function registerHelpCommand(ctx: CommandContext): void {
       '• <code>/search &lt;query&gt;</code> — Search cached tracks for instant download<br/>' +
       '• <code>/info &lt;link | id&gt;</code> — Inspect track details & check cache status<br/>' +
       '• <code>/queue</code> — Check active & pending rip jobs<br/>' +
+      '• <code>/status</code> — Check live download status & queue dashboard<br/>' +
       '• <code>/ping</code> — Test bot latency & system health<br/>' +
       '• <code>/help</code> — Show this usage guide</blockquote><br/>' +
       '<blockquote expandable>💡 <b>Ripping Tips:</b><br/>' +

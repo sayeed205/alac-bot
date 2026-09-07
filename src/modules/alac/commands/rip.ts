@@ -57,6 +57,7 @@ export interface ActiveRipJob {
   id: string
   chatId: number
   userId: number
+  userName?: string
   jobHeader: string
   totalTracks: number
   statusMsgId: number
@@ -68,6 +69,8 @@ export interface ActiveRipJob {
   failedCount: number
   completed: boolean
   queuePosition?: number
+  startTime: number
+  activeActionText?: string
 }
 
 export const activeJobs = new Map<string, ActiveRipJob>()
@@ -541,10 +544,16 @@ export async function executeRipPipeline(
   const jobId = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`
   const jobController = new AbortController()
 
+  const requesterName =
+    displayName ||
+    msg?.sender?.displayName ||
+    (msg?.sender?.username ? `@${msg.sender.username}` : `User ${userId}`)
+
   const currentJob: ActiveRipJob = {
     id: jobId,
     chatId: chatId,
     userId: userId,
+    userName: requesterName,
     jobHeader: '',
     totalTracks: 0,
     statusMsgId: resolvingStatus.id,
@@ -554,6 +563,7 @@ export async function executeRipPipeline(
     rippedCount: 0,
     failedCount: 0,
     completed: false,
+    startTime: Date.now(),
   }
   activeJobs.set(jobId, currentJob)
 
@@ -1094,6 +1104,7 @@ export async function executeRipPipeline(
                 }
 
                 activeDownloadText = `📥 <b>Downloading:</b> ${html.escape(itemTitle)}`
+                currentJob.activeActionText = activeDownloadText
                 await updateProgress()
 
                 const ripResult = await ripper.rip(
@@ -1114,6 +1125,7 @@ export async function executeRipPipeline(
                     } else {
                       activeDownloadText = `📥 <b>Downloading:</b> ${html.escape(itemTitle)}`
                     }
+                    currentJob.activeActionText = activeDownloadText
                     updateProgress().catch(() => {})
                   },
                   item.storefront,
@@ -1121,6 +1133,7 @@ export async function executeRipPipeline(
                 )
 
                 activeDownloadText = ''
+                currentJob.activeActionText = ''
                 await channel.push({
                   index,
                   item,
@@ -1128,6 +1141,7 @@ export async function executeRipPipeline(
                 })
               } catch (err: unknown) {
                 activeDownloadText = ''
+                currentJob.activeActionText = ''
                 if (
                   currentJob.isCancelled ||
                   jobController.signal.aborted ||
@@ -1253,6 +1267,8 @@ export async function executeRipPipeline(
 
                   let currentCaption: FormattedString | string = caption
                   let dumpMsg: Message | null = null
+                  activeUploadText = `📤 <b>Uploading:</b> ${html.escape(itemTitle)}`
+                  currentJob.activeActionText = activeUploadText
                   let uploadAttempt = 0
                   const maxUploadRetries = env.ALAC_MAX_RETRIES
 
@@ -1284,6 +1300,7 @@ export async function executeRipPipeline(
                                 total,
                               )
                               activeUploadText = `📤 <b>Uploading:</b> ${html.escape(itemTitle)} <code>[${mbProgress}]</code>`
+                              currentJob.activeActionText = activeUploadText
                               updateProgress().catch(() => {})
                             }
                           },
@@ -1379,6 +1396,8 @@ export async function executeRipPipeline(
                     })
                   }
 
+                  activeUploadText = ''
+                  currentJob.activeActionText = ''
                   rippedCount++
                   currentJob.rippedCount = rippedCount
                   const totalDurationMs = Date.now() - startTime
@@ -1399,6 +1418,8 @@ export async function executeRipPipeline(
                     status: 'completed',
                   })
                 } catch (err: unknown) {
+                  activeUploadText = ''
+                  currentJob.activeActionText = ''
                   if (currentJob.isCancelled || jobController.signal.aborted) {
                     break
                   }

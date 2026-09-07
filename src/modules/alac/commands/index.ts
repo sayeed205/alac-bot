@@ -31,9 +31,11 @@ import { registerRipCommand } from './rip.ts'
 import { registerSearchCommand } from './search.ts'
 import { registerSpecCommand } from './spec.ts'
 import { registerStatsCommand } from './stats.ts'
+import { registerStatusCommand } from './status.ts'
 import type { CommandContext } from './types.ts'
 
 export * from './autodump.ts'
+export * from './status.ts'
 export * from './types.ts'
 
 export function registerAlacCommands(ctx: CommandContext): void
@@ -78,6 +80,7 @@ export function registerAlacCommands(
   registerIndexCommand(ctx)
   registerSearchCommand(ctx)
   registerRipCommand(ctx)
+  registerStatusCommand(ctx)
   registerRandomCommand(ctx)
   registerSpecCommand(ctx)
   registerReportCommand(ctx)
