@@ -6,6 +6,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+bytes.workspace = true
+futures-util.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -13,6 +15,9 @@ thiserror.workspace = true
 tracing.workspace = true
 reqwest.workspace = true
 indexmap.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time", "test-util"] }
+futures-util.workspace = true

@@ -3,6 +3,8 @@
 
 pub mod catalog;
 pub mod parser;
+pub mod queue;
+pub mod streaming;
 pub mod types;
 
 pub use parser::{extract_batch_items, parse_alac_input, parse_single_item};
