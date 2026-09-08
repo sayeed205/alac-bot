@@ -3,10 +3,17 @@
 mod auth;
 mod migrations;
 mod models;
+mod requests;
+mod settings;
+mod tracks;
 
 pub use auth::{Auth, AuthedPeer};
+pub use engine::orchestrator::deps::{CachedTrack, RequestLog, SaveTrackInput};
 pub use migrations::{initial_schema, migrate};
-pub use models::User;
+pub use models::{Request, Setting, Track, User};
+pub use requests::RequestLogRepository;
+pub use settings::SettingsStore;
+pub use tracks::TracksRepository;
 
 /// Errors returned by the persistence layer.
 #[derive(Debug, thiserror::Error)]

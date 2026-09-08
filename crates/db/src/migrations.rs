@@ -2,17 +2,6 @@ use welds::{errors::Result, migrations::prelude::*};
 
 /// The complete schema represented by the three Drizzle migrations.
 pub const SQL: &str = r#"
-CREATE TABLE "requests" (
-    "id" serial PRIMARY KEY NOT NULL,
-    "telegram_id" bigint NOT NULL,
-    "chat_id" bigint NOT NULL,
-    "apple_track_id" text NOT NULL,
-    "is_cache_hit" boolean NOT NULL,
-    "duration_ms" integer,
-    "status" text NOT NULL,
-    "error_reason" text,
-    "created_at" timestamp with time zone DEFAULT now() NOT NULL
-);
 CREATE TABLE "tracks" (
     "id" serial PRIMARY KEY NOT NULL,
     "apple_track_id" text NOT NULL,
@@ -38,13 +27,22 @@ CREATE TABLE "users" (
     "name" text,
     "created_at" timestamp with time zone DEFAULT now() NOT NULL
 );
+CREATE INDEX "tracks_title_idx" ON "tracks" USING btree ("title");
+CREATE INDEX "tracks_artist_idx" ON "tracks" USING btree ("artist");
+CREATE TABLE "requests" (
+    "id" serial PRIMARY KEY NOT NULL,
+    "telegram_id" bigint NOT NULL,
+    "chat_id" bigint NOT NULL,
+    "apple_track_id" text NOT NULL,
+    "is_cache_hit" boolean NOT NULL,
+    "duration_ms" integer,
+    "status" text NOT NULL,
+    "error_reason" text,
+    "created_at" timestamp with time zone DEFAULT now() NOT NULL
+);
 CREATE INDEX "requests_apple_track_id_idx" ON "requests" USING btree ("apple_track_id");
 CREATE INDEX "requests_telegram_id_idx" ON "requests" USING btree ("telegram_id");
 CREATE INDEX "requests_created_at_idx" ON "requests" USING btree ("created_at");
-CREATE INDEX "tracks_title_idx" ON "tracks" USING btree ("title");
-CREATE INDEX "tracks_artist_idx" ON "tracks" USING btree ("artist");
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
-CREATE INDEX IF NOT EXISTS "tracks_search_trgm_idx" ON "tracks" USING gin (("title" || ' ' || "artist" || ' ' || "album") gin_trgm_ops);
 CREATE TABLE "settings" (
     "key" text PRIMARY KEY NOT NULL,
     "value" jsonb NOT NULL,
@@ -56,7 +54,7 @@ CREATE TABLE "settings" (
 pub fn initial_schema(_state: &TableState) -> Result<MigrationStep> {
     Ok(MigrationStep::new(
         "initial_schema",
-        Manual::up(SQL).down("DROP TABLE users, tracks, requests, settings CASCADE; DROP EXTENSION IF EXISTS pg_trgm;"),
+        Manual::up(SQL).down("DROP TABLE users, tracks, requests, settings CASCADE;"),
     ))
 }
 
