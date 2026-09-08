@@ -53,3 +53,25 @@ first; retarget the engine as M5c.
 4. Collapse the M5b bot inline pipeline onto `engine::orchestrator`
    (handler keeps parsing/gates/preflight/status editing only).
 5. Full gates + commit as M5c.
+
+## Settled status/dashboard UX (2026-09-08)
+
+- `/status` is authorized-user-only and presents a global FIFO queue across
+  DMs, groups, and channels. Requester display names are visible.
+- Each chat has one live dashboard. A subsequent `/status` sends a replacement
+  first and deletes the older dashboard only after the replacement succeeds.
+- Every job change refreshes all registered dashboards, subject to per-message
+  coalescing/flood control. Telegram flood waits pause edits for the requested
+  period, log the event, and send one warning in the affected dashboard chat.
+- Five jobs per page with inline previous/next/refresh controls. Rows show
+  requester, job header, `▶ Processing` or waiting `#N`, percent, and
+  cached/ripped/failed/total counts. There are no job-detail or failure pages.
+- Header displays ripping mode, global queue length, and last-known mirror
+  health (`unknown` initially). The terminal empty state is exactly
+  `✅ <b>No active downloads.</b>` and stops refreshing after its first edit.
+- Cancel controls render only for the requester or an admin. Cancellation
+  delivers a final `🛑 Cancelled` summary including work already
+  cached/ripped/failed.
+- `/alac` has no separate long-lived progress message; the shared dashboard is
+  canonical. Completion: group requests get a compact group notice plus a full
+  requester-DM summary; DM requests get the full DM summary.

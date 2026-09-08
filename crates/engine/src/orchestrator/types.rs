@@ -4,7 +4,28 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::types::ParsedTargetItem;
+use crate::types::{ParsedTargetItem, TargetKind};
+
+/// The non-terminal lifecycle phase of a job.  Terminality is represented by
+/// `terminal_state` below so consumers can retain the last useful phase while
+/// rendering a completed/cancelled job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobPhase {
+    Resolving,
+    CheckingCache,
+    Queued,
+    Processing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalJobState {
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+/// Descriptive alias for callers that prefer the `Job*` naming convention.
+pub type JobTerminalState = TerminalJobState;
 
 /// TS `ActiveRipJob` — live job bookkeeping. TS mutates this object by
 /// reference from several tasks; here the orchestrator owns it and hands
@@ -32,6 +53,12 @@ pub struct ActiveRipJob {
     /// TS `queuePosition?` — maintained by the /alac command handler (M5b),
     /// not by `startJob` itself.
     pub queue_position: Option<u64>,
+    pub phase: JobPhase,
+    pub terminal_state: Option<TerminalJobState>,
+    pub skipped_count: usize,
+    pub is_cache_only: bool,
+    pub is_group: bool,
+    pub reply_to_message_id: Option<i64>,
 }
 
 /// TS `RipJobOptions`.
@@ -92,6 +119,30 @@ pub struct RipJobSummary {
     pub max_collection_limit: u32,
     pub is_cache_only: bool,
     pub is_group: bool,
+}
+
+/// A target which could not be resolved.  The engine deliberately keeps this
+/// structured; presentation (including HTML escaping) belongs to the bot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolutionFailure {
+    pub kind: TargetKind,
+    pub id: String,
+    pub error: String,
+}
+
+impl std::fmt::Display for ResolutionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {}: {}", kind_name(self.kind), self.id, self.error)
+    }
+}
+
+fn kind_name(kind: TargetKind) -> &'static str {
+    match kind {
+        TargetKind::Track => "track",
+        TargetKind::Album => "album",
+        TargetKind::Artist => "artist",
+        TargetKind::Playlist => "playlist",
+    }
 }
 
 /// Events emitted by the orchestrator (TS EventEmitter: job:created,

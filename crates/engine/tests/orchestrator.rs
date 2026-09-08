@@ -14,7 +14,7 @@ use engine::{
             CachedTrack, DumpUpload, OrchestratorDeps, RequestLog, SaveTrackInput, SinkError,
             TelegramSink, UploadProgressCallback,
         },
-        types::{OrchestratorEvent, RipJobOptions, RipJobSummary},
+        types::{JobPhase, OrchestratorEvent, RipJobOptions, RipJobSummary},
         OrchestratorError, RipOrchestrator,
     },
     playlist::{PlaylistData, PlaylistError, PlaylistTrack},
@@ -65,6 +65,9 @@ struct FakeDeps {
     artists: Mutex<HashMap<String, ArtistTracks>>,
     playlists: Mutex<HashMap<String, PlaylistData>>,
     upload_retry_base_ms: u64,
+    upload_max_retries: Mutex<u32>,
+    rip_delay_ms: Mutex<u64>,
+    cache_delay_ms: Mutex<u64>,
     sink: FakeSink,
 }
 
@@ -80,6 +83,9 @@ impl FakeDeps {
             artists: Mutex::new(HashMap::new()),
             playlists: Mutex::new(HashMap::new()),
             upload_retry_base_ms: 1,
+            upload_max_retries: Mutex::new(3),
+            rip_delay_ms: Mutex::new(0),
+            cache_delay_ms: Mutex::new(0),
             sink: FakeSink {
                 state: Arc::clone(&state),
             },
@@ -251,7 +257,13 @@ impl OrchestratorDeps for FakeDeps {
             .filter(|(id, _)| ids.contains(id))
             .map(|(id, t)| (id.clone(), t.clone()))
             .collect();
-        async move { Ok(cache) }
+        let delay_ms = *self.cache_delay_ms.lock().unwrap();
+        async move {
+            if delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            Ok(cache)
+        }
     }
 
     fn save_track(&self, input: SaveTrackInput) -> impl Future<Output = Result<(), String>> + Send {
@@ -331,7 +343,11 @@ impl OrchestratorDeps for FakeDeps {
             .push(track_id.to_string());
         let script = self.rip_scripts.lock().unwrap().get(track_id).cloned();
         let id = track_id.to_string();
+        let delay_ms = *self.rip_delay_ms.lock().unwrap();
         async move {
+            if delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
             match script {
                 Some(RipScript::Fail(msg)) => Err(RipError::Message(msg.to_string())),
                 _ => Ok(Self::rip_result(&id)),
@@ -345,6 +361,10 @@ impl OrchestratorDeps for FakeDeps {
 
     fn upload_retry_base_ms(&self) -> u64 {
         self.upload_retry_base_ms
+    }
+
+    fn upload_max_retries(&self) -> u32 {
+        *self.upload_max_retries.lock().unwrap()
     }
 }
 
@@ -465,7 +485,7 @@ async fn happy_path_single_track() {
     assert_eq!(summary.ripped_count, 1);
     assert_eq!(summary.failed_count, 0);
     assert_eq!(summary.cached_count, 0);
-    assert_eq!(summary.job_header, "Track 1440828878");
+    assert_eq!(summary.job_header, "Track ID: <code>1440828878</code>");
     assert_eq!(summary.skipped_uncached_tracks.len(), 0);
     assert!(!summary.total_elapsed_sec.is_empty());
 
@@ -513,7 +533,7 @@ async fn header_from_rip_metadata_for_single_track() {
     .expect("job succeeds");
     // Multi-link: initial header is `Batch (2 links)` — never refined since
     // plain tracks resolve without titles.
-    assert_eq!(summary.job_header, "Batch (2 tracks)");
+    assert_eq!(summary.job_header, "Batch: <b>2 tracks</b>");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -530,7 +550,10 @@ async fn album_resolution_refines_header_and_lists_tracks() {
         .expect("job succeeds");
 
     assert_eq!(summary.total_tracks, 2);
-    assert_eq!(summary.job_header, "Nils Frahm - Album");
+    assert_eq!(
+        summary.job_header,
+        "Album: <b>Album</b> by <b>Nils Frahm</b>"
+    );
     let st = state.lock().unwrap();
     assert_eq!(st.rip_calls.len(), 2);
     assert!(st.copies[0].3, "silent=true for multi-track");
@@ -540,6 +563,7 @@ async fn album_resolution_refines_header_and_lists_tracks() {
 async fn all_cached_fast_path() {
     let (orch, deps, state, events) = setup();
     deps.cache_track("1440828878", 4242);
+    *deps.cache_delay_ms.lock().unwrap() = 120;
 
     let summary = run_async(
         &orch,
@@ -552,7 +576,7 @@ async fn all_cached_fast_path() {
     assert_eq!(summary.cached_count, 1);
     assert_eq!(summary.ripped_count, 0);
     assert_eq!(summary.total_tracks, 1);
-    assert_eq!(summary.total_elapsed_sec, "0.0");
+    assert_ne!(summary.total_elapsed_sec, "0.0");
     assert_eq!(summary.failed_tracks.len(), 0);
 
     let st = state.lock().unwrap();
@@ -591,22 +615,30 @@ async fn cache_only_marks_cached_without_delivery() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn maintenance_gate_rejects_live_rips() {
+async fn cache_only_serves_hits_and_skips_misses() {
+    let (orch, deps, state, _) = setup();
+    deps.cache_track("hit", 4242);
+    let mut opts = options(vec![track_item("hit"), track_item("miss")], false);
+    opts.is_cache_only = true;
+
+    let summary = run_async(&orch, &deps, &opts)
+        .await
+        .expect("cache job succeeds");
+    assert_eq!(summary.cached_count, 1);
+    assert_eq!(summary.skipped_uncached_tracks, vec!["miss"]);
+    assert!(state.lock().unwrap().rip_calls.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn maintenance_mode_skips_uncached_tracks() {
     let (orch, deps, _, events) = setup();
     deps.set_settings(|s| s.ripping_mode = RippingMode::Paused);
 
-    let err = run_async(&orch, &deps, &options(vec![track_item("1")], false))
+    let summary = run_async(&orch, &deps, &options(vec![track_item("1")], false))
         .await
-        .expect_err("gate must reject");
-
-    assert_eq!(
-        err.to_string(),
-        "Live ripping is temporarily paused for maintenance. Only cached tracks can be played right now."
-    );
-    assert!(
-        events.snapshot().is_empty(),
-        "no events before job registration"
-    );
+        .expect("maintenance mode completes with a skipped miss");
+    assert_eq!(summary.skipped_uncached_tracks, vec!["1"]);
+    assert!(events.snapshot().contains(&"completed".to_string()));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -706,13 +738,65 @@ async fn resolution_error_bubbles_with_prefix() {
         .await
         .expect_err("resolution fails");
 
-    assert_eq!(err.to_string(), "album missing: Album missing not found");
+    assert_eq!(
+        err.to_string(),
+        "Failed to resolve any tracks: album missing: Album missing not found"
+    );
     let ev = events.snapshot();
     assert_eq!(
         *ev.last().unwrap(),
-        "failed:album missing: Album missing not found"
+        "failed:Failed to resolve any tracks: album missing: Album missing not found"
     );
     assert!(orch.get_active_jobs().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partial_resolution_continues_successful_tracks() {
+    let (orch, deps, state, _) = setup();
+    let summary = run_async(
+        &orch,
+        &deps,
+        &options(vec![album_item("missing"), track_item("good")], true),
+    )
+    .await
+    .expect("a resolvable item keeps the job alive");
+
+    assert_eq!(summary.total_tracks, 1);
+    assert_eq!(summary.ripped_count, 1);
+    assert_eq!(state.lock().unwrap().rip_calls, vec!["good"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_resolution_failures_are_structured() {
+    let (orch, deps, _, _) = setup();
+    let err = run_async(
+        &orch,
+        &deps,
+        &options(vec![album_item("a"), playlist_item("p")], true),
+    )
+    .await
+    .expect_err("nothing resolved");
+
+    match err {
+        OrchestratorError::ResolutionFailed { failures } => {
+            assert_eq!(failures.len(), 2);
+            assert_eq!(failures[0].id, "a");
+            assert_eq!(failures[1].id, "p");
+        }
+        other => panic!("expected structured resolution failure, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_can_rip_when_live_mode_is_paused() {
+    let (orch, deps, state, _) = setup();
+    deps.set_settings(|settings| settings.ripping_mode = RippingMode::Paused);
+
+    let summary = run_async(&orch, &deps, &options(vec![track_item("admin")], true))
+        .await
+        .expect("admin live override");
+    assert_eq!(summary.ripped_count, 1);
+    assert_eq!(state.lock().unwrap().rip_calls, vec!["admin"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -738,7 +822,10 @@ async fn empty_resolution_fails() {
     .await
     .expect_err("no tracks");
 
-    assert_eq!(err.to_string(), "No valid tracks found to process.");
+    assert_eq!(
+        err.to_string(),
+        "Failed to resolve any tracks: track : No valid tracks found to process."
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -808,7 +895,7 @@ async fn circuit_breaker_stops_remaining_batch() {
         deps.rip_scripts
             .lock()
             .unwrap()
-            .insert(id.into(), RipScript::Fail("Mirror request timed out"));
+            .insert(id.into(), RipScript::Fail("Mirror /status check timed out"));
     }
 
     let summary = run_async(
@@ -837,6 +924,30 @@ async fn circuit_breaker_stops_remaining_batch() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn generic_timeout_and_status_errors_do_not_break_batch() {
+    let (orch, deps, state, _) = setup();
+    for id in ["t1", "t2", "t3"] {
+        deps.rip_scripts.lock().unwrap().insert(
+            id.into(),
+            RipScript::Fail("request timed out with HTTP 503"),
+        );
+    }
+
+    let summary = run_async(
+        &orch,
+        &deps,
+        &options(
+            vec![track_item("t1"), track_item("t2"), track_item("t3")],
+            true,
+        ),
+    )
+    .await
+    .expect("generic errors are ordinary track failures");
+    assert_eq!(state.lock().unwrap().rip_calls.len(), 3);
+    assert_eq!(summary.failed_tracks.len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn upload_retry_then_success() {
     let (orch, deps, state, _) = setup();
     {
@@ -856,6 +967,50 @@ async fn upload_retry_then_success() {
     let st = state.lock().unwrap();
     assert_eq!(st.sent_audio.len(), 2, "retried exactly once");
     assert_eq!(st.saved_tracks.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configured_upload_retry_count_controls_calls() {
+    let (orch, deps, state, _) = setup();
+    *deps.upload_max_retries.lock().unwrap() = 1;
+    {
+        let mut st = state.lock().unwrap();
+        st.clear_sink_results();
+        st.send_audio_results
+            .push_back(Err(SinkError("flood".into())));
+        st.send_audio_results
+            .push_back(Err(SinkError("flood".into())));
+    }
+
+    let summary = run_async(&orch, &deps, &options(vec![track_item("t1")], true))
+        .await
+        .expect("exhaustion is recorded, not propagated");
+    assert_eq!(summary.failed_tracks.len(), 1);
+    assert_eq!(state.lock().unwrap().sent_audio.len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exhausted_upload_continues_next_track() {
+    let (orch, deps, state, _) = setup();
+    *deps.upload_max_retries.lock().unwrap() = 0;
+    {
+        let mut st = state.lock().unwrap();
+        st.clear_sink_results();
+        st.send_audio_results
+            .push_back(Err(SinkError("first failed".into())));
+        st.send_audio_results.push_back(FakeDeps::upload_ok());
+    }
+
+    let summary = run_async(
+        &orch,
+        &deps,
+        &options(vec![track_item("bad"), track_item("good")], true),
+    )
+    .await
+    .expect("later tracks continue after exhaustion");
+    assert_eq!(summary.failed_tracks.len(), 1);
+    assert_eq!(summary.ripped_count, 1);
+    assert_eq!(state.lock().unwrap().saved_tracks.len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -972,6 +1127,115 @@ async fn queue_position_field_defaults_none() {
     // The command handler (M5b) sets queue_position; startJob never does,
     // and the job map is empty after completion.
     assert!(orch.get_active_jobs().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_position_and_pending_cancel_are_terminally_safe() {
+    let (deps, _) = FakeDeps::new();
+    *deps.rip_delay_ms.lock().unwrap() = 100;
+    let orch = Arc::new(RipOrchestrator::new());
+    let terminal_events = Arc::new(Mutex::new(Vec::<(String, &'static str)>::new()));
+    let phase_snapshots = Arc::new(Mutex::new(Vec::<(JobPhase, Option<u64>)>::new()));
+    let terminals = Arc::clone(&terminal_events);
+    let phases = Arc::clone(&phase_snapshots);
+    orch.subscribe(Arc::new(move |event: &OrchestratorEvent<'_>| {
+        let job = match event {
+            OrchestratorEvent::Created(job)
+            | OrchestratorEvent::Started(job)
+            | OrchestratorEvent::Progress(job, _) => job,
+            OrchestratorEvent::Completed(job, _) => job,
+            OrchestratorEvent::Cancelled(job, _) => job,
+            OrchestratorEvent::Failed(job, _) => job,
+        };
+        match event {
+            OrchestratorEvent::Started(_) => {
+                phases.lock().unwrap().push((job.phase, job.queue_position))
+            }
+            OrchestratorEvent::Completed(_, _) => terminals
+                .lock()
+                .unwrap()
+                .push((job.id.clone(), "completed")),
+            OrchestratorEvent::Cancelled(_, _) => terminals
+                .lock()
+                .unwrap()
+                .push((job.id.clone(), "cancelled")),
+            OrchestratorEvent::Failed(_, _) => {
+                terminals.lock().unwrap().push((job.id.clone(), "failed"))
+            }
+            _ => {}
+        }
+    }));
+
+    let first_orch = Arc::clone(&orch);
+    let first_deps = Arc::clone(&deps);
+    let first_options = options(vec![track_item("first")], true);
+    let first = tokio::spawn(async move { first_orch.start_job(first_deps, &first_options).await });
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    let second_orch = Arc::clone(&orch);
+    let second_deps = Arc::clone(&deps);
+    let second_options = options(vec![track_item("second")], true);
+    let second =
+        tokio::spawn(async move { second_orch.start_job(second_deps, &second_options).await });
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    let queued = orch
+        .get_active_jobs()
+        .into_iter()
+        .find(|job| job.phase == JobPhase::Queued)
+        .expect("second job is queued");
+    assert_eq!(queued.queue_position, Some(1));
+    assert!(orch.cancel_job(&queued.id, Some("tester")));
+
+    let second_result = second.await.unwrap();
+    assert!(second_result.is_err());
+    first.await.unwrap().expect("first job completes");
+
+    let terminal_events = terminal_events.lock().unwrap();
+    let second_terminals: Vec<_> = terminal_events
+        .iter()
+        .filter(|(id, _)| id == &queued.id)
+        .collect();
+    assert_eq!(second_terminals.len(), 1);
+    assert_eq!(second_terminals[0].1, "cancelled");
+    assert!(phase_snapshots
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(phase, position)| *phase == JobPhase::Processing && *position == Some(0)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn active_cancel_emits_only_cancelled_terminal_event() {
+    let (orch, deps, _, events) = setup();
+    *deps.rip_delay_ms.lock().unwrap() = 100;
+    let orch = Arc::new(orch);
+    let run_orch = Arc::clone(&orch);
+    let run_deps = Arc::clone(&deps);
+    let run_options = options(vec![track_item("cancel")], true);
+    let task = tokio::spawn(async move { run_orch.start_job(run_deps, &run_options).await });
+    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    let job = orch
+        .get_active_jobs()
+        .into_iter()
+        .next()
+        .expect("active job");
+    assert!(orch.cancel_job(&job.id, Some("tester")));
+    let _ = task.await.unwrap();
+    let terminal_count = events
+        .snapshot()
+        .iter()
+        .filter(|event| {
+            event.starts_with("completed")
+                || event.starts_with("cancelled")
+                || event.starts_with("failed")
+        })
+        .count();
+    assert_eq!(terminal_count, 1);
+    assert!(events
+        .snapshot()
+        .iter()
+        .any(|event| event.starts_with("cancelled")));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

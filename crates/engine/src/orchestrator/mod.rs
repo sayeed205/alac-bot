@@ -1,8 +1,13 @@
-//! Rip orchestrator (port of `src/modules/alac/orchestrator/rip-orchestrator.ts`).
+//! Rip orchestrator for the live `/alac` command contract.
 //!
 //! Owns job bookkeeping, resolves parsed items to tracks, serves the cache
 //! fast-path, and runs the producer → downloader → uploader pipeline over
 //! bounded channels through the sequential rip queue.
+//!
+//! Upload retry exhaustion is intentionally a Rust deviation from the live
+//! TypeScript command: it records a failed track and continues later tracks
+//! instead of rejecting the whole queue task.  This keeps one bad upload from
+//! stranding the remaining work while preserving the failure in the summary.
 
 pub mod caption;
 pub mod deps;
@@ -22,25 +27,52 @@ use crate::{
         caption::{format_dump_caption, html_escape, DumpCaptionMetadata},
         deps::{DumpUpload, OrchestratorDeps, RequestLog, SaveTrackInput, UploadProgressCallback},
         types::{
-            ActiveRipJob, EventCallback, FailedTrack, OrchestratorEvent, RipJobOptions,
-            RipJobProgress, RipJobSummary,
+            ActiveRipJob, EventCallback, FailedTrack, JobPhase, OrchestratorEvent,
+            ResolutionFailure, RipJobOptions, RipJobProgress, RipJobSummary, TerminalJobState,
         },
     },
     progress::format_byte_progress,
-    queue::SequentialRipQueue,
+    queue::{EnqueueOptions, SequentialRipQueue},
     ripper::RipProgressCallback,
     settings::BotSettings,
     types::{AlbumTracks, ArtistTracks, TargetKind, TrackRipResult},
 };
 
-/// All orchestrator failures surface as messages (TS `new Error(msg)`).
-#[derive(Debug, thiserror::Error)]
+/// All orchestrator failures surface as messages (TS `new Error(msg)`), while
+/// resolution failures retain every failed target for the bot to render.
+#[derive(Debug)]
 pub enum OrchestratorError {
-    #[error("RipOrchestrator dependencies not configured. Call setDependencies() first.")]
     DependenciesNotSet,
-    #[error("{0}")]
     Message(String),
+    ResolutionFailed { failures: Vec<ResolutionFailure> },
 }
+
+impl std::fmt::Display for OrchestratorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DependenciesNotSet => write!(
+                f,
+                "RipOrchestrator dependencies not configured. Call setDependencies() first."
+            ),
+            Self::Message(message) => f.write_str(message),
+            Self::ResolutionFailed { failures } => {
+                write!(f, "Failed to resolve any tracks")?;
+                if !failures.is_empty() {
+                    write!(f, ": ")?;
+                    for (index, failure) in failures.iter().enumerate() {
+                        if index > 0 {
+                            write!(f, "; ")?;
+                        }
+                        write!(f, "{failure}")?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::error::Error for OrchestratorError {}
 
 impl From<crate::queue::QueueError> for OrchestratorError {
     fn from(e: crate::queue::QueueError) -> Self {
@@ -128,8 +160,10 @@ impl EventBus {
     ) {
         let (job, progress) = {
             let guard = shared.lock().expect("job poisoned");
-            let completed_tracks =
-                guard.job.cached_count + guard.job.ripped_count + guard.job.failed_count;
+            let completed_tracks = guard.job.cached_count
+                + guard.job.ripped_count
+                + guard.job.failed_count
+                + guard.job.skipped_count;
             let percent = if guard.job.total_tracks > 0 {
                 ((completed_tracks as f64 / guard.job.total_tracks as f64) * 100.0).round() as u32
             } else {
@@ -142,7 +176,7 @@ impl EventBus {
                 cached_count: guard.job.cached_count,
                 ripped_count: guard.job.ripped_count,
                 failed_count: guard.job.failed_count,
-                skipped_count: 0,
+                skipped_count: guard.job.skipped_count,
                 percent,
                 active_download_text: active_download.map(str::to_string),
                 active_upload_text: active_upload.map(str::to_string),
@@ -207,6 +241,48 @@ impl RipOrchestrator {
             .map(|shared| shared.lock().expect("job poisoned").job.clone())
     }
 
+    fn set_phase(&self, shared: &Arc<Mutex<JobShared>>, phase: JobPhase) {
+        shared.lock().expect("job poisoned").job.phase = phase;
+    }
+
+    /// Emit one and only one terminal event.  Cancellation removes the job
+    /// from the public table immediately, so late queue/pipeline completion
+    /// cannot manufacture a second terminal event.
+    fn terminalize(
+        &self,
+        shared: &Arc<Mutex<JobShared>>,
+        state: TerminalJobState,
+        summary: Option<&RipJobSummary>,
+        error: Option<&str>,
+    ) -> bool {
+        let (job, cancelled_by) = {
+            let mut guard = shared.lock().expect("job poisoned");
+            if guard.job.terminal_state.is_some() {
+                return false;
+            }
+            guard.job.terminal_state = Some(state);
+            guard.job.completed = true;
+            (guard.job.clone(), guard.job.cancelled_by.clone())
+        };
+        match state {
+            TerminalJobState::Completed => {
+                if let Some(summary) = summary {
+                    self.bus.emit(&OrchestratorEvent::Completed(&job, summary));
+                }
+            }
+            TerminalJobState::Cancelled => {
+                self.bus
+                    .emit(&OrchestratorEvent::Cancelled(&job, &cancelled_by));
+            }
+            TerminalJobState::Failed => {
+                if let Some(error) = error {
+                    self.bus.emit(&OrchestratorEvent::Failed(&job, error));
+                }
+            }
+        }
+        true
+    }
+
     /// TS `cancelJob` — false when missing / already cancelled / completed.
     pub fn cancel_job(&self, id: &str, cancelled_by: Option<&str>) -> bool {
         let Some(shared) = self.jobs.lock().expect("jobs poisoned").get(id).cloned() else {
@@ -215,11 +291,13 @@ impl RipOrchestrator {
 
         let cancelled_by = cancelled_by.map(str::to_string);
         let mut guard = shared.lock().expect("job poisoned");
-        if guard.job.is_cancelled || guard.job.completed {
+        if guard.job.is_cancelled || guard.job.terminal_state.is_some() {
             return false;
         }
         guard.job.is_cancelled = true;
         guard.job.cancelled_by = cancelled_by;
+        guard.job.terminal_state = Some(TerminalJobState::Cancelled);
+        guard.job.completed = true;
         guard.job.controller.cancel();
         let event_job = guard.job.clone();
         let by = guard.job.cancelled_by.clone();
@@ -238,15 +316,9 @@ impl RipOrchestrator {
         deps: Arc<D>,
         options: &RipJobOptions,
     ) -> Result<RipJobSummary, OrchestratorError> {
-        // Step 2-3: settings snapshot + maintenance gate (before any job
-        // registration — a gate failure emits no events).
+        // Settings are a snapshot.  The live-availability decision is made
+        // after resolution and cache delivery, not as an early gate.
         let settings = deps.get_settings().await;
-        if !settings.can_rip_live(options.is_admin) && !options.is_cache_only {
-            return Err(OrchestratorError::Message(
-                "Live ripping is temporarily paused for maintenance. Only cached tracks can be played right now."
-                    .to_string(),
-            ));
-        }
 
         let job_controller = CancellationToken::new();
         let job_id = format!("job_{}_{}", now_ms(), random36(4));
@@ -284,6 +356,12 @@ impl RipOrchestrator {
                 start_time_ms: now_ms(),
                 active_action_text: None,
                 queue_position: None,
+                phase: JobPhase::Resolving,
+                terminal_state: None,
+                skipped_count: 0,
+                is_cache_only: options.is_cache_only,
+                is_group: options.is_group,
+                reply_to_message_id: options.reply_to_message_id,
             },
         }));
         self.jobs
@@ -307,21 +385,19 @@ impl RipOrchestrator {
 
         match &result {
             Ok(summary) => {
-                let job = {
-                    let mut guard = shared.lock().expect("job poisoned");
-                    guard.job.completed = true;
-                    guard.job.clone()
-                };
-                self.bus.emit(&OrchestratorEvent::Completed(&job, summary));
+                self.terminalize(&shared, TerminalJobState::Completed, Some(summary), None);
             }
             Err(err) => {
-                let job = {
-                    let mut guard = shared.lock().expect("job poisoned");
-                    guard.job.completed = true;
-                    guard.job.clone()
-                };
-                let msg = err.to_string();
-                self.bus.emit(&OrchestratorEvent::Failed(&job, &msg));
+                let message = err.to_string();
+                let cancelled = shared
+                    .lock()
+                    .expect("job poisoned")
+                    .job
+                    .terminal_state
+                    .is_some_and(|state| state == TerminalJobState::Cancelled);
+                if !cancelled {
+                    self.terminalize(&shared, TerminalJobState::Failed, None, Some(&message));
+                }
             }
         }
         self.jobs.lock().expect("jobs poisoned").remove(&job_id);
@@ -337,6 +413,7 @@ impl RipOrchestrator {
         job_controller: CancellationToken,
         settings: BotSettings,
     ) -> Result<RipJobSummary, OrchestratorError> {
+        self.set_phase(&shared, JobPhase::Resolving);
         self.bus.emit_progress(
             &shared,
             Some("Resolving metadata & tracklist..."),
@@ -348,6 +425,7 @@ impl RipOrchestrator {
         let mut resolved_tracks: Vec<ResolvedTrackItem> = Vec::new();
         let mut album_name: Option<String> = None;
         let mut album_artist: Option<String> = None;
+        let mut resolution_failures = Vec::new();
 
         for item in &options.parsed_items {
             if job_controller.is_cancelled() {
@@ -434,19 +512,25 @@ impl RipOrchestrator {
                     error = %err_msg,
                     "Failed to resolve target item"
                 );
-                return Err(OrchestratorError::Message(format!(
-                    "{} {}: {}",
-                    kind_str(item.kind),
-                    item.id,
-                    err_msg
-                )));
+                resolution_failures.push(ResolutionFailure {
+                    kind: item.kind,
+                    id: item.id.clone(),
+                    error: err_msg,
+                });
             }
         }
 
         if resolved_tracks.is_empty() {
-            return Err(OrchestratorError::Message(
-                "No valid tracks found to process.".to_string(),
-            ));
+            if resolution_failures.is_empty() {
+                resolution_failures.push(ResolutionFailure {
+                    kind: TargetKind::Track,
+                    id: String::new(),
+                    error: "No valid tracks found to process.".to_string(),
+                });
+            }
+            return Err(OrchestratorError::ResolutionFailed {
+                failures: resolution_failures,
+            });
         }
 
         // Step 10: dedup preserving order.
@@ -481,15 +565,33 @@ impl RipOrchestrator {
             s.as_deref().filter(|s| !s.is_empty())
         }
         let header = match (non_empty(&album_name), non_empty(&album_artist)) {
-            (Some(name), Some(artist)) => format!("{artist} - {name}"),
+            (Some(name), Some(artist)) => {
+                format!(
+                    "Album: <b>{}</b> by <b>{}</b>",
+                    html_escape(name),
+                    html_escape(artist)
+                )
+            }
             _ if tracks_to_process.len() == 1 => {
                 let first = &tracks_to_process[0];
                 match (non_empty(&first.title), non_empty(&first.artist)) {
-                    (Some(title), Some(artist)) => format!("{artist} - {title}"),
-                    _ => format!("Track {}", first.id),
+                    (Some(title), Some(artist)) => {
+                        format!(
+                            "<b>{}</b> - <b>{}</b>",
+                            html_escape(artist),
+                            html_escape(title)
+                        )
+                    }
+                    _ if options.is_cache_only => {
+                        format!("Track Cache: <code>{}</code>", html_escape(&first.id))
+                    }
+                    _ => format!("Track ID: <code>{}</code>", html_escape(&first.id)),
                 }
             }
-            _ => format!("Batch ({} tracks)", tracks_to_process.len()),
+            _ if options.is_cache_only => {
+                format!("Batch Cache: <b>{} tracks</b>", tracks_to_process.len())
+            }
+            _ => format!("Batch: <b>{} tracks</b>", tracks_to_process.len()),
         };
         {
             let mut guard = shared.lock().expect("job poisoned");
@@ -498,6 +600,9 @@ impl RipOrchestrator {
         }
 
         // Step 13: cache lookup (DB failure fails the job, TS parity).
+        self.set_phase(&shared, JobPhase::CheckingCache);
+        self.bus
+            .emit_progress(&shared, Some("Checking local cache..."), None, None);
         let requested_ids: Vec<String> = tracks_to_process.iter().map(|t| t.id.clone()).collect();
         let mut existing_tracks_map = deps
             .find_cached_tracks(&requested_ids)
@@ -625,20 +730,37 @@ impl RipOrchestrator {
 
         // Step 16: all-cached fast path.
         if uncached_items.is_empty() {
-            return Ok(summary(cached_count, 0, Vec::new(), Vec::new(), "0.0"));
+            let elapsed = format!(
+                "{:.1}",
+                (now_ms().saturating_sub(shared.lock().expect("job poisoned").job.start_time_ms)
+                    as f64)
+                    / 1000.0
+            );
+            return Ok(summary(cached_count, 0, Vec::new(), Vec::new(), &elapsed));
         }
 
-        // Step 17: cache-only mode with uncached leftovers (live off;
-        // unreachable in practice after the step-3 gate — defensive port).
-        if !settings.can_rip_live(options.is_admin)
-            && !options.is_cache_only
-            && !uncached_items.is_empty()
-        {
+        // Step 17: cache-only and maintenance mode both skip misses.  The bot
+        // decides how to phrase the resulting summary; the engine exposes the
+        // semantic IDs only.
+        if options.is_cache_only || !settings.can_rip_live(options.is_admin) {
             let skipped: Vec<String> = uncached_items.iter().map(|i| i.id.clone()).collect();
-            return Ok(summary(cached_count, 0, Vec::new(), skipped, "0.0"));
+            {
+                let mut guard = shared.lock().expect("job poisoned");
+                guard.job.skipped_count = skipped.len();
+            }
+            self.bus
+                .emit_progress(&shared, Some("Skipping uncached tracks..."), None, None);
+            let elapsed = format!(
+                "{:.1}",
+                (now_ms().saturating_sub(shared.lock().expect("job poisoned").job.start_time_ms)
+                    as f64)
+                    / 1000.0
+            );
+            return Ok(summary(cached_count, 0, Vec::new(), skipped, &elapsed));
         }
 
         // Step 18: live rip through the queue.
+        self.set_phase(&shared, JobPhase::Queued);
         self.bus
             .emit_progress(&shared, Some("Queued for ripping..."), None, None);
 
@@ -665,7 +787,34 @@ impl RipOrchestrator {
         let task_cached_count = cached_count;
         let task_is_multi_track = is_multi_track;
 
-        let task = move |_queue_signal: CancellationToken| {
+        let callback_shared = Arc::clone(&shared);
+        let callback_bus = self.bus.clone();
+        let on_position_change = Arc::new(move |position: u64| {
+            callback_shared
+                .lock()
+                .expect("job poisoned")
+                .job
+                .queue_position = Some(position);
+            callback_bus.emit_progress(
+                &callback_shared,
+                Some(&format!("In Queue: Position #{position}")),
+                None,
+                None,
+            );
+        });
+        let callback_shared = Arc::clone(&shared);
+        let callback_bus = self.bus.clone();
+        let on_start = Arc::new(move || {
+            {
+                let mut guard = callback_shared.lock().expect("job poisoned");
+                guard.job.phase = JobPhase::Processing;
+                guard.job.queue_position = Some(0);
+            }
+            let guard = callback_shared.lock().expect("job poisoned");
+            callback_bus.emit(&OrchestratorEvent::Started(&guard.job));
+        });
+
+        let task = move |queue_signal: CancellationToken| {
             Box::pin(async move {
                 run_pipeline(
                     task_deps,
@@ -674,6 +823,7 @@ impl RipOrchestrator {
                     &task_options,
                     &task_items,
                     task_controller,
+                    queue_signal,
                     task_cached_count,
                     task_is_multi_track,
                     max_collection_limit,
@@ -685,9 +835,17 @@ impl RipOrchestrator {
                 as std::pin::Pin<Box<dyn std::future::Future<Output = RipJobSummary> + Send>>
         };
 
-        // TS calls queue.enqueue(task) with no options (no position
-        // callbacks, no signal) — cancellation is handled inside the task.
-        let result = self.queue.enqueue(task, None).await?;
+        let result = self
+            .queue
+            .enqueue(
+                task,
+                Some(EnqueueOptions {
+                    signal: Some(job_controller.clone()),
+                    on_position_change: Some(on_position_change),
+                    on_start: Some(on_start),
+                }),
+            )
+            .await?;
 
         Ok(result)
     }
@@ -696,9 +854,10 @@ impl RipOrchestrator {
 /// The in-queue pipeline (producer → downloader → uploader over bounded
 /// mpsc channels) — the body of the TS `queue.enqueue` task.
 ///
-/// Upload-retries-exhausted fails the whole job (TS: `throw uploadErr`
-/// rejects `Promise.all`). Deliberate deviation from the TS oracle: when
-/// the downloader aborts the batch (circuit breaker), the TS producer
+/// Upload-retries-exhausted is recorded as a track failure and later tracks
+/// continue (the intentional Rust deviation from TS `throw uploadErr`, which
+/// rejects `Promise.all`). When the downloader aborts the batch (circuit
+/// breaker), the TS producer
 /// stays blocked forever on a full `BoundedChannel` (job + queue-slot
 /// leak). Tokio mpsc senders error when receivers drop, so the Rust
 /// pipeline settles cleanly with the same observable summary (the
@@ -711,6 +870,7 @@ async fn run_pipeline<D: OrchestratorDeps>(
     options: &RipJobOptions,
     uncached_items: &[ResolvedTrackItem],
     job_controller: CancellationToken,
+    queue_signal: CancellationToken,
     cached_count: usize,
     is_multi_track: bool,
     max_collection_limit: u32,
@@ -718,10 +878,6 @@ async fn run_pipeline<D: OrchestratorDeps>(
     queue_start_time_ms: u64,
 ) -> RipJobSummary {
     tracing::debug!("Rip job started from queue");
-    {
-        let guard = shared.lock().expect("job poisoned");
-        bus.emit(&OrchestratorEvent::Started(&guard.job));
-    }
 
     // Rip job temp dir (TS: os.tmpdir()/rip_job_{ts}_{rand36}).
     let rip_job_dir: PathBuf =
@@ -736,8 +892,11 @@ async fn run_pipeline<D: OrchestratorDeps>(
     let (download_tx, download_rx) = tokio::sync::mpsc::channel::<PipelineItem>(1);
     let (upload_tx, upload_rx) = tokio::sync::mpsc::channel::<PipelineRipResult>(2);
 
-    let is_cancelled =
-        || shared.lock().expect("job poisoned").job.is_cancelled || job_controller.is_cancelled();
+    let is_cancelled = || {
+        shared.lock().expect("job poisoned").job.is_cancelled
+            || job_controller.is_cancelled()
+            || queue_signal.is_cancelled()
+    };
 
     // ── Producer ──────────────────────────────────────────────────────────
     // The sender is MOVED into the block: when the producer finishes, the
@@ -815,7 +974,7 @@ async fn run_pipeline<D: OrchestratorDeps>(
                     &item.track_id,
                     Some(&on_progress),
                     &storefront,
-                    job_controller.clone(),
+                    queue_signal.clone(),
                     Some(&rip_job_dir),
                 )
                 .await
@@ -873,12 +1032,17 @@ async fn run_pipeline<D: OrchestratorDeps>(
 
                     // Circuit breaker: abort the remaining batch when the
                     // mirror looks offline.
-                    let lower = err_msg.to_lowercase();
-                    if lower.contains("timed out")
-                        || lower.contains("mirror")
-                        || lower.contains("502")
-                        || lower.contains("503")
-                    {
+                    let is_mirror_down = [
+                        "Mirror /status check timed out",
+                        "Mirror health check failed",
+                        "Lossless wrapper is currently offline",
+                        "Mirror manifest lookup timed out",
+                        "Mirror service is currently offline",
+                        "Failed to connect to mirror stream",
+                    ]
+                    .iter()
+                    .any(|phrase| err_msg.contains(phrase));
+                    if is_mirror_down {
                         {
                             let mut failures = failed_tracks.lock().expect("failures poisoned");
                             failures.push(FailedTrack {
@@ -920,6 +1084,7 @@ async fn run_pipeline<D: OrchestratorDeps>(
                 &ripped_count,
                 options,
                 &job_controller,
+                &queue_signal,
                 is_multi_track,
                 &upload_item,
             )
@@ -973,14 +1138,18 @@ async fn upload_one<D: OrchestratorDeps>(
     ripped_count: &Arc<std::sync::atomic::AtomicUsize>,
     options: &RipJobOptions,
     job_controller: &CancellationToken,
+    queue_signal: &CancellationToken,
     is_multi_track: bool,
     upload_item: &PipelineRipResult,
 ) {
     let track_id = upload_item.track_id.clone();
     let rip_result = &upload_item.rip_result;
     let track_label = format!("{} - {}", rip_result.artist, rip_result.title);
-    let is_cancelled =
-        || shared.lock().expect("job poisoned").job.is_cancelled || job_controller.is_cancelled();
+    let is_cancelled = || {
+        shared.lock().expect("job poisoned").job.is_cancelled
+            || job_controller.is_cancelled()
+            || queue_signal.is_cancelled()
+    };
 
     let caption = format_dump_caption(&DumpCaptionMetadata {
         apple_track_id: &track_id,
@@ -996,6 +1165,12 @@ async fn upload_one<D: OrchestratorDeps>(
         track_number: Some(rip_result.track_number),
         track_count: Some(rip_result.track_count),
     });
+    let plain_caption = format!(
+        "{} - {}\n{}",
+        rip_result.artist, rip_result.title, rip_result.album
+    );
+    let mut current_caption = caption.clone();
+    let mut used_plain_caption = false;
 
     let upload_text = format!("⬆️ <b>Uploading:</b> <i>{}</i>", html_escape(&track_label));
     *texts.upload.lock().expect("texts poisoned") = Some(upload_text.clone());
@@ -1003,15 +1178,16 @@ async fn upload_one<D: OrchestratorDeps>(
     let download_text = texts.download.lock().expect("texts poisoned").clone();
     bus.emit_progress(shared, None, download_text.as_deref(), Some(&upload_text));
 
-    // Send with retries: base * 2^(attempt-1) + rand*500 via abortable sleep.
-    let max_retries = 4;
+    // Send with configured retries.  The initial call is attempt zero, so
+    // `max_retries + 1` calls are made in the ordinary case.
+    let max_retries = deps.upload_max_retries();
     enum SendOutcome {
         Audio(DumpUpload),
         /// Send succeeded but the message carried no audio media.
         NotAudio,
     }
     let mut outcome: Option<SendOutcome> = None;
-    'upload: for attempt in 1..=max_retries {
+    'upload: for attempt in 0..=max_retries {
         let on_upload: UploadProgressCallback = {
             let texts = Arc::clone(texts);
             let shared = Arc::clone(shared);
@@ -1033,7 +1209,7 @@ async fn upload_one<D: OrchestratorDeps>(
                 &rip_result.title,
                 &rip_result.artist,
                 rip_result.duration,
-                &caption,
+                &current_caption,
                 Some(&on_upload),
             )
             .await
@@ -1053,9 +1229,15 @@ async fn upload_one<D: OrchestratorDeps>(
                     // TS: break out of the retry loop without recording.
                     break 'upload;
                 }
+                if upload_err.to_string().contains("ENTITY_BOUNDS_INVALID") && !used_plain_caption {
+                    used_plain_caption = true;
+                    current_caption = plain_caption.clone();
+                    continue 'upload;
+                }
                 if attempt < max_retries {
-                    let delay = deps.upload_retry_base_ms() as f64 * 2f64.powi(attempt - 1)
-                        + (now_ms() % 500) as f64;
+                    let jitter = 0.8 + (now_ms() % 400) as f64 / 1000.0;
+                    let delay =
+                        deps.upload_retry_base_ms() as f64 * 2f64.powi(attempt as i32) * jitter;
                     tracing::warn!(
                         track_id = %track_id,
                         attempt,
@@ -1068,11 +1250,12 @@ async fn upload_one<D: OrchestratorDeps>(
                     tokio::select! {
                         _ = tokio::time::sleep(Duration::from_millis(delay as u64)) => {}
                         _ = job_controller.cancelled() => {}
+                        _ = queue_signal.cancelled() => {}
                     }
                 } else {
                     tracing::error!(
                         track_id = %track_id,
-                        attempts = max_retries,
+                        attempts = max_retries + 1,
                         error = %upload_err,
                         "All upload retries exhausted for track"
                     );

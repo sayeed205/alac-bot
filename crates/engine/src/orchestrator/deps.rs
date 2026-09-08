@@ -197,8 +197,14 @@ pub trait OrchestratorDeps: Send + Sync + 'static {
     // ── telegram sink ────────────────────────────────────────────────────
     fn sink(&self) -> &dyn TelegramSink;
 
-    /// TS `uploadRetryBaseMs` default 3000.
+    /// Base delay for upload retries.  The live command defaults to 2000ms.
     fn upload_retry_base_ms(&self) -> u64 {
-        3000
+        2000
+    }
+
+    /// Number of retries after the initial upload attempt.  Thus the number
+    /// of calls is `upload_max_retries() + 1`.
+    fn upload_max_retries(&self) -> u32 {
+        3
     }
 }
