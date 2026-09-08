@@ -75,3 +75,30 @@ first; retarget the engine as M5c.
 - `/alac` has no separate long-lived progress message; the shared dashboard is
   canonical. Completion: group requests get a compact group notice plus a full
   requester-DM summary; DM requests get the full DM summary.
+
+## Implementation record (M5c, 2026-09-08)
+
+- `3782adb` — bot: live global `/status` dashboard (snapshot rendering,
+  pagination, requester-aware cancel controls, flood coalescing).
+- `d401684` — engine: orchestrator retargeted to live `/alac` semantics
+  (cache-first maintenance, structured resolution failures, queue callbacks,
+  six-phrase circuit breaker, upload retries with jitter, measured elapsed).
+- `6658327` — bot: M5b inline pipeline collapsed onto the orchestrator.
+  `handlers/rip` keeps policy/gates/preflight/input only; `event_bridge.rs`
+  is the single rendering path for status messages and dashboard refreshes;
+  `dashboard_map.rs` maps engine snapshots to viewer-scoped rows.
+
+## Known deviations from the live oracle (intentional)
+
+- **Retry exhaustion**: the TS oracle throws on upload-retry exhaustion and
+  rejects the whole `Promise.all` batch; Rust records the failed track and
+  continues later tracks, completing with a failure summary.
+- **Circuit-breaker stall**: on a mirror-offline break the TS producer leaks
+  its job + queue slot (blocked forever on a full bounded channel); Rust
+  settles cleanly via mpsc sender-drop with the same observable summary.
+- **Mirror health**: the dashboard header shows `unknown` until a health
+  probe integration is wired (last-known value only; no polling yet).
+- **Group completion notice**: the engine summary is edited into the
+  requester-chat status message; the compact group notice + DM-summary pair
+  is delivered as one message rather than the oracle's two-target split.
+
