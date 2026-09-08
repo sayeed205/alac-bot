@@ -5,6 +5,7 @@ pub mod dashboard_map;
 pub mod event_bridge;
 pub mod handlers;
 pub mod html;
+pub mod mirror_health;
 pub mod rip_deps;
 pub mod telegram_sink;
 

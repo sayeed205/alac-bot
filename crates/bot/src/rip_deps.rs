@@ -26,6 +26,9 @@ pub struct RipDeps {
     playlist: PlaylistClient<ReqwestPlaylistHttp>,
     ripper: AlacTrackRipper,
     ripper_deps: EngineRipperDeps,
+    /// Shared with `ripper_deps` so health probes observe the same circuit
+    /// and cache state the ripper uses.
+    mirror_policy: engine::streaming::MirrorPolicyManager<engine::streaming::ReqwestHttp>,
     upload_retry_base_ms: u64,
 }
 
@@ -44,12 +47,14 @@ impl RipDeps {
         let ripper_catalog = Catalog::new(ReqwestTransport::new());
         let wrapper_url = env_option("ALAC_WRAPPER_URL");
         let wrapper_api_key = env_option("ALAC_WRAPPER_API_KEY");
+        let stream_transport =
+            engine::streaming::StreamTransport::new(engine::streaming::ReqwestHttp::new());
         let mirror_policy = engine::streaming::MirrorPolicyManager::new(
             engine::streaming::ReqwestHttp::new(),
             env_option("ALAC_MIRROR_URL").zip(env_option("ALAC_MIRROR_API_KEY")),
         );
-        let stream_transport =
-            engine::streaming::StreamTransport::new(engine::streaming::ReqwestHttp::new());
+        // The ripper and the dashboard health probe share one policy state.
+        let probe_policy = mirror_policy.shared();
         let ripper_deps = EngineRipperDeps::new(
             ripper_catalog,
             mirror_policy,
@@ -71,6 +76,7 @@ impl RipDeps {
             playlist: PlaylistClient::new(ReqwestPlaylistHttp::new()),
             ripper: AlacTrackRipper::new(RipperConfig::default()),
             ripper_deps,
+            mirror_policy: probe_policy,
             upload_retry_base_ms,
         })
     }
@@ -80,6 +86,18 @@ fn env_option(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
         .filter(|value| !value.trim().is_empty())
+}
+
+impl RipDeps {
+    /// Probe mirror health for the status dashboard (oracle
+    /// `commands/health.ts:47-61`). Uses a clone of the ripper's policy
+    /// manager, so circuit state and the endpoint cache stay coherent
+    /// between rips and probes.
+    pub async fn probe_mirror_health(&self) -> crate::mirror_health::HealthReport {
+        use crate::mirror_health::{MirrorHealthProbe, PolicyProbe};
+
+        PolicyProbe::new(self.mirror_policy.shared()).probe().await
+    }
 }
 
 impl OrchestratorDeps for RipDeps {

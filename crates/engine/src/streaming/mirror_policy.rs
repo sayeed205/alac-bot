@@ -1,7 +1,7 @@
 //! Mirror discovery, health verification, caching, and circuit breaking.
 
 use std::{
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -58,10 +58,28 @@ pub struct MirrorPolicyManager<H: MirrorHttp> {
     failure_cooldown: Duration,
     cache_ttl: Duration,
     health_timeout: Duration,
-    state: Mutex<PolicyState>,
+    /// Cloned managers share circuit/cache state: a health probe observes
+    /// the same endpoint the ripper resolves (and vice versa).
+    state: Arc<Mutex<PolicyState>>,
 }
 
 impl<H: MirrorHttp> MirrorPolicyManager<H> {
+    /// Clone that shares circuit/cache state with the original. Config and
+    /// the HTTP adapter are copied; they are immutable after construction.
+    pub fn shared(&self) -> Self
+    where
+        H: Clone,
+    {
+        Self {
+            http: self.http.clone(),
+            env_override: self.env_override.clone(),
+            failure_cooldown: self.failure_cooldown,
+            cache_ttl: self.cache_ttl,
+            health_timeout: self.health_timeout,
+            state: Arc::clone(&self.state),
+        }
+    }
+
     pub fn new(http: H, env_override: Option<(String, String)>) -> Self {
         Self::with_config(
             http,
@@ -85,10 +103,10 @@ impl<H: MirrorHttp> MirrorPolicyManager<H> {
             failure_cooldown,
             cache_ttl,
             health_timeout,
-            state: Mutex::new(PolicyState {
+            state: Arc::new(Mutex::new(PolicyState {
                 cached: None,
                 last_failure: None,
-            }),
+            })),
         }
     }
 

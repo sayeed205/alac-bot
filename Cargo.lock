@@ -129,6 +129,7 @@ dependencies = [
  "dotenvy",
  "engine",
  "ferogram",
+ "futures-util",
  "tokio",
  "tokio-util",
  "tracing",

@@ -25,6 +25,7 @@ use crate::{
         cancelled_text, final_summary, render_progress, ProgressState, StatusEditor, StatusSink,
         SummaryInput, TelegramStatusSink,
     },
+    mirror_health::last_known_health,
     BotState,
 };
 
@@ -184,13 +185,19 @@ pub fn start(state: Arc<BotState>) {
 /// Build a global dashboard snapshot from the engine's current jobs.
 pub async fn current_snapshot(state: &BotState) -> crate::dashboard::DashboardSnapshot {
     let active = state.rip_orchestrator.get_active_jobs();
-    let mode = state
-        .rip_deps
-        .get_settings()
-        .await
-        .ripping_mode
-        .as_str()
-        .to_owned();
+    let settings = state.rip_deps.get_settings().await;
+    let mode = settings.ripping_mode.as_str().to_owned();
+    // Refresh mirror health opportunistically: the last-known value renders
+    // immediately, and a fresh probe runs only when the cached one is stale.
+    // The probe is bounded (4s timeout) and shares the ripper's policy
+    // manager, so an unreachable mirror cannot flood the transport.
+    let health = if last_known_health().is_fresh() {
+        last_known_health().label().map(str::to_owned)
+    } else {
+        let report = state.rip_deps.probe_mirror_health().await;
+        last_known_health().record(report);
+        Some(report.health.label().to_owned())
+    };
     // Per-viewer permissions are applied by the dashboard manager per entry;
     // the global snapshot stays viewer-neutral.
     snapshot_from(
@@ -199,7 +206,7 @@ pub async fn current_snapshot(state: &BotState) -> crate::dashboard::DashboardSn
         0,
         false,
         &mode,
-        None,
+        health,
     )
 }
 
