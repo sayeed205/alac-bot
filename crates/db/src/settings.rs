@@ -202,6 +202,9 @@ impl SettingsStore {
     pub async fn toggle_multi_link_rip(&self) -> bool {
         self.toggle("multi_link_rip_enabled").await
     }
+    pub async fn toggle_auto_dump(&self) -> bool {
+        self.toggle("auto_dump_enabled").await
+    }
 
     async fn toggle(&self, key: &str) -> bool {
         let value = match key {
@@ -209,6 +212,7 @@ impl SettingsStore {
             "playlist_rip_enabled" => !self.get_settings().playlist_rip_enabled,
             "artist_rip_enabled" => !self.get_settings().artist_rip_enabled,
             "txt_rip_enabled" => !self.get_settings().txt_rip_enabled,
+            "auto_dump_enabled" => !self.get_settings().auto_dump_enabled,
             _ => !self.get_settings().multi_link_rip_enabled,
         };
         self.set_setting(key, json!(value)).await;

@@ -130,6 +130,7 @@ dependencies = [
  "engine",
  "ferogram",
  "futures-util",
+ "serde_json",
  "tokio",
  "tokio-util",
  "tracing",

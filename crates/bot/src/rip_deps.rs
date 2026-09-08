@@ -98,6 +98,18 @@ impl RipDeps {
 
         PolicyProbe::new(self.mirror_policy.shared()).probe().await
     }
+
+    /// The mutable settings store backing the admin `/settings` panel
+    /// (oracle settingsService). Reads go through the in-memory snapshot;
+    /// writes are write-through to Postgres.
+    pub fn settings(&self) -> &db::SettingsStore {
+        &self.settings
+    }
+
+    /// Synchronous snapshot read for panel rendering.
+    pub fn settings_snapshot(&self) -> BotSettings {
+        self.settings.get_settings()
+    }
 }
 
 impl OrchestratorDeps for RipDeps {

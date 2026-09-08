@@ -4,6 +4,7 @@ mod list;
 mod revoke;
 #[allow(dead_code)]
 pub(crate) mod rip;
+pub mod settings;
 mod start;
 mod status;
 
@@ -80,6 +81,7 @@ pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
     list::register(dp, Arc::clone(&state));
     rip::register(dp, Arc::clone(&state));
     status::register(dp, Arc::clone(&state));
+    settings::register(dp, Arc::clone(&state));
 
     let callback_state = Arc::clone(&state);
     dp.on_callback_query(filters::all::<CallbackQuery>(), move |query| {
@@ -92,6 +94,11 @@ pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
                 .is_some_and(|data| data.starts_with("dashboard:"))
             {
                 callbacks::dispatch_dashboard(state, query).await;
+            } else if query
+                .data()
+                .is_some_and(|data| data.starts_with("settings:"))
+            {
+                settings::callback(state, query).await;
             } else {
                 list::callback(state, query).await;
             }
