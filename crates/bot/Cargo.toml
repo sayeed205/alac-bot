@@ -11,8 +11,10 @@ path = "src/main.rs"
 
 [dependencies]
 db = { path = "../db" }
+engine = { path = "../engine" }
 ferogram.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true

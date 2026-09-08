@@ -2,7 +2,12 @@ mod auth;
 mod help;
 mod list;
 mod revoke;
+#[allow(dead_code)]
+pub(crate) mod rip;
 mod start;
+
+#[path = "../callbacks.rs"]
+mod callbacks;
 
 use std::sync::Arc;
 
@@ -53,10 +58,17 @@ pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
     auth::register(dp, Arc::clone(&state));
     revoke::register(dp, Arc::clone(&state));
     list::register(dp, Arc::clone(&state));
+    rip::register(dp, Arc::clone(&state));
 
     let callback_state = Arc::clone(&state);
     dp.on_callback_query(filters::all::<CallbackQuery>(), move |query| {
         let state = Arc::clone(&callback_state);
-        async move { list::callback(state, query).await }
+        async move {
+            if query.data().is_some_and(|data| data.starts_with("cancel:")) {
+                callbacks::dispatch_cancel(state, query).await;
+            } else {
+                list::callback(state, query).await;
+            }
+        }
     });
 }

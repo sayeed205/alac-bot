@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use bot::{handlers, BotState};
-use ferogram::{filters::Dispatcher, Client};
+use ferogram::{filters::Dispatcher, Client, PeerRef};
 use tokio::signal;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -100,7 +100,7 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow!(e))
         .context("run database migrations")?;
     info!("Migrations completed successfully!");
-    let auth = db::Auth::new(database, env.admin_id);
+    let auth = db::Auth::new(database.clone(), env.admin_id);
 
     let (client, shutdown) = Client::builder()
         .api_id(env.api_id)
@@ -123,9 +123,24 @@ async fn main() -> Result<()> {
     let me = client.get_me().await.context("get bot identity")?;
     info!(username = ?me.username, bot_id = me.id, dump_channel = env.dump_channel_id, "Bot started successfully");
 
+    let rip_deps = Arc::new(
+        bot::rip_deps::RipDeps::new(
+            Arc::new(client.clone()),
+            PeerRef::from(env.dump_channel_id),
+            db::TracksRepository::new(database.clone()),
+            db::RequestLogRepository::new(database.clone()),
+            db::SettingsStore::new(database),
+        )
+        .await
+        .map_err(|error| anyhow!(error))
+        .context("initialize rip dependencies")?,
+    );
+
     let state = Arc::new(BotState {
         client: client.clone(),
         auth,
+        rip_deps,
+        rip_queue: engine::queue::SequentialRipQueue::new(),
     });
     let mut dispatcher = Dispatcher::new();
     handlers::register(&mut dispatcher, state);

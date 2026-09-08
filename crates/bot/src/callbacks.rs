@@ -1,0 +1,42 @@
+//! Callback dispatcher for list pagination and rip cancellation.
+
+use std::sync::Arc;
+
+use ferogram::update::CallbackQuery;
+
+use crate::{
+    handlers::rip::{self, cancel},
+    BotState,
+};
+
+pub async fn dispatch_cancel(state: Arc<BotState>, query: CallbackQuery) {
+    let Some(job_id) = query
+        .data()
+        .and_then(|d| d.strip_prefix("cancel:"))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    else {
+        return;
+    };
+    let caller = query.user_id;
+    let admin = state.auth.is_admin(caller);
+    let result = cancel::cancel_inline(
+        &rip::active_jobs(),
+        job_id,
+        caller,
+        admin,
+        if admin { "Admin" } else { "User" },
+    )
+    .await;
+    let (text, alert) = match result {
+        cancel::CancelResult::Cancelled => (cancel::CALLBACK_ACK, false),
+        cancel::CancelResult::Unauthorized => (cancel::CALLBACK_UNAUTHORIZED, true),
+        cancel::CancelResult::Expired => (cancel::CALLBACK_EXPIRED, false),
+    };
+    let answer = if alert {
+        query.answer().alert(text)
+    } else {
+        query.answer().text(text)
+    };
+    let _ = answer.send(&state.client).await;
+}
