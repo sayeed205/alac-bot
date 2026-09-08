@@ -150,12 +150,30 @@ struct Entry {
     sink: Arc<dyn DashboardSink>,
     id: i32,
     page: usize,
+    viewer_id: i64,
+    viewer_is_admin: bool,
     snapshot: DashboardSnapshot,
     warning_sent: bool,
     empty_rendered: bool,
+    /// Earliest time this entry's message may be edited again by a
+    /// non-forced refresh (flood/coalescing per dashboard message).
+    next_refresh_at: Option<tokio::time::Instant>,
 }
 pub struct DashboardManager {
     entries: Mutex<HashMap<i64, Entry>>,
+}
+
+/// Progress events can arrive many times per second; dashboards coalesce
+/// them into at most one edit per interval per message.
+const REFRESH_INTERVAL: Duration = Duration::from_millis(2500);
+
+/// Recompute per-row cancel permission for a specific viewer. A shared group
+/// dashboard renders only the actions that viewer is allowed to take
+/// (requester or admin); actual authorization is re-checked on callback.
+pub fn apply_viewer(snapshot: &mut DashboardSnapshot, viewer_id: i64, viewer_is_admin: bool) {
+    for job in &mut snapshot.jobs {
+        job.is_cancel_allowed_for_viewer = viewer_is_admin || viewer_id == job.requester_id;
+    }
 }
 
 impl Default for DashboardManager {
@@ -170,15 +188,20 @@ impl DashboardManager {
         }
     }
 
-    /// Sends the replacement before removing the previous dashboard.
+    /// Sends the replacement before removing the previous dashboard. The
+    /// snapshot is stored viewer-scoped so callbacks (page/refresh) render
+    /// exactly what this viewer may act on.
     pub async fn open(
         &self,
         chat: i64,
-        _viewer: i64,
+        viewer_id: i64,
+        viewer_is_admin: bool,
         sink: Arc<dyn DashboardSink>,
         snapshot: DashboardSnapshot,
     ) -> Result<i32, EditError> {
-        let (text, keyboard) = render(&snapshot, 1, false);
+        let mut snapshot = snapshot;
+        apply_viewer(&mut snapshot, viewer_id, viewer_is_admin);
+        let (text, keyboard) = render(&snapshot, 1, viewer_is_admin);
         let new_id = sink.send(&text, keyboard).await?;
         let empty = snapshot.jobs.is_empty();
         let old = self.entries.lock().await.insert(
@@ -187,9 +210,12 @@ impl DashboardManager {
                 sink: Arc::clone(&sink),
                 id: new_id,
                 page: 1,
+                viewer_id,
+                viewer_is_admin,
                 snapshot,
                 warning_sent: false,
                 empty_rendered: empty,
+                next_refresh_at: None,
             },
         );
         if let Some(old) = old {
@@ -197,7 +223,34 @@ impl DashboardManager {
         }
         Ok(new_id)
     }
+
+    /// Latest engine snapshot for a chat's dashboard, re-scoped to that
+    /// dashboard's viewer. Used by the refresh callback so a stale dashboard
+    /// can resynchronize without the event bridge.
+    pub async fn refresh_entry_from(&self, chat: i64, snapshot: DashboardSnapshot) {
+        let work = {
+            let mut entries = self.entries.lock().await;
+            entries.get_mut(&chat).map(|entry| {
+                let mut viewed = snapshot;
+                apply_viewer(&mut viewed, entry.viewer_id, entry.viewer_is_admin);
+                entry.snapshot = viewed.clone();
+                entry.next_refresh_at = None;
+                let (text, keyboard) = render(&entry.snapshot, entry.page, entry.viewer_is_admin);
+                (Arc::clone(&entry.sink), entry.id, text, keyboard)
+            })
+        };
+        if let Some((sink, id, text, keyboard)) = work {
+            let _ = sink.edit(id, &text, keyboard).await;
+        }
+    }
     pub async fn refresh_all(&self, snapshot: DashboardSnapshot) {
+        self.refresh(snapshot, false).await;
+    }
+
+    /// Refresh every open dashboard. Terminal events pass `force = true` so
+    /// queue changes (job finished/cancelled) are never suppressed by the
+    /// coalescing window.
+    pub async fn refresh(&self, snapshot: DashboardSnapshot, force: bool) {
         // Never retain the manager mutex across Telegram I/O: an edit can
         // block for a flood wait and callers must still be able to replace or
         // page a dashboard meanwhile.
@@ -206,7 +259,17 @@ impl DashboardManager {
             entries
                 .iter_mut()
                 .filter_map(|(chat, entry)| {
-                    entry.snapshot = snapshot.clone();
+                    // Coalesce high-frequency progress events per message.
+                    if !force
+                        && entry
+                            .next_refresh_at
+                            .is_some_and(|at| at > tokio::time::Instant::now())
+                    {
+                        return None;
+                    }
+                    let mut viewed = snapshot.clone();
+                    apply_viewer(&mut viewed, entry.viewer_id, entry.viewer_is_admin);
+                    entry.snapshot = viewed.clone();
                     if entry.snapshot.jobs.is_empty() {
                         if entry.empty_rendered {
                             return None;
@@ -215,7 +278,9 @@ impl DashboardManager {
                     } else {
                         entry.empty_rendered = false;
                     }
-                    let (text, keyboard) = render(&entry.snapshot, entry.page, false);
+                    entry.next_refresh_at = Some(tokio::time::Instant::now() + REFRESH_INTERVAL);
+                    let (text, keyboard) =
+                        render(&entry.snapshot, entry.page, entry.viewer_is_admin);
                     Some((
                         *chat,
                         Arc::clone(&entry.sink),
@@ -235,19 +300,23 @@ impl DashboardManager {
                         entry.warning_sent = false;
                     }
                 }
-                Err(EditError::FloodWait(_)) if !warning_was_sent => {
+                Err(EditError::FloodWait(wait)) => {
                     if let Some(entry) = self.entries.lock().await.get_mut(&chat) {
                         entry.warning_sent = true;
+                        // Suppress further edits until the flood deadline.
+                        entry.next_refresh_at =
+                            Some(tokio::time::Instant::now() + wait + REFRESH_INTERVAL);
                     }
-                    let _ = sink
-                        .send(
-                            "⚠️ Live status updates are temporarily paused; refresh resumes shortly.",
-                            None,
-                        )
-                        .await;
-                    tracing::warn!("dashboard updates throttled");
+                    if !warning_was_sent {
+                        let _ = sink
+                            .send(
+                                "⚠️ Live status updates are temporarily paused; refresh resumes shortly.",
+                                None,
+                            )
+                            .await;
+                        tracing::warn!("dashboard updates throttled");
+                    }
                 }
-                Err(EditError::FloodWait(_)) => {}
                 Err(EditError::Other(error)) => tracing::warn!(%error, "dashboard update failed"),
             }
         }
@@ -257,7 +326,7 @@ impl DashboardManager {
             let mut entries = self.entries.lock().await;
             entries.get_mut(&chat).map(|entry| {
                 entry.page = page;
-                let (text, keyboard) = render(&entry.snapshot, page, false);
+                let (text, keyboard) = render(&entry.snapshot, page, entry.viewer_is_admin);
                 (Arc::clone(&entry.sink), entry.id, text, keyboard)
             })
         };

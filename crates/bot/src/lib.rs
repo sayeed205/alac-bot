@@ -1,6 +1,8 @@
 //! Telegram handlers and small formatting helpers.
 
 pub mod dashboard;
+pub mod dashboard_map;
+pub mod event_bridge;
 pub mod handlers;
 pub mod html;
 pub mod rip_deps;
@@ -13,7 +15,7 @@ pub struct BotState {
     pub client: ferogram::Client,
     pub auth: db::Auth,
     pub rip_deps: Arc<rip_deps::RipDeps>,
-    pub rip_queue: engine::queue::SequentialRipQueue,
+    pub rip_orchestrator: Arc<engine::orchestrator::RipOrchestrator>,
 }
 
 pub type SharedState = Arc<BotState>;

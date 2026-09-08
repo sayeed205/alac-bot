@@ -136,12 +136,15 @@ async fn main() -> Result<()> {
         .context("initialize rip dependencies")?,
     );
 
+    let orchestrator = Arc::new(engine::orchestrator::RipOrchestrator::new());
     let state = Arc::new(BotState {
         client: client.clone(),
         auth,
         rip_deps,
-        rip_queue: engine::queue::SequentialRipQueue::new(),
+        rip_orchestrator: orchestrator,
     });
+    // Bridge subscribes once; its consumer renders status messages + dashboard.
+    bot::event_bridge::start(Arc::clone(&state));
     let mut dispatcher = Dispatcher::new();
     handlers::register(&mut dispatcher, state);
     let dispatcher = Arc::new(dispatcher);

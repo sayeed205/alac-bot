@@ -6,8 +6,8 @@ use ferogram::{
 };
 
 use crate::{
-    dashboard::{DashboardFuture, DashboardSink, DashboardSnapshot, EditError},
-    dashboard_manager, BotState,
+    dashboard::{DashboardFuture, DashboardSink, EditError},
+    dashboard_manager, event_bridge, BotState,
 };
 
 struct TelegramSink {
@@ -84,21 +84,15 @@ pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
             {
                 return;
             }
+            let admin = state.auth.is_admin(user);
             let sink: Arc<dyn DashboardSink> = Arc::new(TelegramSink {
                 client: state.client.clone(),
                 peer: PeerRef::from(msg.chat_id()),
             });
+            // Real engine snapshot, viewer-scoped at open time.
+            let snapshot = event_bridge::current_snapshot(&state).await;
             let _ = dashboard_manager()
-                .open(
-                    msg.chat_id(),
-                    user,
-                    sink,
-                    DashboardSnapshot {
-                        ripping_mode: "sequential".into(),
-                        mirror_health: None,
-                        jobs: Vec::new(),
-                    },
-                )
+                .open(msg.chat_id(), user, admin, sink, snapshot)
                 .await;
         }
     });
