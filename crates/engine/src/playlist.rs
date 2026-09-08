@@ -1,0 +1,921 @@
+//! Apple Music playlist resolver (port of `src/modules/alac/playlist.ts`).
+//!
+//! Two jobs:
+//!
+//! 1. Scrape the Apple Music web-player developer token (with cache + static
+//!    fallback).
+//! 2. Fetch playlist metadata/tracks from the AMP API with US-storefront
+//!    fallback.
+//!
+//! All network I/O crosses the `PlaylistHttp` seam so tests run offline
+//! against canned responses.
+
+use std::{
+    future::Future,
+    sync::Mutex,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use serde::Deserialize;
+
+/// Chrome UA used by every request here (TS parity).
+pub const APPLE_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/145.0.0.0";
+
+/// Static reliable backup token in case live scraping fails (TS
+/// FALLBACK_TOKEN, byte-identical).
+pub const FALLBACK_TOKEN: &str = "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzI1NiIsImtpZCI6IldlYlBsYXlLaWQifQ.eyJpc3MiOiJBTVBXZWJQbGF5IiwiaWF0IjoxNzg2NjMyOTI0LCJleHAiOjE3OTI2ODA5MjQsInJvb3RfaHR0cHNfb3JpZ2luIjpbImFwcGxlLmNvbSJdfQ.hBgj61sZf-y7bmuvT-joXAUAcf7TVJ51732xnH5vFkLHOmsQHxVqGMYUuI4h8c0-RX3fRY3moylhLW8fewFJyw";
+
+/// One header for an HTTP GET.
+pub type Header = (String, String);
+
+/// The seam every playlist fetch crosses. Like the catalog `Transport` but
+/// carries full headers (the AMP API needs `Authorization` + `Origin`) and
+/// surfaces HTTP status codes as errors.
+pub trait PlaylistHttp: Send + Sync {
+    fn get(
+        &self,
+        url: &str,
+        headers: &[Header],
+        timeout: Duration,
+    ) -> impl Future<Output = Result<String, PlaylistHttpError>> + Send;
+}
+
+/// Failures of a single HTTP GET. TS wraps every `fetch()` throw (timeout +
+/// network) into one "timed out after Xms" message; non-OK statuses are
+/// checked explicitly (404 vs everything else).
+#[derive(Debug, thiserror::Error)]
+pub enum PlaylistHttpError {
+    #[error("request failed: {0}")]
+    Network(String),
+    #[error("HTTP {0}")]
+    Status(u16),
+}
+
+/// Production adapter over `reqwest`.
+#[derive(Clone, Default)]
+pub struct ReqwestPlaylistHttp {
+    client: reqwest::Client,
+}
+
+impl ReqwestPlaylistHttp {
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+impl PlaylistHttp for ReqwestPlaylistHttp {
+    async fn get(
+        &self,
+        url: &str,
+        headers: &[Header],
+        timeout: Duration,
+    ) -> Result<String, PlaylistHttpError> {
+        let mut request = self.client.get(url).timeout(timeout);
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| PlaylistHttpError::Network(e.to_string()))?;
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(PlaylistHttpError::Status(status));
+        }
+        response
+            .text()
+            .await
+            .map_err(|e| PlaylistHttpError::Network(e.to_string()))
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PlaylistError {
+    #[error("Playlist lookup timed out after {elapsed_ms}ms: {message}")]
+    TimedOut { elapsed_ms: u64, message: String },
+    #[error("Playlist {playlist_id} not found on storefront '{storefront}'")]
+    NotFound {
+        playlist_id: String,
+        storefront: String,
+    },
+    #[error("Apple Music API returned HTTP {status}")]
+    Http { status: u16 },
+    #[error("No playlist found matching ID {playlist_id}")]
+    NoData { playlist_id: String },
+    #[error("{0}")]
+    Other(String),
+}
+
+/// One track inside a playlist (TS `PlaylistTrack`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaylistTrack {
+    pub id: String,
+    pub title: String,
+    pub artist: String,
+    pub duration: Option<u64>,
+}
+
+/// Playlist metadata + full track list (TS `PlaylistData`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaylistData {
+    pub id: String,
+    pub title: String,
+    pub curator_name: Option<String>,
+    pub description: Option<String>,
+    pub tracks: Vec<PlaylistTrack>,
+}
+
+#[derive(Debug, Default)]
+struct TokenCache {
+    token: Option<String>,
+    expires_at_ms: u64,
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn ua_header() -> Header {
+    ("User-Agent".to_string(), APPLE_USER_AGENT.to_string())
+}
+
+fn auth_headers(token: &str) -> Vec<Header> {
+    vec![
+        ua_header(),
+        ("Authorization".to_string(), format!("Bearer {token}")),
+        ("Origin".to_string(), "https://music.apple.com".to_string()),
+    ]
+}
+
+/// Playlist client with the shared token cache (TS keeps module-level
+/// `cachedToken` variables; one client hands every fetch the same cache).
+#[derive(Debug)]
+pub struct PlaylistClient<H: PlaylistHttp> {
+    http: H,
+    token_cache: Mutex<TokenCache>,
+}
+
+impl<H: PlaylistHttp> PlaylistClient<H> {
+    pub fn new(http: H) -> Self {
+        Self {
+            http,
+            token_cache: Mutex::new(TokenCache::default()),
+        }
+    }
+
+    /// Retrieves the Apple Music Web Client developer token, dynamically
+    /// scraping it from the web player asset bundle or using the cached /
+    /// fallback token (TS `getAppleMusicDeveloperToken`).
+    pub async fn get_developer_token(&self) -> String {
+        let now = now_ms();
+        {
+            let cache = self.token_cache.lock().expect("token cache poisoned");
+            if let Some(token) = &cache.token {
+                if cache.expires_at_ms > now {
+                    return token.clone();
+                }
+            }
+        }
+
+        match self.scrape_token().await {
+            Ok(token) => {
+                let mut cache = self.token_cache.lock().expect("token cache poisoned");
+                cache.token = Some(token.clone());
+                // Cache for 24 hours.
+                cache.expires_at_ms = now + 24 * 60 * 60 * 1000;
+                tracing::debug!("Extracted live Apple Music developer token");
+                token
+            }
+            Err(err) => {
+                tracing::warn!("Dynamic developer token extraction failed, using fallback token");
+                tracing::debug!(error = %err, "scrape failure");
+                let mut cache = self.token_cache.lock().expect("token cache poisoned");
+                cache.token = Some(FALLBACK_TOKEN.to_string());
+                // Fallback cached for 12 hours.
+                cache.expires_at_ms = now + 12 * 60 * 60 * 1000;
+                FALLBACK_TOKEN.to_string()
+            }
+        }
+    }
+
+    /// The live scrape: browse page → index asset → token assignment (or a
+    /// direct JWT anywhere in the asset).
+    async fn scrape_token(&self) -> Result<String, String> {
+        // 1. Browse page.
+        let browse = self
+            .http
+            .get(
+                "https://music.apple.com/us/browse",
+                &[ua_header()],
+                Duration::from_secs(10),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // 2. Match /assets/index~[a-zA-Z0-9]+.js (leftmost occurrence).
+        let asset = find_asset_path(&browse).ok_or("no index asset in browse page")?;
+        let js = self
+            .http
+            .get(
+                &format!("https://music.apple.com{asset}"),
+                &[ua_header()],
+                Duration::from_secs(10),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // 3. developerToken:($varName) → varName = "value".
+        if let Some(var_name) = find_developer_token_var(&js) {
+            if let Some(value) = find_var_assignment(&js, &var_name) {
+                return Ok(value);
+            }
+        }
+
+        // 4. Direct JWT fallback: /eyJh[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*/
+        if let Some(jwt) = find_direct_jwt(&js) {
+            return Ok(jwt);
+        }
+
+        Err("no token found in asset".to_string())
+    }
+
+    /// `fetchPlaylistTracks`: fetch with US-storefront fallback on failure.
+    pub async fn fetch_playlist_tracks(
+        &self,
+        playlist_id: &str,
+        storefront: &str,
+    ) -> Result<PlaylistData, PlaylistError> {
+        // TS: `(storefront || 'us').toLowerCase()` — no trim, empty → 'us'.
+        let sf_raw = storefront.to_ascii_lowercase();
+        let sf = if sf_raw.is_empty() {
+            "us".to_string()
+        } else {
+            sf_raw
+        };
+
+        match self.fetch_playlist_internal(playlist_id, &sf).await {
+            Ok(data) => Ok(data),
+            Err(err) => {
+                if sf != "us" {
+                    tracing::debug!("Retrying playlist lookup on US storefront fallback");
+                    self.fetch_playlist_internal(playlist_id, "us").await
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    /// `fetchPlaylistInternal` — the single-storefront fetch with pagination.
+    async fn fetch_playlist_internal(
+        &self,
+        playlist_id: &str,
+        storefront: &str,
+    ) -> Result<PlaylistData, PlaylistError> {
+        let token = self.get_developer_token().await;
+        let initial_url = format!(
+            "https://amp-api.music.apple.com/v1/catalog/{}/playlists/{}",
+            url_encode(storefront),
+            url_encode(playlist_id)
+        );
+
+        let start = now_ms();
+        let body = match self
+            .http
+            .get(&initial_url, &auth_headers(&token), Duration::from_secs(20))
+            .await
+        {
+            Ok(body) => body,
+            Err(PlaylistHttpError::Network(message)) => {
+                let elapsed_ms = now_ms() - start;
+                tracing::error!(
+                    playlist_id,
+                    elapsed_ms,
+                    "Apple Music playlist request timed out or network failed"
+                );
+                return Err(PlaylistError::TimedOut {
+                    elapsed_ms,
+                    message,
+                });
+            }
+            Err(PlaylistHttpError::Status(404)) => {
+                return Err(PlaylistError::NotFound {
+                    playlist_id: playlist_id.to_string(),
+                    storefront: storefront.to_string(),
+                });
+            }
+            Err(PlaylistHttpError::Status(status)) => {
+                return Err(PlaylistError::Http { status });
+            }
+        };
+
+        let json: RawPlaylistResponse =
+            serde_json::from_str(&body).map_err(|e| PlaylistError::Other(e.to_string()))?;
+
+        let playlist_item =
+            json.data
+                .as_ref()
+                .and_then(|d| d.first())
+                .ok_or(PlaylistError::NoData {
+                    playlist_id: playlist_id.to_string(),
+                })?;
+
+        let title = playlist_item
+            .attributes
+            .as_ref()
+            .and_then(|a| a.name.clone())
+            .unwrap_or_else(|| "Untitled Playlist".to_string());
+        let curator_name = playlist_item
+            .attributes
+            .as_ref()
+            .and_then(|a| a.curator_name.clone());
+        let description = playlist_item
+            .attributes
+            .as_ref()
+            .and_then(|a| a.description.as_ref().and_then(|d| d.standard.clone()));
+
+        let mut tracks: Vec<PlaylistTrack> = Vec::new();
+        let initial_tracks = playlist_item
+            .relationships
+            .as_ref()
+            .and_then(|r| r.tracks.as_ref())
+            .and_then(|t| t.data.as_ref())
+            .map(|d| d.as_slice())
+            .unwrap_or_default();
+        for t in initial_tracks {
+            // TS `if (t.id)` — falsy ids (missing or empty) are skipped.
+            if t.id.as_deref().is_some_and(|id| !id.is_empty()) {
+                tracks.push(map_track(t));
+            }
+        }
+
+        // Pagination: follow `next` while present, joining relative URLs to
+        // the AMP origin. Any failed page silently stops paging (TS break).
+        let mut next_url = playlist_item
+            .relationships
+            .as_ref()
+            .and_then(|r| r.tracks.as_ref())
+            .and_then(|t| t.next.clone());
+        while let Some(next) = next_url {
+            let full_next = if next.starts_with("http") {
+                next
+            } else {
+                format!("https://amp-api.music.apple.com{next}")
+            };
+            match self
+                .http
+                .get(&full_next, &auth_headers(&token), Duration::from_secs(15))
+                .await
+            {
+                Ok(body) => match serde_json::from_str::<RawTracksPageResponse>(&body) {
+                    Ok(page) => {
+                        for t in page.data.unwrap_or_default() {
+                            // TS `if (t.id)` — falsy ids are skipped.
+                            if t.id.as_deref().is_some_and(|id| !id.is_empty()) {
+                                tracks.push(map_track(&t));
+                            }
+                        }
+                        next_url = page.next;
+                    }
+                    Err(_) => break,
+                },
+                Err(_) => break,
+            }
+        }
+
+        tracing::info!(
+            playlist_id,
+            curator = curator_name.as_deref().unwrap_or_default(),
+            track_count = tracks.len(),
+            title = %title,
+            "Apple Music playlist resolved"
+        );
+
+        Ok(PlaylistData {
+            id: playlist_id.to_string(),
+            title,
+            curator_name,
+            description,
+            tracks,
+        })
+    }
+}
+
+fn map_track(t: &RawTrack) -> PlaylistTrack {
+    let raw_id = t.id.clone().unwrap_or_default();
+    PlaylistTrack {
+        id: raw_id.clone(),
+        title: t
+            .attributes
+            .as_ref()
+            .and_then(|a| a.name.clone())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| format!("Track {raw_id}")),
+        artist: t
+            .attributes
+            .as_ref()
+            .and_then(|a| a.artist_name.clone())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "Unknown Artist".to_string()),
+        duration: t
+            .attributes
+            .as_ref()
+            .and_then(|a| a.duration_in_millis)
+            // TS `durationInMillis ? Math.round(ms/1000) : undefined` — 0 or
+            // missing maps to None; Math.round is half-up on .5.
+            .filter(|ms| *ms != 0)
+            .map(|ms| ((ms as f64) / 1000.0).round() as u64),
+    }
+}
+
+/// TS `encodeURIComponent` for path segments.
+fn url_encode(segment: &str) -> String {
+    let mut out = String::new();
+    for byte in segment.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+// ── regex-free scanners for the token scrape (TS regex parity) ──────────
+
+/// `/\/assets\/index~[a-zA-Z0-9]+\.js/` — leftmost match, path + ".js".
+fn find_asset_path(html: &str) -> Option<String> {
+    let pat = "/assets/index~";
+    let mut search_from = 0;
+    while let Some(rel) = html[search_from..].find(pat) {
+        let start = search_from + rel;
+        let after = &html[start + pat.len()..];
+        let hash_len = after
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .count();
+        if hash_len > 0 {
+            let end = start + pat.len() + hash_len;
+            if html[end..].starts_with(".js") {
+                return Some(html[start..end + 3].to_string());
+            }
+        }
+        search_from = start + 1;
+    }
+    None
+}
+
+/// `/developerToken:([$a-zA-Z0-9_]+)/` — capture group 1.
+fn find_developer_token_var(js: &str) -> Option<String> {
+    let pat = "developerToken:";
+    let rel = js.find(pat)?;
+    let after = &js[rel + pat.len()..];
+    let name: String = after
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '$' || *c == '_')
+        .collect();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// `${varName}\\s*=\\s*"([^"]+)"` — first assignment of `var_name`.
+fn find_var_assignment(js: &str, var_name: &str) -> Option<String> {
+    let mut search_from = 0;
+    while let Some(rel) = js[search_from..].find(var_name) {
+        let start = search_from + rel;
+        let rest = &js[start + var_name.len()..];
+        let ws_len = rest.chars().take_while(|c| c.is_whitespace()).count();
+        let rest = &rest[ws_len..];
+        if let Some(stripped) = rest.strip_prefix('=') {
+            let ws_len = stripped.chars().take_while(|c| c.is_whitespace()).count();
+            let rest = &stripped[ws_len..];
+            if let Some(after_quote) = rest.strip_prefix('"') {
+                if let Some(end) = after_quote.find('"') {
+                    return Some(after_quote[..end].to_string());
+                }
+            }
+        }
+        search_from = start + 1;
+    }
+    None
+}
+
+/// `/eyJh[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*/` — first JWT-ish
+/// string starting with `eyJh` (two dots, all segments alphanumeric/-/_).
+fn find_direct_jwt(js: &str) -> Option<String> {
+    let start = js.find("eyJh")?;
+    let rest = &js[start..];
+    let mut end = 0;
+    let mut dots = 0;
+    for (i, ch) in rest.char_indices() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            end = i + ch.len_utf8();
+        } else if ch == '.' && dots < 2 {
+            dots += 1;
+            end = i + 1;
+        } else {
+            break;
+        }
+    }
+    if dots == 2 && end > 0 {
+        Some(rest[..end].to_string())
+    } else {
+        None
+    }
+}
+
+// ── raw AMP response shapes ─────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct RawPlaylistResponse {
+    #[serde(default)]
+    data: Option<Vec<RawPlaylistItem>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawPlaylistItem {
+    #[serde(default)]
+    attributes: Option<RawAttributes>,
+    #[serde(default)]
+    relationships: Option<RawRelationships>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawAttributes {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    curator_name: Option<String>,
+    #[serde(default)]
+    description: Option<RawDescription>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawDescription {
+    #[serde(default)]
+    standard: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawRelationships {
+    #[serde(default)]
+    tracks: Option<RawTracks>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTracks {
+    #[serde(default)]
+    next: Option<String>,
+    #[serde(default)]
+    data: Option<Vec<RawTrack>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTracksPageResponse {
+    #[serde(default)]
+    next: Option<String>,
+    #[serde(default)]
+    data: Option<Vec<RawTrack>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTrack {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    attributes: Option<RawTrackAttributes>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawTrackAttributes {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    artist_name: Option<String>,
+    #[serde(default)]
+    duration_in_millis: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use super::*;
+
+    /// Serves queued responses strictly in request order (first pop wins);
+    /// records every (url, headers) pair for assertions.
+    struct FakeHttp {
+        responses: Mutex<VecDeque<Result<&'static str, PlaylistHttpError>>>,
+        requested: Mutex<Vec<(String, Vec<Header>)>>,
+    }
+
+    impl FakeHttp {
+        fn new(responses: Vec<Result<&'static str, PlaylistHttpError>>) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from(responses)),
+                requested: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn requests(&self) -> Vec<(String, Vec<Header>)> {
+            self.requested.lock().unwrap().clone()
+        }
+    }
+
+    impl PlaylistHttp for FakeHttp {
+        async fn get(
+            &self,
+            url: &str,
+            headers: &[Header],
+            _timeout: Duration,
+        ) -> Result<String, PlaylistHttpError> {
+            self.requested
+                .lock()
+                .unwrap()
+                .push((url.to_string(), headers.to_vec()));
+            match self.responses.lock().unwrap().pop_front() {
+                Some(Ok(body)) => Ok(body.to_string()),
+                Some(Err(e)) => Err(e),
+                None => Err(PlaylistHttpError::Network("no queued response".into())),
+            }
+        }
+    }
+
+    const ASSET_URL: &str = "https://music.apple.com/assets/index~ab12CD.js";
+    const BROWSE_HTML: &str = "<html><script src=\"/assets/index~ab12CD.js\"></script></html>";
+    const JS_ASSET_VAR: &str = "var e=\"eyJhvar.okay.sig\";var t={developerToken:e};";
+    const JS_ASSET_DIRECT: &str = "nothing here eyJhfirst.second.sig tail";
+    const AMP_US_PL1: &str = "https://amp-api.music.apple.com/v1/catalog/us/playlists/pl.1";
+
+    #[tokio::test]
+    async fn token_scrape_via_var_assignment() {
+        let http = FakeHttp::new(vec![Ok(BROWSE_HTML), Ok(JS_ASSET_VAR)]);
+        let client = PlaylistClient::new(http);
+        let token = client.get_developer_token().await;
+        assert_eq!(token, "eyJhvar.okay.sig");
+        assert_eq!(
+            client.http.requests()[0].0,
+            "https://music.apple.com/us/browse"
+        );
+        assert_eq!(client.http.requests()[1].0, ASSET_URL);
+    }
+
+    #[tokio::test]
+    async fn token_scrape_direct_jwt_fallback() {
+        let http = FakeHttp::new(vec![Ok(BROWSE_HTML), Ok(JS_ASSET_DIRECT)]);
+        let client = PlaylistClient::new(http);
+        let token = client.get_developer_token().await;
+        assert_eq!(token, "eyJhfirst.second.sig");
+    }
+
+    #[tokio::test]
+    async fn scrape_failure_falls_back_and_caches_12h() {
+        let http = FakeHttp::new(vec![]); // no responses: first request fails
+        let client = PlaylistClient::new(http);
+        let token = client.get_developer_token().await;
+        assert_eq!(token, FALLBACK_TOKEN);
+        let token2 = client.get_developer_token().await;
+        assert_eq!(token2, FALLBACK_TOKEN);
+        assert_eq!(
+            client.http.requests().len(),
+            1,
+            "fallback cached for 12h — no re-scrape"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_scrape_caches_24h() {
+        let http = FakeHttp::new(vec![Ok(BROWSE_HTML), Ok(JS_ASSET_VAR)]);
+        let client = PlaylistClient::new(http);
+        let _ = client.get_developer_token().await;
+        let _ = client.get_developer_token().await;
+        assert_eq!(
+            client.http.requests().len(),
+            2,
+            "token cache hit — only the initial 2 scrape requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_playlist_sends_auth_headers() {
+        let body = r#"{"data":[{"id":"pl.1","attributes":{"name":"Mix"},"relationships":{"tracks":{"data":[{"id":"100","attributes":{"name":"T1","artistName":"A1","durationInMillis":1500}}]}}}]}"#;
+        let http = FakeHttp::new(vec![Ok(BROWSE_HTML), Ok(JS_ASSET_VAR), Ok(body)]);
+        let client = PlaylistClient::new(http);
+        let data = client.fetch_playlist_tracks("pl.1", "us").await.unwrap();
+        assert_eq!(data.title, "Mix");
+        assert_eq!(data.tracks.len(), 1);
+        assert_eq!(data.tracks[0].duration, Some(2));
+
+        let requests = client.http.requests();
+        let amp_call = requests
+            .iter()
+            .find(|(url, _)| url.contains("amp-api"))
+            .expect("amp call recorded");
+        assert_eq!(amp_call.0, AMP_US_PL1);
+        let header = |name: &str| {
+            amp_call
+                .1
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(header("Authorization"), "Bearer eyJhvar.okay.sig");
+        assert_eq!(header("Origin"), "https://music.apple.com");
+        assert_eq!(header("User-Agent"), APPLE_USER_AGENT);
+    }
+
+    #[tokio::test]
+    async fn fetch_playlist_404_then_us_fallback() {
+        // Storefront 'gb' 404s → retried on 'us' which succeeds.
+        let us_body = r#"{"data":[{"id":"pl.1","attributes":{"name":"US"},"relationships":{"tracks":{"data":[{"id":"7"}]}}}]}"#;
+        let http = FakeHttp::new(vec![
+            Ok(BROWSE_HTML),
+            Ok(JS_ASSET_VAR),
+            Err(PlaylistHttpError::Status(404)),
+            Ok(us_body),
+        ]);
+        let client = PlaylistClient::new(http);
+        let data = client.fetch_playlist_tracks("pl.1", "gb").await.unwrap();
+        assert_eq!(data.title, "US");
+        assert_eq!(data.tracks.len(), 1);
+        assert_eq!(data.tracks[0].title, "Track 7");
+        assert_eq!(data.tracks[0].artist, "Unknown Artist");
+        let requests = client.http.requests();
+        assert_eq!(
+            requests[2].0,
+            "https://amp-api.music.apple.com/v1/catalog/gb/playlists/pl.1"
+        );
+        assert_eq!(requests[3].0, AMP_US_PL1);
+    }
+
+    #[tokio::test]
+    async fn fetch_playlist_404_on_us_reports_not_found() {
+        let http = FakeHttp::new(vec![
+            Ok(BROWSE_HTML),
+            Ok(JS_ASSET_VAR),
+            Err(PlaylistHttpError::Status(404)),
+        ]);
+        let client = PlaylistClient::new(http);
+        let err = client
+            .fetch_playlist_tracks("pl.1", "us")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Playlist pl.1 not found on storefront 'us'"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_playlist_http_error_string() {
+        let http = FakeHttp::new(vec![
+            Ok(BROWSE_HTML),
+            Ok(JS_ASSET_VAR),
+            Err(PlaylistHttpError::Status(503)),
+        ]);
+        let client = PlaylistClient::new(http);
+        let err = client
+            .fetch_playlist_tracks("pl.1", "us")
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "Apple Music API returned HTTP 503");
+    }
+
+    #[tokio::test]
+    async fn fetch_playlist_no_data() {
+        let body = r#"{"data":[]}"#;
+        let http = FakeHttp::new(vec![Ok(BROWSE_HTML), Ok(JS_ASSET_VAR), Ok(body)]);
+        let client = PlaylistClient::new(http);
+        let err = client
+            .fetch_playlist_tracks("pl.x", "us")
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "No playlist found matching ID pl.x");
+    }
+
+    #[tokio::test]
+    async fn fetch_playlist_untitled_defaults() {
+        let body = r#"{"data":[{"id":"pl.1","relationships":{"tracks":{"data":[{"id":"7"}]}}}]}"#;
+        let http = FakeHttp::new(vec![Ok(BROWSE_HTML), Ok(JS_ASSET_VAR), Ok(body)]);
+        let client = PlaylistClient::new(http);
+        let data = client.fetch_playlist_tracks("pl.1", "us").await.unwrap();
+        assert_eq!(data.title, "Untitled Playlist");
+        assert!(data.curator_name.is_none());
+        assert!(data.description.is_none());
+    }
+
+    #[tokio::test]
+    async fn pagination_follows_next() {
+        let first = r#"{"data":[{"id":"pl.p","relationships":{"tracks":{"next":"/v1/catalog/us/playlists/pl.p/tracks?offset=100","data":[{"id":"1"}]}}}]}"#;
+        let page = r#"{"next":null,"data":[{"id":"2"},{"id":"3"}]}"#;
+        let http = FakeHttp::new(vec![Ok(BROWSE_HTML), Ok(JS_ASSET_VAR), Ok(first), Ok(page)]);
+        let client = PlaylistClient::new(http);
+        let data = client.fetch_playlist_tracks("pl.p", "us").await.unwrap();
+        assert_eq!(data.tracks.len(), 3);
+        let requests = client.http.requests();
+        assert_eq!(
+            requests[3].0,
+            "https://amp-api.music.apple.com/v1/catalog/us/playlists/pl.p/tracks?offset=100"
+        );
+    }
+
+    #[tokio::test]
+    async fn pagination_absolute_next_url() {
+        let first = r#"{"data":[{"id":"pl.p","relationships":{"tracks":{"next":"https://amp-api.music.apple.com/v1/catalog/us/playlists/pl.p/tracks?offset=1","data":[{"id":"1"}]}}}]}"#;
+        let page = r#"{"next":null,"data":[{"id":"2"}]}"#;
+        let http = FakeHttp::new(vec![Ok(BROWSE_HTML), Ok(JS_ASSET_VAR), Ok(first), Ok(page)]);
+        let client = PlaylistClient::new(http);
+        let data = client.fetch_playlist_tracks("pl.p", "us").await.unwrap();
+        assert_eq!(data.tracks.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn pagination_stops_on_bad_page() {
+        let first = r#"{"data":[{"id":"pl.p","relationships":{"tracks":{"next":"/v1/catalog/us/playlists/pl.p/tracks?offset=100","data":[{"id":"1"}]}}}]}"#;
+        let bad = "not json at all";
+        let http = FakeHttp::new(vec![Ok(BROWSE_HTML), Ok(JS_ASSET_VAR), Ok(first), Ok(bad)]);
+        let client = PlaylistClient::new(http);
+        let data = client.fetch_playlist_tracks("pl.p", "us").await.unwrap();
+        assert_eq!(data.tracks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn empty_storefront_becomes_us() {
+        let body = r#"{"data":[{"id":"pl.1","attributes":{"name":"US"},"relationships":{"tracks":{"data":[]}}}]}"#;
+        let http = FakeHttp::new(vec![Ok(BROWSE_HTML), Ok(JS_ASSET_VAR), Ok(body)]);
+        let client = PlaylistClient::new(http);
+        let data = client.fetch_playlist_tracks("pl.1", "").await.unwrap();
+        assert_eq!(data.title, "US");
+        let requests = client.http.requests();
+        assert_eq!(requests[2].0, AMP_US_PL1);
+    }
+
+    #[test]
+    fn asset_path_scanner() {
+        assert_eq!(
+            find_asset_path("<script src=\"/assets/index~ab12CD.js\">"),
+            Some("/assets/index~ab12CD.js".to_string())
+        );
+        assert_eq!(find_asset_path("no assets"), None);
+        assert_eq!(find_asset_path("/assets/index~.js"), None);
+    }
+
+    #[test]
+    fn developer_token_var_scanner() {
+        assert_eq!(
+            find_developer_token_var("var t={developerToken:e};"),
+            Some("e".to_string())
+        );
+        assert_eq!(
+            find_developer_token_var("developerToken:$abc_1 rest"),
+            Some("$abc_1".to_string())
+        );
+        assert_eq!(find_developer_token_var("nothing"), None);
+    }
+
+    #[test]
+    fn var_assignment_scanner() {
+        assert_eq!(
+            find_var_assignment("var e = \"tok\";", "e"),
+            Some("tok".to_string())
+        );
+        assert_eq!(
+            find_var_assignment("var e=\"tok\";more", "e"),
+            Some("tok".to_string())
+        );
+        assert_eq!(
+            find_var_assignment("var $e=\"t\";", "$e"),
+            Some("t".to_string())
+        );
+        assert_eq!(find_var_assignment("var f=\"x\";", "e"), None);
+    }
+
+    #[test]
+    fn direct_jwt_scanner() {
+        assert_eq!(
+            find_direct_jwt("x eyJhseg1.seg2.seg3 y"),
+            Some("eyJhseg1.seg2.seg3".to_string())
+        );
+        assert_eq!(find_direct_jwt("no jwt"), None);
+        assert_eq!(find_direct_jwt("eyJh only.one"), None);
+    }
+
+    #[test]
+    fn url_encode_keeps_unreserved() {
+        assert_eq!(url_encode("us"), "us");
+        assert_eq!(url_encode("pl.1234"), "pl.1234");
+        assert_eq!(url_encode("a b/c"), "a%20b%2Fc");
+    }
+}

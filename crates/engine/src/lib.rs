@@ -3,10 +3,13 @@
 
 pub mod catalog;
 pub mod lyrics;
+pub mod orchestrator;
 pub mod parser;
+pub mod playlist;
 pub mod progress;
 pub mod queue;
 pub mod ripper;
+pub mod settings;
 pub mod streaming;
 pub mod tagger;
 pub mod types;
