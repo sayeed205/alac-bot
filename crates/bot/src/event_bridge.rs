@@ -309,6 +309,12 @@ async fn update_status_message(
     job: &ActiveRipJob,
     progress: &RipJobProgress,
 ) -> Result<(), String> {
+    // While resolving (total unknown), the initial "Resolving..." message
+    // stays untouched — the oracle only begins progress edits once the
+    // header and tracklist are known.
+    if progress.total_tracks == 0 {
+        return Ok(());
+    }
     let registry = registry();
     if registry.editor(&job.id).is_none() {
         let sink: Arc<dyn StatusSink> = Arc::new(TelegramStatusSink {

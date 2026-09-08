@@ -17,20 +17,25 @@ pub async fn dispatch_dashboard(state: Arc<BotState>, query: CallbackQuery) {
         .map(super::marked_peer_id)
         .unwrap_or(query.user_id);
 
-    // dashboard:prev / dashboard:next / dashboard:refresh[:page]
-    let page = if let Some(base) = data.strip_prefix("dashboard:refresh") {
-        base.strip_prefix(':')
-            .and_then(|p| p.parse::<usize>().ok())
-            .unwrap_or(1)
-    } else {
-        // prev/next edits the dashboard message and passes its current page.
-        data.rsplit(':')
-            .next()
-            .and_then(|p| p.parse::<usize>().ok())
-            .unwrap_or(1)
+    // Buttons are `dashboard:{action}:{current_page}` — the data carries the
+    // page the dashboard was rendered on, and the action determines the
+    // target page.
+    let Some(payload) = data.strip_prefix("dashboard:") else {
+        return;
+    };
+    let mut parts = payload.split(':');
+    let action = parts.next().unwrap_or("refresh").to_owned();
+    let current = parts
+        .next()
+        .and_then(|p| p.parse::<usize>().ok())
+        .unwrap_or(1);
+    let target = match action.as_str() {
+        "prev" => current.saturating_sub(1),
+        "next" => current + 1,
+        _ => current,
     };
 
-    if data.starts_with("dashboard:refresh") {
+    if action == "refresh" {
         // Re-pull the latest engine snapshot rather than trusting the
         // message-local copy.
         let snapshot = crate::event_bridge::current_snapshot(&state).await;
@@ -38,7 +43,7 @@ pub async fn dispatch_dashboard(state: Arc<BotState>, query: CallbackQuery) {
             .refresh_entry_from(chat, snapshot)
             .await;
     } else {
-        crate::dashboard_manager().page(chat, page).await;
+        crate::dashboard_manager().page(chat, target).await;
     }
 
     let _ = query.answer().send(&state.client).await;

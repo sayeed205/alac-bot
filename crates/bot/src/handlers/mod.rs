@@ -41,6 +41,25 @@ pub(crate) fn marked_peer_id(peer: &ferogram::tl::enums::Peer) -> i64 {
     }
 }
 
+/// Marked chat id for a message's chat, in the storage/DB format.
+/// `msg.chat_id()` returns RAW TL ids (positive for channels), which is a
+/// different format — never mix the two.
+pub(crate) fn marked_chat_id(msg: &ferogram::update::IncomingMessage) -> i64 {
+    msg.peer_id()
+        .map(marked_peer_id)
+        // Peerless updates have no chat; 0 preserves prior behavior.
+        .unwrap_or_default()
+}
+
+/// Chat peer for sends/edits, derived from the message's TL peer so channel
+/// and group ids resolve correctly (PeerRef::from(i64) expects marked ids).
+pub(crate) fn chat_peer_ref(msg: &ferogram::update::IncomingMessage) -> ferogram::PeerRef {
+    msg.peer_id()
+        .map(|peer| ferogram::PeerRef::Peer(peer.clone()))
+        // Fallback mirrors prior behavior for peerless updates.
+        .unwrap_or(ferogram::PeerRef::from(msg.chat_id()))
+}
+
 /// Peer link parity with the TS oracle's getPeerLink: @name -> t.me link,
 /// user id -> tg://user, group/channel id -> t.me/c/ link.
 pub(crate) fn peer_link(name: &str, id: i64) -> String {

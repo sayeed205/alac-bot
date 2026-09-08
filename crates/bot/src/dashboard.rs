@@ -240,7 +240,13 @@ impl DashboardManager {
             })
         };
         if let Some((sink, id, text, keyboard)) = work {
-            let _ = sink.edit(id, &text, keyboard).await;
+            // A successful user-driven edit closes any flood episode: the
+            // next flood wait is a new episode and may warn again.
+            if sink.edit(id, &text, keyboard).await.is_ok() {
+                if let Some(entry) = self.entries.lock().await.get_mut(&chat) {
+                    entry.warning_sent = false;
+                }
+            }
         }
     }
     pub async fn refresh_all(&self, snapshot: DashboardSnapshot) {
@@ -325,13 +331,23 @@ impl DashboardManager {
         let work = {
             let mut entries = self.entries.lock().await;
             entries.get_mut(&chat).map(|entry| {
+                // Clamp to the real page range so repeated Next taps from
+                // the last page stay on the last page.
+                let pages = entry.snapshot.jobs.len().div_ceil(5).max(1);
+                let page = page.clamp(1, pages);
                 entry.page = page;
                 let (text, keyboard) = render(&entry.snapshot, page, entry.viewer_is_admin);
                 (Arc::clone(&entry.sink), entry.id, text, keyboard)
             })
         };
         if let Some((sink, id, text, keyboard)) = work {
-            let _ = sink.edit(id, &text, keyboard).await;
+            // Successful user-driven edits close a flood episode, matching
+            // refresh_entry_from.
+            if sink.edit(id, &text, keyboard).await.is_ok() {
+                if let Some(entry) = self.entries.lock().await.get_mut(&chat) {
+                    entry.warning_sent = false;
+                }
+            }
         }
     }
 }

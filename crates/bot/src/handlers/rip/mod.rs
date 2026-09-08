@@ -39,7 +39,7 @@ pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
 
 async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
     let sender = msg.sender_user_id().unwrap_or_default();
-    let chat = msg.chat_id();
+    let chat = super::marked_chat_id(&msg);
     if !state
         .auth
         .is_authorized(sender, Some(chat))
@@ -101,9 +101,10 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
     // job; on success delivery is retargeted to the DM.
     let mut delivery_chat_id = chat;
     if is_group && !is_cache {
-        let note = InputMessage::html(
-            "📥 <b>Download Queued:</b><br/>Tracks requested in this group will be delivered here!",
-        )
+        let note = InputMessage::html(format!(
+            "📥 <b>Download Queued:</b><br/>Tracks requested in <b>{}</b> will be delivered here!",
+            crate::html::escape(&display_name)
+        ))
         .silent(true);
         match state
             .client
@@ -137,7 +138,7 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
     // Initial resolving status message (engine options carry its id).
     let status_sink = Arc::new(status::TelegramStatusSink {
         client: state.client.clone(),
-        peer: ferogram::PeerRef::from(chat),
+        peer: super::chat_peer_ref(&msg),
     }) as Arc<dyn status::StatusSink>;
     let status_message_id = match status_sink.send(status::initial_text(), None).await {
         Ok(id) => id,
@@ -180,7 +181,7 @@ async fn handle_cancel_command(state: Arc<BotState>, msg: ferogram::update::Inco
     let caller = msg.sender_user_id().unwrap_or_default();
     let admin = state.auth.is_admin(caller);
     let name = if admin { "Admin" } else { "User" };
-    if cancel::cancel_command(&state, msg.chat_id(), caller, admin, name).await {
+    if cancel::cancel_command(&state, super::marked_chat_id(&msg), caller, admin, name).await {
         reply(&msg, cancel::COMMAND_ACK).await;
     } else {
         reply(&msg, cancel::NO_ACTIVE).await;

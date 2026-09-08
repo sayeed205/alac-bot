@@ -78,7 +78,7 @@ pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
             let user = msg.sender_user_id().unwrap_or_default();
             if !state
                 .auth
-                .is_authorized(user, Some(msg.chat_id()))
+                .is_authorized(user, Some(super::marked_chat_id(&msg)))
                 .await
                 .unwrap_or(false)
             {
@@ -87,12 +87,12 @@ pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
             let admin = state.auth.is_admin(user);
             let sink: Arc<dyn DashboardSink> = Arc::new(TelegramSink {
                 client: state.client.clone(),
-                peer: PeerRef::from(msg.chat_id()),
+                peer: super::chat_peer_ref(&msg),
             });
             // Real engine snapshot, viewer-scoped at open time.
             let snapshot = event_bridge::current_snapshot(&state).await;
             let _ = dashboard_manager()
-                .open(msg.chat_id(), user, admin, sink, snapshot)
+                .open(super::marked_chat_id(&msg), user, admin, sink, snapshot)
                 .await;
         }
     });
