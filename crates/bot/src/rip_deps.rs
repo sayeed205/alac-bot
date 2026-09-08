@@ -120,6 +120,11 @@ impl RipDeps {
     pub fn catalog(&self) -> &Catalog<ReqwestTransport> {
         &self.catalog
     }
+
+    /// Apple Music playlist client (autodump's developer-token + catalog API).
+    pub fn playlist(&self) -> &PlaylistClient<ReqwestPlaylistHttp> {
+        &self.playlist
+    }
 }
 
 impl OrchestratorDeps for RipDeps {

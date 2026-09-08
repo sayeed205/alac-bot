@@ -125,12 +125,14 @@ name = "bot"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "db",
  "dotenvy",
  "engine",
  "ferogram",
  "futures-util",
  "regex",
+ "reqwest",
  "serde_json",
  "tokio",
  "tokio-util",

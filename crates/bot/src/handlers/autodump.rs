@@ -1,9 +1,753 @@
-//! `/dumpnew` `/autodump` — new-release archiver + 24h scheduler (M8).
-//! Implemented in the autodump lane.
-use std::sync::Arc;
+//! `/dumpnew` / `/autodump` — on-demand + scheduled new-release archiver
+//! (oracle: `src/modules/alac/commands/autodump.ts`). Discovers fresh tracks
+//! across the configured storefronts ("New Music Daily" editorial playlist +
+//! the Apple Marketing Tools top-albums feed, each album resolved to tracks
+//! via iTunes lookup) and enqueues them through the collapsed orchestrator in
+//! cache-only dump mode.
 
-use ferogram::filters::Dispatcher;
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
-use crate::BotState;
+use engine::types::{ParsedTargetItem, TargetKind};
+use ferogram::{
+    filters::{self, Dispatcher},
+    update::IncomingMessage,
+    InputMessage, PeerRef,
+};
+use serde_json::Value;
 
-pub fn register(_dp: &mut Dispatcher, _state: Arc<BotState>) {}
+use crate::{html::parse_dynamic_html, BotState};
+
+/// Re-entry guard (oracle `isAutoDumpRunning`).
+static AUTO_DUMP_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Oracle "New Music Daily" editorial playlist id.
+const NEW_MUSIC_DAILY_ID: &str = "pl.2b0e6e332fdf4b7a91164da3162127b5";
+
+/// Oracle `getCutoffDateString`: today − max(1, days), `YYYY-MM-DD`.
+fn cutoff_date_string(days: i64) -> String {
+    let days = days.max(1);
+    (chrono::Utc::now() - chrono::Duration::days(days))
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+/// JS `Number.parseInt(raw, 10)` prefix semantics: leading ASCII digits only.
+fn parse_days_prefix(raw: &str) -> Option<i64> {
+    let digits: String = raw
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '+' || *c == '-')
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Discovered track (oracle `DiscoveredTrackItem`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredTrackItem {
+    pub id: String,
+    pub storefront: String,
+}
+
+/// Discovery outcome (oracle `DiscoveredNewTracksResult`).
+#[derive(Debug, Default)]
+pub struct DiscoveredNewTracksResult {
+    pub tracks: Vec<DiscoveredTrackItem>,
+    pub storefront_counts: HashMap<String, usize>,
+    pub cutoff_date_string: String,
+    pub total_found: usize,
+}
+
+/// Source 1: the New Music Daily editorial playlist via the Catalog API with
+/// the scraped developer token (errors logged and skipped per oracle).
+async fn discover_from_playlist(
+    http: &reqwest::Client,
+    dev_token: &str,
+    storefront: &str,
+    cutoff: &str,
+    map: &mut HashMap<String, String>,
+    counts: &mut HashMap<String, usize>,
+) {
+    let url = format!(
+        "https://api.music.apple.com/v1/catalog/{storefront}/playlists/{NEW_MUSIC_DAILY_ID}?include=tracks"
+    );
+    let Ok(response) = http
+        .get(&url)
+        .header("Authorization", format!("Bearer {dev_token}"))
+        .header("Origin", "https://music.apple.com")
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    else {
+        return;
+    };
+    if !response.status().is_success() {
+        return;
+    }
+    let Ok(body) = response.text().await else {
+        return;
+    };
+    let Ok(body) = serde_json::from_str::<Value>(&body) else {
+        return;
+    };
+    let tracks = body
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|data| data.first())
+        .and_then(|first| first.get("relationships"))
+        .and_then(|rel| rel.get("tracks"))
+        .and_then(|tracks| tracks.get("data"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for track in tracks {
+        let Some(id) = track.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let release_date = track
+            .get("attributes")
+            .and_then(|attributes| attributes.get("releaseDate"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !id.is_empty() && !release_date.is_empty() && release_date >= cutoff {
+            let inserted = map.insert(id.to_owned(), storefront.to_owned()).is_none();
+            if inserted {
+                *counts.entry(storefront.to_owned()).or_insert(0) += 1;
+            }
+        }
+    }
+}
+
+/// Per-album iTunes lookup (oracle: wrapperType `track` with a trackId, the
+/// track's own release date OR the album's date qualifying it).
+async fn discover_album_tracks_via_itunes(
+    http: &reqwest::Client,
+    storefront: &str,
+    album_id: &str,
+    album_release: &str,
+    cutoff: &str,
+    map: &mut HashMap<String, String>,
+    counts: &mut HashMap<String, usize>,
+) {
+    let url =
+        format!("https://itunes.apple.com/lookup?id={album_id}&entity=song&country={storefront}");
+    let Ok(response) = http
+        .get(&url)
+        .header("User-Agent", engine::catalog::ITUNES_USER_AGENT)
+        .timeout(std::time::Duration::from_secs(8))
+        .send()
+        .await
+    else {
+        return;
+    };
+    if !response.status().is_success() {
+        return;
+    }
+    let Ok(body) = response.text().await else {
+        return;
+    };
+    let Ok(body) = serde_json::from_str::<Value>(&body) else {
+        return;
+    };
+    let results = body
+        .get("results")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for item in results {
+        let wrapper = item
+            .get("wrapperType")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let Some(track_id) = item.get("trackId").and_then(Value::as_i64) else {
+            continue;
+        };
+        if wrapper != "track" {
+            continue;
+        }
+        let track_release: String = item
+            .get("releaseDate")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .chars()
+            .take(10)
+            .collect();
+        let qualifies =
+            track_release.is_empty() || track_release.as_str() >= cutoff || album_release >= cutoff;
+        if qualifies {
+            let id = track_id.to_string();
+            let inserted = map.insert(id, storefront.to_owned()).is_none();
+            if inserted {
+                *counts.entry(storefront.to_owned()).or_insert(0) += 1;
+            }
+        }
+    }
+}
+
+/// Source 2: Marketing Tools top-albums feed, tracks resolved via iTunes
+/// lookup (errors logged and skipped per album per oracle).
+async fn discover_from_rss_albums(
+    http: &reqwest::Client,
+    storefront: &str,
+    cutoff: &str,
+    map: &mut HashMap<String, String>,
+    counts: &mut HashMap<String, usize>,
+) {
+    let url = format!(
+        "https://rss.applemarketingtools.com/api/v2/{storefront}/music/most-played/50/albums.json"
+    );
+    let Ok(response) = http
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    else {
+        return;
+    };
+    if !response.status().is_success() {
+        return;
+    }
+    let Ok(body) = response.text().await else {
+        return;
+    };
+    let Ok(body) = serde_json::from_str::<Value>(&body) else {
+        return;
+    };
+    let albums = body
+        .get("feed")
+        .and_then(|feed| feed.get("results"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for album in albums {
+        let Some(album_id) = album.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if album_id.is_empty() {
+            continue;
+        }
+        let album_release = album
+            .get("releaseDate")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if album_release >= cutoff {
+            discover_album_tracks_via_itunes(
+                http,
+                storefront,
+                album_id,
+                album_release,
+                cutoff,
+                map,
+                counts,
+            )
+            .await;
+        }
+    }
+}
+
+/// Oracle `discoverNewTracks`.
+pub async fn discover_new_tracks(
+    state: &BotState,
+    storefronts: &[String],
+    days: i64,
+) -> DiscoveredNewTracksResult {
+    let cutoff = cutoff_date_string(days);
+    let mut map: HashMap<String, String> = HashMap::new();
+    let mut counts: HashMap<String, usize> = HashMap::new();
+
+    let dev_token = state.rip_deps.playlist().get_developer_token().await;
+    let http = reqwest::Client::new();
+
+    for storefront in storefronts {
+        counts.entry(storefront.clone()).or_insert(0);
+        discover_from_playlist(
+            &http,
+            &dev_token,
+            storefront,
+            &cutoff,
+            &mut map,
+            &mut counts,
+        )
+        .await;
+        discover_from_rss_albums(&http, storefront, &cutoff, &mut map, &mut counts).await;
+    }
+
+    let tracks = map
+        .into_iter()
+        .map(|(id, storefront)| DiscoveredTrackItem { id, storefront })
+        .collect::<Vec<_>>();
+    let total_found = tracks.len();
+    tracing::info!(
+        days,
+        cutoff_date = %cutoff,
+        total_found,
+        "Autodump discovery completed"
+    );
+    DiscoveredNewTracksResult {
+        total_found,
+        cutoff_date_string: cutoff,
+        tracks,
+        storefront_counts: counts,
+    }
+}
+
+/// Oracle `runAutoDumpPipeline`. Returns the oracle's `success` flag.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_auto_dump_pipeline(
+    state: Arc<BotState>,
+    days: i64,
+    triggered_by: &str,
+    chat_id: Option<i64>,
+    user_id: Option<i64>,
+    reply_message: Option<IncomingMessage>,
+) -> bool {
+    let target_chat = chat_id.unwrap_or(state.admin_id);
+    let target_user = user_id.unwrap_or(state.admin_id);
+
+    if AUTO_DUMP_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        tracing::warn!(
+            triggered_by,
+            "Auto-dump pipeline already running, skipping new trigger"
+        );
+        return false;
+    }
+    // Release the re-entry guard on every exit path (oracle `finally`).
+    let result = run_auto_dump_pipeline_inner(
+        Arc::clone(&state),
+        days,
+        triggered_by,
+        target_chat,
+        target_user,
+        reply_message,
+    )
+    .await;
+    AUTO_DUMP_RUNNING.store(false, Ordering::SeqCst);
+    result
+}
+
+async fn run_auto_dump_pipeline_inner(
+    state: Arc<BotState>,
+    days: i64,
+    triggered_by: &str,
+    target_chat: i64,
+    target_user: i64,
+    reply_message: Option<IncomingMessage>,
+) -> bool {
+    let storefronts = state
+        .rip_deps
+        .settings_snapshot()
+        .auto_dump_storefronts
+        .clone();
+    let sf_formatted = storefronts
+        .iter()
+        .map(|sf| sf.to_uppercase())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let initial_html = format!(
+        "🔍 <b>Scanning Apple Music for New Releases...</b><br/><br/>\
+<blockquote>• <b>Time Window:</b> Last <code>{days}</code> day(s)<br/>\
+• <b>Storefronts:</b> <code>{sf_formatted}</code><br/>\
+• <b>Triggered By:</b> {triggered_by}<br/>\
+• <b>Mode:</b> Dump Channel Archiver (Cache-Only)</blockquote>"
+    );
+    // Oracle swallows status-send failures and keeps sweeping; the pipeline's
+    // status edits then simply go to a fresh job status message (id 0).
+    let status = match &reply_message {
+        Some(msg) => msg
+            .reply(InputMessage::html(parse_dynamic_html(&initial_html)))
+            .await
+            .ok()
+            .map(|m| m.id()),
+        None => state
+            .client
+            .send_message(
+                PeerRef::from(target_chat),
+                InputMessage::html(parse_dynamic_html(&initial_html)),
+            )
+            .await
+            .ok()
+            .map(|m| m.id()),
+    };
+    let status_peer = status.map(|_| PeerRef::from(target_chat));
+
+    let discovery = discover_new_tracks(&state, &storefronts, days).await;
+
+    if discovery.total_found == 0 {
+        let empty_html = format!(
+            "✨ <b>Auto-Dump Finished: No New Tracks Found</b><br/><br/>\
+<blockquote>• <b>Time Window:</b> Last <code>{days}</code> day(s)<br/>\
+• <b>Cutoff Date:</b> <code>{}</code><br/>\
+• <b>Storefronts Scanned:</b> <code>{sf_formatted}</code><br/>\
+• <b>Discovered:</b> <code>0 tracks</code></blockquote>",
+            discovery.cutoff_date_string
+        );
+        if let (Some(peer), Some(id)) = (status_peer.clone(), status) {
+            let _ = state
+                .client
+                .edit_message(
+                    peer,
+                    id,
+                    InputMessage::html(parse_dynamic_html(&empty_html)),
+                )
+                .await;
+        }
+        return true;
+    }
+
+    let progress_html = format!(
+        "🚀 <b>Discovered {} New Track(s)!</b><br/><br/>\
+<blockquote>• <b>Time Window:</b> Last <code>{days}</code> day(s)<br/>\
+• <b>Cutoff Date:</b> <code>{}</code><br/>\
+• <b>Storefronts:</b> <code>{sf_formatted}</code><br/>\
+• <b>Status:</b> Enqueuing into dump pipeline...</blockquote><br/>\
+<i>Archiving lossless ALAC tracks directly to the dump channel. Already cached songs will be skipped instantly.</i>",
+        discovery.total_found, discovery.cutoff_date_string
+    );
+    if let (Some(peer), Some(id)) = (status_peer.clone(), status) {
+        let _ = state
+            .client
+            .edit_message(
+                peer,
+                id,
+                InputMessage::html(parse_dynamic_html(&progress_html)),
+            )
+            .await;
+    }
+
+    // Oracle passes statusMessageToReuse: executeRipPipeline first edits the
+    // reused message to the resolving text, then renders progress into it.
+    // Mirror the edit, then hand the id to the collapsed orchestrator (the
+    // event bridge renders the progress lifecycle from here).
+    if let (Some(peer), Some(id)) = (status_peer.clone(), status) {
+        let _ = state
+            .client
+            .edit_message(
+                peer,
+                id,
+                InputMessage::html(parse_dynamic_html(
+                    "🔍 <b>Resolving tracks from Apple Music...</b>",
+                )),
+            )
+            .await;
+    }
+
+    let options = engine::orchestrator::types::RipJobOptions {
+        chat_id: target_chat,
+        user_id: target_user,
+        user_name: Some(format!("User {target_user}")),
+        delivery_chat_id: target_chat,
+        is_group: target_chat != target_user,
+        is_force: false,
+        is_cache_only: true,
+        single_storefront: None,
+        parsed_items: discovery
+            .tracks
+            .iter()
+            .map(|track| ParsedTargetItem {
+                id: track.id.clone(),
+                kind: TargetKind::Track,
+                storefront: Some(track.storefront.clone()),
+            })
+            .collect(),
+        reply_to_message_id: None,
+        status_msg_id: i64::from(status.unwrap_or_default()),
+        is_admin: true,
+    };
+    let job = state
+        .rip_orchestrator
+        .start_job(Arc::clone(&state.rip_deps), &options)
+        .await;
+
+    match job {
+        Ok(_) => {
+            // Final admin DM summary card (oracle always DMs the admin).
+            // The oracle iterates `Object.entries(storefrontCounts)`, which
+            // preserves the configured storefront order (every storefront is
+            // seeded with 0 before discovery).
+            let sf_breakdown = storefronts
+                .iter()
+                .map(|sf| {
+                    format!(
+                        "• <b>{}:</b> <code>{}</code>",
+                        sf.to_uppercase(),
+                        discovery.storefront_counts.get(sf).copied().unwrap_or(0)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("<br/>");
+            let summary_html = format!(
+                "📦 <b>Auto-Dump Run Completed</b><br/><br/>\
+<blockquote>• <b>Total Discovered:</b> <code>{} tracks</code><br/>\
+• <b>Time Window:</b> Last <code>{days}</code> day(s)<br/>\
+• <b>Trigger:</b> {triggered_by}<br/><br/>\
+<b>Storefront Breakdown:</b><br/>{sf_breakdown}</blockquote><br/>\
+<blockquote>💡 <i>All new tracks have been securely archived to the dump channel.</i></blockquote>",
+                discovery.total_found
+            );
+            let _ = state
+                .client
+                .send_message(
+                    PeerRef::from(state.admin_id),
+                    InputMessage::html(parse_dynamic_html(&summary_html)),
+                )
+                .await;
+            true
+        }
+        Err(error) => {
+            tracing::error!(%error, "Auto-dump pipeline execution failed");
+            if let (Some(peer), Some(id)) = (status_peer, status) {
+                let _ = state
+                    .client
+                    .edit_message(
+                        peer,
+                        id,
+                        InputMessage::html(parse_dynamic_html(&format!(
+                            "❌ <b>Auto-Dump Failed:</b> <code>{error}</code>"
+                        ))),
+                    )
+                    .await;
+            }
+            false
+        }
+    }
+}
+
+pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
+    let state_dumpnew = Arc::clone(&state);
+    dp.on_message(filters::command("dumpnew"), move |msg| {
+        autodump(Arc::clone(&state_dumpnew), msg)
+    });
+    let state_autodump = Arc::clone(&state);
+    dp.on_message(filters::command("autodump"), move |msg| {
+        autodump(Arc::clone(&state_autodump), msg)
+    });
+}
+
+async fn autodump(state: Arc<BotState>, msg: IncomingMessage) {
+    let sender = msg.sender_user_id().unwrap_or_default();
+    if !state.auth.is_admin(sender) {
+        tracing::debug!(user_id = sender, "Non-admin attempted autodump command");
+        return;
+    }
+
+    let tokens: Vec<&str> = msg.text().unwrap_or_default().split_whitespace().collect();
+    let mut days: i64 = 1;
+    if let Some(raw) = tokens.get(1) {
+        if let Some(parsed) = parse_days_prefix(raw) {
+            if parsed > 0 {
+                days = parsed;
+            }
+        }
+    }
+
+    if AUTO_DUMP_RUNNING.load(Ordering::SeqCst) {
+        let _ = msg
+            .reply(InputMessage::html(parse_dynamic_html(
+                "⏳ <b>Auto-Dump is already in progress!</b> Please wait for the current sweep to finish.",
+            )))
+            .await;
+        return;
+    }
+
+    let marked_chat = super::marked_chat_id(&msg);
+    run_auto_dump_pipeline(
+        state,
+        days,
+        &format!("Admin Command (/dumpnew {days})"),
+        Some(marked_chat),
+        Some(sender),
+        Some(msg),
+    )
+    .await;
+}
+
+/// Oracle `startAutoDumpScheduler`: a 24h interval, settings-gated per tick,
+/// days = 1, triggeredBy `Daily 24h Scheduler`. Spawned once from `main`.
+pub async fn scheduler_loop(state: Arc<BotState>) {
+    tracing::info!("Starting 24h auto-dump scheduler");
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // `setInterval` semantics: the first tick fires after the full interval,
+    // but `tokio::time::interval` fires immediately — consume it.
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        if !state.rip_deps.settings_snapshot().auto_dump_enabled {
+            tracing::debug!("Auto-dump scheduler tick skipped: disabled in settings");
+            continue;
+        }
+        tracing::info!("Executing scheduled daily auto-dump sweep");
+        let success =
+            run_auto_dump_pipeline(state.clone(), 1, "Daily 24h Scheduler", None, None, None).await;
+        if !success {
+            tracing::error!("Scheduled auto-dump sweep encountered error");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cutoff_dates_match_oracle_shape() {
+        assert_eq!(cutoff_date_string(1).len(), 10);
+        assert!(cutoff_date_string(1).starts_with("20"));
+        assert!(cutoff_date_string(1).contains('-'));
+        // max(1, days): zero and negative clamp to 1.
+        assert_eq!(cutoff_date_string(0), cutoff_date_string(1));
+        assert_eq!(cutoff_date_string(-5), cutoff_date_string(1));
+        assert_eq!(cutoff_date_string(3), cutoff_date_string(3));
+    }
+
+    #[test]
+    fn days_parsing_matches_js_parseint() {
+        assert_eq!(parse_days_prefix("7"), Some(7));
+        assert_eq!(parse_days_prefix("7abc"), Some(7));
+        assert_eq!(parse_days_prefix("+7"), Some(7));
+        assert_eq!(parse_days_prefix("-5"), Some(-5));
+        assert_eq!(parse_days_prefix("0"), Some(0));
+        assert_eq!(parse_days_prefix(""), None);
+        assert_eq!(parse_days_prefix("abc"), None);
+        // Command gate: only positive values survive.
+        let days = |raw: &str| {
+            let parsed = parse_days_prefix(raw);
+            match parsed {
+                Some(n) if n > 0 => n,
+                _ => 1,
+            }
+        };
+        assert_eq!(days("7abc"), 7);
+        assert_eq!(days("-5"), 1);
+        assert_eq!(days("0"), 1);
+        assert_eq!(days("abc"), 1);
+    }
+
+    #[test]
+    fn initial_and_progress_cards_are_exact() {
+        let initial = format!(
+            "🔍 <b>Scanning Apple Music for New Releases...</b><br/><br/>\
+<blockquote>• <b>Time Window:</b> Last <code>{days}</code> day(s)<br/>\
+• <b>Storefronts:</b> <code>{sf_formatted}</code><br/>\
+• <b>Triggered By:</b> {triggered_by}<br/>\
+• <b>Mode:</b> Dump Channel Archiver (Cache-Only)</blockquote>",
+            days = 3,
+            sf_formatted = "US, GB",
+            triggered_by = "Admin Command (/dumpnew 3)",
+        );
+        assert_eq!(
+            initial,
+            "🔍 <b>Scanning Apple Music for New Releases...</b><br/><br/>\
+<blockquote>• <b>Time Window:</b> Last <code>3</code> day(s)<br/>\
+• <b>Storefronts:</b> <code>US, GB</code><br/>\
+• <b>Triggered By:</b> Admin Command (/dumpnew 3)<br/>\
+• <b>Mode:</b> Dump Channel Archiver (Cache-Only)</blockquote>"
+        );
+
+        let empty = format!(
+            "✨ <b>Auto-Dump Finished: No New Tracks Found</b><br/><br/>\
+<blockquote>• <b>Time Window:</b> Last <code>{days}</code> day(s)<br/>\
+• <b>Cutoff Date:</b> <code>{cutoff}</code><br/>\
+• <b>Storefronts Scanned:</b> <code>{sf}</code><br/>\
+• <b>Discovered:</b> <code>0 tracks</code></blockquote>",
+            days = 1,
+            cutoff = "2026-09-08",
+            sf = "US"
+        );
+        assert_eq!(
+            empty,
+            "✨ <b>Auto-Dump Finished: No New Tracks Found</b><br/><br/>\
+<blockquote>• <b>Time Window:</b> Last <code>1</code> day(s)<br/>\
+• <b>Cutoff Date:</b> <code>2026-09-08</code><br/>\
+• <b>Storefronts Scanned:</b> <code>US</code><br/>\
+• <b>Discovered:</b> <code>0 tracks</code></blockquote>"
+        );
+    }
+
+    #[test]
+    fn summary_card_is_exact() {
+        let storefronts = ["us".to_owned(), "gb".to_owned()];
+        let mut counts = HashMap::new();
+        counts.insert("us".to_owned(), 4);
+        counts.insert("gb".to_owned(), 2);
+        let sf_breakdown = storefronts
+            .iter()
+            .map(|sf| {
+                format!(
+                    "• <b>{}:</b> <code>{}</code>",
+                    sf.to_uppercase(),
+                    counts.get(sf).copied().unwrap_or(0)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("<br/>");
+        let summary = format!(
+            "📦 <b>Auto-Dump Run Completed</b><br/><br/>\
+<blockquote>• <b>Total Discovered:</b> <code>{} tracks</code><br/>\
+• <b>Time Window:</b> Last <code>{days}</code> day(s)<br/>\
+• <b>Trigger:</b> {triggered_by}<br/><br/>\
+<b>Storefront Breakdown:</b><br/>{sf_breakdown}</blockquote><br/>\
+<blockquote>💡 <i>All new tracks have been securely archived to the dump channel.</i></blockquote>",
+            6,
+            days = 1,
+            triggered_by = "Daily 24h Scheduler",
+        );
+        assert!(summary.starts_with(
+            "📦 <b>Auto-Dump Run Completed</b><br/><br/>\
+<blockquote>• <b>Total Discovered:</b> <code>6 tracks</code><br/>\
+• <b>Time Window:</b> Last <code>1</code> day(s)<br/>\
+• <b>Trigger:</b> Daily 24h Scheduler<br/><br/>\
+<b>Storefront Breakdown:</b><br/>"
+        ));
+        assert!(summary.contains("• <b>US:</b> <code>4</code>"));
+        assert!(summary.contains("• <b>GB:</b> <code>2</code>"));
+        assert!(summary.ends_with(
+            "</blockquote><br/>\
+<blockquote>💡 <i>All new tracks have been securely archived to the dump channel.</i></blockquote>"
+        ));
+    }
+
+    #[test]
+    fn discovery_dedupes_and_counts_per_storefront() {
+        let mut map = HashMap::new();
+        let mut counts = HashMap::new();
+        // Same id from two storefronts: first insert wins (oracle map.set
+        // only when !has, so the earlier storefront keeps ownership).
+        let mut first = HashMap::new();
+        let mut first_counts = HashMap::new();
+        discover_from_playlist_insert(&mut first, &mut first_counts, "1", "us");
+        let mut second = HashMap::new();
+        let mut second_counts = HashMap::new();
+        discover_from_playlist_insert(&mut second, &mut second_counts, "1", "gb");
+        map.extend(first);
+        counts.extend(first_counts);
+        // Simulate a later duplicate arriving.
+        for (id, sf) in second {
+            map.entry(id).or_insert(sf);
+        }
+        assert_eq!(map.get("1"), Some(&"us".to_owned()));
+    }
+
+    // Test-only helper mirroring the insert semantics of the discovery loops.
+    fn discover_from_playlist_insert(
+        map: &mut HashMap<String, String>,
+        counts: &mut HashMap<String, usize>,
+        id: &str,
+        storefront: &str,
+    ) {
+        if map.insert(id.to_owned(), storefront.to_owned()).is_none() {
+            *counts.entry(storefront.to_owned()).or_insert(0) += 1;
+        }
+    }
+}

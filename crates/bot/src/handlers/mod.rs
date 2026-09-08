@@ -1,5 +1,5 @@
 mod auth;
-mod autodump;
+pub mod autodump;
 mod backup;
 mod clean;
 mod delete;
@@ -13,8 +13,8 @@ mod report;
 mod revoke;
 #[allow(dead_code)]
 pub(crate) mod rip;
-pub mod search;
-mod settings;
+mod search;
+pub mod settings;
 mod spec;
 mod start;
 mod status;

@@ -1,9 +1,800 @@
-//! `/random` — random album explorer (M8). Implemented in the random lane.
+//! `/random` — random album explorer (oracle:
+//! `src/modules/alac/commands/random.ts`): discovery sources, preview cards,
+//! and `random:*` callbacks. Admin-only (the oracle replies with a restricted
+//! card rather than staying silent).
+
 use std::sync::Arc;
 
-use ferogram::{filters::Dispatcher, update::CallbackQuery};
+use engine::types::{ParsedTargetItem, TargetKind};
+use ferogram::{
+    filters::{self, Dispatcher},
+    keyboard::{Button, InlineKeyboard},
+    update::{CallbackQuery, IncomingMessage},
+    InputMessage, PeerRef,
+};
+use serde_json::Value;
 
-use crate::BotState;
+use crate::{
+    html::{escape, parse_dynamic_html},
+    BotState,
+};
 
-pub fn register(_dp: &mut Dispatcher, _state: Arc<BotState>) {}
-pub async fn callback(_state: Arc<BotState>, _query: CallbackQuery) {}
+/// Oracle WILD_SEEDS (50 words).
+pub const WILD_SEEDS: &[&str] = &[
+    "future",
+    "midnight",
+    "electric",
+    "dream",
+    "sunset",
+    "horizon",
+    "velvet",
+    "echo",
+    "shadow",
+    "crystal",
+    "neon",
+    "ocean",
+    "silver",
+    "aurora",
+    "cosmic",
+    "paradise",
+    "vintage",
+    "solitude",
+    "infinite",
+    "rhythm",
+    "harmony",
+    "odyssey",
+    "mirage",
+    "serenade",
+    "astral",
+    "stellar",
+    "cascade",
+    "monochrome",
+    "sanctuary",
+    "voyage",
+    "illusions",
+    "phantom",
+    "solstice",
+    "vortex",
+    "genesis",
+    "celestial",
+    "timeless",
+    "radiant",
+    "nostalgia",
+    "euphoria",
+    "zenith",
+    "spectrum",
+    "whisper",
+    "pulse",
+    "nebula",
+    "labyrinth",
+    "reverie",
+    "resonance",
+    "destiny",
+    "memory",
+];
+
+/// Oracle SOURCE_LABELS.
+pub fn source_label(source: &str) -> Option<&'static str> {
+    Some(match source {
+        "charts" => "🏆 Top Charts",
+        "wild" => "🎲 Wild Search",
+        "rock" => "🎸 Rock",
+        "hiphop" => "🎤 Hip-Hop",
+        "pop" => "⚡ Pop",
+        "electronic" => "🎹 Electronic",
+        "jazz" => "🎷 Jazz",
+        "indie" => "💿 Indie",
+        _ => return None,
+    })
+}
+
+/// Oracle fetchCandidateBySource mapping for fixed search terms; None means
+/// the source takes a different path (charts/wild) or is used as a raw query.
+fn source_search_term(source: &str) -> Option<&'static str> {
+    Some(match source {
+        "rock" => "rock album",
+        "hiphop" | "rap" => "hip hop album",
+        "pop" => "pop album",
+        "electronic" | "edm" => "electronic album",
+        "jazz" => "jazz album",
+        "indie" => "indie album",
+        _ => return None,
+    })
+}
+
+/// A discovered album candidate (oracle RandomAlbumCandidate).
+#[derive(Debug, Clone, Default)]
+pub struct RandomAlbumCandidate {
+    pub id: String,
+    pub title: String,
+    pub artist: String,
+    pub url: String,
+    /// Carried for oracle-interface parity; the preview card never renders it.
+    #[allow(dead_code)]
+    pub artwork_url: Option<String>,
+    pub release_date: Option<String>,
+    pub genre: Option<String>,
+    pub track_count: Option<usize>,
+    pub storefront: String,
+}
+
+/// Tiny xorshift PRNG — seeded from the clock once, tested for range.
+fn pick_index(rng: &mut u64, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    *rng ^= *rng << 13;
+    *rng ^= *rng >> 7;
+    *rng ^= *rng << 17;
+    (*rng % len as u64) as usize
+}
+
+fn now_seed() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15);
+    nanos | 1
+}
+
+/// Oracle buildSourcesMenuText.
+pub fn build_sources_menu_text() -> String {
+    "🎲 <b>Apple Music Random Album Explorer</b> (Admin)<br/><br/>\
+     <blockquote>Select a discovery source below to pick a random album to dump into your cache channel:</blockquote>"
+        .to_owned()
+}
+
+/// Oracle buildPreviewText.
+pub fn build_preview_text(candidate: &RandomAlbumCandidate) -> String {
+    let release = candidate
+        .release_date
+        .as_deref()
+        .map(|date| date.split('T').next().unwrap_or(date))
+        .unwrap_or("Unknown");
+    let tracks = candidate
+        .track_count
+        .map(|n| format!("{n} tracks"))
+        .unwrap_or_else(|| "Full Album".to_owned());
+    format!(
+        "🎲 <b>Random Album Picked!</b><br/><br/>\
+💿 <b>Album:</b> {}<br/>\
+👤 <b>Artist:</b> {}<br/>\
+🎵 <b>Tracks:</b> <code>{}</code><br/>\
+📅 <b>Released:</b> <code>{}</code><br/>\
+🏷 <b>Genre:</b> <code>{}</code><br/>\
+🌍 <b>Storefront:</b> <code>{}</code><br/><br/>\
+🔗 <a href=\"{}\">Open in Apple Music</a>",
+        escape(&candidate.title),
+        escape(&candidate.artist),
+        escape(&tracks),
+        escape(release),
+        escape(candidate.genre.as_deref().unwrap_or("Music")),
+        escape(candidate.storefront.to_uppercase().as_str()),
+        escape(&candidate.url),
+    )
+}
+
+fn sources_keyboard() -> ferogram::tl::enums::ReplyMarkup {
+    InlineKeyboard::new()
+        .row(vec![
+            Button::callback("🏆 Top Charts", b"random:src:charts"),
+            Button::callback("🎲 Wild Search", b"random:src:wild"),
+        ])
+        .row(vec![
+            Button::callback("🎸 Rock", b"random:src:rock"),
+            Button::callback("🎤 Hip-Hop", b"random:src:hiphop"),
+            Button::callback("⚡ Pop", b"random:src:pop"),
+        ])
+        .row(vec![
+            Button::callback("🎹 Electronic", b"random:src:electronic"),
+            Button::callback("🎷 Jazz", b"random:src:jazz"),
+            Button::callback("💿 Indie", b"random:src:indie"),
+        ])
+        .row(vec![Button::callback("❌ Close", b"random:close")])
+        .into_markup()
+}
+
+fn preview_keyboard(
+    album_id: &str,
+    storefront: &str,
+    source: &str,
+) -> ferogram::tl::enums::ReplyMarkup {
+    InlineKeyboard::new()
+        .row(vec![Button::callback(
+            "🚀 Start Dump",
+            format!("random:dump:{album_id}:{storefront}").as_bytes(),
+        )])
+        .row(vec![
+            Button::callback(
+                "🎲 Re-roll",
+                format!("random:reroll:{source}:{storefront}").as_bytes(),
+            ),
+            Button::callback("⬅️ Sources", b"random:menu"),
+        ])
+        .row(vec![Button::callback("❌ Cancel", b"random:close")])
+        .into_markup()
+}
+
+fn retry_keyboard(source: &str, storefront: &str) -> ferogram::tl::enums::ReplyMarkup {
+    InlineKeyboard::new()
+        .row(vec![
+            Button::callback(
+                "🔄 Try Again",
+                format!("random:reroll:{source}:{storefront}").as_bytes(),
+            ),
+            Button::callback("⬅️ Sources", b"random:menu"),
+        ])
+        .row(vec![Button::callback("❌ Close", b"random:close")])
+        .into_markup()
+}
+
+/// Oracle fetchSearchAlbum (iTunes album-entity search, random pick).
+async fn fetch_search_album(
+    http: &reqwest::Client,
+    query: &str,
+    storefront: &str,
+    rng: &mut u64,
+) -> Result<RandomAlbumCandidate, String> {
+    let sf = storefront.to_lowercase();
+    let url = format!(
+        "https://itunes.apple.com/search?term={}&entity=album&limit=50&country={}",
+        urlencode(query),
+        urlencode(&sf),
+    );
+    let response = http
+        .get(&url)
+        .header("User-Agent", engine::catalog::ITUNES_USER_AGENT)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("Failed to search iTunes catalog (HTTP {status})"));
+    }
+    let body_text = response.text().await.map_err(|e| e.to_string())?;
+    let body: Value = serde_json::from_str(&body_text).map_err(|e| e.to_string())?;
+    let results = body
+        .get("results")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut candidates: Vec<RandomAlbumCandidate> = results
+        .into_iter()
+        .filter_map(|item| {
+            let id = item.get("collectionId")?.as_i64()?.to_string();
+            let url = item
+                .get("collectionViewUrl")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("https://music.apple.com/{sf}/album/{id}"));
+            Some(RandomAlbumCandidate {
+                id,
+                title: item
+                    .get("collectionName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Unknown Album")
+                    .to_owned(),
+                artist: item
+                    .get("artistName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Unknown Artist")
+                    .to_owned(),
+                url,
+                artwork_url: item
+                    .get("artworkUrl100")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                release_date: item
+                    .get("releaseDate")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                genre: item
+                    .get("primaryGenreName")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                track_count: item
+                    .get("trackCount")
+                    .and_then(Value::as_i64)
+                    .map(|n| n as usize),
+                storefront: sf.clone(),
+            })
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Err(format!(
+            "No albums found matching \"{query}\" on storefront {sf}"
+        ));
+    }
+    let index = pick_index(rng, candidates.len());
+    Ok(candidates.swap_remove(index))
+}
+
+/// Oracle fetchChartsAlbum via the engine's charts feed, random pick.
+async fn fetch_charts_album(
+    state: &BotState,
+    storefront: &str,
+    rng: &mut u64,
+) -> Result<RandomAlbumCandidate, String> {
+    let charts = state
+        .rip_deps
+        .catalog()
+        .fetch_charts_albums(&storefront.to_lowercase(), 50)
+        .await
+        .map_err(|error| format!("Failed to fetch Apple Music charts: {error}"))?;
+    if charts.is_empty() {
+        return Err("No albums found in Apple Music charts".to_owned());
+    }
+    let index = pick_index(rng, charts.len());
+    let chart = &charts[index];
+    Ok(RandomAlbumCandidate {
+        id: chart.id.clone(),
+        title: chart.title.clone(),
+        artist: chart.artist.clone(),
+        url: chart.url.clone(),
+        artwork_url: chart.artwork_url.clone(),
+        release_date: chart.release_date.clone(),
+        genre: chart.genre.clone(),
+        track_count: None,
+        storefront: storefront.to_lowercase(),
+    })
+}
+
+async fn fetch_wild_album(
+    http: &reqwest::Client,
+    storefront: &str,
+    rng: &mut u64,
+) -> Result<RandomAlbumCandidate, String> {
+    let seed = WILD_SEEDS[pick_index(rng, WILD_SEEDS.len())];
+    fetch_search_album(http, seed, storefront, rng).await
+}
+
+/// Oracle fetchCandidateBySource.
+async fn fetch_candidate_by_source(
+    state: &BotState,
+    http: &reqwest::Client,
+    source: &str,
+    storefront: &str,
+    rng: &mut u64,
+) -> Result<RandomAlbumCandidate, String> {
+    let source = source.to_lowercase();
+    match source.as_str() {
+        "charts" | "top" => fetch_charts_album(state, storefront, rng).await,
+        "wild" | "random" => fetch_wild_album(http, storefront, rng).await,
+        _ => {
+            let term = source_search_term(&source).unwrap_or(source.as_str());
+            fetch_search_album(http, term, storefront, rng).await
+        }
+    }
+}
+
+/// Oracle album enrichment via fetchAlbumTracks, errors swallowed.
+async fn enrich_from_catalog(state: &BotState, candidate: &mut RandomAlbumCandidate) {
+    let Ok(full) = state
+        .rip_deps
+        .catalog()
+        .fetch_album_tracks(&candidate.id, &candidate.storefront)
+        .await
+    else {
+        return;
+    };
+    candidate.track_count = Some(full.tracks.len());
+    if !full.album.title.is_empty() {
+        candidate.title = full.album.title.clone();
+    }
+    if !full.album.artist.is_empty() {
+        candidate.artist = full.album.artist.clone();
+    }
+    // Oracle `fullAlbum.album.genre || candidate.genre`: an empty/absent
+    // catalog genre falls back to the candidate's own value.
+    if let Some(genre) = full.album.genre.clone().filter(|g| !g.is_empty()) {
+        candidate.genre = Some(genre);
+    }
+    if !full.album.release_date.is_empty() {
+        candidate.release_date = Some(full.album.release_date.clone());
+    }
+}
+
+fn urlencode(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn http_client() -> reqwest::Client {
+    reqwest::Client::new()
+}
+
+pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
+    let random_state = Arc::clone(&state);
+    dp.on_message(filters::command("random"), move |msg| {
+        random(Arc::clone(&random_state), msg)
+    });
+}
+
+async fn random(state: Arc<BotState>, msg: IncomingMessage) {
+    let sender = msg.sender_user_id().unwrap_or_default();
+    let marked_chat = super::marked_chat_id(&msg);
+    if !state
+        .auth
+        .is_authorized(sender, Some(marked_chat))
+        .await
+        .unwrap_or(false)
+    {
+        return;
+    }
+    if !state.auth.is_admin(sender) {
+        let _ = msg
+            .reply(InputMessage::html(parse_dynamic_html(
+                "🔒 <b>Access Restricted:</b> Random album discovery is restricted to the bot owner.",
+            )))
+            .await;
+        return;
+    }
+
+    let tokens: Vec<String> = msg
+        .text()
+        .unwrap_or_default()
+        .split_whitespace()
+        .skip(1)
+        .map(str::to_owned)
+        .collect();
+    let source_arg = tokens.first().map(|s| s.to_lowercase());
+    let storefront_arg = tokens
+        .get(1)
+        .map(|s| s.to_lowercase())
+        .unwrap_or("us".to_owned());
+
+    let Some(source_arg) = source_arg else {
+        let _ = msg
+            .reply(
+                InputMessage::html(parse_dynamic_html(&build_sources_menu_text()))
+                    .reply_markup(sources_keyboard()),
+            )
+            .await;
+        return;
+    };
+
+    let loading = msg
+        .reply(InputMessage::html(parse_dynamic_html(&format!(
+            "🎲 <i>Discovering random album from {} ({})...</i>",
+            escape(&source_arg),
+            escape(&storefront_arg.to_uppercase()),
+        ))))
+        .await;
+    let Ok(loading) = loading else { return };
+
+    let mut rng = now_seed();
+    let http = http_client();
+    let peer = super::chat_peer_ref(&msg);
+    let result =
+        fetch_candidate_by_source(&state, &http, &source_arg, &storefront_arg, &mut rng).await;
+    match result {
+        Ok(mut candidate) => {
+            enrich_from_catalog(&state, &mut candidate).await;
+            let text = build_preview_text(&candidate);
+            let keyboard = preview_keyboard(&candidate.id, &candidate.storefront, &source_arg);
+            let _ = state
+                .client
+                .edit_message(
+                    peer,
+                    loading.id(),
+                    InputMessage::html(parse_dynamic_html(&text)).reply_markup(keyboard),
+                )
+                .await;
+        }
+        Err(error) => {
+            let text = format!(
+                "⚠️ <b>Failed to pick random album:</b> <code>{}</code>",
+                escape(&error)
+            );
+            let _ = state
+                .client
+                .edit_message(
+                    peer,
+                    loading.id(),
+                    InputMessage::html(parse_dynamic_html(&text)),
+                )
+                .await;
+        }
+    }
+}
+
+pub async fn callback(state: Arc<BotState>, query: CallbackQuery) {
+    let marked_chat = query
+        .chat_peer
+        .as_ref()
+        .map(super::marked_peer_id)
+        .unwrap_or(query.user_id);
+    if !state
+        .auth
+        .is_authorized(query.user_id, Some(marked_chat))
+        .await
+        .unwrap_or(false)
+    {
+        let _ = query
+            .answer()
+            .alert("Unauthorized")
+            .send(&state.client)
+            .await;
+        return;
+    }
+    if !state.auth.is_admin(query.user_id) {
+        let _ = query
+            .answer()
+            .alert("🔒 Access restricted to bot owner.")
+            .send(&state.client)
+            .await;
+        return;
+    }
+
+    let data = query.data().unwrap_or_default().to_owned();
+    let parts: Vec<&str> = data.split(':').collect();
+    let action = parts.get(1).copied().unwrap_or_default();
+    let peer = query
+        .chat_peer
+        .as_ref()
+        .map(|p| PeerRef::Peer(p.clone()))
+        .unwrap_or_else(|| PeerRef::from(query.user_id));
+    let message_id = query.message_id.unwrap_or_default();
+
+    match action {
+        "close" => {
+            let _ = query.answer().send(&state.client).await;
+            delete_message(&state, &peer, message_id).await;
+        }
+        "menu" => {
+            let _ = query.answer().send(&state.client).await;
+            let text = build_sources_menu_text();
+            let _ = state
+                .client
+                .edit_message(
+                    peer,
+                    message_id,
+                    InputMessage::html(parse_dynamic_html(&text)).reply_markup(sources_keyboard()),
+                )
+                .await;
+        }
+        "src" | "reroll" => {
+            // Oracle `parts[2] || 'wild'`: empty falls back like missing.
+            let source = parts
+                .get(2)
+                .copied()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("wild")
+                .to_owned();
+            let storefront = parts
+                .get(3)
+                .copied()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("us")
+                .to_owned();
+            let _ = query
+                .answer()
+                .text("🎲 Discovering random album...")
+                .send(&state.client)
+                .await;
+            let label = source_label(&source).unwrap_or(source.as_str()).to_owned();
+            let _ = state
+                .client
+                .edit_message(
+                    peer.clone(),
+                    message_id,
+                    InputMessage::html(parse_dynamic_html(&format!(
+                        "🔄 <i>Discovering random album from {}...</i>",
+                        escape(&label)
+                    ))),
+                )
+                .await;
+
+            let mut rng = now_seed();
+            let http = http_client();
+            match fetch_candidate_by_source(&state, &http, &source, &storefront, &mut rng).await {
+                Ok(mut candidate) => {
+                    enrich_from_catalog(&state, &mut candidate).await;
+                    let text = build_preview_text(&candidate);
+                    let keyboard = preview_keyboard(&candidate.id, &candidate.storefront, &source);
+                    let _ = state
+                        .client
+                        .edit_message(
+                            peer,
+                            message_id,
+                            InputMessage::html(parse_dynamic_html(&text)).reply_markup(keyboard),
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    let text = format!(
+                        "⚠️ <b>Failed to discover album:</b> <code>{}</code>",
+                        escape(&error)
+                    );
+                    let _ = state
+                        .client
+                        .edit_message(
+                            peer,
+                            message_id,
+                            InputMessage::html(parse_dynamic_html(&text))
+                                .reply_markup(retry_keyboard(&source, &storefront)),
+                        )
+                        .await;
+                }
+            }
+        }
+        "dump" => {
+            let album_id = parts.get(2).copied().unwrap_or_default().to_owned();
+            let storefront = parts
+                .get(3)
+                .copied()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("us")
+                .to_owned();
+            let _ = query
+                .answer()
+                .text("🚀 Queuing album dump...")
+                .send(&state.client)
+                .await;
+            delete_message(&state, &peer, message_id).await;
+
+            // Oracle delegates to executeRipPipeline in cache-only mode;
+            // the collapsed orchestrator takes that path (recorded deviation).
+            let status = state
+                .client
+                .send_message(
+                    peer.clone(),
+                    InputMessage::html(parse_dynamic_html(
+                        "🔍 <b>Resolving tracks from Apple Music...</b>",
+                    )),
+                )
+                .await;
+            let status_msg_id = status.map(|m| i64::from(m.id())).unwrap_or_default();
+            let options = engine::orchestrator::types::RipJobOptions {
+                chat_id: marked_chat,
+                user_id: query.user_id,
+                user_name: Some(format!("User {}", query.user_id)),
+                delivery_chat_id: marked_chat,
+                is_group: marked_chat != query.user_id,
+                is_force: false,
+                is_cache_only: true,
+                single_storefront: Some(storefront.clone()),
+                parsed_items: vec![ParsedTargetItem {
+                    id: album_id,
+                    kind: TargetKind::Album,
+                    storefront: Some(storefront),
+                }],
+                reply_to_message_id: None,
+                status_msg_id,
+                is_admin: true,
+            };
+            if let Err(error) = state
+                .rip_orchestrator
+                .start_job(Arc::clone(&state.rip_deps), &options)
+                .await
+            {
+                tracing::warn!(%error, "random album dump job failed to start");
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn delete_message(state: &BotState, peer: &PeerRef, message_id: i32) {
+    if let Ok(messages) = state.client.get_messages(peer.clone(), &[message_id]).await {
+        if let Some(message) = messages.first() {
+            let _ = message.delete().await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate() -> RandomAlbumCandidate {
+        RandomAlbumCandidate {
+            id: "1".to_owned(),
+            title: "Moon Dreams".to_owned(),
+            artist: "Luna".to_owned(),
+            url: "https://music.apple.com/us/album/x/1".to_owned(),
+            artwork_url: None,
+            release_date: Some("2024-05-01T00:00:00Z".to_owned()),
+            genre: Some("Pop".to_owned()),
+            track_count: Some(12),
+            storefront: "us".to_owned(),
+        }
+    }
+
+    #[test]
+    fn preview_text_is_exact() {
+        assert_eq!(
+            build_preview_text(&candidate()),
+            "🎲 <b>Random Album Picked!</b><br/><br/>\
+💿 <b>Album:</b> Moon Dreams<br/>\
+👤 <b>Artist:</b> Luna<br/>\
+🎵 <b>Tracks:</b> <code>12 tracks</code><br/>\
+📅 <b>Released:</b> <code>2024-05-01</code><br/>\
+🏷 <b>Genre:</b> <code>Pop</code><br/>\
+🌍 <b>Storefront:</b> <code>US</code><br/><br/>\
+🔗 <a href=\"https://music.apple.com/us/album/x/1\">Open in Apple Music</a>"
+        );
+    }
+
+    #[test]
+    fn preview_text_fallbacks_match_oracle() {
+        let mut c = candidate();
+        c.track_count = None;
+        c.release_date = None;
+        c.genre = None;
+        let text = build_preview_text(&c);
+        assert!(text.contains("🎵 <b>Tracks:</b> <code>Full Album</code>"));
+        assert!(text.contains("📅 <b>Released:</b> <code>Unknown</code>"));
+        assert!(text.contains("🏷 <b>Genre:</b> <code>Music</code>"));
+    }
+
+    #[test]
+    fn sources_menu_text_is_exact() {
+        assert_eq!(
+            build_sources_menu_text(),
+            "🎲 <b>Apple Music Random Album Explorer</b> (Admin)<br/><br/>\
+<blockquote>Select a discovery source below to pick a random album to dump into your cache channel:</blockquote>"
+        );
+    }
+
+    #[test]
+    fn source_terms_match_oracle() {
+        assert_eq!(source_search_term("rock"), Some("rock album"));
+        assert_eq!(source_search_term("rap"), Some("hip hop album"));
+        assert_eq!(source_search_term("hiphop"), Some("hip hop album"));
+        assert_eq!(source_search_term("pop"), Some("pop album"));
+        assert_eq!(source_search_term("edm"), Some("electronic album"));
+        assert_eq!(source_search_term("electronic"), Some("electronic album"));
+        assert_eq!(source_search_term("jazz"), Some("jazz album"));
+        assert_eq!(source_search_term("indie"), Some("indie album"));
+        assert_eq!(source_search_term("charts"), None);
+        assert_eq!(source_search_term("wild"), None);
+        assert_eq!(source_search_term("custom query"), None);
+    }
+
+    #[test]
+    fn source_labels_match_oracle() {
+        assert_eq!(source_label("charts"), Some("🏆 Top Charts"));
+        assert_eq!(source_label("hiphop"), Some("🎤 Hip-Hop"));
+        assert_eq!(source_label("unknown"), None);
+    }
+
+    #[test]
+    fn prng_stays_in_range() {
+        let mut rng = now_seed();
+        for _ in 0..1000 {
+            let index = pick_index(&mut rng, 50);
+            assert!(index < 50);
+        }
+        // Distinct seeds spread across the range.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let index = pick_index(&mut rng, 50);
+            seen.insert(index);
+        }
+        assert!(seen.len() > 10, "PRNG looks degenerate: {seen:?}");
+    }
+
+    #[test]
+    fn wild_seeds_match_oracle_length() {
+        assert_eq!(WILD_SEEDS.len(), 50);
+        assert!(WILD_SEEDS.contains(&"future"));
+        assert!(WILD_SEEDS.contains(&"memory"));
+    }
+
+    #[test]
+    fn urlencode_encodes_like_js() {
+        assert_eq!(urlencode("rock album"), "rock%20album");
+        assert_eq!(urlencode("hip hop album"), "hip%20hop%20album");
+        assert_eq!(urlencode("us"), "us");
+    }
+}
