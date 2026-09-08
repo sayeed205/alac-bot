@@ -96,9 +96,14 @@ first; retarget the engine as M5c.
 - **Circuit-breaker stall**: on a mirror-offline break the TS producer leaks
   its job + queue slot (blocked forever on a full bounded channel); Rust
   settles cleanly via mpsc sender-drop with the same observable summary.
-- **Mirror health**: the dashboard header shows `unknown` until a health
-  probe integration is wired (last-known value only; no polling yet).
 - **Group completion notice**: the engine summary is edited into the
   requester-chat status message; the compact group notice + DM-summary pair
   is delivered as one message rather than the oracle's two-target split.
+
+Closed in hardening (`63259cd`): mirror health now probes through the shared
+`MirrorPolicyManager` (4s bounded, last-known cache, refreshed
+opportunistically on dashboard renders) — the header no longer sits on
+`unknown`. The cancel-vs-complete race is covered by bot-level tests
+(`tests/races.rs`): exactly one terminal event in both orderings, and a
+settled job is no longer cancellable.
 
