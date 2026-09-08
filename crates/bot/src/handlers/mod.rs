@@ -5,6 +5,7 @@ mod revoke;
 #[allow(dead_code)]
 pub(crate) mod rip;
 mod start;
+mod status;
 
 #[path = "../callbacks.rs"]
 mod callbacks;
@@ -59,6 +60,7 @@ pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
     revoke::register(dp, Arc::clone(&state));
     list::register(dp, Arc::clone(&state));
     rip::register(dp, Arc::clone(&state));
+    status::register(dp, Arc::clone(&state));
 
     let callback_state = Arc::clone(&state);
     dp.on_callback_query(filters::all::<CallbackQuery>(), move |query| {
@@ -66,6 +68,11 @@ pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
         async move {
             if query.data().is_some_and(|data| data.starts_with("cancel:")) {
                 callbacks::dispatch_cancel(state, query).await;
+            } else if query
+                .data()
+                .is_some_and(|data| data.starts_with("dashboard:"))
+            {
+                callbacks::dispatch_dashboard(state, query).await;
             } else {
                 list::callback(state, query).await;
             }

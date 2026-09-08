@@ -9,6 +9,25 @@ use crate::{
     BotState,
 };
 
+pub async fn dispatch_dashboard(state: Arc<BotState>, query: CallbackQuery) {
+    let Some(data) = query.data() else { return };
+    let page = data
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<usize>().ok())
+        .unwrap_or(1);
+    let _ = query.answer().send(&state.client).await;
+    crate::dashboard_manager()
+        .page(
+            query
+                .chat_peer
+                .map(|p| super::marked_peer_id(&p))
+                .unwrap_or(query.user_id),
+            page,
+        )
+        .await;
+}
+
 pub async fn dispatch_cancel(state: Arc<BotState>, query: CallbackQuery) {
     let Some(job_id) = query
         .data()
