@@ -8,11 +8,15 @@ mod settings;
 mod tracks;
 
 pub use auth::{Auth, AuthedPeer};
+pub use dump::{DbDumpService, DumpStats, RestoreStats};
 pub use engine::orchestrator::deps::{CachedTrack, RequestLog, SaveTrackInput};
 pub use migrations::{initial_schema, migrate};
 pub use models::{Request, Setting, Track, User};
 pub use requests::RequestLogRepository;
 pub use settings::SettingsStore;
+pub mod dump;
+mod stats;
+pub use stats::{AlacStats, StatsRepository, TopTrackStat};
 pub use tracks::TracksRepository;
 
 /// Errors returned by the persistence layer.

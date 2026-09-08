@@ -110,6 +110,16 @@ impl RipDeps {
     pub fn settings_snapshot(&self) -> BotSettings {
         self.settings.get_settings()
     }
+
+    /// Track cache repository (find-by-id, file-unique-id, delete).
+    pub fn tracks(&self) -> &db::TracksRepository {
+        &self.tracks
+    }
+
+    /// Apple Music catalog for track metadata lookups (`/info`).
+    pub fn catalog(&self) -> &Catalog<ReqwestTransport> {
+        &self.catalog
+    }
 }
 
 impl OrchestratorDeps for RipDeps {

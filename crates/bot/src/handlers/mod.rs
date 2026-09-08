@@ -1,10 +1,18 @@
 mod auth;
+mod backup;
+mod clean;
+mod delete;
 mod help;
+mod index;
+mod info;
 mod list;
+mod ops;
+mod report;
 mod revoke;
 #[allow(dead_code)]
 pub(crate) mod rip;
 pub mod settings;
+mod spec;
 mod start;
 mod status;
 
@@ -82,6 +90,14 @@ pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
     rip::register(dp, Arc::clone(&state));
     status::register(dp, Arc::clone(&state));
     settings::register(dp, Arc::clone(&state));
+    ops::register(dp, Arc::clone(&state));
+    info::register(dp, Arc::clone(&state));
+    clean::register(dp, Arc::clone(&state));
+    delete::register(dp, Arc::clone(&state));
+    spec::register(dp, Arc::clone(&state));
+    index::register(dp, Arc::clone(&state));
+    backup::register(dp, Arc::clone(&state));
+    report::register(dp, Arc::clone(&state));
 
     let callback_state = Arc::clone(&state);
     dp.on_callback_query(filters::all::<CallbackQuery>(), move |query| {
@@ -99,6 +115,8 @@ pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
                 .is_some_and(|data| data.starts_with("settings:"))
             {
                 settings::callback(state, query).await;
+            } else if query.data().is_some_and(|data| data.starts_with("report:")) {
+                report::callback(state, query).await;
             } else {
                 list::callback(state, query).await;
             }

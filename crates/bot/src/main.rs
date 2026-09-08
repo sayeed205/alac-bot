@@ -129,7 +129,7 @@ async fn main() -> Result<()> {
             PeerRef::from(env.dump_channel_id),
             db::TracksRepository::new(database.clone()),
             db::RequestLogRepository::new(database.clone()),
-            db::SettingsStore::new(database),
+            db::SettingsStore::new(database.clone()),
         )
         .await
         .map_err(|error| anyhow!(error))
@@ -142,6 +142,12 @@ async fn main() -> Result<()> {
         auth,
         rip_deps,
         rip_orchestrator: orchestrator,
+        admin_id: env.admin_id,
+        dump_channel_id: env.dump_channel_id,
+        dump_peer: PeerRef::from(env.dump_channel_id),
+        stats: Some(db::StatsRepository::new(database.clone())),
+        db_client: database.clone(),
+        started_at: std::time::Instant::now(),
     });
     // Bridge subscribes once; its consumer renders status messages + dashboard.
     bot::event_bridge::start(Arc::clone(&state));

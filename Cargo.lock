@@ -130,6 +130,7 @@ dependencies = [
  "engine",
  "ferogram",
  "futures-util",
+ "regex",
  "serde_json",
  "tokio",
  "tokio-util",
@@ -352,6 +353,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "engine",
+ "flate2",
  "serde_json",
  "sqlx",
  "thiserror",

@@ -7,9 +7,13 @@ pub mod handlers;
 pub mod html;
 pub mod mirror_health;
 pub mod rip_deps;
+pub mod spectrogram;
 pub mod telegram_sink;
 
-use std::sync::{Arc, OnceLock};
+use std::{
+    sync::{Arc, OnceLock},
+    time::Instant,
+};
 
 #[derive(Clone)]
 pub struct BotState {
@@ -17,6 +21,19 @@ pub struct BotState {
     pub auth: db::Auth,
     pub rip_deps: Arc<rip_deps::RipDeps>,
     pub rip_orchestrator: Arc<engine::orchestrator::RipOrchestrator>,
+    /// Env-driven ids/peers the ops commands need (oracle `env.ADMIN_ID`,
+    /// `env.DUMP_CHANNEL_ID`). `dump_peer` is the TL-level peer used for
+    /// sends/queries; `dump_channel_id` is the raw id for link building.
+    pub admin_id: i64,
+    pub dump_channel_id: i64,
+    pub dump_peer: ferogram::PeerRef,
+    /// Stats aggregation for `/stats` (lazy-initialized in main).
+    pub stats: Option<db::StatsRepository>,
+    /// Raw DB client for the dump service (`/export`, `/import`) — cheap
+    /// Arc-pool clone shared with the repositories.
+    pub db_client: welds::connections::postgres::PostgresClient,
+    /// Process start, for `/health` uptime (oracle process.uptime()).
+    pub started_at: Instant,
 }
 
 pub type SharedState = Arc<BotState>;
