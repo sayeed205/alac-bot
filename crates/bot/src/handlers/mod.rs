@@ -1,4 +1,5 @@
 mod auth;
+mod autodump;
 mod backup;
 mod clean;
 mod delete;
@@ -7,11 +8,13 @@ mod index;
 mod info;
 mod list;
 mod ops;
+mod random;
 mod report;
 mod revoke;
 #[allow(dead_code)]
 pub(crate) mod rip;
-pub mod settings;
+pub mod search;
+mod settings;
 mod spec;
 mod start;
 mod status;
@@ -98,6 +101,9 @@ pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
     index::register(dp, Arc::clone(&state));
     backup::register(dp, Arc::clone(&state));
     report::register(dp, Arc::clone(&state));
+    search::register(dp, Arc::clone(&state));
+    random::register(dp, Arc::clone(&state));
+    autodump::register(dp, Arc::clone(&state));
 
     let callback_state = Arc::clone(&state);
     dp.on_callback_query(filters::all::<CallbackQuery>(), move |query| {
@@ -117,6 +123,12 @@ pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
                 settings::callback(state, query).await;
             } else if query.data().is_some_and(|data| data.starts_with("report:")) {
                 report::callback(state, query).await;
+            } else if query.data().is_some_and(|data| data.starts_with("random:")) {
+                random::callback(state, query).await;
+            } else if query.data().is_some_and(|data| {
+                data.starts_with("dl:") || data.starts_with("rip:") || data == "search_close"
+            }) {
+                search::callback(state, query).await;
             } else {
                 list::callback(state, query).await;
             }
