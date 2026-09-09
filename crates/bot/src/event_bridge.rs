@@ -209,7 +209,7 @@ async fn handle_event(state: Arc<BotState>, event: BridgeEvent) -> Result<(), St
     match event {
         BridgeEvent::Created { job } => {
             registry().remember(&job);
-            refresh_dashboard(state_ref, true).await;
+            refresh_dashboard_for_job(state_ref, &job).await;
         }
         BridgeEvent::Progress { job, progress } => {
             registry().remember(&job);
@@ -247,6 +247,39 @@ async fn handle_event(state: Arc<BotState>, event: BridgeEvent) -> Result<(), St
 async fn refresh_dashboard(state: &BotState, force: bool) {
     let snapshot = current_snapshot(state).await;
     dashboard_manager().refresh(snapshot, force).await;
+}
+
+/// Ensure a dashboard exists for a job even when the command-side preflight
+/// could not open one (for example, a transient Telegram send failure). The
+/// Created event is emitted after the job is admitted, so this is the first
+/// reliable point at which we can recover without losing the status surface.
+async fn refresh_dashboard_for_job(state: &BotState, job: &ActiveRipJob) {
+    let snapshot = current_snapshot(state).await;
+    let manager = dashboard_manager();
+    if manager.contains(job.chat_id).await {
+        manager.refresh(snapshot, true).await;
+        return;
+    }
+
+    let sink =
+        crate::handlers::dashboard_sink(state.client.clone(), ferogram::PeerRef::from(job.chat_id));
+    if let Err(error) = manager
+        .open(
+            job.chat_id,
+            job.user_id,
+            state.auth.is_admin(job.user_id),
+            sink,
+            snapshot,
+        )
+        .await
+    {
+        tracing::warn!(
+            chat_id = job.chat_id,
+            job_id = %job.id,
+            error = ?error,
+            "failed to open status dashboard for new job"
+        );
+    }
 }
 
 #[cfg(test)]

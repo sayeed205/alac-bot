@@ -88,10 +88,21 @@ pub(crate) async fn ensure_dashboard(
         manager.refresh_entry_from(chat, snapshot).await;
     } else {
         let sink = status::dashboard_sink(state.client.clone(), peer);
-        let _ = manager
+        if let Err(error) = manager
             .open(chat, viewer_id, viewer_is_admin, sink, snapshot)
-            .await;
+            .await
+        {
+            tracing::warn!(chat_id = chat, error = ?error, "failed to open status dashboard");
+        }
     }
+}
+
+/// Shared dashboard sink factory for event-driven recovery paths.
+pub(crate) fn dashboard_sink(
+    client: ferogram::Client,
+    peer: ferogram::PeerRef,
+) -> Arc<dyn crate::dashboard::DashboardSink> {
+    status::dashboard_sink(client, peer)
 }
 
 /// Peer link parity with the TS oracle's getPeerLink: @name -> t.me link,

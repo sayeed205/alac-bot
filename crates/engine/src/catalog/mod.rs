@@ -493,7 +493,15 @@ impl<T: Transport> Catalog<T> {
             .collect();
 
         if tracks.is_empty() {
-            error!(collection_id, "No tracks found for collection");
+            // An empty storefront response is a normal miss while the
+            // fallback chain checks other regions. Logging each attempt at
+            // error level produced one noisy line per storefront; the
+            // orchestrator still reports the final unresolved album once.
+            debug!(
+                collection_id,
+                storefront = sf,
+                "No tracks found for collection"
+            );
             return Err(CatalogError::Message(format!(
                 "iTunes found no tracks for collection {collection_id}"
             )));
