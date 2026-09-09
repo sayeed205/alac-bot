@@ -69,9 +69,13 @@ fn track_json() -> String {
             "wrapperType": "track",
             "kind": "song",
             "trackId": 1440841730,
+            "collectionId": 1440841723,
+            "artistId": 12345,
             "trackName": "The Hills",
             "collectionName": "Beauty Behind the Madness",
             "artistName": "The Weeknd",
+            "collectionArtistName": "The Weeknd",
+            "composerName": "Abel Tesfaye",
             "primaryGenreName": "R&B/Soul",
             "releaseDate": "2015-05-27T07:00:00Z",
             "trackNumber": 7,
@@ -80,6 +84,10 @@ fn track_json() -> String {
             "discCount": 1,
             "trackTimeMillis": 241758,
             "trackExplicitness": "explicit",
+            "isrc": "USUG11500631",
+            "recordLabel": "Republic Records",
+            "copyright": "2015 The Weeknd XO, Inc.",
+            "upc": "602547151602",
             "artworkUrl100": "https://is1-ssl.mzstatic.com/image/thumb/Music/v4/99/9b/abc/xyz/100x100bb.jpg"
         }]
     }"#
@@ -102,13 +110,20 @@ async fn track_mapping_parity() {
     assert_eq!(meta.album_artist, "The Weeknd");
     assert_eq!(meta.genre.as_deref(), Some("R&B/Soul"));
     assert_eq!(meta.release_date, "2015-05-27"); // sliced to 10 chars
-    assert_eq!(meta.composer, None); // catalog never sets composer
+    assert_eq!(meta.composer.as_deref(), Some("Abel Tesfaye"));
+    assert_eq!(meta.album_id.as_deref(), Some("1440841723"));
+    assert_eq!(meta.artist_id.as_deref(), Some("12345"));
+    assert_eq!(meta.isrc.as_deref(), Some("USUG11500631"));
+    assert_eq!(meta.record_label.as_deref(), Some("Republic Records"));
+    assert_eq!(meta.copyright.as_deref(), Some("2015 The Weeknd XO, Inc."));
+    assert_eq!(meta.upc.as_deref(), Some("602547151602"));
     assert_eq!(meta.track_number, Some(7));
     assert_eq!(meta.track_count, Some(14));
     assert_eq!(meta.disc_number, Some(1));
     assert_eq!(meta.disc_count, Some(1));
     assert_eq!(meta.duration_secs, 242); // 241758ms rounds to 242
     assert!(meta.explicit);
+    assert_eq!(meta.content_advisory.as_deref(), Some("explicit"));
     assert_eq!(
         meta.artwork_url,
         "https://is1-ssl.mzstatic.com/image/thumb/Music/v4/99/9b/abc/xyz/3000x3000bb.jpg"

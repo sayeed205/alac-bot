@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+media = { path = "../media" }
 bytes.workspace = true
 diesel.workspace = true
 futures-util.workspace = true

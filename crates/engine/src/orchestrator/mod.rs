@@ -117,6 +117,13 @@ struct PipelineRipResult {
     start_time_ms: u64,
 }
 
+fn stream_display_label(status: &str) -> Option<&str> {
+    status
+        .strip_prefix("Connecting stream for ")
+        .map(|value| value.strip_suffix("...").unwrap_or(value).trim())
+        .filter(|value| !value.is_empty())
+}
+
 /// Job state shared by the orchestrator and the pipeline stages (the TS job
 /// object mutated by reference from several concurrent stages).
 struct JobShared {
@@ -624,8 +631,8 @@ impl RipOrchestrator {
                     (Some(title), Some(artist)) => {
                         format!(
                             "<b>{}</b> - <b>{}</b>",
-                            html_escape(artist),
-                            html_escape(title)
+                            html_escape(title),
+                            html_escape(artist)
                         )
                     }
                     _ if options.is_cache_only => {
@@ -754,6 +761,18 @@ impl RipOrchestrator {
                             error = %err,
                             "Failed to deliver cached track copy, marking for re-rip"
                         );
+                        // The database row points at a dump message that no
+                        // longer exists (for example after channel cleanup).
+                        // Remove it immediately so a failed re-rip cannot
+                        // leave a ghost cache entry behind.
+                        let stale_key = TrackKey::new(Provider::Apple, item.id.clone());
+                        if let Err(delete_error) = deps.delete_track(&stale_key).await {
+                            tracing::warn!(
+                                track_id = %item.id,
+                                error = %delete_error,
+                                "Failed to remove stale cache row after dump copy failure"
+                            );
+                        }
                         uncached_items.push(item.clone());
                     }
                 }
@@ -991,17 +1010,28 @@ async fn run_pipeline<D: OrchestratorDeps>(
                 // TS truthiness: `meta?.title && meta?.artist` — an empty
                 // string counts as absent.
                 (Some(title), Some(artist)) if !title.is_empty() && !artist.is_empty() => {
-                    format!("{artist} - {title}")
+                    format!("{title} - {artist}")
                 }
                 _ => format!("Track {}", item.track_id),
             };
+            let dynamic_label = Arc::new(Mutex::new(track_label.clone()));
+            let update_single_track_header =
+                !is_multi_track && item.meta_title.is_none() && item.meta_artist.is_none();
 
             let on_progress: RipProgressCallback = {
                 let texts = Arc::clone(&texts);
                 let shared = Arc::clone(&shared);
                 let bus = bus.clone();
-                let track_label = track_label.clone();
+                let dynamic_label = Arc::clone(&dynamic_label);
                 Arc::new(move |status, downloaded, total| {
+                    if let Some(label) = stream_display_label(status) {
+                        *dynamic_label.lock().expect("label poisoned") = label.to_owned();
+                        if update_single_track_header {
+                            shared.lock().expect("job poisoned").job.job_header =
+                                format!("<b>{}</b>", html_escape(label));
+                        }
+                    }
+                    let track_label = dynamic_label.lock().expect("label poisoned").clone();
                     let text = match (downloaded, total) {
                         (Some(d), Some(t)) => format!(
                             "⬇️ <b>{}:</b> <code>{}</code>",
@@ -1217,7 +1247,7 @@ async fn upload_one<D: OrchestratorDeps>(
 ) {
     let track_id = upload_item.track_id.clone();
     let rip_result = &upload_item.rip_result;
-    let track_label = format!("{} - {}", rip_result.artist, rip_result.title);
+    let track_label = format!("{} - {}", rip_result.title, rip_result.artist);
     let is_cancelled = || {
         shared.lock().expect("job poisoned").job.is_cancelled
             || job_controller.is_cancelled()
@@ -1240,7 +1270,7 @@ async fn upload_one<D: OrchestratorDeps>(
     });
     let plain_caption = format!(
         "{} - {}\n{}",
-        rip_result.artist, rip_result.title, rip_result.album
+        rip_result.title, rip_result.artist, rip_result.album
     );
     let mut current_caption = caption.clone();
     let mut used_plain_caption = false;
@@ -1445,7 +1475,7 @@ async fn upload_one<D: OrchestratorDeps>(
             shared.lock().expect("job poisoned").job.ripped_count = new_count;
 
             tracing::info!(
-                track = format!("{} - {}", rip_result.artist, rip_result.title),
+                track = format!("{} - {}", rip_result.title, rip_result.artist),
                 time = format!("{:.1}s", total_duration_ms as f64 / 1000.0),
                 event = if options.is_cache_only {
                     "Track cached to dump"
@@ -1558,6 +1588,15 @@ mod hardening_tests {
             callback_data.strip_prefix("cancel:").map(str::trim),
             Some(id.as_str())
         );
+    }
+
+    #[test]
+    fn stream_status_extracts_human_label() {
+        assert_eq!(
+            stream_display_label("Connecting stream for Never Gonna Give You Up - Rick Astley..."),
+            Some("Never Gonna Give You Up - Rick Astley")
+        );
+        assert_eq!(stream_display_label("Fetching track metadata..."), None);
     }
 
     #[test]

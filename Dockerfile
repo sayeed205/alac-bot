@@ -1,33 +1,27 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.7
 
 # ==============================================================================
-# Stage 1: Base with system dependencies (ffmpeg, sox, certificates)
+# Stage 1: Runtime with native media support and TLS certificates
 # ==============================================================================
-FROM docker.io/debian:bookworm-slim AS base
+FROM docker.io/debian:bookworm-slim AS runtime
 
-# Install system dependencies:
-# - ffmpeg / ffprobe: audio metadata probing, tagging, and cover art embedding
-# - sox / libsox-fmt-all: audio spectrogram generation (/spec and /spectrogram)
-# - ca-certificates: TLS root certificates
+# Native media decoding, metadata, and spectrogram rendering are provided by
+# the Rust media crate. Keep only the TLS root certificates required for
+# outbound HTTPS connections at runtime.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    sox \
-    libsox-fmt-all \
     ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
-
 # ==============================================================================
-# Stage 2: Builder (stable toolchain; nightly is only needed for `just fmt`)
+# Stage 2: Builder
 # ==============================================================================
-FROM docker.io/rust:1-slim AS builder
+FROM docker.io/rust:1-bookworm AS builder
 WORKDIR /app
 
 # TLS roots for crates.io / git dependencies (cargo fetches the ferogram
 # git dependency over HTTPS via its bundled libgit2 — no system git needed).
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates binutils \
  && rm -rf /var/lib/apt/lists/*
 
 # Build dependencies first for layer caching: manifests + lockfile only.
@@ -36,10 +30,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY Cargo.toml Cargo.lock ./
 COPY crates/engine/Cargo.toml crates/engine/Cargo.toml
 COPY crates/db/Cargo.toml crates/db/Cargo.toml
+COPY crates/media/Cargo.toml crates/media/Cargo.toml
 COPY crates/bot/Cargo.toml crates/bot/Cargo.toml
-RUN mkdir -p crates/engine/src crates/db/src crates/bot/src \
+RUN --mount=type=cache,id=alac-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=alac-cargo-git,target=/usr/local/cargo/git \
+    mkdir -p crates/engine/src crates/db/src crates/media/src crates/bot/src \
  && echo 'pub fn _stub() {}' > crates/engine/src/lib.rs \
  && echo 'pub fn _stub() {}' > crates/db/src/lib.rs \
+ && echo 'pub fn _stub() {}' > crates/media/src/lib.rs \
  && echo 'pub fn _stub() {}' > crates/bot/src/lib.rs \
  && echo 'fn main() {}' > crates/bot/src/main.rs \
  && cargo build --release --locked -p bot \
@@ -47,25 +45,29 @@ RUN mkdir -p crates/engine/src crates/db/src crates/bot/src \
 
 # Real sources: build the binary (dependency layers above are reused).
 COPY crates ./crates
-RUN touch crates/engine/src/lib.rs crates/db/src/lib.rs crates/bot/src/lib.rs crates/bot/src/main.rs \
- && cargo build --release --locked -p bot
+RUN --mount=type=cache,id=alac-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=alac-cargo-git,target=/usr/local/cargo/git \
+    touch crates/engine/src/lib.rs crates/db/src/lib.rs crates/media/src/lib.rs crates/bot/src/lib.rs crates/bot/src/main.rs \
+ && cargo build --release --locked -p bot \
+ && strip --strip-unneeded target/release/bot
 
 # ==============================================================================
 # Stage 3: Production runner
 # ==============================================================================
-FROM base AS runner
+FROM runtime AS runner
 WORKDIR /app
 
 # Set default production environment
 ENV LOG_LEVEL=info
 
-# Copy the statically simple runtime: binary + module-free config
+# Copy only the stripped runtime binary; configuration is supplied at runtime.
 COPY --from=builder /app/target/release/bot ./bot
 
 # Non-root user; bot-data holds the Telegram session and download scratch.
-RUN useradd --system --home-dir /app --shell /usr/sbin/nologin alac \
- && mkdir -p /app/bot-data /app/bot-data/downloads \
- && chown -R alac:alac /app
+RUN useradd --system --uid 10001 --home-dir /app --shell /usr/sbin/nologin alac \
+ && mkdir -p /app/bot-data/downloads \
+ && chown -R alac:alac /app \
+ && chmod 0755 /app/bot
 
 USER alac
 

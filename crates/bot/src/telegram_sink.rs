@@ -9,6 +9,7 @@ use ferogram::{InputMessage, PeerRef, TransferHandle};
 pub struct FerogramTelegramSink {
     client: Arc<ferogram::Client>,
     dump_peer: PeerRef,
+    dump_peer_native_id: i64,
 }
 
 impl FerogramTelegramSink {
@@ -17,9 +18,11 @@ impl FerogramTelegramSink {
             .resolve(&client)
             .await
             .map_err(|error| SinkError(error.to_string()))?;
+        let dump_peer_native_id = ferogram::PeerExt::bare_id(&dump_peer);
         Ok(Self {
             client,
             dump_peer: PeerRef::from(dump_peer),
+            dump_peer_native_id,
         })
     }
 
@@ -93,7 +96,25 @@ impl TelegramSink for FerogramTelegramSink {
                 .await
                 .map_err(|error| SinkError(error.to_string()))?;
 
+            tracing::info!(
+                message_id = message.id(),
+                dump_peer_id = self.dump_peer_native_id,
+                "Audio uploaded to dump channel"
+            );
+
+            let actual_peer = message.peer_id().map(ferogram::PeerExt::bare_id);
+            if actual_peer != Some(self.dump_peer_native_id) {
+                return Err(SinkError(format!(
+                    "dump upload landed in unexpected peer (expected {}, got {:?})",
+                    self.dump_peer_native_id, actual_peer
+                )));
+            }
+
             let Some(document) = message.document() else {
+                tracing::warn!(
+                    message_id = message.id(),
+                    "Dump upload returned no document"
+                );
                 return Ok(None);
             };
             let is_audio = document.raw.attributes.iter().any(|attribute| {

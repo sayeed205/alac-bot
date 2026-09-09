@@ -1,0 +1,19 @@
+[package]
+name = "media"
+description = "Native audio inspection and spectrogram rendering for alac-bot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+png.workspace = true
+font8x8.workspace = true
+realfft.workspace = true
+symphonia.workspace = true
+mp4ameta.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

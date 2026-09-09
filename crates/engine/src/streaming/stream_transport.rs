@@ -23,6 +23,14 @@ pub struct FetchEndpointOptions {
 pub enum StreamError {
     #[error("{0}")]
     Message(String),
+    #[error(
+        "incomplete audio body from {source_name}: expected {expected} bytes, received {received}"
+    )]
+    IncompleteBody {
+        source_name: String,
+        expected: u64,
+        received: u64,
+    },
 }
 
 impl StreamError {
@@ -33,6 +41,13 @@ impl StreamError {
     fn into_message(self) -> String {
         match self {
             Self::Message(message) => message,
+            Self::IncompleteBody {
+                source_name,
+                expected,
+                received,
+            } => format!(
+                "Incomplete audio body from {source_name}: expected {expected} bytes, received {received}"
+            ),
         }
     }
 }

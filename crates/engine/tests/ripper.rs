@@ -35,11 +35,18 @@ fn meta() -> TrackMeta {
         disc_count: None,
         duration_secs: 240,
         explicit: false,
+        content_advisory: None,
         artwork_url: String::new(), // → no artwork fetch
+        album_id: None,
+        artist_id: None,
+        isrc: None,
+        record_label: None,
+        copyright: None,
+        upc: None,
     }
 }
 
-fn fake_stream(chunks: Vec<Bytes>) -> AudioStreamSource {
+fn fake_stream_with_length(chunks: Vec<Bytes>, content_length: Option<u64>) -> AudioStreamSource {
     AudioStreamSource {
         stream: Box::pin(stream::iter(
             chunks
@@ -50,7 +57,7 @@ fn fake_stream(chunks: Vec<Bytes>) -> AudioStreamSource {
         codec: "alac".into(),
         bit_depth: 24,
         sample_rate: 96_000,
-        content_length: None,
+        content_length,
     }
 }
 
@@ -61,6 +68,7 @@ struct FakeDeps {
     meta_calls: AtomicU32,
     mirror: Option<MirrorEndpoint>,
     stream_chunks: Vec<Bytes>,
+    stream_content_length: Option<u64>,
     connect_fails: u32, // first N connect calls fail with a stall message
     connect_calls: AtomicU32,
     lyrics: Option<String>,
@@ -80,6 +88,7 @@ impl FakeDeps {
                 api_key: "k".into(),
             }),
             stream_chunks: vec![Bytes::from(vec![1u8; 10]), Bytes::from(vec![2u8; 5])],
+            stream_content_length: None,
             connect_fails: 0,
             connect_calls: AtomicU32::new(0),
             lyrics: Some("la\nla".into()),
@@ -117,7 +126,10 @@ impl RipperDeps for FakeDeps {
             ));
         }
         assert_eq!(primary.is_some(), self.mirror.is_some());
-        Ok(fake_stream(self.stream_chunks.clone()))
+        Ok(fake_stream_with_length(
+            self.stream_chunks.clone(),
+            self.stream_content_length,
+        ))
     }
 
     async fn fetch_lyrics(
@@ -146,7 +158,7 @@ impl RipperDeps for FakeDeps {
             .push((raw_path.to_owned(), output_path.to_owned()));
         if self.tag_should_fail {
             return Err(RipError::Message(
-                "FFmpeg tagging failed (exit code 1): boom".into(),
+                "native media finalization failed: boom".into(),
             ));
         }
         Ok(())
@@ -203,7 +215,7 @@ async fn happy_path_progress_and_result_mapping() {
         statuses[..3],
         [
             "Fetching track metadata...",
-            "Connecting stream for Artist - Title...",
+            "Connecting stream for Title - Artist...",
             "Downloading lossless audio: 0.0 MB"
         ]
     );
@@ -479,6 +491,23 @@ async fn progress_totals_with_content_length() {
 }
 
 #[tokio::test]
+async fn short_body_is_rejected_before_tagging() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut deps = FakeDeps::ok();
+    deps.stream_content_length = Some(20);
+    let ripper = AlacTrackRipper::new(config(dir.path(), 0, 1));
+
+    let error = ripper
+        .rip(&deps, "42", None, "us", None, None)
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("Incomplete audio body"));
+    assert!(deps.tag_calls.lock().unwrap().is_empty());
+    assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+}
+
+#[tokio::test]
 async fn output_dir_override_used() {
     let base = tempfile::tempdir().unwrap();
     let other = tempfile::tempdir().unwrap();
@@ -504,10 +533,7 @@ async fn tag_failure_is_retryable_and_exhausts() {
         .rip(&deps, "42", None, "us", None, None)
         .await
         .unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "FFmpeg tagging failed (exit code 1): boom"
-    );
+    assert_eq!(error.to_string(), "native media finalization failed: boom");
     assert_eq!(deps.tag_calls.lock().unwrap().len(), 3);
     // Temp raw cleaned even after failures.
     let raw_left: Vec<_> = std::fs::read_dir(dir.path())

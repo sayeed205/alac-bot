@@ -30,8 +30,8 @@ Built in Rust: [ferogram](https://github.com/ankit-chaubey/ferogram) (Telegram M
     - Permission-controlled: only the requester or a bot admin can cancel.
 - **Synced Lyrics Embedding**: Automatically prefetches and embeds word-by-word synced lyrics (TTML -> Enhanced LRC) or
   line-synced LRC from Apple Music and LRCLIB.
-- **High-Res Metadata & Artwork**: Tags every track using FFmpeg with embedded high-resolution album cover art, release
-  date, genre, track/disc numbers, and explicit `[E]` flags.
+- **High-Res Metadata & Artwork**: Tags every track with the native Rust media pipeline, embedding high-resolution
+  album cover art, release date, genre, track/disc numbers, and explicit `[E]` flags.
 - **Interactive Catalog Search**: `/search <query>` searches both cached tracks (with pg_trgm fuzzy matching) and Apple
   Music's catalog with interactive inline button results.
 - **Access Control**: Granular user and group authorization system (`/auth`, `/revoke`, `/authlist`).
@@ -48,8 +48,8 @@ Built in Rust: [ferogram](https://github.com/ankit-chaubey/ferogram) (Telegram M
 
 - [Rust](https://rustup.rs) (stable toolchain; nightly is only needed for `just fmt`)
 - [just](https://github.com/casey/just) (task runner)
-- [FFmpeg](https://ffmpeg.org) installed on system path (required for audio tagging and artwork embedding)
-- [SoX](http://sox.sourceforge.net) with `libsox-fmt-all` (required for `/spec` spectrograms)
+- No external audio tools are required. Audio inspection, tagging, and `/spec` spectrograms are implemented by the
+  native Rust media module.
 - [PostgreSQL](https://www.postgresql.org/) database (with `pg_trgm` extension for fuzzy search — installed
   automatically by the bot's migrations)
 - **Telegram API Credentials**: `API_ID` & `API_HASH` from [my.telegram.org](https://my.telegram.org), plus a
@@ -116,8 +116,8 @@ docker run -d --name alac-bot \
   alac-bot
 ```
 
-The container ships ffmpeg/sox, runs as a non-root user, and persists the Telegram session + download scratch in the
-`/app/bot-data` volume.
+The container includes only the TLS certificate bundle needed for HTTPS, runs as a non-root user, and persists the
+Telegram session + download scratch in the `/app/bot-data` volume.
 
 ---
 

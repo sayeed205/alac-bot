@@ -219,7 +219,7 @@ async fn handle(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
                 (rate as f64 / 1000.0).round()
             ))
         );
-        spectrogram::generate_spectrogram(
+        spectrogram::generate_native_spectrogram(
             &input_path,
             &output_path,
             Some(&header_title),

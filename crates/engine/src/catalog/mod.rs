@@ -66,9 +66,12 @@ struct ItunesRawItem {
     track_id: Option<i64>,
     collection_id: Option<i64>,
     artist_id: Option<i64>,
+    collection_artist_id: Option<i64>,
     track_name: Option<String>,
     collection_name: Option<String>,
     artist_name: Option<String>,
+    collection_artist_name: Option<String>,
+    composer_name: Option<String>,
     primary_genre_name: Option<String>,
     release_date: Option<String>,
     track_number: Option<i64>,
@@ -77,8 +80,14 @@ struct ItunesRawItem {
     disc_count: Option<i64>,
     track_time_millis: Option<i64>,
     track_explicitness: Option<String>,
+    #[serde(rename = "contentAdvisoryRating")]
+    content_advisory_rating: Option<String>,
     collection_explicitness: Option<String>,
     artwork_url_100: Option<String>,
+    isrc: Option<String>,
+    record_label: Option<String>,
+    copyright: Option<String>,
+    upc: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -128,7 +137,8 @@ fn format_artwork_url(url: Option<&str>) -> String {
     re.replace(url, "3000x3000bb").into_owned()
 }
 
-/// Map a raw iTunes item to [`TrackMeta`] exactly as the TS oracle does.
+/// Map a raw iTunes item to [`TrackMeta`], retaining both the legacy core
+/// fields and any richer provider metadata present in the response.
 /// Note: TS `String(x || '')` maps `0` → `''` (JS falsy), so ids of `0`
 /// become empty strings here too.
 fn map_itunes_item(item: &ItunesRawItem) -> TrackMeta {
@@ -140,7 +150,11 @@ fn map_itunes_item(item: &ItunesRawItem) -> TrackMeta {
         title: item.track_name.clone().unwrap_or_default(),
         artist: item.artist_name.clone().unwrap_or_default(),
         album: item.collection_name.clone().unwrap_or_default(),
-        album_artist: item.artist_name.clone().unwrap_or_default(),
+        album_artist: item
+            .collection_artist_name
+            .clone()
+            .or_else(|| item.artist_name.clone())
+            .unwrap_or_default(),
         genre: item.primary_genre_name.clone(),
         release_date: item
             .release_date
@@ -149,14 +163,37 @@ fn map_itunes_item(item: &ItunesRawItem) -> TrackMeta {
             .chars()
             .take(10)
             .collect(),
-        composer: None,
+        composer: item.composer_name.clone(),
         track_number: item.track_number,
         track_count: item.track_count,
         disc_number: item.disc_number,
         disc_count: item.disc_count,
         duration_secs: (item.track_time_millis.unwrap_or(0) as f64 / 1000.0).round() as i64,
-        explicit: item.track_explicitness.as_deref() == Some("explicit"),
+        explicit: item
+            .track_explicitness
+            .as_deref()
+            .or(item.content_advisory_rating.as_deref())
+            .or(item.collection_explicitness.as_deref())
+            == Some("explicit"),
+        content_advisory: item
+            .track_explicitness
+            .clone()
+            .or_else(|| item.content_advisory_rating.clone())
+            .or_else(|| item.collection_explicitness.clone()),
         artwork_url: format_artwork_url(item.artwork_url_100.as_deref()),
+        album_id: item
+            .collection_id
+            .filter(|id| *id != 0)
+            .map(|id| id.to_string()),
+        artist_id: item
+            .artist_id
+            .or(item.collection_artist_id)
+            .filter(|id| *id != 0)
+            .map(|id| id.to_string()),
+        isrc: item.isrc.clone().filter(|value| !value.is_empty()),
+        record_label: item.record_label.clone().filter(|value| !value.is_empty()),
+        copyright: item.copyright.clone().filter(|value| !value.is_empty()),
+        upc: item.upc.clone().filter(|value| !value.is_empty()),
     }
 }
 
@@ -472,7 +509,11 @@ impl<T: Transport> Catalog<T> {
                 title: c.collection_name.clone().unwrap_or_default(),
                 artist: c.artist_name.clone().unwrap_or_default(),
                 album: c.collection_name.clone().unwrap_or_default(),
-                album_artist: c.artist_name.clone().unwrap_or_default(),
+                album_artist: c
+                    .collection_artist_name
+                    .clone()
+                    .or_else(|| c.artist_name.clone())
+                    .unwrap_or_default(),
                 genre: c.primary_genre_name.clone(),
                 release_date: c
                     .release_date
@@ -481,14 +522,28 @@ impl<T: Transport> Catalog<T> {
                     .chars()
                     .take(10)
                     .collect(),
-                composer: None,
+                composer: c.composer_name.clone(),
                 track_number: None,
                 track_count: None,
                 disc_number: None,
                 disc_count: None,
                 duration_secs: 0,
                 explicit: c.collection_explicitness.as_deref() == Some("explicit"),
+                content_advisory: c.collection_explicitness.clone(),
                 artwork_url: format_artwork_url(c.artwork_url_100.as_deref()),
+                album_id: c
+                    .collection_id
+                    .filter(|id| *id != 0)
+                    .map(|id| id.to_string()),
+                artist_id: c
+                    .artist_id
+                    .or(c.collection_artist_id)
+                    .filter(|id| *id != 0)
+                    .map(|id| id.to_string()),
+                isrc: c.isrc.clone().filter(|value| !value.is_empty()),
+                record_label: c.record_label.clone().filter(|value| !value.is_empty()),
+                copyright: c.copyright.clone().filter(|value| !value.is_empty()),
+                upc: c.upc.clone().filter(|value| !value.is_empty()),
             },
             None => first_track,
         };

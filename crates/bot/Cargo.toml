@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 db = { path = "../db" }
 engine = { path = "../engine" }
+media = { path = "../media" }
 ferogram.workspace = true
 regex.workspace = true
 futures-util.workspace = true

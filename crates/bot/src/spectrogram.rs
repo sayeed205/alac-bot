@@ -1,61 +1,6 @@
 //! Audio probing and spectrogram generation used by the `/spec` command.
 
-use std::{
-    path::Path,
-    process::{ExitStatus, Output, Stdio},
-    sync::{Arc, OnceLock},
-};
-
-use engine::limits::{MAX_PROCESS_OUTPUT_BYTES, PROCESS_TIMEOUT};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    process::Command,
-    sync::Semaphore,
-};
-
-static SPECTROGRAM_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
-
-fn spectrogram_slot() -> Arc<Semaphore> {
-    SPECTROGRAM_SLOTS
-        .get_or_init(|| Arc::new(Semaphore::new(2)))
-        .clone()
-}
-
-async fn read_limited<R: tokio::io::AsyncRead + Unpin>(mut reader: R) -> Result<Vec<u8>, String> {
-    let mut output = Vec::new();
-    let mut buffer = [0_u8; 8192];
-    loop {
-        let read = reader.read(&mut buffer).await.map_err(|e| e.to_string())?;
-        if read == 0 {
-            return Ok(output);
-        }
-        let remaining = MAX_PROCESS_OUTPUT_BYTES.saturating_sub(output.len());
-        output.extend_from_slice(&buffer[..read.min(remaining)]);
-    }
-}
-
-async fn run_bounded(mut command: Command) -> Result<Output, String> {
-    let mut child = command.spawn().map_err(|e| e.to_string())?;
-    let stdout = child.stdout.take().ok_or("process stdout unavailable")?;
-    let stderr = child.stderr.take().ok_or("process stderr unavailable")?;
-    let stdout_task = tokio::spawn(read_limited(stdout));
-    let stderr_task = tokio::spawn(read_limited(stderr));
-    let status: ExitStatus = match tokio::time::timeout(PROCESS_TIMEOUT, child.wait()).await {
-        Ok(status) => status.map_err(|e| e.to_string())?,
-        Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            return Err("audio process timed out".to_owned());
-        }
-    };
-    let stdout = stdout_task.await.map_err(|e| e.to_string())??;
-    let stderr = stderr_task.await.map_err(|e| e.to_string())??;
-    Ok(Output {
-        status,
-        stdout,
-        stderr,
-    })
-}
+use std::path::Path;
 
 /// Metadata extracted from the first stream in an audio file.
 #[derive(Clone, Debug, PartialEq)]
@@ -72,266 +17,54 @@ pub struct AudioProbeResult {
 }
 
 /// Extensions accepted as audio documents by the command.
-pub const AUDIO_EXTENSIONS: [&str; 18] = [
+pub const AUDIO_EXTENSIONS: [&str; 12] = [
     ".m4a", ".flac", ".mp3", ".wav", ".wave", ".aac", ".alac", ".ogg", ".oga", ".opus", ".aiff",
-    ".aif", ".wma", ".mka", ".ape", ".wv", ".dsf", ".dff",
+    ".aif",
 ];
 
-fn number(value: Option<&serde_json::Value>) -> Option<f64> {
-    value.and_then(|value| {
-        value
-            .as_f64()
-            .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
-    })
-}
-
-fn string(value: Option<&serde_json::Value>) -> Option<String> {
-    value.and_then(|value| {
-        value
-            .as_str()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(str::to_owned)
-    })
-}
-
-fn tag(
-    stream: Option<&serde_json::Value>,
-    format: Option<&serde_json::Value>,
-    name: &str,
-) -> Option<String> {
-    for object in [stream, format].into_iter().flatten() {
-        if let Some(tags) = object.get("tags").and_then(serde_json::Value::as_object) {
-            if let Some(value) = tags.iter().find_map(|(key, value)| {
-                key.eq_ignore_ascii_case(name)
-                    .then(|| string(Some(value)))
-                    .flatten()
-            }) {
-                return Some(value);
-            }
-        }
-    }
-    None
-}
-
-/// Probe audio metadata with ffprobe.
+/// Probe audio metadata through the native media module.
 pub async fn probe_audio(file: &Path) -> Result<AudioProbeResult, String> {
-    let _permit = spectrogram_slot()
-        .acquire_owned()
+    let info = media::MediaProcessor::new()
+        .inspect(file, &tokio_util::sync::CancellationToken::new())
         .await
-        .map_err(|_| "spectrogram worker unavailable".to_owned())?;
-    let mut command = Command::new("ffprobe");
-    command
-        .args([
-            "-v",
-            "quiet",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-        ])
-        .arg(file)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = run_bounded(command).await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        return Err(if stderr.is_empty() {
-            format!("ffprobe exited with {}", output.status)
-        } else {
-            stderr
-        });
-    }
-
-    let data: serde_json::Value =
-        serde_json::from_slice(&output.stdout).map_err(|error| error.to_string())?;
-    let stream = data
-        .get("streams")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|v| v.first());
-    let format = data.get("format");
-
-    let sample_rate = number(stream.and_then(|v| v.get("sample_rate")))
-        .filter(|value| *value > 0.0)
-        .map(|value| value as u32)
-        .unwrap_or(44_100);
-    let channels = number(stream.and_then(|v| v.get("channels")))
-        .filter(|value| *value > 0.0)
-        .map(|value| value as u32)
-        .unwrap_or(2);
-    let bit_depth = number(stream.and_then(|v| v.get("bits_per_raw_sample")))
-        .or_else(|| number(stream.and_then(|v| v.get("bits_per_sample"))))
-        .filter(|value| *value > 0.0)
-        .map(|value| value as u32);
-    let duration = number(stream.and_then(|v| v.get("duration")))
-        .or_else(|| number(format.and_then(|v| v.get("duration"))))
-        .filter(|value| *value > 0.0)
-        .unwrap_or(0.0);
-    let bit_rate = number(stream.and_then(|v| v.get("bit_rate")))
-        .or_else(|| number(format.and_then(|v| v.get("bit_rate"))))
-        .filter(|value| *value > 0.0)
-        .map(|value| value as u64);
-
+        .map_err(|error| error.to_string())?;
     Ok(AudioProbeResult {
-        title: tag(stream, format, "title"),
-        artist: tag(stream, format, "artist"),
-        album: tag(stream, format, "album"),
-        codec: string(stream.and_then(|v| v.get("codec_name"))).unwrap_or_else(|| "unknown".into()),
-        sample_rate,
-        bit_depth,
-        channels,
-        bit_rate,
-        duration,
+        title: info.title,
+        artist: info.artist,
+        album: info.album,
+        codec: info.codec,
+        sample_rate: info.sample_rate,
+        bit_depth: info.bit_depth,
+        channels: info.channels,
+        bit_rate: None,
+        duration: info.duration_secs,
     })
 }
 
-fn spectrogram_args(
-    program: &str,
-    input: &Path,
-    output: &Path,
-    title: Option<&str>,
-    comment: Option<&str>,
-    duration_secs: f64,
-) -> Vec<String> {
-    let mut args = vec![
-        program.to_owned(),
-        input.display().to_string(),
-        "-n".into(),
-        "spectrogram".into(),
-        "-x".into(),
-        "1200".into(),
-        "-y".into(),
-        "551".into(),
-        "-z".into(),
-        "120".into(),
-    ];
-    if duration_secs > 0.0 {
-        args.extend(["-d".into(), format!("{duration_secs:.2}")]);
-    }
-    if let Some(title) = title {
-        args.extend(["-t".into(), title.to_owned()]);
-    }
-    if let Some(comment) = comment {
-        args.extend(["-c".into(), comment.to_owned()]);
-    }
-    args.extend(["-o".into(), output.display().to_string()]);
-    args
-}
-
-fn process_error(prefix: &str, status: Option<std::process::ExitStatus>, stderr: &[u8]) -> String {
-    let stderr = String::from_utf8_lossy(stderr).trim().to_owned();
-    if stderr.is_empty() {
-        match status {
-            Some(status) => format!("{prefix} exited with {status}"),
-            None => format!("{prefix} failed"),
-        }
-    } else {
-        stderr
-    }
-}
-
-/// Generate a SoX spectrogram, falling back to an ffmpeg-to-SoX pipe.
-pub async fn generate_spectrogram(
+/// Generate a native spectrogram with the same presentation contract as `/spec`.
+pub async fn generate_native_spectrogram(
     input: &Path,
     output: &Path,
     title: Option<&str>,
     comment: Option<&str>,
     duration_secs: f64,
 ) -> Result<(), String> {
-    let _permit = spectrogram_slot()
-        .acquire_owned()
+    let options = media::SpectrogramOptions {
+        title: title.map(str::to_owned),
+        comment: comment.map(str::to_owned),
+        max_duration_secs: (duration_secs > 0.0).then_some(duration_secs),
+        ..media::SpectrogramOptions::default()
+    };
+    media::MediaProcessor::new()
+        .render_spectrogram(
+            input,
+            output,
+            &options,
+            &tokio_util::sync::CancellationToken::new(),
+        )
         .await
-        .map_err(|_| "spectrogram worker unavailable".to_owned())?;
-    let args = spectrogram_args("sox", input, output, title, comment, duration_secs);
-    let mut direct_command = Command::new(&args[0]);
-    direct_command
-        .args(&args[1..])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let direct = run_bounded(direct_command).await;
-    if let Ok(result) = direct {
-        if result.status.success() && output.exists() {
-            return Ok(());
-        }
-    }
-
-    let mut ffmpeg = Command::new("ffmpeg")
-        .args(["-v", "error", "-i"])
-        .arg(input)
-        .args(["-f", "wav", "-"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| error.to_string())?;
-    let mut ffmpeg_stdout = ffmpeg
-        .stdout
-        .take()
-        .ok_or_else(|| "ffmpeg stdout unavailable".to_owned())?;
-    let ffmpeg_stderr = ffmpeg
-        .stderr
-        .take()
-        .ok_or_else(|| "ffmpeg stderr unavailable".to_owned())?;
-    let ffmpeg_stderr_task =
-        tokio::spawn(async move { read_limited(ffmpeg_stderr).await.unwrap_or_default() });
-
-    let sox_args = spectrogram_args("sox", Path::new("-"), output, title, comment, duration_secs);
-    let mut sox = match Command::new(&sox_args[0])
-        .args(["-t", "wav"])
-        .args(&sox_args[1..])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(sox) => sox,
-        Err(error) => {
-            let _ = ffmpeg.kill().await;
-            return Err(error.to_string());
-        }
-    };
-    let mut sox_stdin = sox
-        .stdin
-        .take()
-        .ok_or_else(|| "sox stdin unavailable".to_owned())?;
-    let sox_stderr = sox
-        .stderr
-        .take()
-        .ok_or_else(|| "sox stderr unavailable".to_owned())?;
-    let sox_stderr_task =
-        tokio::spawn(async move { read_limited(sox_stderr).await.unwrap_or_default() });
-
-    let pipeline = async {
-        let copy_result = tokio::io::copy(&mut ffmpeg_stdout, &mut sox_stdin).await;
-        let _ = sox_stdin.shutdown().await;
-        let ffmpeg_status = ffmpeg.wait().await.ok();
-        let sox_status = sox.wait().await.ok();
-        (copy_result, ffmpeg_status, sox_status)
-    };
-    let (copy_result, ffmpeg_status, sox_status) =
-        match tokio::time::timeout(PROCESS_TIMEOUT, pipeline).await {
-            Ok(result) => result,
-            Err(_) => {
-                let _ = ffmpeg.kill().await;
-                let _ = sox.kill().await;
-                let _ = ffmpeg.wait().await;
-                let _ = sox.wait().await;
-                return Err("audio process timed out".to_owned());
-            }
-        };
-    let ffmpeg_error = ffmpeg_stderr_task.await.unwrap_or_default();
-    let sox_error = sox_stderr_task.await.unwrap_or_default();
-
-    if let Err(error) = copy_result {
-        return Err(error.to_string());
-    }
-    if ffmpeg_status.is_none_or(|status| !status.success()) {
-        return Err(process_error("ffmpeg", ffmpeg_status, &ffmpeg_error));
-    }
-    if sox_status.is_none_or(|status| !status.success()) || !output.exists() {
-        return Err(process_error("sox", sox_status, &sox_error));
-    }
-    Ok(())
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 /// Format a duration like the TypeScript command (`m:ss` or `h:mm:ss`).
@@ -431,7 +164,7 @@ mod tests {
     fn has_all_audio_extensions() {
         assert!(AUDIO_EXTENSIONS.contains(&".m4a"));
         assert!(AUDIO_EXTENSIONS.contains(&".flac"));
-        assert_eq!(AUDIO_EXTENSIONS.len(), 18);
+        assert_eq!(AUDIO_EXTENSIONS.len(), 12);
     }
 
     #[test]

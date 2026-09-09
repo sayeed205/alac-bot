@@ -1,7 +1,7 @@
 //! Domain types shared across the core crate.
 //!
 //! Field-level parity with the TS oracle (`src/modules/alac/types.ts`) matters:
-//! these values flow into Telegram replies, DB rows, and ffmpeg tags.
+//! these values flow into Telegram replies, DB rows, and media finalization.
 
 use diesel::{deserialize::FromSql, pg::Pg, serialize::ToSql};
 use serde::{Deserialize, Serialize};
@@ -137,7 +137,7 @@ pub struct TrackMeta {
     /// First 10 chars of the raw release date, or `''` when absent — the TS
     /// oracle always produces a string here (like `artwork_url`).
     pub release_date: String,
-    /// Never set by the catalog (TS leaves it undefined; the tagger fills it).
+    /// Composer when the provider exposes it; otherwise omitted.
     pub composer: Option<String>,
     pub track_number: Option<i64>,
     pub track_count: Option<i64>,
@@ -146,8 +146,20 @@ pub struct TrackMeta {
     /// Duration in seconds (milliseconds / 1000, rounded).
     pub duration_secs: i64,
     pub explicit: bool,
+    /// Provider advisory value (`explicit`, `clean`, or another inoffensive
+    /// classification), retained so the media layer can write the precise
+    /// iTunes rating atom.
+    pub content_advisory: Option<String>,
     /// TS maps missing artwork to `''` (not undefined) — kept for parity.
     pub artwork_url: String,
+    /// Provider-native album and artist identifiers, when available.
+    pub album_id: Option<String>,
+    pub artist_id: Option<String>,
+    /// Recording and release metadata exposed by the provider.
+    pub isrc: Option<String>,
+    pub record_label: Option<String>,
+    pub copyright: Option<String>,
+    pub upc: Option<String>,
 }
 
 /// An album plus its ordered track list.

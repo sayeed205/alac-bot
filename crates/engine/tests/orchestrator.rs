@@ -131,7 +131,14 @@ impl FakeDeps {
             disc_count: None,
             duration_secs: 215,
             explicit: false,
+            content_advisory: None,
             artwork_url: String::new(),
+            album_id: None,
+            artist_id: None,
+            isrc: None,
+            record_label: None,
+            copyright: None,
+            upc: None,
         }
     }
 
@@ -495,6 +502,15 @@ async fn happy_path_single_track() {
     let st = state.lock().unwrap();
     assert_eq!(st.rip_calls, vec!["1440828878".to_string()]);
     assert_eq!(st.saved_tracks.len(), 1);
+    assert_eq!(
+        st.sent_audio,
+        vec![(
+            "/tmp/does-not-exist-1440828878.m4a".to_string(),
+            "Night Song".to_string(),
+            "A&R <duo>".to_string(),
+        )],
+        "a live miss must upload to the dump before delivering the DM copy"
+    );
     let saved = &st.saved_tracks[0];
     assert_eq!(saved.track_key, TrackKey::apple("1440828878"));
     assert_eq!(saved.message_id, 777);
@@ -1108,7 +1124,9 @@ async fn cache_copy_failure_marks_re_rip() {
         .await
         .expect("job succeeds");
     assert_eq!(summary.ripped_count, 1);
-    assert_eq!(state.lock().unwrap().rip_calls, vec!["t1".to_string()]);
+    let st = state.lock().unwrap();
+    assert_eq!(st.rip_calls, vec!["t1".to_string()]);
+    assert_eq!(st.deleted_tracks, vec!["t1".to_string()]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -21,7 +21,7 @@ use crate::{
         AudioStreamSource, MirrorEndpoint, MirrorPolicyManager, ProgressCallback, StreamError,
         StreamTransport,
     },
-    tagger::{self, ProcessRunner},
+    tagger,
     types::{TrackMeta, TrackRipResult},
 };
 
@@ -46,12 +46,6 @@ impl From<CatalogError> for RipError {
 
 impl From<std::io::Error> for RipError {
     fn from(error: std::io::Error) -> Self {
-        RipError::Message(error.to_string())
-    }
-}
-
-impl From<tagger::TagError> for RipError {
-    fn from(error: tagger::TagError) -> Self {
         RipError::Message(error.to_string())
     }
 }
@@ -236,7 +230,7 @@ impl AlacTrackRipper {
 
         emit_progress(
             on_progress,
-            &format!("Connecting stream for {} - {}...", meta.artist, meta.title),
+            &format!("Connecting stream for {} - {}...", meta.title, meta.artist),
             None,
             None,
         );
@@ -412,6 +406,15 @@ impl AlacTrackRipper {
                 }
             }
 
+            if let Some(expected) = total {
+                if downloaded_bytes != expected {
+                    return Err(RipError::Message(format!(
+                        "Incomplete audio body from {}: expected {expected} bytes, received {downloaded_bytes}",
+                        stream.source_name
+                    )));
+                }
+            }
+
             file.flush().await?;
 
             if signal.is_some_and(|t| t.is_cancelled()) {
@@ -538,7 +541,7 @@ fn unique_temp_suffix() -> u64 {
 }
 
 /// Production dependency bundle wiring catalog, mirror policy, stream
-/// transport, lyrics, artwork, and the real ffmpeg runner.
+/// transport, lyrics, artwork, and native media finalization.
 pub struct EngineRipperDeps {
     catalog: Catalog<ReqwestTransport>,
     mirror_policy: MirrorPolicyManager<crate::streaming::ReqwestHttp>,
@@ -547,7 +550,7 @@ pub struct EngineRipperDeps {
     wrapper_api_key: Option<String>,
     artwork_client: reqwest::Client,
     lyrics_client: reqwest::Client,
-    ffmpeg: ProcessRunner,
+    media: media::MediaProcessor,
 }
 
 impl EngineRipperDeps {
@@ -567,7 +570,7 @@ impl EngineRipperDeps {
             wrapper_api_key,
             artwork_client: reqwest::Client::new(),
             lyrics_client: reqwest::Client::new(),
-            ffmpeg: ProcessRunner,
+            media: media::MediaProcessor::new(),
         }
     }
 }
@@ -661,9 +664,72 @@ impl RipperDeps for EngineRipperDeps {
         cover: Option<&[u8]>,
         lyrics: Option<&str>,
     ) -> Result<(), RipError> {
-        tagger::tag_m4a_file(&self.ffmpeg, raw_path, output_path, meta, cover, lyrics)
+        let tags = media::TrackTags {
+            title: (!meta.title.is_empty()).then(|| meta.title.clone()),
+            title_sort: (!meta.title.is_empty()).then(|| meta.title.clone()),
+            artist: (!meta.artist.is_empty()).then(|| meta.artist.clone()),
+            artist_sort: (!meta.artist.is_empty()).then(|| meta.artist.clone()),
+            album: (!meta.album.is_empty()).then(|| meta.album.clone()),
+            album_sort: (!meta.album.is_empty()).then(|| meta.album.clone()),
+            album_artist: (!meta.album_artist.is_empty()).then(|| meta.album_artist.clone()),
+            album_artist_sort: (!meta.album_artist.is_empty()).then(|| meta.album_artist.clone()),
+            release_date: (!meta.release_date.is_empty()).then(|| meta.release_date.clone()),
+            genre: meta.genre.clone().filter(|value| !value.is_empty()),
+            composer: meta.composer.clone().filter(|value| !value.is_empty()),
+            composer_sort: meta.composer.clone().filter(|value| !value.is_empty()),
+            track_number: meta
+                .track_number
+                .filter(|value| *value != 0)
+                .and_then(|value| u16::try_from(value).ok()),
+            track_count: meta
+                .track_count
+                .filter(|value| *value != 0)
+                .and_then(|value| u16::try_from(value).ok()),
+            disc_number: meta
+                .disc_number
+                .filter(|value| *value != 0)
+                .and_then(|value| u16::try_from(value).ok()),
+            disc_count: meta
+                .disc_count
+                .filter(|value| *value != 0)
+                .and_then(|value| u16::try_from(value).ok()),
+            lyrics: lyrics.map(str::to_owned).filter(|value| !value.is_empty()),
+            artwork_jpeg: cover
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_vec()),
+            isrc: meta.isrc.clone().filter(|value| !value.is_empty()),
+            label: meta.record_label.clone().filter(|value| !value.is_empty()),
+            copyright: meta.copyright.clone().filter(|value| !value.is_empty()),
+            publisher: meta.record_label.clone().filter(|value| !value.is_empty()),
+            performer: (!meta.artist.is_empty()).then(|| meta.artist.clone()),
+            release_time: (!meta.release_date.is_empty()).then(|| meta.release_date.clone()),
+            upc: meta.upc.clone().filter(|value| !value.is_empty()),
+            song_id: meta.id.parse::<u64>().ok(),
+            album_id: meta
+                .album_id
+                .as_deref()
+                .and_then(|value| value.parse().ok()),
+            artist_id: meta
+                .artist_id
+                .as_deref()
+                .and_then(|value| value.parse().ok()),
+            explicit: Some(meta.explicit),
+            advisory: Some(match meta.content_advisory.as_deref() {
+                Some(value) if value.eq_ignore_ascii_case("explicit") => {
+                    media::AdvisoryKind::Explicit
+                }
+                Some(value) if value.eq_ignore_ascii_case("clean") => media::AdvisoryKind::Clean,
+                Some(_) => media::AdvisoryKind::Inoffensive,
+                None if meta.explicit => media::AdvisoryKind::Explicit,
+                None => media::AdvisoryKind::Inoffensive,
+            }),
+            media_kind: Some(media::MediaKind::Music),
+        };
+        let cancellation = CancellationToken::new();
+        self.media
+            .finalize_alac(raw_path, output_path, &tags, &cancellation)
             .await
             .map(|_| ())
-            .map_err(RipError::from)
+            .map_err(|error| RipError::Message(error.to_string()))
     }
 }
