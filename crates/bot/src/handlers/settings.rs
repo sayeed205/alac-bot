@@ -21,7 +21,11 @@ use ferogram::{
     InputMessage, PeerRef,
 };
 
-use crate::{html::parse_dynamic_html, BotState};
+use crate::{
+    html::parse_dynamic_html,
+    interaction::{SettingFeature, SettingsAction},
+    BotState,
+};
 
 /// Oracle POPULAR_STOREFRONTS (settings.ts:15-24).
 pub const POPULAR_STOREFRONTS: [&str; 8] = ["us", "gb", "jp", "in", "ca", "au", "de", "fr"];
@@ -422,11 +426,7 @@ fn upper_join(list: &[String]) -> String {
 }
 
 /// `settings:*` callbacks — oracle settings.ts:416-547.
-pub async fn callback(state: Arc<BotState>, query: CallbackQuery) {
-    let Some(data) = query.data().map(str::to_owned) else {
-        return;
-    };
-
+pub async fn callback(state: Arc<BotState>, query: CallbackQuery, action: SettingsAction) {
     // Admin re-check on every callback (owner only).
     if !state.auth.is_admin(query.user_id) {
         let _ = query
@@ -440,14 +440,14 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery) {
     let peer = query.chat_peer.clone().map(PeerRef::Peer);
     let message_id = query.message_id;
 
-    match data.as_str() {
-        "settings:close" => {
+    match action {
+        SettingsAction::Close => {
             let _ = query.answer().send(&state.client).await;
             if let (Some(peer), Some(id)) = (peer, message_id) {
                 delete_panel_message(state, peer, id).await;
             }
         }
-        "settings:refresh" => {
+        SettingsAction::Refresh => {
             let _ = query
                 .answer()
                 .text("Settings refreshed")
@@ -457,13 +457,13 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery) {
                 render_settings_message(&state, &peer, Some(id), None).await;
             }
         }
-        "settings:sf_menu" => {
+        SettingsAction::Storefronts => {
             let _ = query.answer().send(&state.client).await;
             if let (Some(peer), Some(id)) = (peer, message_id) {
                 render_storefronts_message(&state, &peer, id).await;
             }
         }
-        "settings:mode" => {
+        SettingsAction::Mode => {
             let new_mode = state.rip_deps.settings().cycle_ripping_mode().await;
             let label = match new_mode {
                 engine::settings::RippingMode::Live => "Mode: Live Ripping",
@@ -475,19 +475,20 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery) {
                 render_settings_message(&state, &peer, Some(id), None).await;
             }
         }
-        "settings:album" | "settings:playlist" | "settings:artist" | "settings:txt"
-        | "settings:multilink" | "settings:autodump" => {
+        SettingsAction::Toggle(feature) => {
             let settings_store = state.rip_deps.settings();
-            let (enabled, label) = match data.as_str() {
-                "settings:album" => (settings_store.toggle_album().await, "Album ripping"),
-                "settings:playlist" => (settings_store.toggle_playlist().await, "Playlist ripping"),
-                "settings:artist" => (settings_store.toggle_artist().await, "Artist ripping"),
-                "settings:txt" => (settings_store.toggle_txt().await, ".TXT batch ripping"),
-                "settings:multilink" => (
+            let (enabled, label) = match feature {
+                SettingFeature::Album => (settings_store.toggle_album().await, "Album ripping"),
+                SettingFeature::Playlist => {
+                    (settings_store.toggle_playlist().await, "Playlist ripping")
+                }
+                SettingFeature::Artist => (settings_store.toggle_artist().await, "Artist ripping"),
+                SettingFeature::Txt => (settings_store.toggle_txt().await, ".TXT batch ripping"),
+                SettingFeature::MultiLink => (
                     settings_store.toggle_multi_link_rip().await,
                     "Multi-link ripping",
                 ),
-                _ => (settings_store.toggle_auto_dump().await, "Auto-dump"),
+                SettingFeature::AutoDump => (settings_store.toggle_auto_dump().await, "Auto-dump"),
             };
             let _ = query
                 .answer()
@@ -498,74 +499,55 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery) {
                 render_settings_message(&state, &peer, Some(id), None).await;
             }
         }
-        _ => {
-            // settings:limit:<n> and settings:sf:toggle:<sf>
-            if let Some(limit_str) = data.strip_prefix("settings:limit:") {
-                let Ok(limit) = limit_str.parse::<i64>() else {
-                    let _ = query
-                        .answer()
-                        .alert("This settings action is invalid. Please open /settings again.")
-                        .send(&state.client)
-                        .await;
-                    return;
-                };
-                if limit >= 0 {
-                    state
-                        .rip_deps
-                        .settings()
-                        .set_max_collection_tracks(limit)
-                        .await;
-                    let _ = query
-                        .answer()
-                        .text(format!(
-                            "Collection limit: {}",
-                            if limit == 0 {
-                                "Unlimited".to_owned()
-                            } else {
-                                format!("{limit} tracks")
-                            }
-                        ))
-                        .send(&state.client)
-                        .await;
-                    if let (Some(peer), Some(id)) = (peer, message_id) {
-                        render_settings_message(&state, &peer, Some(id), None).await;
+        SettingsAction::Limit(limit) => {
+            state
+                .rip_deps
+                .settings()
+                .set_max_collection_tracks(i64::from(limit))
+                .await;
+            let _ = query
+                .answer()
+                .text(format!(
+                    "Collection limit: {}",
+                    if limit == 0 {
+                        "Unlimited".to_owned()
+                    } else {
+                        format!("{limit} tracks")
                     }
-                }
-            } else if let Some(sf) = data.strip_prefix("settings:sf:toggle:") {
-                let sf = sf.to_lowercase();
-                let current = state.rip_deps.settings_snapshot().auto_dump_storefronts;
-                if current.iter().any(|value| value.eq_ignore_ascii_case(&sf)) {
-                    state
-                        .rip_deps
-                        .settings()
-                        .remove_auto_dump_storefront(&sf)
-                        .await;
-                    let _ = query
-                        .answer()
-                        .text(format!("Removed {}", sf.to_uppercase()))
-                        .send(&state.client)
-                        .await;
-                } else {
-                    state
-                        .rip_deps
-                        .settings()
-                        .add_auto_dump_storefront(&sf)
-                        .await;
-                    let _ = query
-                        .answer()
-                        .text(format!("Added {}", sf.to_uppercase()))
-                        .send(&state.client)
-                        .await;
-                }
-                if let (Some(peer), Some(id)) = (peer, message_id) {
-                    render_storefronts_message(&state, &peer, id).await;
-                }
-            } else {
+                ))
+                .send(&state.client)
+                .await;
+            if let (Some(peer), Some(id)) = (peer, message_id) {
+                render_settings_message(&state, &peer, Some(id), None).await;
+            }
+        }
+        SettingsAction::ToggleStorefront(sf) => {
+            let current = state.rip_deps.settings_snapshot().auto_dump_storefronts;
+            if current.iter().any(|value| value.eq_ignore_ascii_case(&sf)) {
+                state
+                    .rip_deps
+                    .settings()
+                    .remove_auto_dump_storefront(&sf)
+                    .await;
                 let _ = query
                     .answer()
-                    .alert("This settings action is unavailable. Please open /settings again.")
+                    .text(format!("Removed {}", sf.to_uppercase()))
                     .send(&state.client)
                     .await;
+            } else {
+                state
+                    .rip_deps
+                    .settings()
+                    .add_auto_dump_storefront(&sf)
+                    .await;
+                let _ = query
+                    .answer()
+                    .text(format!("Added {}", sf.to_uppercase()))
+                    .send(&state.client)
+                    .await;
+            }
+            if let (Some(peer), Some(id)) = (peer, message_id) {
+                render_storefronts_message(&state, &peer, id).await;
             }
         }
     }

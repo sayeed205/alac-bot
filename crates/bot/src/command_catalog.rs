@@ -17,6 +17,13 @@ pub struct CommandDescriptor {
 
 pub const COMMANDS: &[CommandDescriptor] = &[
     CommandDescriptor {
+        name: "start",
+        aliases: &[],
+        role: CommandRole::User,
+        summary: "Show the quick start guide",
+        usage: "/start",
+    },
+    CommandDescriptor {
         name: "alac",
         aliases: &["rip", "batch", "dl", "download"],
         role: CommandRole::User,
@@ -53,14 +60,14 @@ pub const COMMANDS: &[CommandDescriptor] = &[
     },
     CommandDescriptor {
         name: "spec",
-        aliases: &[],
+        aliases: &["spectogram", "spectrogram", "spek"],
         role: CommandRole::User,
         summary: "Generate a spectrogram from replied audio",
         usage: "/spec",
     },
     CommandDescriptor {
         name: "report",
-        aliases: &[],
+        aliases: &["issue"],
         role: CommandRole::User,
         summary: "Report a problem with a track",
         usage: "/report",
@@ -141,6 +148,41 @@ pub const COMMANDS: &[CommandDescriptor] = &[
         role: CommandRole::Admin,
         summary: "Remove leftover temporary files",
         usage: "/clean",
+    },
+    CommandDescriptor {
+        name: "ping",
+        aliases: &["health"],
+        role: CommandRole::Admin,
+        summary: "Check Telegram, database, and mirror health",
+        usage: "/ping",
+    },
+    CommandDescriptor {
+        name: "queue",
+        aliases: &[],
+        role: CommandRole::Admin,
+        summary: "View active and pending downloads",
+        usage: "/queue",
+    },
+    CommandDescriptor {
+        name: "index",
+        aliases: &[],
+        role: CommandRole::Admin,
+        summary: "Reconcile the dump channel with the database",
+        usage: "/index",
+    },
+    CommandDescriptor {
+        name: "export",
+        aliases: &[],
+        role: CommandRole::Admin,
+        summary: "Export a database archive",
+        usage: "/export",
+    },
+    CommandDescriptor {
+        name: "import",
+        aliases: &[],
+        role: CommandRole::Admin,
+        summary: "Restore a database archive",
+        usage: "/import",
     },
 ];
 

@@ -4,7 +4,7 @@
 //! The orchestrator emits events from inside its pipeline; those callbacks
 //! must not perform network I/O (they can run under the job mutex and would
 //! stall the whole queue). The sync subscription only **clones** event data
-//! into an unbounded mpsc channel; this module's spawned consumer does the
+//! into a bounded mpsc channel; this module's spawned consumer does the
 //! async rendering: per-request status messages + the global dashboard.
 
 use std::{
@@ -57,6 +57,13 @@ pub enum BridgeEvent {
 }
 
 impl BridgeEvent {
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Completed { .. } | Self::Cancelled { .. } | Self::Failed { .. }
+        )
+    }
+
     /// Clone a borrowed engine event into an owned, sendable copy.
     pub fn from_engine(event: &OrchestratorEvent<'_>) -> Option<Self> {
         Some(match event {
@@ -160,7 +167,7 @@ pub fn registry() -> Arc<BridgeRegistry> {
 }
 
 /// The consumer loop: one event at a time, network edits allowed.
-async fn consume(state: Arc<BotState>, mut rx: mpsc::UnboundedReceiver<BridgeEvent>) {
+async fn consume(state: Arc<BotState>, mut rx: mpsc::Receiver<BridgeEvent>) {
     while let Some(event) = rx.recv().await {
         if let Err(error) = handle_event(Arc::clone(&state), event).await {
             tracing::warn!(%error, "status event handling failed");
@@ -170,12 +177,27 @@ async fn consume(state: Arc<BotState>, mut rx: mpsc::UnboundedReceiver<BridgeEve
 
 /// Subscribe the bridge to orchestrator events and spawn its consumer.
 pub fn start(state: Arc<BotState>) {
-    let (tx, rx) = mpsc::unbounded_channel();
+    const EVENT_BUFFER: usize = 256;
+    let (tx, rx) = mpsc::channel(EVENT_BUFFER);
 
     // Sync subscriber: clone event data only, never await.
     state.rip_orchestrator.subscribe(Arc::new(move |event| {
         if let Some(owned) = BridgeEvent::from_engine(event) {
-            let _ = tx.send(owned);
+            match tx.try_send(owned) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(event)) if event.is_terminal() => {
+                    // Never lose a terminal state just because progress edits
+                    // are filling the bounded queue.
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let _ = tx.send(event).await;
+                    });
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::debug!("dropping stale progress event after queue saturation");
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => (),
+            }
         }
     }));
 
@@ -278,14 +300,14 @@ async fn handle_event(state: Arc<BotState>, event: BridgeEvent) -> Result<(), St
         }
         BridgeEvent::Failed { job, error } => {
             registry().remember(&job);
-            // Oracle commands-rip.ts:662-687 renders resolution failures with
-            // their details in a code block; other failures are generic.
+            // Keep provider and transport details in logs; ordinary users get
+            // a stable recovery step instead of internal error text.
             let text = if error.starts_with("Failed to resolve any tracks") {
-                format!(
-                    "! <b>Could not resolve any tracks.</b><br/><i>Check the link and try again.</i><br/><code>{}</code>",
-                    crate::html::escape(&error)
-                )
+                tracing::warn!(error = %error, "track resolution failed");
+                "! <b>Could not resolve any tracks.</b><br/><i>Check the link and try again.</i>"
+                    .to_owned()
             } else {
+                tracing::warn!(error = %error, "download failed");
                 "× <b>Download failed.</b><br/><i>Please try again or use /report if the track is corrupt.</i>".to_owned()
             };
             finish_status(&job, text).await?;

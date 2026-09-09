@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use bot::{handlers, BotState};
 use ferogram::{filters::Dispatcher, Client, PeerRef};
-use tokio::signal;
+use tokio::{signal, sync::Semaphore};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -92,7 +92,7 @@ fn init_tracing(log_level: &str) {
     } else {
         log_level
     };
-    let filter = format!("warn,bot={level},db={level},core={level}");
+    let filter = format!("warn,bot={level},db={level},engine={level}");
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter)),
@@ -169,6 +169,7 @@ async fn main() -> Result<()> {
     let mut dispatcher = Dispatcher::new();
     handlers::register(&mut dispatcher, state);
     let dispatcher = Arc::new(dispatcher);
+    let update_slots = Arc::new(Semaphore::new(32));
     let mut updates = client.stream_updates();
     #[cfg(unix)]
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
@@ -181,7 +182,13 @@ async fn main() -> Result<()> {
         _ = async {
             while let Some(update) = updates.next().await {
                 let dispatcher = Arc::clone(&dispatcher);
-                tokio::spawn(async move { dispatcher.dispatch(update).await; });
+                let Ok(slot) = Arc::clone(&update_slots).acquire_owned().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    dispatcher.dispatch(update).await;
+                    drop(slot);
+                });
             }
         } => {},
         _ = signal::ctrl_c() => {},

@@ -262,7 +262,13 @@ pub async fn discover_new_tracks(
     let mut map: HashMap<String, String> = HashMap::new();
     let mut counts: HashMap<String, usize> = HashMap::new();
 
-    let dev_token = state.rip_deps.playlist().get_developer_token().await;
+    let dev_token = match state.rip_deps.playlist().get_developer_token().await {
+        Ok(token) => token,
+        Err(error) => {
+            tracing::warn!(%error, "Apple Music developer token unavailable; skipping release discovery");
+            return DiscoveredNewTracksResult::default();
+        }
+    };
     let http = reqwest::Client::new();
 
     for storefront in storefronts {

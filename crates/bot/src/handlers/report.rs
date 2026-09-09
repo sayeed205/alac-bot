@@ -21,6 +21,7 @@ use regex::Regex;
 
 use crate::{
     html::{escape, parse_dynamic_html},
+    interaction::{ReportAction, ReportReason},
     BotState,
 };
 
@@ -186,7 +187,7 @@ fn reason_keyboard(track_id: &str) -> ferogram::tl::enums::ReplyMarkup {
     InlineKeyboard::new()
         .row([
             Button::callback(
-                "🔇 Corrupted / Won't Play",
+                "Corrupted / Won't play",
                 format!("report:sub:{track_id}:corrupted").as_bytes(),
             ),
             Button::callback(
@@ -434,6 +435,20 @@ async fn delete_message(state: &BotState, peer: PeerRef, message_id: i32) {
     }
 }
 
+async fn delete_dump_message_checked(state: &BotState, message_id: i64) -> Result<(), String> {
+    let message_id = i32::try_from(message_id)
+        .map_err(|error| format!("dump message id out of range: {error}"))?;
+    let messages = state
+        .client
+        .get_messages(state.dump_peer.clone(), &[message_id])
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some(message) = messages.first() else {
+        return Ok(());
+    };
+    message.delete().await.map_err(|error| error.to_string())
+}
+
 async fn edit_query(
     state: &BotState,
     query: &CallbackQuery,
@@ -455,9 +470,9 @@ async fn callback_submission(
     state: Arc<BotState>,
     query: CallbackQuery,
     track_id: &str,
-    preset: &str,
+    preset: ReportReason,
 ) {
-    if preset == "other" {
+    if preset == ReportReason::Other {
         let _ = query.answer().send(&state.client).await;
         edit_query(
             &state,
@@ -469,10 +484,10 @@ async fn callback_submission(
         return;
     }
     let reason = match preset {
-        "corrupted" => "🔇 Corrupted / Won't play",
-        "incomplete" => "✂️ Incomplete / Audio cut off",
-        "metadata" => "🏷️ Wrong metadata / tags / lyrics",
-        _ => "⚠️ General playback problem",
+        ReportReason::Corrupted => "Corrupted / Won't play",
+        ReportReason::Incomplete => "Incomplete / Audio cut off",
+        ReportReason::Metadata => "Wrong metadata / tags / lyrics",
+        ReportReason::Other => "General playback problem",
     };
     let duplicate = report_state()
         .lock()
@@ -542,7 +557,7 @@ async fn callback_submission(
     edit_query(&state, &query, &text, None).await;
 }
 
-async fn admin_callback(state: Arc<BotState>, query: CallbackQuery, parts: &[&str]) {
+async fn admin_callback(state: Arc<BotState>, query: CallbackQuery, action: ReportAction) {
     if !state.auth.is_admin(query.user_id) {
         let _ = query
             .answer()
@@ -551,19 +566,25 @@ async fn admin_callback(state: Arc<BotState>, query: CallbackQuery, parts: &[&st
             .await;
         return;
     }
-    let action = parts.get(2).copied().unwrap_or_default();
     match action {
-        "dismiss" => {
-            let report_id = parts.get(3).copied().unwrap_or_default();
+        ReportAction::Dismiss { report_id } => {
             let report = {
                 let mut registry = report_state()
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let report = registry.reports.remove(report_id);
+                let report = registry.reports.remove(&report_id);
                 if let Some(report) = &report {
                     registry.reports_by_track.remove(&report.track_id);
                 }
                 report
+            };
+            let Some(report) = report else {
+                let _ = query
+                    .answer()
+                    .alert("This report action has expired. Open the report again.")
+                    .send(&state.client)
+                    .await;
+                return;
             };
             let _ = query
                 .answer()
@@ -572,42 +593,76 @@ async fn admin_callback(state: Arc<BotState>, query: CallbackQuery, parts: &[&st
                 .await;
             let text = format!(
                 "❌ <b>Report Dismissed</b><br/><br/><blockquote>The report for track <code>{}</code> was dismissed.</blockquote>",
-                escape(report.as_ref().map(|r| r.track_id.as_str()).unwrap_or("N/A"))
+                escape(&report.track_id)
             );
             edit_query(&state, &query, &text, None).await;
         }
-        "del" => {
-            let track_id = parts.get(3).copied().unwrap_or_default();
-            let report_id = parts.get(4).copied().unwrap_or_default();
+        ReportAction::Delete {
+            track_id,
+            report_id,
+        } => {
             let report = report_state()
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .reports
-                .get(report_id)
+                .get(&report_id)
                 .cloned();
+            let Some(report) = report.filter(|report| report.track_id == track_id) else {
+                let _ = query
+                    .answer()
+                    .alert("This report action has expired. Open the report again.")
+                    .send(&state.client)
+                    .await;
+                return;
+            };
             let _ = query
                 .answer()
                 .text("Deleting track...")
                 .send(&state.client)
                 .await;
-            if let Some(track) = find_cached_track(&state, track_id).await {
-                if let Ok(message_id) = i32::try_from(track.message_id) {
-                    delete_message(&state, state.dump_peer.clone(), message_id).await;
-                }
+            let Some(track) = find_cached_track(&state, &track_id).await else {
+                let _ = query
+                    .answer()
+                    .alert("This track is no longer cached. Open the report again.")
+                    .send(&state.client)
+                    .await;
+                return;
+            };
+            if let Err(error) = delete_dump_message_checked(&state, track.message_id).await {
+                tracing::warn!(%error, track_id, "failed to delete dump message; database row retained");
+                edit_query(
+                    &state,
+                    &query,
+                    "! <b>Track was not deleted.</b><br/>The dump message could not be removed. Try again.",
+                    Some(admin_keyboard(&track_id, &report_id)),
+                )
+                .await;
+                return;
             }
-            let _ = state
+            if let Err(error) = state
                 .rip_deps
                 .tracks()
-                .delete_track(&TrackKey::new(Provider::Apple, track_id))
+                .delete_track(&TrackKey::new(Provider::Apple, &track_id))
+                .await
+            {
+                tracing::warn!(%error, track_id, "failed to delete cached track after message deletion");
+                edit_query(
+                    &state,
+                    &query,
+                    "! <b>Track was not deleted completely.</b><br/>The database could not be updated. Try again.",
+                    Some(admin_keyboard(&track_id, &report_id)),
+                )
                 .await;
+                return;
+            }
             {
                 let mut registry = report_state()
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                registry.reports_by_track.remove(track_id);
-                registry.reports.remove(report_id);
+                registry.reports_by_track.remove(&track_id);
+                registry.reports.remove(&report_id);
             }
-            if let Some(report) = &report {
+            {
                 let text = format!(
                     "ℹ️ <b>Report Update:</b><br/>The reported track <b>{}</b> has been removed from the database by the administrator.",
                     escape(&report.track_title)
@@ -622,34 +677,38 @@ async fn admin_callback(state: Arc<BotState>, query: CallbackQuery, parts: &[&st
             }
             let text = format!(
                 "🗑️ <b>Track Deleted</b><br/><br/><blockquote>Track <code>{}</code> (<b>{}</b>) has been deleted from both the database and dump channel.</blockquote>",
-                escape(track_id),
-                escape(report.as_ref().map(|r| r.track_title.as_str()).unwrap_or("Track"))
+                escape(&track_id),
+                escape(&report.track_title)
             );
             edit_query(&state, &query, &text, None).await;
         }
-        "rerip" => {
-            let track_id = parts.get(3).copied().unwrap_or_default();
-            let report_id = parts.get(4).copied().unwrap_or_default();
+        ReportAction::Rerip {
+            track_id,
+            report_id,
+        } => {
             let report = report_state()
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .reports
-                .get(report_id)
+                .get(&report_id)
                 .cloned();
+            let Some(report) = report.filter(|report| report.track_id == track_id) else {
+                let _ = query
+                    .answer()
+                    .alert("This report action has expired. Open the report again.")
+                    .send(&state.client)
+                    .await;
+                return;
+            };
             let _ = query
                 .answer()
                 .text("Starting force re-rip...")
                 .send(&state.client)
                 .await;
-            let title = escape(
-                report
-                    .as_ref()
-                    .map(|r| r.track_title.as_str())
-                    .unwrap_or("Track"),
-            );
+            let title = escape(&report.track_title);
             let text = format!(
                 "🔄 <b>Re-ripping Track...</b><br/><br/><blockquote>Re-ripping track <code>{}</code> (<b>{}</b>) in force cache-only mode. Old corrupted dump message will be replaced automatically.</blockquote>",
-                escape(track_id), title
+                escape(&track_id), title
             );
             edit_query(&state, &query, &text, None).await;
             let marked_chat = query
@@ -697,7 +756,7 @@ async fn admin_callback(state: Arc<BotState>, query: CallbackQuery, parts: &[&st
                 .await
             {
                 Ok(_) => {
-                    if let Some(report) = report {
+                    {
                         let courtesy = format!(
                             "✅ <b>Report Update:</b><br/>The issue with <b>{}</b> has been resolved! The track was re-ripped and replaced with a healthy lossless version.",
                             escape(&report.track_title)
@@ -714,32 +773,38 @@ async fn admin_callback(state: Arc<BotState>, query: CallbackQuery, parts: &[&st
                         let mut registry = report_state()
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        registry.reports_by_track.remove(track_id);
-                        registry.reports.remove(report_id);
+                        registry.reports_by_track.remove(&track_id);
+                        registry.reports.remove(&report_id);
                     }
                     let text = format!(
                         "✅ <b>Track Re-ripped Successfully!</b><br/><br/><blockquote>Track <code>{}</code> (<b>{}</b>) was successfully re-ripped and replaced in the dump channel. Old message was deleted.</blockquote>",
-                        escape(track_id), title
+                        escape(&track_id), title
                     );
                     edit_query(&state, &query, &text, None).await;
                 }
                 Err(error) => {
                     let text = format!(
                         "❌ <b>Re-rip Failed</b><br/><br/><blockquote>Failed to re-rip track <code>{}</code>: <code>{}</code></blockquote>",
-                        escape(track_id),
+                        escape(&track_id),
                         escape(&error.to_string())
                     );
                     edit_query(
                         &state,
                         &query,
                         &text,
-                        Some(admin_keyboard(track_id, report_id)),
+                        Some(admin_keyboard(&track_id, &report_id)),
                     )
                     .await;
                 }
             }
         }
-        _ => {}
+        ReportAction::Cancel | ReportAction::Submit { .. } => {
+            let _ = query
+                .answer()
+                .alert("This report action is unavailable.")
+                .send(&state.client)
+                .await;
+        }
     }
 }
 
@@ -752,10 +817,7 @@ pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
     }
 }
 
-pub async fn callback(state: Arc<BotState>, query: CallbackQuery) {
-    let Some(data) = query.data().map(str::to_owned) else {
-        return;
-    };
+pub async fn callback(state: Arc<BotState>, query: CallbackQuery, action: ReportAction) {
     let chat_id = query
         .chat_peer
         .as_ref()
@@ -775,7 +837,7 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery) {
             .await;
         return;
     }
-    if data == "report:cancel" {
+    if action == ReportAction::Cancel {
         let _ = query
             .answer()
             .text("Report cancelled")
@@ -788,15 +850,14 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery) {
         }
         return;
     }
-    let parts: Vec<&str> = data.split(':').collect();
-    match parts.get(1).copied() {
-        Some("sub") => {
-            if let (Some(track_id), Some(preset)) = (parts.get(2), parts.get(3)) {
-                callback_submission(state, query, track_id, preset).await;
-            }
+    match action {
+        ReportAction::Submit { track_id, reason } => {
+            callback_submission(state, query, &track_id, reason).await;
         }
-        Some("act") => admin_callback(state, query, &parts).await,
-        _ => {}
+        ReportAction::Dismiss { .. } | ReportAction::Delete { .. } | ReportAction::Rerip { .. } => {
+            admin_callback(state, query, action).await
+        }
+        ReportAction::Cancel => unreachable!("cancel handled above"),
     }
 }
 

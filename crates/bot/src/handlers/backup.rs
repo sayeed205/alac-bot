@@ -5,10 +5,26 @@
 //! Both commands are admin-only AND DM-only (the oracle silently returns
 //! outside a private chat).
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    fs::OpenOptions,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use engine::limits::MAX_DOCUMENT_BYTES;
-use ferogram::{filters, filters::Dispatcher, InputMessage, PeerRef};
+use ferogram::{
+    filters,
+    filters::Dispatcher,
+    keyboard::{Button, InlineKeyboard},
+    update::CallbackQuery,
+    InputMessage, PeerRef,
+};
 
 use crate::{
     handlers::chat_peer_ref,
@@ -17,6 +33,52 @@ use crate::{
 };
 
 const KB: f64 = 1024.0;
+const CONFIRMATION_TTL: Duration = Duration::from_secs(120);
+
+#[derive(Clone)]
+struct PendingImport {
+    user_id: i64,
+    media: ferogram::tl::enums::MessageMedia,
+    file_name: String,
+    expires_at: Instant,
+}
+
+fn pending_imports() -> &'static Mutex<HashMap<String, PendingImport>> {
+    static PENDING: OnceLock<Mutex<HashMap<String, PendingImport>>> = OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn next_token() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    format!(
+        "{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn confirmation_keyboard(token: &str) -> ferogram::tl::enums::ReplyMarkup {
+    InlineKeyboard::new()
+        .row([
+            Button::callback(
+                "Restore database",
+                crate::interaction::TelegramAction::ConfirmImport {
+                    token: token.to_owned(),
+                }
+                .encode()
+                .as_bytes(),
+            ),
+            Button::callback(
+                "Cancel",
+                crate::interaction::TelegramAction::CancelImport {
+                    token: token.to_owned(),
+                }
+                .encode()
+                .as_bytes(),
+            ),
+        ])
+        .into_markup()
+}
 
 /// Oracle caption: "Compressed Size" in KB with one decimal.
 fn export_caption(users: i64, tracks: i64, requests: i64, bytes: usize) -> String {
@@ -103,14 +165,19 @@ async fn export(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
     };
 
     // Write to a temp file, upload as a document, then clean up.
-    let tmp = std::env::temp_dir().join(format!(
-        "alac_export_{}.json.gz",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or_default()
-    ));
-    if let Err(error) = std::fs::write(&tmp, &buffer) {
+    let (tmp, mut file) = match secure_temp_file("alac_export") {
+        Ok(file) => file,
+        Err(error) => {
+            let text = "× <b>Export failed</b><br/>Could not create a temporary archive.";
+            tracing::warn!(%error, "failed to create secure export temporary file");
+            let _ = msg
+                .reply(InputMessage::html(parse_dynamic_html(text)))
+                .await;
+            return;
+        }
+    };
+    if let Err(error) = file.write_all(&buffer) {
+        let _ = std::fs::remove_file(&tmp);
         let text = format!(
             "× <b>Export failed</b>\n\n<code>{}</code>",
             escape(&error.to_string())
@@ -120,6 +187,7 @@ async fn export(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
             .await;
         return;
     }
+    drop(file);
 
     let caption = export_caption(
         stats.users_count,
@@ -187,22 +255,140 @@ async fn import(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
         return;
     }
 
-    let status = msg
-        .reply(InputMessage::html(parse_dynamic_html(
-            "… <i>Downloading and restoring database dump</i>",
-        )))
+    let token = next_token();
+    {
+        let mut pending = pending_imports()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Instant::now();
+        pending.retain(|_, value| value.expires_at > now);
+        pending.insert(
+            token.clone(),
+            PendingImport {
+                user_id: msg.sender_user_id().unwrap_or_default(),
+                media: doc,
+                file_name: file_name.clone(),
+                expires_at: now + CONFIRMATION_TTL,
+            },
+        );
+    }
+    let text = format!(
+        "<b>Restore this database archive?</b><br/><br/><blockquote>File: <code>{}</code></blockquote><br/><i>Current database records may be merged or replaced according to the archive contents.</i>",
+        escape(&file_name)
+    );
+    let _ = msg
+        .reply(
+            InputMessage::html(parse_dynamic_html(&text))
+                .reply_markup(confirmation_keyboard(&token)),
+        )
+        .await;
+}
+
+pub async fn callback(
+    state: Arc<BotState>,
+    query: CallbackQuery,
+    action: crate::interaction::TelegramAction,
+) {
+    if !state.auth.is_admin(query.user_id) {
+        let _ = query
+            .answer()
+            .alert("Access restricted.")
+            .send(&state.client)
+            .await;
+        return;
+    }
+    if !matches!(query.chat_peer, Some(ferogram::tl::enums::Peer::User(_))) {
+        let _ = query
+            .answer()
+            .alert("Database restore is available in direct messages only.")
+            .send(&state.client)
+            .await;
+        return;
+    }
+    let is_confirm = matches!(
+        action,
+        crate::interaction::TelegramAction::ConfirmImport { .. }
+    );
+    let token = match action {
+        crate::interaction::TelegramAction::ConfirmImport { token }
+        | crate::interaction::TelegramAction::CancelImport { token } => token,
+        _ => {
+            let _ = query
+                .answer()
+                .alert("This restore action is unavailable.")
+                .send(&state.client)
+                .await;
+            return;
+        }
+    };
+    let pending = {
+        let mut map = pending_imports()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.retain(|_, value| value.expires_at > Instant::now());
+        map.remove(&token)
+    };
+    let Some(pending) = pending else {
+        let _ = query
+            .answer()
+            .alert("This action has expired. Run /import again.")
+            .send(&state.client)
+            .await;
+        return;
+    };
+    if pending.user_id != query.user_id || !is_confirm {
+        let _ = query.answer().send(&state.client).await;
+        if !is_confirm {
+            delete_query_message(&state, &query).await;
+        }
+        return;
+    }
+    let _ = query
+        .answer()
+        .text("Restoring database")
+        .send(&state.client)
+        .await;
+    let Some(peer) = query.chat_peer.clone().map(PeerRef::Peer) else {
+        return;
+    };
+    restore_archive(&state, peer, pending.media, pending.file_name).await;
+    delete_query_message(&state, &query).await;
+}
+
+async fn restore_archive(
+    state: &BotState,
+    peer: PeerRef,
+    doc: ferogram::tl::enums::MessageMedia,
+    file_name: String,
+) {
+    let status = state
+        .client
+        .send_message(
+            peer.clone(),
+            InputMessage::html(parse_dynamic_html(
+                "… <i>Downloading and restoring database dump</i>",
+            )),
+        )
         .await
         .ok();
-
-    let tmp = std::env::temp_dir().join(format!(
-        "alac_import_{}.json.gz",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or_default()
-    ));
-
-    let restore_result = match download_document(&state, &doc, &tmp).await {
+    let (tmp, file) = match secure_temp_file("alac_import") {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::warn!(%error, "failed to create secure import temporary file");
+            let _ = state
+                .client
+                .send_message(
+                    peer,
+                    InputMessage::html(parse_dynamic_html(
+                        "<b>Restore failed</b><br/>Could not create a temporary archive.",
+                    )),
+                )
+                .await;
+            return;
+        }
+    };
+    drop(file);
+    let restore_result = match download_document(state, &doc, &tmp).await {
         Ok(bytes) => {
             let dump = db::DbDumpService::new(state.db_client.clone());
             match dump
@@ -221,31 +407,32 @@ async fn import(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
         }
         Err(error) => Err(error),
     };
-
     let _ = std::fs::remove_file(&tmp);
-
     let text = match restore_result {
-        Ok(stats) => format!(
-            "<b>✓ Database restored</b>\n\n\
-• <b>Users Restored:</b> {}\n\
-• <b>Tracks Restored:</b> {}\n\
-• <b>Requests Restored:</b> {}\n\
-• <b>Elapsed Time:</b> {}ms",
-            stats.users_merged, stats.tracks_merged, stats.requests_merged, stats.duration_ms
-        ),
-        Err(error) => format!(
-            "<b>× Database restore failed</b>\n\n<code>{}</code>\n\n<i>Transaction rolled back. Database state remains unchanged.</i>",
-            escape(&error)
-        ),
+        Ok(stats) => format!("<b>Database restored</b><br/><br/><blockquote>• Users: {}<br/>• Tracks: {}<br/>• Requests: {}<br/>• Elapsed: {}ms</blockquote>", stats.users_merged, stats.tracks_merged, stats.requests_merged, stats.duration_ms),
+        Err(error) => {
+            tracing::warn!(%error, file_name, "database restore failed");
+            "<b>Database restore failed</b><br/>The archive could not be applied. The database was left unchanged.".to_owned()
+        }
     };
-
-    let _ = msg
-        .reply(InputMessage::html(parse_dynamic_html(&text)))
+    let _ = state
+        .client
+        .send_message(peer, InputMessage::html(parse_dynamic_html(&text)))
         .await;
-
-    // Oracle deletes the status message in a finally.
     if let Some(status) = status {
         let _ = status.delete().await;
+    }
+}
+
+async fn delete_query_message(state: &BotState, query: &CallbackQuery) {
+    if let (Some(peer), Some(message_id)) =
+        (query.chat_peer.clone().map(PeerRef::Peer), query.message_id)
+    {
+        if let Ok(messages) = state.client.get_messages(peer, &[message_id]).await {
+            if let Some(message) = messages.first() {
+                let _ = message.delete().await;
+            }
+        }
     }
 }
 
@@ -253,7 +440,7 @@ async fn import(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
 async fn download_document(
     state: &BotState,
     media: &ferogram::tl::enums::MessageMedia,
-    tmp: &std::path::Path,
+    tmp: &Path,
 ) -> Result<Vec<u8>, String> {
     use ferogram::media::MediaQuality;
     state
@@ -272,4 +459,25 @@ async fn download_document(
         ));
     }
     std::fs::read(tmp).map_err(|error| error.to_string())
+}
+
+fn secure_temp_file(prefix: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let pid = std::process::id();
+    for attempt in 0..16_u32 {
+        let path =
+            std::env::temp_dir().join(format!("{prefix}_{pid}_{timestamp}_{attempt}.json.gz"));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique temporary archive path",
+    ))
 }

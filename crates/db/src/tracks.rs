@@ -202,18 +202,28 @@ impl TracksRepository {
     ) -> Result<u64, DbError> {
         let mut connection = self.pool.connection().await?;
         let valid: HashSet<_> = valid_track_keys.iter().cloned().collect();
-        let rows = tracks::table
-            .select((tracks::id, tracks::provider, tracks::track_id))
-            .load::<(i32, engine::Provider, String)>(&mut *connection)
-            .await?;
-        let mut count = 0_u64;
-        for (id, provider, track_id) in rows {
-            if !valid.contains(&engine::TrackKey::new(provider, track_id)) {
-                count += diesel::delete(tracks::table.filter(tracks::id.eq(id)))
-                    .execute(&mut *connection)
-                    .await? as u64;
-            }
-        }
-        Ok(count)
+        connection
+            .build_transaction()
+            .run(async |transaction| -> Result<u64, diesel::result::Error> {
+                let rows = tracks::table
+                    .select((tracks::id, tracks::provider, tracks::track_id))
+                    .load::<(i32, engine::Provider, String)>(&mut *transaction)
+                    .await?;
+                let stale_ids: Vec<i32> = rows
+                    .into_iter()
+                    .filter_map(|(id, provider, track_id)| {
+                        (!valid.contains(&engine::TrackKey::new(provider, track_id))).then_some(id)
+                    })
+                    .collect();
+                if stale_ids.is_empty() {
+                    return Ok(0_u64);
+                }
+                let deleted = diesel::delete(tracks::table.filter(tracks::id.eq_any(stale_ids)))
+                    .execute(&mut *transaction)
+                    .await?;
+                Ok(deleted as u64)
+            })
+            .await
+            .map_err(DbError::from)
     }
 }

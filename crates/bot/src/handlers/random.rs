@@ -16,6 +16,7 @@ use serde_json::Value;
 
 use crate::{
     html::{escape, parse_dynamic_html},
+    interaction::DiscoveryAction,
     BotState,
 };
 
@@ -76,13 +77,13 @@ pub const WILD_SEEDS: &[&str] = &[
 /// Oracle SOURCE_LABELS.
 pub fn source_label(source: &str) -> Option<&'static str> {
     Some(match source {
-        "charts" => "🏆 Top Charts",
+        "charts" => "Top charts",
         "wild" => "Wild search",
-        "rock" => "🎸 Rock",
-        "hiphop" => "🎤 Hip-Hop",
+        "rock" => "Rock",
+        "hiphop" => "Hip-hop",
         "pop" => "Pop",
-        "electronic" => "🎹 Electronic",
-        "jazz" => "🎷 Jazz",
+        "electronic" => "Electronic",
+        "jazz" => "Jazz",
         "indie" => "Indie",
         _ => return None,
     })
@@ -177,7 +178,7 @@ pub fn build_preview_text(candidate: &RandomAlbumCandidate) -> String {
 fn sources_keyboard() -> ferogram::tl::enums::ReplyMarkup {
     InlineKeyboard::new()
         .row(vec![
-            Button::callback("🏆 Top Charts", b"random:src:charts"),
+            Button::callback("Top charts", b"random:src:charts"),
             Button::callback("Wild search", b"random:src:wild"),
         ])
         .row(vec![
@@ -507,7 +508,7 @@ async fn random(state: Arc<BotState>, msg: IncomingMessage) {
     }
 }
 
-pub async fn callback(state: Arc<BotState>, query: CallbackQuery) {
+pub async fn callback(state: Arc<BotState>, query: CallbackQuery, action: DiscoveryAction) {
     let marked_chat = query
         .chat_peer
         .as_ref()
@@ -535,9 +536,6 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery) {
         return;
     }
 
-    let data = query.data().unwrap_or_default().to_owned();
-    let parts: Vec<&str> = data.split(':').collect();
-    let action = parts.get(1).copied().unwrap_or_default();
     let peer = query
         .chat_peer
         .as_ref()
@@ -546,11 +544,11 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery) {
     let message_id = query.message_id.unwrap_or_default();
 
     match action {
-        "close" => {
+        DiscoveryAction::Close => {
             let _ = query.answer().send(&state.client).await;
             delete_message(&state, &peer, message_id).await;
         }
-        "menu" => {
+        DiscoveryAction::Menu => {
             let _ = query.answer().send(&state.client).await;
             let text = build_sources_menu_text();
             let _ = state
@@ -562,20 +560,8 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery) {
                 )
                 .await;
         }
-        "src" | "reroll" => {
-            // Oracle `parts[2] || 'wild'`: empty falls back like missing.
-            let source = parts
-                .get(2)
-                .copied()
-                .filter(|s| !s.is_empty())
-                .unwrap_or("wild")
-                .to_owned();
-            let storefront = parts
-                .get(3)
-                .copied()
-                .filter(|s| !s.is_empty())
-                .unwrap_or("us")
-                .to_owned();
+        DiscoveryAction::Discover { source, storefront }
+        | DiscoveryAction::Reroll { source, storefront } => {
             let _ = query
                 .answer()
                 .text("… Discovering a random album")
@@ -627,14 +613,10 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery) {
                 }
             }
         }
-        "dump" => {
-            let album_id = parts.get(2).copied().unwrap_or_default().to_owned();
-            let storefront = parts
-                .get(3)
-                .copied()
-                .filter(|s| !s.is_empty())
-                .unwrap_or("us")
-                .to_owned();
+        DiscoveryAction::Dump {
+            album_id,
+            storefront,
+        } => {
             let _ = query
                 .answer()
                 .text("Queuing album dump")
@@ -679,13 +661,6 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery) {
             {
                 tracing::warn!(%error, "random album dump job failed to start");
             }
-        }
-        _ => {
-            let _ = query
-                .answer()
-                .alert("This discovery action is unavailable. Please open /random again.")
-                .send(&state.client)
-                .await;
         }
     }
 }
@@ -769,8 +744,8 @@ mod tests {
 
     #[test]
     fn source_labels_match_oracle() {
-        assert_eq!(source_label("charts"), Some("🏆 Top Charts"));
-        assert_eq!(source_label("hiphop"), Some("🎤 Hip-Hop"));
+        assert_eq!(source_label("charts"), Some("Top charts"));
+        assert_eq!(source_label("hiphop"), Some("Hip-hop"));
         assert_eq!(source_label("unknown"), None);
     }
 

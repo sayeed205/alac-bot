@@ -2,8 +2,7 @@
 //!
 //! Two jobs:
 //!
-//! 1. Scrape the Apple Music web-player developer token (with cache + static
-//!    fallback).
+//! 1. Scrape the Apple Music web-player developer token and cache it.
 //! 2. Fetch playlist metadata/tracks from the AMP API with US-storefront
 //!    fallback.
 //!
@@ -20,10 +19,6 @@ use serde::Deserialize;
 
 /// Chrome UA used by every request here (TS parity).
 pub const APPLE_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/145.0.0.0";
-
-/// Static reliable backup token in case live scraping fails (TS
-/// FALLBACK_TOKEN, byte-identical).
-pub const FALLBACK_TOKEN: &str = "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzI1NiIsImtpZCI6IldlYlBsYXlLaWQifQ.eyJpc3MiOiJBTVBXZWJQbGF5IiwiaWF0IjoxNzg2NjMyOTI0LCJleHAiOjE3OTI2ODA5MjQsInJvb3RfaHR0cHNfb3JpZ2luIjpbImFwcGxlLmNvbSJdfQ.hBgj61sZf-y7bmuvT-joXAUAcf7TVJ51732xnH5vFkLHOmsQHxVqGMYUuI4h8c0-RX3fRY3moylhLW8fewFJyw";
 
 /// One header for an HTTP GET.
 pub type Header = (String, String);
@@ -158,6 +153,7 @@ fn auth_headers(token: &str) -> Vec<Header> {
 pub struct PlaylistClient<H: PlaylistHttp> {
     http: H,
     token_cache: Mutex<TokenCache>,
+    token_refresh: tokio::sync::Mutex<()>,
 }
 
 impl<H: PlaylistHttp> PlaylistClient<H> {
@@ -165,19 +161,23 @@ impl<H: PlaylistHttp> PlaylistClient<H> {
         Self {
             http,
             token_cache: Mutex::new(TokenCache::default()),
+            token_refresh: tokio::sync::Mutex::new(()),
         }
     }
 
-    /// Retrieves the Apple Music Web Client developer token, dynamically
-    /// scraping it from the web player asset bundle or using the cached /
-    /// fallback token (TS `getAppleMusicDeveloperToken`).
-    pub async fn get_developer_token(&self) -> String {
+    /// Retrieves and caches the Apple Music Web Client developer token.
+    ///
+    /// A failed scrape is returned to the caller instead of falling back to a
+    /// committed bearer token. Callers that observe an authentication failure
+    /// should invalidate the cache and retry once.
+    pub async fn get_developer_token(&self) -> Result<String, String> {
+        let _refresh_guard = self.token_refresh.lock().await;
         let now = now_ms();
         {
             let cache = self.token_cache.lock().expect("token cache poisoned");
             if let Some(token) = &cache.token {
                 if cache.expires_at_ms > now {
-                    return token.clone();
+                    return Ok(token.clone());
                 }
             }
         }
@@ -189,18 +189,17 @@ impl<H: PlaylistHttp> PlaylistClient<H> {
                 // Cache for 24 hours.
                 cache.expires_at_ms = now + 24 * 60 * 60 * 1000;
                 tracing::debug!("Extracted live Apple Music developer token");
-                token
+                Ok(token)
             }
-            Err(err) => {
-                tracing::warn!("Dynamic developer token extraction failed, using fallback token");
-                tracing::debug!(error = %err, "scrape failure");
-                let mut cache = self.token_cache.lock().expect("token cache poisoned");
-                cache.token = Some(FALLBACK_TOKEN.to_string());
-                // Fallback cached for 12 hours.
-                cache.expires_at_ms = now + 12 * 60 * 60 * 1000;
-                FALLBACK_TOKEN.to_string()
-            }
+            Err(err) => Err(err),
         }
+    }
+
+    /// Drops the cached token so the next request performs a fresh scrape.
+    pub fn invalidate_developer_token(&self) {
+        let mut cache = self.token_cache.lock().expect("token cache poisoned");
+        cache.token = None;
+        cache.expires_at_ms = 0;
     }
 
     /// The live scrape: browse page → index asset → token assignment (or a
@@ -277,7 +276,10 @@ impl<H: PlaylistHttp> PlaylistClient<H> {
         playlist_id: &str,
         storefront: &str,
     ) -> Result<PlaylistData, PlaylistError> {
-        let token = self.get_developer_token().await;
+        let mut token = self
+            .get_developer_token()
+            .await
+            .map_err(PlaylistError::Other)?;
         let initial_url = format!(
             "https://amp-api.music.apple.com/v1/catalog/{}/playlists/{}",
             url_encode(storefront),
@@ -308,6 +310,29 @@ impl<H: PlaylistHttp> PlaylistClient<H> {
                     playlist_id: playlist_id.to_string(),
                     storefront: storefront.to_string(),
                 });
+            }
+            Err(PlaylistHttpError::Status(401 | 403)) => {
+                // A cached token can expire or be revoked before its local
+                // TTL. Refresh once, then surface the second failure.
+                self.invalidate_developer_token();
+                token = self
+                    .get_developer_token()
+                    .await
+                    .map_err(PlaylistError::Other)?;
+                self.http
+                    .get(&initial_url, &auth_headers(&token), Duration::from_secs(20))
+                    .await
+                    .map_err(|error| match error {
+                        PlaylistHttpError::Network(message) => PlaylistError::TimedOut {
+                            elapsed_ms: now_ms() - start,
+                            message,
+                        },
+                        PlaylistHttpError::Status(404) => PlaylistError::NotFound {
+                            playlist_id: playlist_id.to_string(),
+                            storefront: storefront.to_string(),
+                        },
+                        PlaylistHttpError::Status(status) => PlaylistError::Http { status },
+                    })?
             }
             Err(PlaylistHttpError::Status(status)) => {
                 return Err(PlaylistError::Http { status });
@@ -662,7 +687,7 @@ mod tests {
     async fn token_scrape_via_var_assignment() {
         let http = FakeHttp::new(vec![Ok(BROWSE_HTML), Ok(JS_ASSET_VAR)]);
         let client = PlaylistClient::new(http);
-        let token = client.get_developer_token().await;
+        let token = client.get_developer_token().await.unwrap();
         assert_eq!(token, "eyJhvar.okay.sig");
         assert_eq!(
             client.http.requests()[0].0,
@@ -675,22 +700,20 @@ mod tests {
     async fn token_scrape_direct_jwt_fallback() {
         let http = FakeHttp::new(vec![Ok(BROWSE_HTML), Ok(JS_ASSET_DIRECT)]);
         let client = PlaylistClient::new(http);
-        let token = client.get_developer_token().await;
+        let token = client.get_developer_token().await.unwrap();
         assert_eq!(token, "eyJhfirst.second.sig");
     }
 
     #[tokio::test]
-    async fn scrape_failure_falls_back_and_caches_12h() {
+    async fn scrape_failure_is_returned_and_not_cached() {
         let http = FakeHttp::new(vec![]); // no responses: first request fails
         let client = PlaylistClient::new(http);
-        let token = client.get_developer_token().await;
-        assert_eq!(token, FALLBACK_TOKEN);
-        let token2 = client.get_developer_token().await;
-        assert_eq!(token2, FALLBACK_TOKEN);
+        assert!(client.get_developer_token().await.is_err());
+        assert!(client.get_developer_token().await.is_err());
         assert_eq!(
             client.http.requests().len(),
-            1,
-            "fallback cached for 12h — no re-scrape"
+            2,
+            "failed scrapes are not cached"
         );
     }
 
@@ -698,8 +721,8 @@ mod tests {
     async fn successful_scrape_caches_24h() {
         let http = FakeHttp::new(vec![Ok(BROWSE_HTML), Ok(JS_ASSET_VAR)]);
         let client = PlaylistClient::new(http);
-        let _ = client.get_developer_token().await;
-        let _ = client.get_developer_token().await;
+        let _ = client.get_developer_token().await.unwrap();
+        let _ = client.get_developer_token().await.unwrap();
         assert_eq!(
             client.http.requests().len(),
             2,
@@ -734,6 +757,27 @@ mod tests {
         assert_eq!(header("Authorization"), "Bearer eyJhvar.okay.sig");
         assert_eq!(header("Origin"), "https://music.apple.com");
         assert_eq!(header("User-Agent"), APPLE_USER_AGENT);
+    }
+
+    #[tokio::test]
+    async fn refreshes_cached_token_once_after_auth_failure() {
+        let body = r#"{"data":[{"id":"pl.1","attributes":{"name":"Mix"},"relationships":{"tracks":{"data":[]}}}]}"#;
+        let http = FakeHttp::new(vec![
+            Ok(BROWSE_HTML),
+            Ok(JS_ASSET_VAR),
+            Err(PlaylistHttpError::Status(401)),
+            Ok(BROWSE_HTML),
+            Ok(JS_ASSET_DIRECT),
+            Ok(body),
+        ]);
+        let client = PlaylistClient::new(http);
+        let data = client.fetch_playlist_tracks("pl.1", "us").await.unwrap();
+        assert_eq!(data.title, "Mix");
+        assert_eq!(
+            client.http.requests().len(),
+            6,
+            "the token is regenerated exactly once after authentication failure"
+        );
     }
 
     #[tokio::test]

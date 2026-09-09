@@ -10,6 +10,7 @@ use ferogram::{
 
 use crate::{
     html::{escape, parse_dynamic_html},
+    interaction::TelegramAction,
     BotState,
 };
 
@@ -121,7 +122,7 @@ pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
     });
 }
 
-pub async fn callback(state: Arc<BotState>, query: CallbackQuery) {
+pub async fn callback(state: Arc<BotState>, query: CallbackQuery, action: TelegramAction) {
     if !state.auth.is_admin(query.user_id) {
         let _ = query
             .answer()
@@ -130,16 +131,13 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery) {
             .await;
         return;
     }
-    let Some(data) = query.data() else {
-        return;
-    };
     // The peer the button was pressed in, used for edits/deletes.
     let peer = query.chat_peer.clone().map(PeerRef::Peer);
-    match data {
-        "noop" => {
+    match action {
+        TelegramAction::Noop => {
             let _ = query.answer().send(&state.client).await;
         }
-        "authclose" => {
+        TelegramAction::AuthClose => {
             let _ = query.answer().send(&state.client).await;
             if let (Some(peer), Some(id)) = (peer, query.message_id) {
                 // Channel-aware deletion parity: IncomingMessage::delete
@@ -153,13 +151,18 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery) {
                 }
             }
         }
-        _ => {
-            if let Some(page) = data.strip_prefix("authpage:").and_then(|x| x.parse().ok()) {
-                let _ = query.answer().send(&state.client).await;
-                if let (Some(peer), Some(id)) = (peer, query.message_id) {
-                    render(&state, peer, Some(id), page, None).await;
-                }
+        TelegramAction::AuthPage { page } => {
+            let _ = query.answer().send(&state.client).await;
+            if let (Some(peer), Some(id)) = (peer, query.message_id) {
+                render(&state, peer, Some(id), page, None).await;
             }
+        }
+        _ => {
+            let _ = query
+                .answer()
+                .alert("This action is unavailable. Open the authorization list again.")
+                .send(&state.client)
+                .await;
         }
     }
 }

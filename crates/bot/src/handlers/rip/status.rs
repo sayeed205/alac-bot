@@ -245,16 +245,20 @@ impl StatusEditor {
             }
             *editing = true;
         }
+        let previous_text = self.last_text.lock().await.clone();
         *self.last_text.lock().await = text.clone();
         *self.last_edit.lock().await = Some(tokio::time::Instant::now());
         let keyboard = (!terminal).then(|| cancel_keyboard(&self.job_id));
         let result = self.sink.edit(self.message_id, &text, keyboard).await;
         *self.editing.lock().await = false;
-        if result.is_err() && terminal {
-            *self.blocked.lock().await = true;
-            let _ = self.sink.send(&text, None).await;
-        } else if result.is_err() {
-            *self.blocked.lock().await = true;
+        if result.is_err() {
+            // A transient edit failure must not permanently freeze progress.
+            // Restore the previous text so the next update can retry it.
+            *self.last_text.lock().await = previous_text;
+            if terminal {
+                *self.blocked.lock().await = true;
+                let _ = self.sink.send(&text, None).await;
+            }
         }
         result.is_ok()
     }

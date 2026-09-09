@@ -113,20 +113,38 @@ pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
                 .data()
                 .and_then(|data| TelegramAction::decode(data).ok());
             match action {
-                Some(TelegramAction::Cancel { .. }) => {
-                    callbacks::dispatch_cancel(state, query).await
+                Some(TelegramAction::Cancel { job_id }) => {
+                    callbacks::dispatch_cancel(state, query, job_id).await
                 }
-                Some(TelegramAction::Dashboard { .. }) => {
-                    callbacks::dispatch_dashboard(state, query).await
+                Some(TelegramAction::Dashboard {
+                    action: dashboard_action,
+                    page,
+                }) => callbacks::dispatch_dashboard(state, query, dashboard_action, page).await,
+                Some(TelegramAction::Settings(action)) => {
+                    settings::callback(state, query, action).await
                 }
-                Some(TelegramAction::Settings { .. }) => settings::callback(state, query).await,
-                Some(TelegramAction::Report { .. }) => report::callback(state, query).await,
-                Some(TelegramAction::Discovery { .. }) => random::callback(state, query).await,
-                Some(TelegramAction::DeliverCached { .. })
-                | Some(TelegramAction::Rip { .. })
-                | Some(TelegramAction::SearchClose) => search::callback(state, query).await,
-                Some(TelegramAction::AuthPage { .. }) | Some(TelegramAction::AuthClose) => {
-                    list::callback(state, query).await
+                Some(TelegramAction::Report(action)) => {
+                    report::callback(state, query, action).await
+                }
+                Some(TelegramAction::Discovery(action)) => {
+                    random::callback(state, query, action).await
+                }
+                Some(action @ TelegramAction::ConfirmDelete { .. })
+                | Some(action @ TelegramAction::CancelDelete { .. }) => {
+                    delete::callback(state, query, action).await
+                }
+                Some(action @ TelegramAction::ConfirmImport { .. })
+                | Some(action @ TelegramAction::CancelImport { .. }) => {
+                    backup::callback(state, query, action).await
+                }
+                Some(action @ TelegramAction::DeliverCached { .. })
+                | Some(action @ TelegramAction::Rip { .. })
+                | Some(action @ TelegramAction::SearchClose) => {
+                    search::callback(state, query, action).await
+                }
+                Some(action @ TelegramAction::AuthPage { .. })
+                | Some(action @ TelegramAction::AuthClose) => {
+                    list::callback(state, query, action).await
                 }
                 Some(TelegramAction::Noop) => {
                     let _ = query.answer().send(&state.client).await;

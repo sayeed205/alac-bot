@@ -1176,6 +1176,25 @@ async fn run_pipeline<D: OrchestratorDeps>(
 }
 // (summary end)
 
+/// Best-effort cleanup for a cancellation after an upload has completed.
+async fn rollback_cancelled<D: OrchestratorDeps>(
+    deps: &Arc<D>,
+    track_id: &str,
+    dump_message_id: i64,
+    delete_record: bool,
+) {
+    let dump_removed = deps
+        .sink()
+        .delete_dump_messages(&[dump_message_id])
+        .await
+        .is_ok();
+    if dump_removed && delete_record {
+        let _ = deps
+            .delete_track(&TrackKey::new(Provider::Apple, track_id))
+            .await;
+    }
+}
+
 /// One upload iteration: caption → send (retries + backoff) → save → copy →
 /// log. Upload-retries-exhausted is recorded as a track failure here
 /// (Rust deviation note: TS throws and fails the whole job; see
@@ -1359,6 +1378,13 @@ async fn upload_one<D: OrchestratorDeps>(
     // Post-upload block: save + copy + log share one try/catch — any
     // failure records the track failure and continues.
     let post_upload: Result<i64, String> = async {
+        if is_cancelled() {
+            let _ = deps
+                .sink()
+                .delete_dump_messages(&[dump_upload.message_id])
+                .await;
+            return Err("cancelled".to_owned());
+        }
         deps.save_track(SaveTrackInput::from_rip_result(
             &track_id,
             rip_result,
@@ -1368,6 +1394,11 @@ async fn upload_one<D: OrchestratorDeps>(
         ))
         .await
         .map_err(|e| e.to_string())?;
+
+        if is_cancelled() {
+            rollback_cancelled(deps, &track_id, dump_upload.message_id, true).await;
+            return Err("cancelled".to_owned());
+        }
 
         if !options.is_cache_only {
             let reply_to = (options.delivery_chat_id == options.chat_id)
@@ -1382,6 +1413,11 @@ async fn upload_one<D: OrchestratorDeps>(
                 )
                 .await
                 .map_err(|e| e.to_string())?;
+        }
+
+        if is_cancelled() {
+            rollback_cancelled(deps, &track_id, dump_upload.message_id, true).await;
+            return Err("cancelled".to_owned());
         }
 
         let total_duration_ms = (now_ms() - upload_item.start_time_ms) as i64;

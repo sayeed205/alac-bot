@@ -17,6 +17,7 @@ use ferogram::{
 
 use crate::{
     html::{escape, parse_dynamic_html},
+    interaction::TelegramAction,
     BotState,
 };
 
@@ -225,14 +226,24 @@ async fn search(state: Arc<BotState>, msg: IncomingMessage) {
         .await;
 }
 
-pub async fn callback(state: Arc<BotState>, query: CallbackQuery) {
-    let data = query.data().unwrap_or_default().to_owned();
-    if data == "search_close" {
-        close(state, query).await;
-    } else if let Some(track_id) = data.strip_prefix("dl:") {
-        deliver_cached(state, query, track_id.to_owned()).await;
-    } else if let Some(track_id) = data.strip_prefix("rip:") {
-        rip(state, query, track_id.to_owned()).await;
+pub async fn callback(state: Arc<BotState>, query: CallbackQuery, action: TelegramAction) {
+    match action {
+        TelegramAction::SearchClose => {
+            close(state, query).await;
+        }
+        TelegramAction::DeliverCached { track_id } => {
+            deliver_cached(state, query, track_id).await;
+        }
+        TelegramAction::Rip { track_id } => {
+            rip(state, query, track_id).await;
+        }
+        _ => {
+            let _ = query
+                .answer()
+                .alert("This search action is unavailable. Run /search again.")
+                .send(&state.client)
+                .await;
+        }
     }
 }
 
