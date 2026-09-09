@@ -175,10 +175,13 @@ impl TracksRepository {
         let pattern = format!("%{trimmed}%");
         let trimmed = trimmed.to_owned();
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        // TS parity (track.repository.ts): id equality, per-column ILIKE, and
+        // a pg_trgm `word_similarity` fuzzy clause over the concatenated
+        // title/artist/album, ordered by match class then similarity.
         let rows = self
             .client
             .fetch_rows(
-                "SELECT * FROM tracks WHERE apple_track_id = $1 OR title ILIKE $2 OR artist ILIKE $2 OR album ILIKE $2 ORDER BY CASE WHEN apple_track_id = $1 THEN 3 WHEN (title ILIKE $2 OR artist ILIKE $2 OR album ILIKE $2) THEN 2 ELSE 1 END DESC LIMIT $3",
+                "SELECT * FROM tracks WHERE apple_track_id = $1 OR title ILIKE $2 OR artist ILIKE $2 OR album ILIKE $2 OR word_similarity($1, title || ' ' || artist || ' ' || album) >= 0.35 ORDER BY CASE WHEN apple_track_id = $1 THEN 3 WHEN (title ILIKE $2 OR artist ILIKE $2 OR album ILIKE $2) THEN 2 ELSE 1 END DESC, word_similarity($1, title || ' ' || artist || ' ' || album) DESC LIMIT $3",
                 &[
                     &trimmed as &(dyn Param + Sync),
                     &pattern as &(dyn Param + Sync),

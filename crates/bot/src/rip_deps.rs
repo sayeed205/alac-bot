@@ -45,13 +45,17 @@ impl RipDeps {
 
         let catalog = Catalog::new(ReqwestTransport::new());
         let ripper_catalog = Catalog::new(ReqwestTransport::new());
-        let wrapper_url = env_option("ALAC_WRAPPER_URL");
+        // TS env schema (`src/env.ts`): the wrapper default is
+        // `http://127.0.0.1:12340`; the mirror key is `ALAC_API_KEY`.
+        let wrapper_url = Some(
+            env_option("ALAC_WRAPPER_URL").unwrap_or_else(|| "http://127.0.0.1:12340".to_owned()),
+        );
         let wrapper_api_key = env_option("ALAC_WRAPPER_API_KEY");
         let stream_transport =
             engine::streaming::StreamTransport::new(engine::streaming::ReqwestHttp::new());
         let mirror_policy = engine::streaming::MirrorPolicyManager::new(
             engine::streaming::ReqwestHttp::new(),
-            env_option("ALAC_MIRROR_URL").zip(env_option("ALAC_MIRROR_API_KEY")),
+            env_option("ALAC_MIRROR_URL").zip(env_option("ALAC_API_KEY")),
         );
         // The ripper and the dashboard health probe share one policy state.
         let probe_policy = mirror_policy.shared();
@@ -65,7 +69,8 @@ impl RipDeps {
         let upload_retry_base_ms = std::env::var("ALAC_RETRY_BASE_MS")
             .ok()
             .and_then(|value| value.parse().ok())
-            .unwrap_or(3000);
+            // TS default: 2000ms (`src/env.ts` ALAC_RETRY_BASE_MS).
+            .unwrap_or(2000);
 
         Ok(Self {
             sink: FerogramTelegramSink::new(client, dump_peer).await?,
@@ -216,5 +221,13 @@ impl OrchestratorDeps for RipDeps {
 
     fn upload_retry_base_ms(&self) -> u64 {
         self.upload_retry_base_ms
+    }
+
+    fn upload_max_retries(&self) -> u32 {
+        // TS: `maxUploadRetries = env.ALAC_MAX_RETRIES` (default 3).
+        std::env::var("ALAC_MAX_RETRIES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(3)
     }
 }

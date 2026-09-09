@@ -54,7 +54,10 @@ fn load_env() -> Env {
     )
     .unwrap_or_default();
     let database_url = required("DATABASE_URL", &mut invalid);
-    let log_level = std::env::var("LOG_LEVEL").unwrap_or_else(|_| "info".to_owned());
+    // TS parity (`src/utils/logger.ts`): LOG_LEVEL || RUST_LOG || 'info'.
+    let log_level = std::env::var("LOG_LEVEL")
+        .or_else(|_| std::env::var("RUST_LOG"))
+        .unwrap_or_else(|_| "info".to_owned());
     if !invalid.is_empty() {
         panic!("missing or invalid environment variables: {invalid:?}");
     }
