@@ -29,7 +29,7 @@ use ferogram::{
     update::CallbackQuery,
 };
 
-use crate::BotState;
+use crate::{interaction::TelegramAction, BotState};
 
 /// Bot-API marked group id (-100...) -> t.me/c/ link segment, matching the
 /// TS oracle's string slice(4) semantics.
@@ -109,28 +109,35 @@ pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
     dp.on_callback_query(filters::all::<CallbackQuery>(), move |query| {
         let state = Arc::clone(&callback_state);
         async move {
-            if query.data().is_some_and(|data| data.starts_with("cancel:")) {
-                callbacks::dispatch_cancel(state, query).await;
-            } else if query
+            let action = query
                 .data()
-                .is_some_and(|data| data.starts_with("dashboard:"))
-            {
-                callbacks::dispatch_dashboard(state, query).await;
-            } else if query
-                .data()
-                .is_some_and(|data| data.starts_with("settings:"))
-            {
-                settings::callback(state, query).await;
-            } else if query.data().is_some_and(|data| data.starts_with("report:")) {
-                report::callback(state, query).await;
-            } else if query.data().is_some_and(|data| data.starts_with("random:")) {
-                random::callback(state, query).await;
-            } else if query.data().is_some_and(|data| {
-                data.starts_with("dl:") || data.starts_with("rip:") || data == "search_close"
-            }) {
-                search::callback(state, query).await;
-            } else {
-                list::callback(state, query).await;
+                .and_then(|data| TelegramAction::decode(data).ok());
+            match action {
+                Some(TelegramAction::Cancel { .. }) => {
+                    callbacks::dispatch_cancel(state, query).await
+                }
+                Some(TelegramAction::Dashboard { .. }) => {
+                    callbacks::dispatch_dashboard(state, query).await
+                }
+                Some(TelegramAction::Settings { .. }) => settings::callback(state, query).await,
+                Some(TelegramAction::Report { .. }) => report::callback(state, query).await,
+                Some(TelegramAction::Discovery { .. }) => random::callback(state, query).await,
+                Some(TelegramAction::DeliverCached { .. })
+                | Some(TelegramAction::Rip { .. })
+                | Some(TelegramAction::SearchClose) => search::callback(state, query).await,
+                Some(TelegramAction::AuthPage { .. }) | Some(TelegramAction::AuthClose) => {
+                    list::callback(state, query).await
+                }
+                Some(TelegramAction::Noop) => {
+                    let _ = query.answer().send(&state.client).await;
+                }
+                None => {
+                    let _ = query
+                        .answer()
+                        .alert("This action is unavailable. Please run the command again.")
+                        .send(&state.client)
+                        .await;
+                }
             }
         }
     });

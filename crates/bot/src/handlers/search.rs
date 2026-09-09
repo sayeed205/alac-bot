@@ -63,7 +63,7 @@ fn build_results_html(query: &str, cached: &[Row], live: &[Row]) -> String {
             .collect::<Vec<_>>()
             .join("<br/>");
         sections.push(format!(
-            "⚡ <b>Instant Lossless Cache:</b><br/><blockquote>{lines}</blockquote>"
+            "<b>Cached tracks:</b><br/><blockquote>{lines}</blockquote>"
         ));
     }
     if !live.is_empty() {
@@ -82,11 +82,11 @@ fn build_results_html(query: &str, cached: &[Row], live: &[Row]) -> String {
             .collect::<Vec<_>>()
             .join("<br/>");
         sections.push(format!(
-            "🎵 <b>Apple Music Catalog:</b><br/><blockquote>{lines}</blockquote>"
+            "<b>Apple Music catalog:</b><br/><blockquote>{lines}</blockquote>"
         ));
     }
     format!(
-        "🔍 <b>Search results for \"<i>{}</i>\":</b><br/><br/>{}<br/><br/><i>Tap ⚡ for instant cache delivery or 🎵 to rip ALAC lossless:</i>",
+        "<b>Search results for \"<i>{}</i>\":</b><br/><br/>{}<br/><br/><i>Choose Cached for instant delivery or Rip for lossless audio.</i>",
         escape(query),
         sections.join("<br/><br/>")
     )
@@ -100,24 +100,32 @@ fn build_results_keyboard(
     let mut kb = InlineKeyboard::new();
     for (index, (id, title, artist)) in cached.iter().enumerate() {
         kb = kb.row(vec![Button::callback(
-            format!("⚡ {}. {}", index + 1, short_title(artist, title)),
-            format!("dl:{id}").as_bytes(),
+            format!("Cached · {}. {}", index + 1, short_title(artist, title)),
+            crate::interaction::TelegramAction::DeliverCached {
+                track_id: id.clone(),
+            }
+            .encode()
+            .as_bytes(),
         )]);
     }
     let start = cached.len() + 1;
     for (index, (id, title, artist)) in live.iter().enumerate() {
         kb = kb.row(vec![Button::callback(
-            format!("🎵 {}. {}", start + index, short_title(artist, title)),
-            format!("rip:{id}").as_bytes(),
+            format!("Rip · {}. {}", start + index, short_title(artist, title)),
+            crate::interaction::TelegramAction::Rip {
+                track_id: id.clone(),
+            }
+            .encode()
+            .as_bytes(),
         )]);
     }
-    kb = kb.row(vec![Button::callback("❌ Close", b"search_close")]);
+    kb = kb.row(vec![Button::callback("Close", b"search_close")]);
     kb.into_markup()
 }
 
 /// Gate text shared by the command surface.
 const PAUSED: &str =
-    "⚠️ <b>Service is temporarily paused for maintenance.</b><br/>Please check back later.";
+    "! <b>Service is temporarily paused for maintenance.</b><br/>Please try again later.";
 
 pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
     let search_state = Arc::clone(&state);
@@ -153,7 +161,7 @@ async fn search(state: Arc<BotState>, msg: IncomingMessage) {
         .collect::<Vec<_>>()
         .join(" ");
     if query.is_empty() {
-        let usage = "🔍 <b>Search Music:</b><br/><br/><blockquote><b>Usage:</b> <code>/search &lt;track title or artist&gt;</code><br/><i>Searches both local lossless cache and the live Apple Music catalog.</i></blockquote>";
+        let usage = "<b>Search music</b><br/><br/><blockquote><b>Usage:</b> <code>/search &lt;track title or artist&gt;</code><br/><i>Searches cached tracks and the Apple Music catalog.</i></blockquote>";
         let _ = msg
             .reply(InputMessage::html(parse_dynamic_html(usage)))
             .await;
@@ -169,7 +177,7 @@ async fn search(state: Arc<BotState>, msg: IncomingMessage) {
 
     if cached.is_empty() && live.is_empty() {
         let text = format!(
-            "🔍 No tracks found for \"<b>{}</b>\". Try refining your search query!",
+            "<b>No tracks found for \"{}\".</b><br/>Try a different title or artist.",
             escape(&query)
         );
         let _ = msg
@@ -257,7 +265,7 @@ async fn deliver_cached(state: Arc<BotState>, query: CallbackQuery, track_id: St
     if !state.rip_deps.settings_snapshot().can_serve_cache(is_admin) {
         let _ = query
             .answer()
-            .alert("⚠️ Service is temporarily paused for maintenance.")
+            .alert("Service is temporarily paused for maintenance.")
             .send(&state.client)
             .await;
         return;
@@ -276,11 +284,6 @@ async fn deliver_cached(state: Arc<BotState>, query: CallbackQuery, track_id: St
             .await;
         return;
     };
-    let _ = query
-        .answer()
-        .text("⚡ Delivering lossless track from cache!")
-        .send(&state.client)
-        .await;
     if let Err(error) = state
         .rip_deps
         .sink()
@@ -295,6 +298,11 @@ async fn deliver_cached(state: Arc<BotState>, query: CallbackQuery, track_id: St
             .await;
         return;
     }
+    let _ = query
+        .answer()
+        .text("Delivering cached lossless track")
+        .send(&state.client)
+        .await;
     delete_query_message(&state, &query).await;
     let _ = state
         .rip_deps
@@ -342,14 +350,14 @@ async fn rip(state: Arc<BotState>, query: CallbackQuery, track_id: String) {
         if !state.rip_deps.settings_snapshot().can_serve_cache(is_admin) {
             let _ = query
                 .answer()
-                .alert("⚠️ Service is temporarily paused for maintenance.")
+                .alert("Service is temporarily paused for maintenance.")
                 .send(&state.client)
                 .await;
             return;
         }
         let _ = query
             .answer()
-            .text("⚡ Already cached! Delivering track...")
+            .text("Already cached. Delivering track.")
             .send(&state.client)
             .await;
         let _ = state
@@ -364,7 +372,7 @@ async fn rip(state: Arc<BotState>, query: CallbackQuery, track_id: String) {
     if !state.rip_deps.settings_snapshot().can_rip_live(is_admin) {
         let _ = query
             .answer()
-            .alert("⚠️ Live ripping is temporarily paused for maintenance. Only cached tracks can be played right now.")
+            .alert("Live ripping is temporarily paused. Only cached tracks can be delivered.")
             .send(&state.client)
             .await;
         return;
@@ -372,7 +380,7 @@ async fn rip(state: Arc<BotState>, query: CallbackQuery, track_id: String) {
 
     let _ = query
         .answer()
-        .text("⏳ Queuing lossless rip...")
+        .text("Queuing lossless rip")
         .send(&state.client)
         .await;
 
@@ -386,7 +394,7 @@ async fn rip(state: Arc<BotState>, query: CallbackQuery, track_id: String) {
         .send_message(
             peer,
             InputMessage::html(parse_dynamic_html(&format!(
-                "⏳ <b>Queuing track {track_id} for ripping...</b>"
+                "… <b>Queuing track {track_id} for ripping</b>"
             )))
             .reply_to(query.message_id),
         )
@@ -494,7 +502,7 @@ mod tests {
         let text = build_results_html("query", &cached, &live);
         assert_eq!(
             text,
-            "🔍 <b>Search results for \"<i>query</i>\":</b><br/><br/>⚡ <b>Instant Lossless Cache:</b><br/><blockquote>1. <b>Cached One</b> — <i>Artist A</i><code> [24-bit/48.0kHz]</code><br/>2. <b>Cached Two</b> — <i>Artist B</i><code></code></blockquote><br/><br/>🎵 <b>Apple Music Catalog:</b><br/><blockquote>3. <b>Live One</b> — <i>Artist C</i></blockquote><br/><br/><i>Tap ⚡ for instant cache delivery or 🎵 to rip ALAC lossless:</i>"
+            "<b>Search results for \"<i>query</i>\":</b><br/><br/><b>Cached tracks:</b><br/><blockquote>1. <b>Cached One</b> — <i>Artist A</i><code> [24-bit/48.0kHz]</code><br/>2. <b>Cached Two</b> — <i>Artist B</i><code></code></blockquote><br/><br/><b>Apple Music catalog:</b><br/><blockquote>3. <b>Live One</b> — <i>Artist C</i></blockquote><br/><br/><i>Choose Cached for instant delivery or Rip for lossless audio.</i>"
         );
     }
 
@@ -503,12 +511,12 @@ mod tests {
         let cached = vec![("C".to_owned(), "A".to_owned(), String::new())];
         assert_eq!(
             build_results_html("q", &cached, &[]),
-            "🔍 <b>Search results for \"<i>q</i>\":</b><br/><br/>⚡ <b>Instant Lossless Cache:</b><br/><blockquote>1. <b>C</b> — <i>A</i><code></code></blockquote><br/><br/><i>Tap ⚡ for instant cache delivery or 🎵 to rip ALAC lossless:</i>"
+            "<b>Search results for \"<i>q</i>\":</b><br/><br/><b>Cached tracks:</b><br/><blockquote>1. <b>C</b> — <i>A</i><code></code></blockquote><br/><br/><i>Choose Cached for instant delivery or Rip for lossless audio.</i>"
         );
         let live = vec![("L".to_owned(), "B".to_owned(), String::new())];
         assert_eq!(
             build_results_html("q", &[], &live),
-            "🔍 <b>Search results for \"<i>q</i>\":</b><br/><br/>🎵 <b>Apple Music Catalog:</b><br/><blockquote>1. <b>L</b> — <i>B</i></blockquote><br/><br/><i>Tap ⚡ for instant cache delivery or 🎵 to rip ALAC lossless:</i>"
+            "<b>Search results for \"<i>q</i>\":</b><br/><br/><b>Apple Music catalog:</b><br/><blockquote>1. <b>L</b> — <i>B</i></blockquote><br/><br/><i>Choose Cached for instant delivery or Rip for lossless audio.</i>"
         );
     }
 }

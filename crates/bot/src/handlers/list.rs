@@ -59,7 +59,7 @@ pub(crate) async fn render(
     };
     if items.is_empty() {
         let input = InputMessage::html(parse_dynamic_html(
-            "ℹ️ <b>No users or groups authorized yet.</b><br/>Use <code>/auth &lt;id | @username&gt;</code> to grant access.",
+            "<b>No users or groups are authorized yet.</b><br/>Use <code>/auth &lt;id | @username&gt;</code> to grant access.",
         ));
         if let Some(msg) = reply {
             let _ = msg.reply(input).await;

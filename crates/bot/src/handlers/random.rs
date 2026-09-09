@@ -77,13 +77,13 @@ pub const WILD_SEEDS: &[&str] = &[
 pub fn source_label(source: &str) -> Option<&'static str> {
     Some(match source {
         "charts" => "🏆 Top Charts",
-        "wild" => "🎲 Wild Search",
+        "wild" => "Wild search",
         "rock" => "🎸 Rock",
         "hiphop" => "🎤 Hip-Hop",
-        "pop" => "⚡ Pop",
+        "pop" => "Pop",
         "electronic" => "🎹 Electronic",
         "jazz" => "🎷 Jazz",
-        "indie" => "💿 Indie",
+        "indie" => "Indie",
         _ => return None,
     })
 }
@@ -139,7 +139,7 @@ fn now_seed() -> u64 {
 
 /// Oracle buildSourcesMenuText.
 pub fn build_sources_menu_text() -> String {
-    "🎲 <b>Apple Music Random Album Explorer</b> (Admin)<br/><br/>\
+    "<b>Apple Music random album explorer</b> (admin)<br/><br/>\
      <blockquote>Select a discovery source below to pick a random album to dump into your cache channel:</blockquote>"
         .to_owned()
 }
@@ -156,14 +156,14 @@ pub fn build_preview_text(candidate: &RandomAlbumCandidate) -> String {
         .map(|n| format!("{n} tracks"))
         .unwrap_or_else(|| "Full Album".to_owned());
     format!(
-        "🎲 <b>Random Album Picked!</b><br/><br/>\
-💿 <b>Album:</b> {}<br/>\
-👤 <b>Artist:</b> {}<br/>\
-🎵 <b>Tracks:</b> <code>{}</code><br/>\
-📅 <b>Released:</b> <code>{}</code><br/>\
-🏷 <b>Genre:</b> <code>{}</code><br/>\
-🌍 <b>Storefront:</b> <code>{}</code><br/><br/>\
-🔗 <a href=\"{}\">Open in Apple Music</a>",
+        "✓ <b>Random album selected</b><br/><br/>\
+<b>Album:</b> {}<br/>\
+<b>Artist:</b> {}<br/>\
+<b>Tracks:</b> <code>{}</code><br/>\
+<b>Released:</b> <code>{}</code><br/>\
+<b>Genre:</b> <code>{}</code><br/>\
+<b>Storefront:</b> <code>{}</code><br/><br/>\
+<a href=\"{}\">Open in Apple Music</a>",
         escape(&candidate.title),
         escape(&candidate.artist),
         escape(&tracks),
@@ -178,19 +178,19 @@ fn sources_keyboard() -> ferogram::tl::enums::ReplyMarkup {
     InlineKeyboard::new()
         .row(vec![
             Button::callback("🏆 Top Charts", b"random:src:charts"),
-            Button::callback("🎲 Wild Search", b"random:src:wild"),
+            Button::callback("Wild search", b"random:src:wild"),
         ])
         .row(vec![
-            Button::callback("🎸 Rock", b"random:src:rock"),
-            Button::callback("🎤 Hip-Hop", b"random:src:hiphop"),
-            Button::callback("⚡ Pop", b"random:src:pop"),
+            Button::callback("Rock", b"random:src:rock"),
+            Button::callback("Hip-hop", b"random:src:hiphop"),
+            Button::callback("Pop", b"random:src:pop"),
         ])
         .row(vec![
-            Button::callback("🎹 Electronic", b"random:src:electronic"),
-            Button::callback("🎷 Jazz", b"random:src:jazz"),
-            Button::callback("💿 Indie", b"random:src:indie"),
+            Button::callback("Electronic", b"random:src:electronic"),
+            Button::callback("Jazz", b"random:src:jazz"),
+            Button::callback("Indie", b"random:src:indie"),
         ])
-        .row(vec![Button::callback("❌ Close", b"random:close")])
+        .row(vec![Button::callback("Close", b"random:close")])
         .into_markup()
 }
 
@@ -206,12 +206,12 @@ fn preview_keyboard(
         )])
         .row(vec![
             Button::callback(
-                "🎲 Re-roll",
+                "Choose another",
                 format!("random:reroll:{source}:{storefront}").as_bytes(),
             ),
-            Button::callback("⬅️ Sources", b"random:menu"),
+            Button::callback("Back to sources", b"random:menu"),
         ])
-        .row(vec![Button::callback("❌ Cancel", b"random:close")])
+        .row(vec![Button::callback("Close", b"random:close")])
         .into_markup()
 }
 
@@ -219,12 +219,12 @@ fn retry_keyboard(source: &str, storefront: &str) -> ferogram::tl::enums::ReplyM
     InlineKeyboard::new()
         .row(vec![
             Button::callback(
-                "🔄 Try Again",
+                "Try again",
                 format!("random:reroll:{source}:{storefront}").as_bytes(),
             ),
-            Button::callback("⬅️ Sources", b"random:menu"),
+            Button::callback("Back to sources", b"random:menu"),
         ])
-        .row(vec![Button::callback("❌ Close", b"random:close")])
+        .row(vec![Button::callback("Close", b"random:close")])
         .into_markup()
 }
 
@@ -464,7 +464,7 @@ async fn random(state: Arc<BotState>, msg: IncomingMessage) {
 
     let loading = msg
         .reply(InputMessage::html(parse_dynamic_html(&format!(
-            "🎲 <i>Discovering random album from {} ({})...</i>",
+            "… <i>Discovering a random album from {} ({})</i>",
             escape(&source_arg),
             escape(&storefront_arg.to_uppercase()),
         ))))
@@ -492,7 +492,7 @@ async fn random(state: Arc<BotState>, msg: IncomingMessage) {
         }
         Err(error) => {
             let text = format!(
-                "⚠️ <b>Failed to pick random album:</b> <code>{}</code>",
+                "! <b>Could not select a random album.</b><br/><code>{}</code>",
                 escape(&error)
             );
             let _ = state
@@ -578,7 +578,7 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery) {
                 .to_owned();
             let _ = query
                 .answer()
-                .text("🎲 Discovering random album...")
+                .text("… Discovering a random album")
                 .send(&state.client)
                 .await;
             let label = source_label(&source).unwrap_or(source.as_str()).to_owned();
@@ -588,7 +588,7 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery) {
                     peer.clone(),
                     message_id,
                     InputMessage::html(parse_dynamic_html(&format!(
-                        "🔄 <i>Discovering random album from {}...</i>",
+                        "… <i>Discovering a random album from {}</i>",
                         escape(&label)
                     ))),
                 )
@@ -612,7 +612,7 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery) {
                 }
                 Err(error) => {
                     let text = format!(
-                        "⚠️ <b>Failed to discover album:</b> <code>{}</code>",
+                        "! <b>Could not discover an album.</b><br/><code>{}</code>",
                         escape(&error)
                     );
                     let _ = state
@@ -637,7 +637,7 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery) {
                 .to_owned();
             let _ = query
                 .answer()
-                .text("🚀 Queuing album dump...")
+                .text("Queuing album dump")
                 .send(&state.client)
                 .await;
             delete_message(&state, &peer, message_id).await;
@@ -649,7 +649,7 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery) {
                 .send_message(
                     peer.clone(),
                     InputMessage::html(parse_dynamic_html(
-                        "🔍 <b>Resolving tracks from Apple Music...</b>",
+                        "… <b>Resolving tracks from Apple Music</b>",
                     )),
                 )
                 .await;
@@ -680,7 +680,13 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery) {
                 tracing::warn!(%error, "random album dump job failed to start");
             }
         }
-        _ => {}
+        _ => {
+            let _ = query
+                .answer()
+                .alert("This discovery action is unavailable. Please open /random again.")
+                .send(&state.client)
+                .await;
+        }
     }
 }
 
@@ -714,14 +720,14 @@ mod tests {
     fn preview_text_is_exact() {
         assert_eq!(
             build_preview_text(&candidate()),
-            "🎲 <b>Random Album Picked!</b><br/><br/>\
-💿 <b>Album:</b> Moon Dreams<br/>\
-👤 <b>Artist:</b> Luna<br/>\
-🎵 <b>Tracks:</b> <code>12 tracks</code><br/>\
-📅 <b>Released:</b> <code>2024-05-01</code><br/>\
-🏷 <b>Genre:</b> <code>Pop</code><br/>\
-🌍 <b>Storefront:</b> <code>US</code><br/><br/>\
-🔗 <a href=\"https://music.apple.com/us/album/x/1\">Open in Apple Music</a>"
+            "✓ <b>Random album selected</b><br/><br/>\
+<b>Album:</b> Moon Dreams<br/>\
+<b>Artist:</b> Luna<br/>\
+<b>Tracks:</b> <code>12 tracks</code><br/>\
+<b>Released:</b> <code>2024-05-01</code><br/>\
+<b>Genre:</b> <code>Pop</code><br/>\
+<b>Storefront:</b> <code>US</code><br/><br/>\
+<a href=\"https://music.apple.com/us/album/x/1\">Open in Apple Music</a>"
         );
     }
 
@@ -732,16 +738,16 @@ mod tests {
         c.release_date = None;
         c.genre = None;
         let text = build_preview_text(&c);
-        assert!(text.contains("🎵 <b>Tracks:</b> <code>Full Album</code>"));
-        assert!(text.contains("📅 <b>Released:</b> <code>Unknown</code>"));
-        assert!(text.contains("🏷 <b>Genre:</b> <code>Music</code>"));
+        assert!(text.contains("<b>Tracks:</b> <code>Full Album</code>"));
+        assert!(text.contains("<b>Released:</b> <code>Unknown</code>"));
+        assert!(text.contains("<b>Genre:</b> <code>Music</code>"));
     }
 
     #[test]
     fn sources_menu_text_is_exact() {
         assert_eq!(
             build_sources_menu_text(),
-            "🎲 <b>Apple Music Random Album Explorer</b> (Admin)<br/><br/>\
+            "<b>Apple Music random album explorer</b> (admin)<br/><br/>\
 <blockquote>Select a discovery source below to pick a random album to dump into your cache channel:</blockquote>"
         );
     }

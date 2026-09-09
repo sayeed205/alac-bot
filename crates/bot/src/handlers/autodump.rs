@@ -355,7 +355,7 @@ async fn run_auto_dump_pipeline_inner(
         .join(", ");
 
     let initial_html = format!(
-        "🔍 <b>Scanning Apple Music for New Releases...</b><br/><br/>\
+        "… <b>Scanning Apple Music for new releases</b><br/><br/>\
 <blockquote>• <b>Time Window:</b> Last <code>{days}</code> day(s)<br/>\
 • <b>Storefronts:</b> <code>{sf_formatted}</code><br/>\
 • <b>Triggered By:</b> {triggered_by}<br/>\
@@ -436,7 +436,7 @@ async fn run_auto_dump_pipeline_inner(
                 peer,
                 id,
                 InputMessage::html(parse_dynamic_html(
-                    "🔍 <b>Resolving tracks from Apple Music...</b>",
+                    "… <b>Resolving tracks from Apple Music</b>",
                 )),
             )
             .await;
@@ -492,7 +492,7 @@ async fn run_auto_dump_pipeline_inner(
 • <b>Time Window:</b> Last <code>{days}</code> day(s)<br/>\
 • <b>Trigger:</b> {triggered_by}<br/><br/>\
 <b>Storefront Breakdown:</b><br/>{sf_breakdown}</blockquote><br/>\
-<blockquote>💡 <i>All new tracks have been securely archived to the dump channel.</i></blockquote>",
+<blockquote><i>All new tracks have been archived to the dump channel.</i></blockquote>",
                 discovery.total_found
             );
             let _ = state
@@ -513,7 +513,7 @@ async fn run_auto_dump_pipeline_inner(
                         peer,
                         id,
                         InputMessage::html(parse_dynamic_html(&format!(
-                            "❌ <b>Auto-Dump Failed:</b> <code>{error}</code>"
+                            "× <b>Auto-dump failed.</b><br/><code>{error}</code>"
                         ))),
                     )
                     .await;
@@ -554,7 +554,7 @@ async fn autodump(state: Arc<BotState>, msg: IncomingMessage) {
     if AUTO_DUMP_RUNNING.load(Ordering::SeqCst) {
         let _ = msg
             .reply(InputMessage::html(parse_dynamic_html(
-                "⏳ <b>Auto-Dump is already in progress!</b> Please wait for the current sweep to finish.",
+                "… <b>Auto-dump is already in progress.</b> Please wait for the current sweep to finish.",
             )))
             .await;
         return;
@@ -637,7 +637,7 @@ mod tests {
     #[test]
     fn initial_and_progress_cards_are_exact() {
         let initial = format!(
-            "🔍 <b>Scanning Apple Music for New Releases...</b><br/><br/>\
+            "… <b>Scanning Apple Music for new releases</b><br/><br/>\
 <blockquote>• <b>Time Window:</b> Last <code>{days}</code> day(s)<br/>\
 • <b>Storefronts:</b> <code>{sf_formatted}</code><br/>\
 • <b>Triggered By:</b> {triggered_by}<br/>\
@@ -648,7 +648,7 @@ mod tests {
         );
         assert_eq!(
             initial,
-            "🔍 <b>Scanning Apple Music for New Releases...</b><br/><br/>\
+            "… <b>Scanning Apple Music for new releases</b><br/><br/>\
 <blockquote>• <b>Time Window:</b> Last <code>3</code> day(s)<br/>\
 • <b>Storefronts:</b> <code>US, GB</code><br/>\
 • <b>Triggered By:</b> Admin Command (/dumpnew 3)<br/>\
@@ -698,7 +698,7 @@ mod tests {
 • <b>Time Window:</b> Last <code>{days}</code> day(s)<br/>\
 • <b>Trigger:</b> {triggered_by}<br/><br/>\
 <b>Storefront Breakdown:</b><br/>{sf_breakdown}</blockquote><br/>\
-<blockquote>💡 <i>All new tracks have been securely archived to the dump channel.</i></blockquote>",
+<blockquote><i>All new tracks have been archived to the dump channel.</i></blockquote>",
             6,
             days = 1,
             triggered_by = "Daily 24h Scheduler",
@@ -714,7 +714,7 @@ mod tests {
         assert!(summary.contains("• <b>GB:</b> <code>2</code>"));
         assert!(summary.ends_with(
             "</blockquote><br/>\
-<blockquote>💡 <i>All new tracks have been securely archived to the dump channel.</i></blockquote>"
+<blockquote><i>All new tracks have been archived to the dump channel.</i></blockquote>"
         ));
     }
 

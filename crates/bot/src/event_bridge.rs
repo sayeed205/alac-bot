@@ -282,14 +282,11 @@ async fn handle_event(state: Arc<BotState>, event: BridgeEvent) -> Result<(), St
             // their details in a code block; other failures are generic.
             let text = if error.starts_with("Failed to resolve any tracks") {
                 format!(
-                    "⚠️ <b>Failed to resolve any tracks:</b><br/><code>{}</code>",
+                    "! <b>Could not resolve any tracks.</b><br/><i>Check the link and try again.</i><br/><code>{}</code>",
                     crate::html::escape(&error)
                 )
             } else {
-                format!(
-                    "⚠️ <b>Download Failed:</b><br/><br/><code>{}</code>",
-                    crate::html::escape(&error)
-                )
+                "× <b>Download failed.</b><br/><i>Please try again or use /report if the track is corrupt.</i>".to_owned()
             };
             finish_status(&job, text).await?;
             registry().forget(&job.id);

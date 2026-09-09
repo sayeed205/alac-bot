@@ -368,7 +368,7 @@ pub fn thousands_separator(value: u32) -> String {
 /// Build the HTML caption sent with the generated image.
 pub fn build_caption(probe: &AudioProbeResult, song_title: &str, codec: &str) -> String {
     let mut caption = format!(
-        "📊 <b>Audio Spectrogram Analysis</b><br/><br/>• <b>Track:</b> <code>{}</code><br/>",
+        "<b>Audio spectrogram analysis</b><br/><br/>• <b>Track:</b> <code>{}</code><br/>",
         crate::html::escape(song_title)
     );
     if let Some(artist) = &probe.artist {

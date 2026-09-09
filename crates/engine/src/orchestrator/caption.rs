@@ -1,13 +1,10 @@
-//! Dump-channel caption formatting and parsing (port of
-//! `formatDumpCaption`/`parseDumpCaption` in `src/modules/alac/indexer.ts`).
+//! Dump-channel caption formatting and parsing.
 //!
-//! TS builds the caption as HTML and hands it to `parseDynamicHtml`, which
-//! parses it into an mtcute `FormattedString` (text + entities). Telegram's
-//! HTML parser is the equivalent here — the bot crate will feed the returned
-//! HTML string to ferogram's HTML support. Entity sanitization (the
-//! `sanitizeAndSortEntities` step) is a mtcute MTProto concern; ferogram's
-//! own HTML layer handles entity validity. The parity surface is the exact
-//! HTML string.
+//! The caption has two audiences: a compact operator-facing summary and a
+//! canonical machine-readable JSON record consumed by the indexer. Telegram's
+//! HTML parser is the equivalent here — the bot crate feeds the returned HTML
+//! string to ferogram's HTML support. Captions are clean-slate: the indexer
+//! accepts only the current payload shape and does not support older formats.
 
 use crate::types::{Provider, TrackKey, TrackRipResult};
 
@@ -64,31 +61,24 @@ pub fn html_escape(input: &str) -> String {
     out
 }
 
-/// Formats a clean human-readable track caption with an expandable
-/// blockquote containing rich metadata and the machine-readable payload.
-/// Returns the exact HTML the TS oracle builds (spec §D).
+/// Formats a compact operational caption.
+///
+/// The first three lines are for quick scanning in the dump channel. The
+/// expandable block contains the single canonical machine record consumed by
+/// the indexer; human-readable metadata is intentionally not repeated there.
 pub fn format_dump_caption(meta: &DumpCaptionMetadata<'_>) -> String {
-    let mut parts: Vec<String> = Vec::new();
-
-    // 🎵 <b>{title}</b> — {artist}
-    parts.push(format!(
-        "🎵 <b>{}</b> — {}",
-        html_escape(meta.title),
-        html_escape(meta.artist)
-    ));
-    // 💽 {album}
-    parts.push(format!("💽 {}", html_escape(meta.album)));
-
     let m = meta.duration / 60;
     let s = format!("{:02}", meta.duration % 60);
-    let spec_parts = [
-        "ALAC".to_string(),
-        format!("{}-bit", meta.bit_depth),
-        format!("{:.1} kHz", meta.sample_rate as f64 / 1000.0),
-        format!("{m}:{s}"),
-    ];
-    // 🎧 specs joined by ' • '
-    parts.push(format!("🎧 {}", spec_parts.join(" • ")));
+    let track_number = meta.track_number.unwrap_or(1);
+    let track_count = meta.track_count.unwrap_or(1);
+    let summary = format!(
+        "<b>{}</b> — {}<br/><i>{}</i> · <code>{track_number}/{track_count}</code><br/><code>ALAC · {}-bit · {:.1} kHz · {m}:{s}</code>",
+        html_escape(meta.title),
+        html_escape(meta.artist),
+        html_escape(meta.album),
+        meta.bit_depth,
+        meta.sample_rate as f64 / 1000.0,
+    );
 
     // Machine payload. TS: JSON.stringify(payload, null, 2), each line
     // escaped, joined with <br/>.
@@ -113,40 +103,7 @@ pub fn format_dump_caption(meta: &DumpCaptionMetadata<'_>) -> String {
         .collect::<Vec<_>>()
         .join("<br/>");
 
-    let track_number = meta.track_number.unwrap_or(1);
-    let track_count = meta.track_count.unwrap_or(1);
-    let quote_lines = [
-        "<b>Track Specs &amp; Metadata:</b>".to_string(),
-        format!(
-            "• Quality: <b>ALAC {}-bit / {:.1} kHz</b>",
-            meta.bit_depth,
-            meta.sample_rate as f64 / 1000.0
-        ),
-        format!("• Album: <b>{}</b>", html_escape(meta.album)),
-        format!("• Track: <b>{track_number}/{track_count}</b>"),
-        format!(
-            "• Genre: <b>{}</b>",
-            html_escape(meta.genre.unwrap_or("Music"))
-        ),
-        format!(
-            "• Release Date: <b>{}</b>",
-            html_escape(meta.release_date.unwrap_or(""))
-        ),
-        format!(
-            "• {} Track ID: <b>{}</b>",
-            meta.track_key.provider,
-            html_escape(&meta.track_key.track_id)
-        ),
-        String::new(),
-        payload_html,
-    ];
-
-    parts.push(format!(
-        "<blockquote expandable>{}</blockquote>",
-        quote_lines.join("<br/>")
-    ));
-
-    parts.join("<br/>")
+    format!("{summary}<br/><blockquote expandable>{payload_html}</blockquote>")
 }
 
 /// TS `ParsedDumpMetadata` — the round-trip shape of the embedded payload.
@@ -165,14 +122,12 @@ pub struct ParsedDumpMetadata {
     pub track_count: i64,
 }
 
-/// Extracts the structured metadata from message text/caption. Returns
-/// `None` when there is no text, no payload match, or the payload does not
-/// parse as JSON with a supported provider and string `track_id`.
+/// Extracts the current structured metadata from a message caption. Returns
+/// `None` for missing, stale, unrelated, or invalid records.
 pub fn parse_dump_caption(text: Option<&str>) -> Option<ParsedDumpMetadata> {
     let text = text?;
     let payload = extract_payload(text)?;
     let parsed: serde_json::Value = serde_json::from_str(&payload).ok()?;
-
     let provider = parsed.get("provider")?.as_str()?.parse::<Provider>().ok()?;
     let track_id = parsed.get("track_id")?.as_str()?;
     if track_id.is_empty() {
@@ -284,15 +239,12 @@ mod tests {
     }
 
     #[test]
-    fn caption_matches_ts_shape() {
+    fn caption_is_compact_and_keeps_machine_record() {
         let html = format_dump_caption(&sample_meta());
-        assert!(html.starts_with("🎵 <b>Night Song</b> — A&amp;R &lt;duo&gt;"));
-        assert!(html.contains("💽 Escapes"));
-        assert!(html.contains("🎧 ALAC • 24-bit • 48.0 kHz • 3:35"));
+        assert!(html.starts_with("<b>Night Song</b> — A&amp;R &lt;duo&gt;"));
+        assert!(html.contains("<i>Escapes</i> · <code>2/10</code>"));
+        assert!(html.contains("<code>ALAC · 24-bit · 48.0 kHz · 3:35</code>"));
         assert!(html.contains("<blockquote expandable>"));
-        assert!(html.contains("• Quality: <b>ALAC 24-bit / 48.0 kHz</b>"));
-        assert!(html.contains("• Track: <b>2/10</b>"));
-        assert!(html.contains("• apple Track ID: <b>1440828878</b>"));
         // Payload JSON is escaped and <br/>-joined.
         assert!(html.contains("&quot;track_id&quot;: &quot;1440828878&quot;"));
         assert!(html.ends_with("</blockquote>"));
@@ -315,11 +267,9 @@ mod tests {
             track_count: None,
         };
         let html = format_dump_caption(&meta);
-        assert!(html.contains("🎵 <b></b> — "));
-        assert!(html.contains("• Genre: <b>Music</b>"));
-        assert!(html.contains("• Release Date: <b></b>"));
-        assert!(html.contains("• Track: <b>1/1</b>"));
-        assert!(html.contains("🎧 ALAC • 16-bit • 44.1 kHz • 1:01"));
+        assert!(html.contains("<b></b> — "));
+        assert!(html.contains("<i></i> · <code>1/1</code>"));
+        assert!(html.contains("<code>ALAC · 16-bit · 44.1 kHz · 1:01</code>"));
     }
 
     #[test]
@@ -371,6 +321,14 @@ mod tests {
         assert_eq!(parsed.genre, "Music");
         assert_eq!(parsed.track_number, 1);
         assert_eq!(parsed.track_count, 1);
+    }
+
+    #[test]
+    fn payloads_without_required_fields_are_rejected() {
+        assert!(
+            parse_dump_caption(Some("{\"provider\": \"apple\", \"title\": \"Missing id\"}"))
+                .is_none()
+        );
     }
 
     #[test]

@@ -618,7 +618,7 @@ async fn cache_only_marks_cached_without_delivery() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cache_only_serves_hits_and_skips_misses() {
+async fn cache_only_serves_hits_and_seeds_misses() {
     let (orch, deps, state, _) = setup();
     deps.cache_track("hit", 4242);
     let mut opts = options(vec![track_item("hit"), track_item("miss")], false);
@@ -628,8 +628,12 @@ async fn cache_only_serves_hits_and_skips_misses() {
         .await
         .expect("cache job succeeds");
     assert_eq!(summary.cached_count, 1);
-    assert_eq!(summary.skipped_uncached_tracks, vec!["miss"]);
-    assert!(state.lock().unwrap().rip_calls.is_empty());
+    assert_eq!(summary.ripped_count, 1);
+    assert!(summary.skipped_uncached_tracks.is_empty());
+    let st = state.lock().unwrap();
+    assert_eq!(st.rip_calls, vec!["miss"]);
+    assert_eq!(st.saved_tracks.len(), 1);
+    assert!(st.copies.is_empty(), "cache-only never delivers copies");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

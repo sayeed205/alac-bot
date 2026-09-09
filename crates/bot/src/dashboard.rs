@@ -62,23 +62,33 @@ pub fn render(
     viewer_is_admin: bool,
 ) -> (String, Option<ferogram::tl::enums::ReplyMarkup>) {
     if snapshot.jobs.is_empty() {
-        return ("✅ <b>No active downloads.</b>".into(), None);
+        return ("<b>No active downloads.</b>".into(), None);
     }
     let pages = snapshot.jobs.len().div_ceil(5);
     let page = page.clamp(1, pages);
     let start = (page - 1) * 5;
     let health = snapshot.mirror_health.as_deref().unwrap_or("unknown");
     let mut text = format!(
-        "📡 <b>Live downloads</b>\n<i>Mode: {} • Mirror: {}</i>\n",
+        "<b>Live downloads</b>\n<i>Mode: {} · Mirror: {}</i>\n",
         esc(&snapshot.ripping_mode),
         esc(health)
     );
     for job in snapshot.jobs.iter().skip(start).take(5) {
         let state = match job.phase {
-            JobPhase::Processing => "▶ Processing".to_owned(),
+            JobPhase::Processing => "Processing".to_owned(),
             JobPhase::Queued => format!("#{}", job.queue_position.unwrap_or(0)),
         };
-        text.push_str(&format!("\n<b>{}</b>\n👤 {} · <i>{}</i>\n{}% · ⚡ {} cached · 🎵 {} ripped · ⚠️ {} failed / {} total\n", esc(&job.header), esc(&job.requester_name), state, job.percent.min(100), job.cached, job.ripped, job.failed, job.total));
+        text.push_str(&format!(
+            "\n<b>{}</b>\n{} · <i>{}</i>\n{}% · {} cached · {} ripped · {} failed / {} total\n",
+            esc(&job.header),
+            esc(&job.requester_name),
+            state,
+            job.percent.min(100),
+            job.cached,
+            job.ripped,
+            job.failed,
+            job.total
+        ));
         // Actions are represented in the keyboard, never as a global control:
         // this keeps a shared dashboard safe in a group chat.
     }
@@ -89,26 +99,45 @@ pub fn render(
     let mut nav = Vec::new();
     if page > 1 {
         nav.push(ferogram::keyboard::Button::callback(
-            "‹ Prev",
-            format!("dashboard:prev:{page}").into_bytes(),
+            "Previous",
+            crate::interaction::TelegramAction::Dashboard {
+                action: crate::interaction::DashboardAction::Previous,
+                page,
+            }
+            .encode()
+            .into_bytes(),
         ));
     }
     nav.push(ferogram::keyboard::Button::callback(
-        "↻ Refresh",
-        format!("dashboard:refresh:{page}").into_bytes(),
+        "Refresh",
+        crate::interaction::TelegramAction::Dashboard {
+            action: crate::interaction::DashboardAction::Refresh,
+            page,
+        }
+        .encode()
+        .into_bytes(),
     ));
     if page < pages {
         nav.push(ferogram::keyboard::Button::callback(
-            "Next ›",
-            format!("dashboard:next:{page}").into_bytes(),
+            "Next",
+            crate::interaction::TelegramAction::Dashboard {
+                action: crate::interaction::DashboardAction::Next,
+                page,
+            }
+            .encode()
+            .into_bytes(),
         ));
     }
     let mut keyboard_builder = ferogram::keyboard::InlineKeyboard::new();
     for job in snapshot.jobs.iter().skip(start).take(5) {
         if job.is_cancel_allowed_for_viewer || viewer_is_admin {
             keyboard_builder = keyboard_builder.row([ferogram::keyboard::Button::callback(
-                format!("❌ Cancel · {}", truncate(&job.header, 18)),
-                format!("cancel:{}", job.id).into_bytes(),
+                format!("Cancel download · {}", truncate(&job.header, 18)),
+                crate::interaction::TelegramAction::Cancel {
+                    job_id: job.id.clone(),
+                }
+                .encode()
+                .into_bytes(),
             )]);
         }
     }
@@ -316,7 +345,7 @@ impl DashboardManager {
                     if !warning_was_sent {
                         let _ = sink
                             .send(
-                                "⚠️ Live status updates are temporarily paused; refresh resumes shortly.",
+                    "! Live status updates are temporarily paused; use Refresh to resume.",
                                 None,
                             )
                             .await;

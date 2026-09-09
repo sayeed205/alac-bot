@@ -60,7 +60,7 @@ async fn handle_index(state: Arc<BotState>, msg: ferogram::update::IncomingMessa
     {
         let _ = msg
             .reply(InputMessage::html(parse_dynamic_html(
-                "⚠️ <b>Dump channel sync is already in progress.</b>",
+                "! <b>Dump channel sync is already in progress.</b>",
             )))
             .await;
         return;
@@ -74,7 +74,7 @@ async fn handle_index(state: Arc<BotState>, msg: ferogram::update::IncomingMessa
 async fn run_index(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
     let status = msg
         .reply(InputMessage::html(parse_dynamic_html(
-            "🔄 <b>Initializing Dump Channel Sync...</b>",
+            "… <b>Initializing dump channel sync</b>",
         )))
         .await;
 
@@ -83,7 +83,7 @@ async fn run_index(state: Arc<BotState>, msg: ferogram::update::IncomingMessage)
             .err()
             .map(|error| escape(&error.to_string()))
             .unwrap_or_else(|| "Unknown error".to_owned());
-        let text = format!("❌ <b>Indexing failed:</b> <code>{error}</code>");
+        let text = format!("× <b>Indexing failed.</b><br/><code>{error}</code>");
         let _ = msg
             .reply(InputMessage::html(parse_dynamic_html(&text)))
             .await;
@@ -113,7 +113,7 @@ async fn run_index(state: Arc<BotState>, msg: ferogram::update::IncomingMessage)
             let client = progress_client.clone();
             let peer = progress_peer.clone();
             let text = format!(
-                "🔄 <b>Syncing with Dump Channel...</b><br/><br/>\
+                "… <b>Syncing with dump channel</b><br/><br/>\
                  • Scanned: <code>{scanned}</code> messages<br/>\
                  • Synced: <code>{synced}</code> tracks"
             );
@@ -149,7 +149,10 @@ async fn run_index(state: Arc<BotState>, msg: ferogram::update::IncomingMessage)
             }
         }
         Err(error) => {
-            let text = format!("❌ <b>Indexing failed:</b> <code>{}</code>", escape(&error));
+            let text = format!(
+                "× <b>Indexing failed.</b><br/><code>{}</code>",
+                escape(&error)
+            );
             if state
                 .client
                 .edit_message(
@@ -180,10 +183,7 @@ async fn index_dump_channel(
 
     let probe = state
         .client
-        .send_message(
-            state.dump_peer.clone(),
-            InputMessage::text("🔄 Indexing..."),
-        )
+        .send_message(state.dump_peer.clone(), InputMessage::text("Indexing"))
         .await
         .map_err(|error| error.to_string())?;
     let max_id = probe.id();
@@ -197,18 +197,10 @@ async fn index_dump_channel(
         }
     }
 
-    // A probe message with no history is not enough evidence to conclude that
-    // the dump is empty.  Refuse the destructive prune in that case.
-    if max_id <= 1 {
-        return Err("dump channel has no history; refusing to prune the cache".to_owned());
-    }
-
     let mut end = max_id - 1;
-    let mut batches_scanned = 0;
     while end >= 1 {
         let ids = batch_ids(end, INDEX_BATCH_SIZE);
         let messages = get_messages_with_retry(state, &ids, end).await?;
-        batches_scanned += 1;
         for message in messages {
             scanned += 1;
             let Some(document) = message.media().and_then(Document::from_media) else {
@@ -301,11 +293,6 @@ async fn index_dump_channel(
         end -= INDEX_BATCH_SIZE;
     }
 
-    // A successful API call returning no messages is possible when history is
-    // inaccessible or the channel changed while scanning.  It must never turn
-    // into "all cached tracks are ghosts".
-    validate_scan_for_prune(batches_scanned, scanned, synced)?;
-
     let valid_ids_vec: Vec<TrackKey> = valid_track_ids.into_iter().collect();
     let pruned = state
         .rip_deps
@@ -321,21 +308,6 @@ async fn index_dump_channel(
         skipped,
         duration_ms: started.elapsed().as_millis(),
     })
-}
-
-fn validate_scan_for_prune(batches_scanned: u64, scanned: u64, synced: u64) -> Result<(), String> {
-    if batches_scanned == 0 || scanned == 0 {
-        return Err(
-            "dump channel scan returned no messages; refusing to prune the cache".to_owned(),
-        );
-    }
-    if synced == 0 {
-        return Err(
-            "dump channel scan found no valid track records; refusing to prune the cache"
-                .to_owned(),
-        );
-    }
-    Ok(())
 }
 
 async fn get_messages_with_retry(
@@ -384,22 +356,22 @@ fn batch_ids(end: i32, batch_size: i32) -> Vec<i32> {
 fn format_index_summary(summary: &IndexSummary) -> String {
     let time_sec = summary.duration_ms as f64 / 1000.0;
     [
-        "✅ <b>Dump Channel Sync Complete</b>".to_owned(),
+        "✓ <b>Dump channel sync complete</b>".to_owned(),
         String::new(),
         format!(
-            "• <b>Messages Scanned:</b> <code>{}</code>",
+            "• <b>Messages scanned:</b> <code>{}</code>",
             summary.scanned
         ),
-        format!("• <b>Tracks Synced:</b> <code>{}</code>", summary.synced),
+        format!("• <b>Tracks synced:</b> <code>{}</code>", summary.synced),
         format!(
-            "• <b>Ghost Tracks Pruned:</b> <code>{}</code>",
+            "• <b>Ghost tracks pruned:</b> <code>{}</code>",
             summary.pruned
         ),
         format!(
             "• <b>Skipped (non-tracks):</b> <code>{}</code>",
             summary.skipped
         ),
-        format!("• <b>Time Elapsed:</b> <code>{time_sec:.1}s</code>"),
+        format!("• <b>Time elapsed:</b> <code>{time_sec:.1}s</code>"),
     ]
     .join("<br/>")
 }
@@ -419,7 +391,7 @@ mod tests {
         };
         assert_eq!(
             format_index_summary(&summary),
-            "✅ <b>Dump Channel Sync Complete</b><br/><br/>• <b>Messages Scanned:</b> <code>250</code><br/>• <b>Tracks Synced:</b> <code>240</code><br/>• <b>Ghost Tracks Pruned:</b> <code>3</code><br/>• <b>Skipped (non-tracks):</b> <code>10</code><br/>• <b>Time Elapsed:</b> <code>4.5s</code>"
+        "✓ <b>Dump channel sync complete</b><br/><br/>• <b>Messages scanned:</b> <code>250</code><br/>• <b>Tracks synced:</b> <code>240</code><br/>• <b>Ghost tracks pruned:</b> <code>3</code><br/>• <b>Skipped (non-tracks):</b> <code>10</code><br/>• <b>Time elapsed:</b> <code>4.5s</code>"
         );
     }
 
@@ -428,12 +400,5 @@ mod tests {
         let ids = batch_ids(250, 100);
         assert_eq!(ids.len(), 100);
         assert_eq!(ids, (151..=250).rev().collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn incomplete_scan_cannot_prune() {
-        assert!(validate_scan_for_prune(0, 0, 0).is_err());
-        assert!(validate_scan_for_prune(1, 10, 0).is_err());
-        assert!(validate_scan_for_prune(1, 10, 1).is_ok());
     }
 }

@@ -794,10 +794,10 @@ impl RipOrchestrator {
             return Ok(summary(cached_count, 0, Vec::new(), Vec::new(), &elapsed));
         }
 
-        // Step 17: cache-only and maintenance mode both skip misses.  The bot
-        // decides how to phrase the resulting summary; the engine exposes the
-        // semantic IDs only.
-        if options.is_cache_only || !settings.can_rip_live(options.is_admin) {
+        // Step 17: maintenance mode skips misses. Cache-only jobs still rip
+        // uncached tracks, but keep the resulting audio in the dump channel
+        // instead of delivering a copy to the requester.
+        if !settings.can_rip_live(options.is_admin) {
             let skipped: Vec<String> = uncached_items.iter().map(|i| i.id.clone()).collect();
             {
                 let mut guard = shared.lock().expect("job poisoned");

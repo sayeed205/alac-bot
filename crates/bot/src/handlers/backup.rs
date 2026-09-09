@@ -89,7 +89,7 @@ async fn export(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
         Ok(ok) => ok,
         Err(error) => {
             let text = format!(
-                "❌ <b>Export Failed</b>\n\n<code>{}</code>",
+                "× <b>Export failed</b>\n\n<code>{}</code>",
                 escape(&error.to_string())
             );
             let _ = msg
@@ -112,7 +112,7 @@ async fn export(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
     ));
     if let Err(error) = std::fs::write(&tmp, &buffer) {
         let text = format!(
-            "❌ <b>Export Failed</b>\n\n<code>{}</code>",
+            "× <b>Export failed</b>\n\n<code>{}</code>",
             escape(&error.to_string())
         );
         let _ = msg
@@ -144,7 +144,7 @@ async fn export(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
     let _ = std::fs::remove_file(&tmp);
 
     if let Err(error) = send_result {
-        let text = format!("❌ <b>Export Failed</b>\n\n<code>{}</code>", escape(&error));
+        let text = format!("× <b>Export failed</b>\n\n<code>{}</code>", escape(&error));
         let _ = msg
             .reply(InputMessage::html(parse_dynamic_html(&text)))
             .await;
@@ -173,7 +173,7 @@ async fn import(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
     let Some((doc, file_name)) = replied_document(&state, &msg).await else {
         let _ = msg
             .reply(InputMessage::html(parse_dynamic_html(
-                "⚠️ Please reply to a valid <code>.json.gz</code> database archive with <code>/import</code> to restore.",
+                "! Reply to a valid <code>.json.gz</code> database archive with <code>/import</code> to restore.",
             )))
             .await;
         return;
@@ -181,7 +181,7 @@ async fn import(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
     if !file_name.ends_with(".json.gz") && !file_name.ends_with(".gz") {
         let _ = msg
             .reply(InputMessage::html(parse_dynamic_html(
-                "⚠️ The replied file must be a <code>.json.gz</code> database archive.",
+                "! The replied file must be a <code>.json.gz</code> database archive.",
             )))
             .await;
         return;
@@ -189,7 +189,7 @@ async fn import(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
 
     let status = msg
         .reply(InputMessage::html(parse_dynamic_html(
-            "⏳ <i>Downloading and restoring database dump...</i>",
+            "… <i>Downloading and restoring database dump</i>",
         )))
         .await
         .ok();
@@ -226,7 +226,7 @@ async fn import(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
 
     let text = match restore_result {
         Ok(stats) => format!(
-            "<b>✅ Database Restored Successfully!</b>\n\n\
+            "<b>✓ Database restored</b>\n\n\
 • <b>Users Restored:</b> {}\n\
 • <b>Tracks Restored:</b> {}\n\
 • <b>Requests Restored:</b> {}\n\
@@ -234,7 +234,7 @@ async fn import(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
             stats.users_merged, stats.tracks_merged, stats.requests_merged, stats.duration_ms
         ),
         Err(error) => format!(
-            "<b>❌ Database Restore Failed</b>\n\n<code>{}</code>\n\n<i>Transaction rolled back. Database state remains unchanged.</i>",
+            "<b>× Database restore failed</b>\n\n<code>{}</code>\n\n<i>Transaction rolled back. Database state remains unchanged.</i>",
             escape(&error)
         ),
     };

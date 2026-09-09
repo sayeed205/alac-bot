@@ -164,7 +164,7 @@ ALAC_WRAPPER_API_KEY=your_secret_api_key
 | :--- | :--- |
 | `/alac <url\|id> [-f]` | Download Apple Music track, album, or playlist in lossless ALAC (`-f` forces re-rip for admins) |
 | `/rip`, `/batch`, `/dl`, `/download` | Aliases for `/alac` |
-| `/search <query>` | Search Apple Music catalog and cached library with interactive buttons |
+| `/search <query>` | Search the cached library and Apple Music catalog with text-labelled buttons |
 | `/info <url\|id>` | Show track metadata and cache availability |
 | `/cancel` | Cancel your current active download |
 | `/help` | Display usage instructions and available commands |
@@ -191,7 +191,7 @@ ALAC_WRAPPER_API_KEY=your_secret_api_key
 | `/report`, `/issue` | Report a corrupt track to the admin for a re-rip |
 | `/settings` | Bot operational settings & ripping toggles |
 | `/dumpnew <days>` / `/autodump` | Auto-dump new releases from Apple Music (also runs daily on a 24h scheduler) |
-| `/cache <link>` / `/dump` | Pre-cache/seed tracks directly into dump channel without sending audio |
+| `/cache <link>` / `/dump` | Seed tracks directly into the dump channel without delivering a copy |
 | `/random` | Interactive random album discovery & dump |
 | `/export` | Export a compressed PostgreSQL database archive (`.json.gz`) via DM |
 | `/import` | Restore database by replying to a `.json.gz` archive file |

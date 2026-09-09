@@ -90,7 +90,7 @@ pub(crate) async fn authorize(msg: ferogram::update::IncomingMessage, state: Arc
         return;
     }
     let Some((id, name, is_user)) = resolve_target(&msg, &state).await else {
-        let text = "🔑 <b>Authorization Usage:</b><br/><br/><blockquote>• Reply to a message with <code>/auth</code><br/>• <code>/auth &lt;id | @username&gt;</code><br/>• Send <code>/auth</code> inside a group to authorize the whole group</blockquote>";
+        let text = "<b>Authorization usage</b><br/><br/><blockquote>• Reply to a message with <code>/auth</code><br/>• <code>/auth &lt;id | @username&gt;</code><br/>• Send <code>/auth</code> inside a group to authorize the whole group</blockquote>";
         let _ = msg
             .reply(InputMessage::html(parse_dynamic_html(text)))
             .await;
@@ -102,7 +102,7 @@ pub(crate) async fn authorize(msg: ferogram::update::IncomingMessage, state: Arc
             let word = if new { "Authorized" } else { "Updated" };
             let kind = if is_user { "User" } else { "Group" };
             let text = format!(
-                "✅ <b>{word} {kind}:</b> {} <a href=\"{link}\">{}</a> (<code>{id}</code>)",
+                "✓ <b>{word} {kind}:</b> {} <a href=\"{link}\">{}</a> (<code>{id}</code>)",
                 if is_user { "👤" } else { "👥" },
                 escape(&name)
             );

@@ -4,16 +4,17 @@
 use engine::{settings::BotSettings, types::ParsedTargetItem};
 
 pub const CACHE_RESTRICTED: &str =
-    "🔒 <b>Access Restricted:</b> Caching directly to dump channel is restricted to the bot owner.";
+    "! <b>Access restricted</b><br/>Caching directly to the dump channel is restricted to the bot owner.";
 pub const FORCE_RESTRICTED: &str =
-    "🔒 <b>Access Restricted:</b> Force re-rip is restricted to the bot owner.";
+    "! <b>Access restricted</b><br/>Force re-rip is restricted to the bot owner.";
 pub const PAUSED: &str =
-    "⚠️ <b>Ripping is temporarily paused for maintenance.</b><br/>Please check back later.";
-pub const ALBUM_DISABLED: &str = "⚠️ <b>Album ripping is currently disabled by admin.</b><br/>Please request individual tracks instead.";
-pub const PLAYLIST_DISABLED: &str = "⚠️ <b>Playlist ripping is currently disabled by admin.</b><br/>Please request individual tracks instead.";
-pub const ARTIST_DISABLED: &str = "⚠️ <b>Artist ripping is currently disabled by admin.</b><br/>Please request individual tracks or albums instead.";
-pub const TXT_DISABLED: &str = "⚠️ <b>.TXT file ripping is currently disabled by admin.</b><br/>Please request individual links instead.";
-pub const MULTI_DISABLED: &str = "⚠️ <b>Multi-link ripping is currently disabled by admin.</b><br/>Please request tracks or collections one at a time.";
+    "! <b>Ripping is temporarily paused for maintenance.</b><br/>Please try again later.";
+pub const ALBUM_DISABLED: &str =
+    "! <b>Album ripping is currently disabled.</b><br/>Please request individual tracks instead.";
+pub const PLAYLIST_DISABLED: &str = "! <b>Playlist ripping is currently disabled.</b><br/>Please request individual tracks instead.";
+pub const ARTIST_DISABLED: &str = "! <b>Artist ripping is currently disabled.</b><br/>Please request individual tracks or albums instead.";
+pub const TXT_DISABLED: &str = "! <b>.TXT file ripping is currently disabled.</b><br/>Please request individual links instead.";
+pub const MULTI_DISABLED: &str = "! <b>Multi-link ripping is currently disabled.</b><br/>Please request tracks or collections one at a time.";
 
 pub fn cache_gate(is_cache_only: bool, is_admin: bool) -> Option<&'static str> {
     (is_cache_only && !is_admin).then_some(CACHE_RESTRICTED)
@@ -68,9 +69,9 @@ pub fn feature_gate(
 
 pub fn usage(is_cache_only: bool) -> &'static str {
     if is_cache_only {
-        "💾 <b>Apple Music Lossless Cacher (Admin)</b><br/><br/><blockquote><b>Usage:</b><br/>• <b>Track:</b> <code>/cache &lt;link | id&gt;</code><br/>• <b>Album:</b> <code>/cache &lt;album_link&gt;</code><br/>• <b>Playlist:</b> <code>/cache &lt;playlist_link&gt;</code><br/>• <b>Artist:</b> <code>/cache &lt;artist_link&gt;</code><br/>• <b>Batch:</b> Send multiple links or attach a <code>.txt</code> file<br/>• <b>Alias:</b> <code>/dump</code><br/>• <b>Options:</b> <code>-f</code> <i>(force re-rip even if cached)</i><br/><i>Rips and seeds lossless audio directly into dump channel and database without sending files to chat.</i></blockquote>"
+        "<b>Apple Music lossless cacher (admin)</b><br/><br/><blockquote><b>Usage:</b><br/>• <code>/cache &lt;link | id&gt;</code><br/>• Send multiple links or attach a <code>.txt</code> file<br/>• Alias: <code>/dump</code><br/>• Option: <code>-f</code> (force re-rip)<br/><i>Seeds lossless audio into the dump channel and database.</i></blockquote>"
     } else {
-        "🎵 <b>Apple Music Lossless Ripper</b><br/><br/><blockquote><b>Supported Inputs:</b><br/>• <b>Track:</b> <code>/alac &lt;link | id&gt;</code><br/>• <b>Album:</b> <code>/alac &lt;album_link&gt;</code><br/>• <b>Playlist:</b> <code>/alac &lt;playlist_link&gt;</code><br/>• <b>Artist:</b> <code>/alac &lt;artist_link&gt;</code><br/>• <b>Batch:</b> Send multiple links or attach a <code>.txt</code> file<br/>• <b>Aliases:</b> <code>/rip</code>, <code>/batch</code>, <code>/dl</code>, <code>/download</code><br/>• <b>Cancel:</b> <code>/cancel</code> or tap the Cancel button on any active download<br/>• <b>Options:</b> <code>-f</code> <i>(force re-rip)</i></blockquote>"
+        "<b>Apple Music lossless downloader</b><br/><br/><blockquote><b>Supported inputs:</b><br/>• <code>/alac &lt;link | id&gt;</code><br/>• Send multiple links or attach a <code>.txt</code> file<br/>• Aliases: <code>/rip</code>, <code>/batch</code>, <code>/dl</code>, <code>/download</code><br/>• Cancel with <code>/cancel</code> or the Cancel download button<br/>• Option: <code>-f</code> (force re-rip)</blockquote>"
     }
 }
 
@@ -78,10 +79,9 @@ pub fn usage(is_cache_only: bool) -> &'static str {
 mod tests {
     use super::*;
     #[test]
-    fn usage_and_restrictions_are_exact() {
-        assert!(
-            usage(false).contains("• <b>Cancel:</b> <code>/cancel</code> or tap the Cancel button")
-        );
+    fn usage_and_restrictions_are_actionable() {
+        assert!(usage(false).contains("Cancel download button"));
+        assert!(!usage(false).contains('🎵'));
         assert_eq!(cache_gate(true, false), Some(CACHE_RESTRICTED));
         assert_eq!(force_gate(true, false), Some(FORCE_RESTRICTED));
         assert_eq!(cache_gate(true, true), None);

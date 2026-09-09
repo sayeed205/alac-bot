@@ -16,8 +16,9 @@ use crate::{
     BotState,
 };
 
-const USAGE: &str = "📊 <b>Audio Spectrogram Analyzer</b><br/><br/>Reply to any audio file, voice note, or audio document with <code>/spec</code> or <code>/spectogram</code> to generate its frequency spectrogram.<br/><br/><blockquote>💡 <i>Spectrograms visually expose frequency cut-offs (e.g. 16kHz for 128k MP3, 20kHz for 320k MP3), verifying genuine uncompressed lossless masters.</i></blockquote>";
-const UNSUPPORTED: &str = "⚠️ <b>Unsupported Media:</b> Please reply to an audio track, voice message, or audio document.";
+const USAGE: &str = "<b>Audio spectrogram analyzer</b><br/><br/>Reply to any audio file, voice note, or audio document with <code>/spec</code> or <code>/spectogram</code> to generate its frequency spectrogram.<br/><br/><blockquote><i>Spectrograms expose frequency cut-offs and help verify lossless masters.</i></blockquote>";
+const UNSUPPORTED: &str =
+    "! <b>Unsupported media</b><br/>Reply to an audio track, voice message, or audio document.";
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 struct ClassifiedMedia {
@@ -143,7 +144,7 @@ async fn handle(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
         .send_message(
             peer.clone(),
             InputMessage::html(parse_dynamic_html(
-                "⏳ <i>Downloading audio for spectrogram analysis...</i>",
+                "… <i>Downloading audio for spectrogram analysis</i>",
             ))
             .reply_to(Some(msg.id())),
         )
@@ -252,7 +253,7 @@ async fn handle(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
             &peer,
             status.id(),
             &format!(
-                "❌ <b>Spectrogram Generation Failed:</b> <code>{}</code>",
+                "× <b>Spectrogram generation failed.</b><br/><code>{}</code>",
                 escape(&error)
             ),
         )

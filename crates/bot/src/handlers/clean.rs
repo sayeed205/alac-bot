@@ -67,7 +67,7 @@ async fn clean(msg: ferogram::update::IncomingMessage, state: Arc<BotState>) {
     match result {
         Ok((files_removed, bytes_freed)) => {
             let text = format!(
-                "🧹 <b>Temporary Storage Cleaned</b><br/><br/><blockquote>• Files Removed: <code>{files_removed}</code><br/>• Space Reclaimed: <code>{}</code><br/>• Target: <code>bot-data/downloads/</code></blockquote>",
+                "✓ <b>Temporary storage cleaned</b><br/><br/><blockquote>• Files removed: <code>{files_removed}</code><br/>• Space reclaimed: <code>{}</code><br/>• Target: <code>bot-data/downloads/</code></blockquote>",
                 format_bytes(bytes_freed)
             );
             let _ = msg
@@ -76,7 +76,7 @@ async fn clean(msg: ferogram::update::IncomingMessage, state: Arc<BotState>) {
         }
         Err(error) => {
             let text = format!(
-                "⚠️ <b>Failed to clean directory:</b> <code>{}</code>",
+                "! <b>Could not clean temporary storage.</b><br/><code>{}</code>",
                 escape(&error.to_string())
             );
             let _ = msg

@@ -8,7 +8,7 @@ use crate::{
     BotState,
 };
 
-const USAGE: &str = "ℹ️ <b>Track Info Usage:</b><br/><br/><blockquote>• <code>/info &lt;apple_music_link | id&gt;</code><br/>• Reply to an Apple Music link with <code>/info</code></blockquote>";
+const USAGE: &str = "<b>Track info usage</b><br/><br/><blockquote>• <code>/info &lt;apple_music_link | id&gt;</code><br/>• Reply to an Apple Music link with <code>/info</code></blockquote>";
 
 async fn reply_text(msg: &ferogram::update::IncomingMessage, state: &BotState) -> Option<String> {
     let reply_id = msg.reply_to_message_id()?;
@@ -95,7 +95,7 @@ async fn info(msg: ferogram::update::IncomingMessage, state: Arc<BotState>) {
 
         let (cache_status, cache_details) = match cached {
             Some(cached) => (
-                "✅ <b>Cached in Database</b>".to_owned(),
+                "✓ <b>Cached in database</b>".to_owned(),
                 {
                     let mut quality = vec!["ALAC".to_owned()];
                     if let Some(row) = cached_row.as_ref() {
@@ -115,13 +115,13 @@ async fn info(msg: ferogram::update::IncomingMessage, state: Arc<BotState>) {
                 },
             ),
             None => (
-                "❌ <b>Not Cached</b>".to_owned(),
+                "! <b>Not cached</b>".to_owned(),
                 format!("Use <code>/alac {track_id}</code> to rip in lossless ALAC."),
             ),
         };
 
         Ok::<_, String>(format!(
-            "🎵 <b>{title}</b> — {artist}<br/><br/><blockquote><b>Metadata:</b><br/>• Album: <b>{album}</b><br/>• Track Number: <code>{}</code> of <code>{}</code><br/>• Duration: <code>{duration}</code><br/>• Release Year: <code>{year}</code><br/>• Genre: <code>{genre}</code><br/>• Apple Track ID: <code>{track_id}</code></blockquote><br/><blockquote><b>Cache Status:</b><br/>• Status: {cache_status}<br/>• {cache_details}</blockquote>",
+            "<b>{title}</b> — {artist}<br/><br/><blockquote><b>Metadata:</b><br/>• Album: <b>{album}</b><br/>• Track number: <code>{}</code> of <code>{}</code><br/>• Duration: <code>{duration}</code><br/>• Release year: <code>{year}</code><br/>• Genre: <code>{genre}</code><br/>• Apple track ID: <code>{track_id}</code></blockquote><br/><blockquote><b>Cache status:</b><br/>• Status: {cache_status}<br/>• {cache_details}</blockquote>",
             meta.track_number.unwrap_or(1),
             meta.track_count.unwrap_or(1),
         ))
@@ -136,7 +136,7 @@ async fn info(msg: ferogram::update::IncomingMessage, state: Arc<BotState>) {
         }
         Err(error) => {
             let text = format!(
-                "⚠️ <b>Failed to fetch info:</b> <code>{}</code>",
+                "! <b>Could not fetch track info.</b><br/><code>{}</code>",
                 escape(&error)
             );
             let _ = msg

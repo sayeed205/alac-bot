@@ -9,8 +9,8 @@ use crate::{
 };
 
 const RESTRICTED: &str =
-    "🔒 <b>Access Restricted:</b> This command is restricted to the bot owner.";
-const USAGE: &str = "🗑️ <b>Delete Track Usage:</b><br/><br/><blockquote>• <code>/delete &lt;apple_music_link | track_id&gt;</code><br/>• Reply to an Apple Music link with <code>/delete</code></blockquote>";
+    "! <b>Access restricted</b><br/>This command is restricted to the bot owner.";
+const USAGE: &str = "<b>Delete track usage</b><br/><br/><blockquote>• <code>/delete &lt;apple_music_link | track_id&gt;</code><br/>• Reply to an Apple Music link with <code>/delete</code></blockquote>";
 
 async fn reply_text(msg: &ferogram::update::IncomingMessage, state: &BotState) -> Option<String> {
     let reply_id = msg.reply_to_message_id()?;
@@ -59,7 +59,7 @@ async fn delete(msg: ferogram::update::IncomingMessage, state: Arc<BotState>) {
     };
     let Some(cached) = cached else {
         let text = format!(
-            "⚠️ <b>Track Not Found:</b> ID <code>{track_id}</code> is not in the database."
+            "! <b>Track not found</b><br/>ID <code>{track_id}</code> is not in the database."
         );
         let _ = msg
             .reply(InputMessage::html(parse_dynamic_html(&text)))
@@ -97,7 +97,7 @@ async fn delete(msg: ferogram::update::IncomingMessage, state: Arc<BotState>) {
     };
     let artist = escape(&artist);
     let text = format!(
-        "🗑️ <b>Track Deleted Successfully</b><br/><br/><blockquote><b>Details:</b><br/>• Title: <b>{title}</b> — {artist}<br/>• Apple ID: <code>{track_id}</code><br/>• Dump Message: <code>#{}</code><br/>• Purged from database & dump channel.</blockquote>",
+        "✓ <b>Track deleted</b><br/><br/><blockquote><b>Details:</b><br/>• Title: <b>{title}</b> — {artist}<br/>• Apple ID: <code>{track_id}</code><br/>• Dump message: <code>#{}</code><br/>• Removed from the database and dump channel.</blockquote>",
         cached.message_id
     );
     let _ = msg

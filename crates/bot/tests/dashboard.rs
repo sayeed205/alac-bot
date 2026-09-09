@@ -28,7 +28,7 @@ fn empty_dashboard_is_exact_and_pages_are_mobile_friendly() {
         mirror_health: None,
         jobs: vec![],
     };
-    assert_eq!(render(&empty, 1, false).0, "✅ <b>No active downloads.</b>");
+    assert_eq!(render(&empty, 1, false).0, "<b>No active downloads.</b>");
     let jobs = (0..6).map(|n| job(n, n == 0)).collect();
     let snapshot = DashboardSnapshot {
         ripping_mode: "sequential".into(),
@@ -36,7 +36,7 @@ fn empty_dashboard_is_exact_and_pages_are_mobile_friendly() {
         jobs,
     };
     let (text, keyboard) = render(&snapshot, 1, false);
-    assert!(text.contains("Requester 0") && text.contains("▶ Processing") && text.contains("#1"));
+    assert!(text.contains("Requester 0") && text.contains("Processing") && text.contains("#1"));
     assert!(text.contains("Page 1/2") && keyboard.is_some());
 }
 

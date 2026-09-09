@@ -36,11 +36,11 @@ test:
 
 # Debug build of the bot binary.
 build:
-    cargo build --locked -p bot
+    cargo build
 
 # Optimized release build.
 release:
-    cargo build --release --locked -p bot
+    cargo build --release
 
 # Build and run the bot (loads .env from the repo root).
 run: build

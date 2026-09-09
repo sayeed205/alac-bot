@@ -1,6 +1,4 @@
-//! M6 `/settings` parity tests: render text, keyboard layout, storefront
-//! toggling semantics, and the callback data strings — the observable
-//! contract with the TS oracle (settings.ts).
+//! `/settings` presentation and storefront behavior tests.
 
 use bot::handlers::settings::{render_settings_text, render_storefronts_text, POPULAR_STOREFRONTS};
 use engine::settings::{BotSettings, RippingMode};
@@ -22,16 +20,16 @@ fn settings() -> BotSettings {
 #[test]
 fn settings_text_matches_oracle_exactly() {
     let text = render_settings_text(&settings());
-    assert!(text.starts_with("⚙️ <b>Bot Settings & Operation Controls</b><br/><br/>"));
+    assert!(text.starts_with("<b>Bot settings and operation controls</b><br/><br/>"));
     assert!(text.contains(
-        "• <b>Engine Mode:</b> 🟢 <b>Live Ripping</b> (Normal operation: cache hits + live decryption)<br/>"
+        "• <b>Engine Mode:</b> <b>Live ripping</b> (Cache hits and live decryption)<br/>"
     ));
-    assert!(text.contains("• <b>Album Ripping:</b> 🟢 Enabled<br/>"));
-    assert!(text.contains("• <b>Auto-Dump New Music:</b> 🔴 Disabled<br/>"));
+    assert!(text.contains("• <b>Album Ripping:</b> Enabled<br/>"));
+    assert!(text.contains("• <b>Auto-Dump New Music:</b> Disabled<br/>"));
     assert!(text.contains("• <b>Auto-Dump Storefronts:</b> <code>US</code><br/>"));
     assert!(text.contains("• <b>Max Collection Limit:</b> <code>50 tracks</code>"));
     assert!(text.ends_with(
-        "<blockquote>💡 <i>Tap buttons below to toggle. Owner requests always bypass these limits.</i></blockquote>"
+        "<blockquote><i>Use the buttons below to toggle settings. Owner requests bypass these limits.</i></blockquote>"
     ));
 }
 
@@ -40,11 +38,11 @@ fn settings_text_mode_and_limit_variants_match_oracle() {
     let mut s = settings();
     s.ripping_mode = RippingMode::CacheOnly;
     assert!(render_settings_text(&s).contains(
-        "• <b>Engine Mode:</b> 🟡 <b>Cache Only</b> (Serves cached songs; live decryption blocked)<br/>"
+        "• <b>Engine Mode:</b> <b>Cache only</b> (Serves cached songs; live decryption blocked)<br/>"
     ));
     s.ripping_mode = RippingMode::Paused;
     assert!(render_settings_text(&s).contains(
-        "• <b>Engine Mode:</b> 🔴 <b>Paused</b> (All ripping commands suspended for regular users)<br/>"
+        "• <b>Engine Mode:</b> ! <b>Paused</b> (Ripping commands suspended for regular users)<br/>"
     ));
     s.max_collection_tracks = 0;
     assert!(
@@ -55,7 +53,7 @@ fn settings_text_mode_and_limit_variants_match_oracle() {
 #[test]
 fn storefronts_text_matches_oracle_exactly() {
     let text = render_storefronts_text(&settings());
-    assert!(text.starts_with("🌐 <b>Auto-Dump Storefront Configuration</b><br/><br/>"));
+    assert!(text.starts_with("<b>Auto-dump storefront configuration</b><br/><br/>"));
     assert!(text.contains("• <b>Active Storefronts:</b> <code>US</code>"));
     assert!(text
         .ends_with("<i>You can also use:</i> <code>/settings storefronts add &lt;code&gt;</code>"));

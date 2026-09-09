@@ -102,7 +102,7 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
     let mut delivery_chat_id = chat;
     if is_group && !is_cache {
         let note = InputMessage::html(format!(
-            "📥 <b>Download Queued:</b><br/>Tracks requested in <b>{}</b> will be delivered here!",
+            "<b>Download queued</b><br/>Tracks requested in <b>{}</b> will be delivered to your private chat.",
             crate::html::escape(&display_name)
         ))
         .silent(true);
@@ -122,11 +122,11 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
                     .unwrap_or_else(|| "alac_bot".to_owned());
                 let keyboard = ferogram::keyboard::InlineKeyboard::new()
                     .row([ferogram::keyboard::Button::url(
-                        "👉 Start Bot in DM",
+                        "Start bot in private chat",
                         format!("https://t.me/{bot_username}?start=start"),
                     )])
                     .into_markup();
-                let text = "⚠️ <b>Direct Message Required</b><br/><br/>To keep this group clean, all audio files are sent directly to your private DM.<br/>Please click the button below to start the bot in DM, then send your request again!";
+                let text = "! <b>Private chat required</b><br/><br/>Audio files are delivered to your private chat to keep this group clean.<br/>Start the bot in private chat, then send your request again.";
                 let _ = msg
                     .reply(InputMessage::html(text).reply_markup(keyboard))
                     .await;

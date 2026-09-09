@@ -4,13 +4,12 @@ use ferogram::{filters, filters::Dispatcher, InputMessage};
 
 use crate::{html::parse_dynamic_html, BotState};
 
-const WELCOME: &str =
-    "👋 <b>Welcome to ALAC Bot!</b><br/><br/>\
-Download lossless ALAC music from Apple Music with <code>/alac &lt;link&gt;</code>.<br/><br/>\
-Use <code>/help</code> to see the available commands. Audio requested from a group is delivered to your private chat.";
+const WELCOME: &str = "<b>Welcome to ALAC Bot</b><br/><br/>\
+Send <code>/alac &lt;link&gt;</code> to download lossless audio.<br/><br/>\
+Use <code>/help</code> for commands. Audio requested in a group is delivered to your private chat.";
 
 const UNAUTHORIZED: &str =
-    "🔒 <b>Welcome to ALAC Bot!</b><br/><br/>\
+    "! <b>Welcome to ALAC Bot</b><br/><br/>\
 This bot is invite-only. Send your Telegram user ID to the bot owner to request access, then use <code>/start</code> again.<br/><br/>\
 After approval, <code>/help</code> shows the full command guide.";
 

@@ -167,16 +167,16 @@ fn admin_keyboard(track_id: &str, report_id: &str) -> ferogram::tl::enums::Reply
     InlineKeyboard::new()
         .row([
             Button::callback(
-                "🔄 Re-rip Now (-f)",
+                "Re-rip now (-f)",
                 format!("report:act:rerip:{track_id}:{report_id}").as_bytes(),
             ),
             Button::callback(
-                "🗑️ Delete Track",
+                "Delete track",
                 format!("report:act:del:{track_id}:{report_id}").as_bytes(),
             ),
         ])
         .row([Button::callback(
-            "❌ Dismiss",
+            "Dismiss",
             format!("report:act:dismiss:{report_id}").as_bytes(),
         )])
         .into_markup()
@@ -190,27 +190,27 @@ fn reason_keyboard(track_id: &str) -> ferogram::tl::enums::ReplyMarkup {
                 format!("report:sub:{track_id}:corrupted").as_bytes(),
             ),
             Button::callback(
-                "✂️ Incomplete / Cut Off",
+                "Incomplete / cut off",
                 format!("report:sub:{track_id}:incomplete").as_bytes(),
             ),
         ])
         .row([
             Button::callback(
-                "🏷️ Wrong Tags / Metadata",
+                "Wrong tags / metadata",
                 format!("report:sub:{track_id}:metadata").as_bytes(),
             ),
             Button::callback(
-                "✍️ Other (Custom Note)",
+                "Other (custom note)",
                 format!("report:sub:{track_id}:other").as_bytes(),
             ),
         ])
-        .row([Button::callback("❌ Cancel", b"report:cancel")])
+        .row([Button::callback("Cancel", b"report:cancel")])
         .into_markup()
 }
 
 fn close_keyboard() -> ferogram::tl::enums::ReplyMarkup {
     InlineKeyboard::new()
-        .row([Button::callback("❌ Close", b"report:cancel")])
+        .row([Button::callback("Close", b"report:cancel")])
         .into_markup()
 }
 

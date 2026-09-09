@@ -1,11 +1,14 @@
 //! Telegram handlers and small formatting helpers.
 
+pub mod command_catalog;
 pub mod dashboard;
 pub mod dashboard_map;
 pub mod event_bridge;
 pub mod handlers;
 pub mod html;
+pub mod interaction;
 pub mod mirror_health;
+pub mod presentation;
 pub mod rip_deps;
 pub mod spectrogram;
 pub mod telegram_sink;

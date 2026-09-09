@@ -56,9 +56,9 @@ pub fn cancel_inline(
     }
 }
 
-pub const NO_ACTIVE: &str = "ℹ️ <b>No active download to cancel in this chat.</b>";
-pub const COMMAND_ACK: &str = "🛑 <b>Download has been cancelled.</b>";
-pub const CALLBACK_ACK: &str = "🛑 Download cancelled.";
+pub const NO_ACTIVE: &str = "<b>No active download to cancel in this chat.</b>";
+pub const COMMAND_ACK: &str = "✓ <b>Download cancelled.</b>";
+pub const CALLBACK_ACK: &str = "Download cancelled.";
 pub const CALLBACK_UNAUTHORIZED: &str =
     "⛔ Only the person who requested this download or an admin can cancel it.";
-pub const CALLBACK_EXPIRED: &str = "⚠️ This download has already completed or expired.";
+pub const CALLBACK_EXPIRED: &str = "This download has already completed or expired.";

@@ -33,14 +33,14 @@ const LIMIT_PRESETS: [u32; 4] = [25, 50, 100, 0];
 fn mode_button_label(mode: engine::settings::RippingMode) -> &'static str {
     use engine::settings::RippingMode::{CacheOnly, Live, Paused};
     match mode {
-        Live => "Mode: 🟢 Live Ripping",
-        CacheOnly => "Mode: 🟡 Cache Only",
-        Paused => "Mode: 🔴 Fully Paused",
+        Live => "Mode: Live ripping",
+        CacheOnly => "Mode: Cache only",
+        Paused => "Mode: Fully paused",
     }
 }
 
 fn toggle_label(label: &str, enabled: bool) -> String {
-    format!("{label}: {}", if enabled { "🟢 ON" } else { "🔴 OFF" })
+    format!("{label}: {}", if enabled { "ON" } else { "OFF" })
 }
 
 /// Oracle buildSettingsKeyboard (settings.ts:26-78).
@@ -54,7 +54,7 @@ fn settings_keyboard(settings: &engine::settings::BotSettings) -> ferogram::tl::
                 &preset.to_string()
             };
             let text = if settings.max_collection_tracks == preset {
-                format!("✅ {label}")
+                format!("Selected · {label}")
             } else {
                 label.to_owned()
             };
@@ -97,14 +97,14 @@ fn settings_keyboard(settings: &engine::settings::BotSettings) -> ferogram::tl::
                 b"settings:autodump",
             ),
             Button::callback(
-                format!("🌐 Storefronts ({})", settings.auto_dump_storefronts.len()),
+                format!("Storefronts ({})", settings.auto_dump_storefronts.len()),
                 b"settings:sf_menu",
             ),
         ]);
     kb = kb.row(limit_buttons);
     kb.row([
-        Button::callback("🔄 Refresh", b"settings:refresh"),
-        Button::callback("❌ Close", b"settings:close"),
+        Button::callback("Refresh", b"settings:refresh"),
+        Button::callback("Close", b"settings:close"),
     ])
     .into_markup()
 }
@@ -126,7 +126,7 @@ fn storefronts_keyboard(
             .map(|&sf| {
                 let active = active.contains(sf.to_lowercase().as_str());
                 let label = if active {
-                    format!("✅ {}", sf.to_uppercase())
+                    format!("Selected · {}", sf.to_uppercase())
                 } else {
                     sf.to_uppercase()
                 };
@@ -136,8 +136,8 @@ fn storefronts_keyboard(
         kb = kb.row(row);
     }
     kb.row([
-        Button::callback("🔙 Back to Settings", b"settings:refresh"),
-        Button::callback("❌ Close", b"settings:close"),
+        Button::callback("Back to settings", b"settings:refresh"),
+        Button::callback("Close", b"settings:close"),
     ])
     .into_markup()
 }
@@ -146,9 +146,9 @@ fn storefronts_keyboard(
 fn mode_description(mode: engine::settings::RippingMode) -> &'static str {
     use engine::settings::RippingMode::{CacheOnly, Live, Paused};
     match mode {
-        Live => "🟢 <b>Live Ripping</b> (Normal operation: cache hits + live decryption)",
-        CacheOnly => "🟡 <b>Cache Only</b> (Serves cached songs; live decryption blocked)",
-        Paused => "🔴 <b>Paused</b> (All ripping commands suspended for regular users)",
+        Live => "<b>Live ripping</b> (Cache hits and live decryption)",
+        CacheOnly => "<b>Cache only</b> (Serves cached songs; live decryption blocked)",
+        Paused => "! <b>Paused</b> (Ripping commands suspended for regular users)",
     }
 }
 
@@ -167,7 +167,7 @@ pub fn render_settings_text(settings: &engine::settings::BotSettings) -> String 
         .join(", ");
 
     format!(
-        "⚙️ <b>Bot Settings & Operation Controls</b><br/><br/>\
+        "<b>Bot settings and operation controls</b><br/><br/>\
 • <b>Engine Mode:</b> {}<br/>\
 • <b>Album Ripping:</b> {}<br/>\
 • <b>Playlist Ripping:</b> {}<br/>\
@@ -177,7 +177,7 @@ pub fn render_settings_text(settings: &engine::settings::BotSettings) -> String 
 • <b>Auto-Dump New Music:</b> {}<br/>\
 • <b>Auto-Dump Storefronts:</b> <code>{sf_list}</code><br/>\
 • <b>Max Collection Limit:</b> <code>{limit_text}</code><br/><br/>\
-<blockquote>💡 <i>Tap buttons below to toggle. Owner requests always bypass these limits.</i></blockquote>",
+<blockquote><i>Use the buttons below to toggle settings. Owner requests bypass these limits.</i></blockquote>",
         mode_description(settings.ripping_mode),
         flag(settings.album_rip_enabled),
         flag(settings.playlist_rip_enabled),
@@ -185,18 +185,18 @@ pub fn render_settings_text(settings: &engine::settings::BotSettings) -> String 
         flag(settings.txt_rip_enabled),
         flag(settings.multi_link_rip_enabled),
         if settings.auto_dump_enabled {
-            "🟢 Enabled (Daily)"
+            "Enabled (daily)"
         } else {
-            "🔴 Disabled"
+            "Disabled"
         },
     )
 }
 
 fn flag(enabled: bool) -> &'static str {
     if enabled {
-        "🟢 Enabled"
+        "Enabled"
     } else {
-        "🔴 Disabled"
+        "Disabled"
     }
 }
 
@@ -209,7 +209,7 @@ pub fn render_storefronts_text(settings: &engine::settings::BotSettings) -> Stri
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "🌐 <b>Auto-Dump Storefront Configuration</b><br/><br/>\
+        "<b>Auto-dump storefront configuration</b><br/><br/>\
 • <b>Active Storefronts:</b> <code>{sf_list}</code><br/><br/>\
 Tap a country below to toggle it on or off for the daily new music auto-dump.<br/>\
 <i>You can also use:</i> <code>/settings storefronts add &lt;code&gt;</code>"
@@ -502,6 +502,11 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery) {
             // settings:limit:<n> and settings:sf:toggle:<sf>
             if let Some(limit_str) = data.strip_prefix("settings:limit:") {
                 let Ok(limit) = limit_str.parse::<i64>() else {
+                    let _ = query
+                        .answer()
+                        .alert("This settings action is invalid. Please open /settings again.")
+                        .send(&state.client)
+                        .await;
                     return;
                 };
                 if limit >= 0 {
@@ -555,6 +560,12 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery) {
                 if let (Some(peer), Some(id)) = (peer, message_id) {
                     render_storefronts_message(&state, &peer, id).await;
                 }
+            } else {
+                let _ = query
+                    .answer()
+                    .alert("This settings action is unavailable. Please open /settings again.")
+                    .send(&state.client)
+                    .await;
             }
         }
     }
