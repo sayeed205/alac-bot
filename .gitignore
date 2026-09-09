@@ -1,15 +1,23 @@
-node_modules/
-dist/
-.nyc_output/
+# Rust
+/target
+/bot-data/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+client.*
+*.session*
+
+# Editor / OS noise
 **/.DS_Store
 .idea
 .vscode
 *.log
-*.tsbuildinfo
-.env
-client.*
-*.session*
+*.tmp
+coverage
 
-# Rust (migration branch)
-/target
-/bot-data/
+# BEGIN oh-my-opencode-slim worktrees
+.slim/worktrees/
+.slim/worktrees.json
+# END oh-my-opencode-slim worktrees

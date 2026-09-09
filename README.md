@@ -2,7 +2,9 @@
 
 A high-performance Telegram bot for downloading Apple Music lossless (ALAC) audio tracks, albums, and playlists with synchronized lyrics, embedded high-resolution artwork, and smart channel caching.
 
-Built with [Bun](https://bun.sh), [@mtcute/bun](https://mtcute.dev), and [Drizzle ORM](https://orm.drizzle.team).
+Built in Rust: [ferogram](https://github.com/ankit-chaubey/ferogram) (Telegram MTProto), tokio, and welds/PostgreSQL.
+
+> **Migration note**: this codebase is the Rust port of the original Bun/TypeScript bot. The TypeScript implementation is preserved on the `typescript` branch; the migration history and per-milestone parity records live in [docs/](docs/).
 
 ---
 
@@ -24,18 +26,21 @@ Built with [Bun](https://bun.sh), [@mtcute/bun](https://mtcute.dev), and [Drizzl
   - Permission-controlled: only the requester or a bot admin can cancel.
 - **Synced Lyrics Embedding**: Automatically prefetches and embeds word-by-word synced lyrics (TTML -> Enhanced LRC) or line-synced LRC from Apple Music and LRCLIB.
 - **High-Res Metadata & Artwork**: Tags every track using FFmpeg with embedded high-resolution album cover art, release date, genre, track/disc numbers, and explicit `[E]` flags.
-- **Interactive Catalog Search**: `/search <query>` searches both cached tracks and Apple Music's catalog with interactive inline button results.
-- **Access Control**: Granular user and group authorization system (`/auth`, `/revoke`, `/list`).
+- **Interactive Catalog Search**: `/search <query>` searches both cached tracks (with pg_trgm fuzzy matching) and Apple Music's catalog with interactive inline button results.
+- **Access Control**: Granular user and group authorization system (`/auth`, `/revoke`, `/authlist`).
 - **Resilient Mirror Architecture**: Automatic mirror manifest resolution, health checks, 30s connection timeout, 45s streaming chunk inactivity reset, and circuit breakers against mirror outages.
+- **Auto-Dump Scheduler**: Daily 24h sweep that discovers new Apple Music releases and archives them straight to the dump channel.
 - **Database Backup & Restore**: Export and import compressed database snapshots (`.sql.gz`) directly via Telegram DM.
 
 ---
 
 ## Prerequisites
 
-- [Bun](https://bun.sh) (v1.2 or later)
+- [Rust](https://rustup.rs) (stable toolchain; nightly is only needed for `just fmt`)
+- [just](https://github.com/casey/just) (task runner)
 - [FFmpeg](https://ffmpeg.org) installed on system path (required for audio tagging and artwork embedding)
-- [PostgreSQL](https://www.postgresql.org/) database (with `pg_trgm` extension for fuzzy search)
+- [SoX](http://sox.sourceforge.net) with `libsox-fmt-all` (required for `/spec` spectrograms)
+- [PostgreSQL](https://www.postgresql.org/) database (with `pg_trgm` extension for fuzzy search — installed automatically by the bot's migrations)
 - **Telegram API Credentials**: `API_ID` & `API_HASH` from [my.telegram.org](https://my.telegram.org), plus a `BOT_TOKEN` from [@BotFather](https://t.me/BotFather)
 - **Telegram Dump Channel**: A private channel where the bot is added as an administrator (to store and cache audio files)
 
@@ -43,19 +48,11 @@ Built with [Bun](https://bun.sh), [@mtcute/bun](https://mtcute.dev), and [Drizzl
 
 ## Quick Start
 
-### 1. Clone & Install Dependencies
+### 1. Clone & Configure
 
 ```bash
 git clone https://github.com/sayeed205/alac-bot.git
 cd alac-bot
-bun install
-```
-
-### 2. Configure Environment
-
-Copy the example configuration file:
-
-```bash
 cp .env.example .env
 ```
 
@@ -71,7 +68,7 @@ DUMP_CHANNEL_ID=-1001234567890
 # PostgreSQL Connection
 DATABASE_URL=postgresql://user:password@localhost:5432/alac_bot
 
-# Logging (trace | debug | info | warn | error | critical)
+# Logging (trace | debug | info | warn | error)
 LOG_LEVEL=info
 
 # (Optional) Primary mirror overrides (defaults to dynamic manifest resolution)
@@ -83,21 +80,31 @@ ALAC_WRAPPER_URL=http://127.0.0.1:12340
 # ALAC_WRAPPER_API_KEY=ak_wrapper_key
 ```
 
-### 3. Run Database Migrations
+### 2. Start the Bot
+
+Database migrations run automatically at startup (idempotent — safe against
+both fresh and pre-existing databases).
 
 ```bash
-bun run db:migrate
+# Development (debug build)
+just run
+
+# Or release mode
+just release && ./target/release/bot
 ```
 
-### 4. Start the Bot
+### 3. Docker
 
 ```bash
-# Development mode (with file watching)
-bun dev
-
-# Production mode
-bun start
+docker build -t alac-bot .
+docker run -d --name alac-bot \
+  --env-file .env \
+  -v alac-bot-data:/app/bot-data \
+  alac-bot
 ```
+
+The container ships ffmpeg/sox, runs as a non-root user, and persists the
+Telegram session + download scratch in the `/app/bot-data` volume.
 
 ---
 
@@ -116,6 +123,8 @@ bun start
 | `ALAC_API_KEY` | Optional static mirror API key override | Dynamic manifest |
 | `ALAC_WRAPPER_URL` | Secondary decryption wrapper / mirror URL fallback | `http://127.0.0.1:12340` |
 | `ALAC_WRAPPER_API_KEY` | Optional API key for wrapper URL | None |
+| `ALAC_MAX_RETRIES` | Max retries per rip/upload attempt | `3` |
+| `ALAC_RETRY_BASE_MS` | Exponential backoff base delay (ms) | `2000` |
 
 ---
 
@@ -130,7 +139,7 @@ If the primary mirror is unreachable, returns HTTP 502/503, or drops the connect
 
 ### Swapping the Wrapper Engine with Any Link
 
-To swap the local wrapper with an alternative remote wrapper or third-party mirror in the future, simply update `ALAC_WRAPPER_URL` in `.env`:
+To swap the local wrapper with an alternative remote wrapper or third-party mirror, simply update `ALAC_WRAPPER_URL` in `.env`:
 
 ```env
 # Example 1: Local containerized wrapper
@@ -169,45 +178,61 @@ ALAC_WRAPPER_API_KEY=your_secret_api_key
 | :--- | :--- |
 | `/auth [id\|username]` | Authorize a user or group to use the bot |
 | `/revoke [id\|username]` | Revoke access from a user or group |
-| `/list` | Show paginated list of authorized users and groups |
-| `/health` | Check live latency and mirror wrapper instance health |
+| `/authlist` | Show paginated list of authorized users and groups |
+| `/health`, `/ping` | Check live latency and mirror wrapper instance health |
 | `/stats` | View bot performance, queue metrics, and top requested tracks |
 | `/queue` | View active and pending download tasks in the sequential queue |
+| `/status` | Live download status & queue dashboard |
 | `/clean` | Clean up leftover temporary files in download scratch directory |
 | `/delete <id>` | Remove a track from cache and the dump channel |
 | `/index` | Re-index and synchronize existing tracks in the dump channel |
+| `/spec` | Reply to audio to generate a frequency spectrogram (aliases: `/spectogram`, `/spectrogram`, `/spek`) |
+| `/report`, `/issue` | Report a corrupt track to the admin for a re-rip |
+| `/settings` | Bot operational settings & ripping toggles |
+| `/dumpnew <days>` / `/autodump` | Auto-dump new releases from Apple Music (also runs daily on a 24h scheduler) |
+| `/cache <link>` / `/dump` | Pre-cache/seed tracks directly into dump channel without sending audio |
+| `/random` | Interactive random album discovery & dump |
 | `/export` | Export a compressed PostgreSQL database backup (`.sql.gz`) via DM |
 | `/import` | Restore database by replying to a `.sql.gz` backup file |
 
 ---
 
-## Testing & Code Quality
+## Development
 
-The repository includes a test suite covering parsing, iTunes integration, playlist scraping, sequential queue handling, ripper timeouts, wrapper failover, and database schema constraints.
+Task recipes live in [justfile](justfile) — `just` with no arguments lists them.
 
 ```bash
-# Run all tests
-bun test
+just fmt          # format (nightly rustfmt: import grouping/sorting)
+just fmt-check    # CI-style format verification
+just check        # fast workspace type-check
+just clippy       # lint with warnings as errors
+just test         # test suite (needs PostgreSQL; set DATABASE_URL)
+just build        # debug build
+just release      # optimized build
+just run          # build + run with .env
+just docker       # build the container image
+```
 
-# Run linter and typecheck
-bun run lint
+Toolchains: **stable** for build/lint/test — **nightly** only for `fmt`,
+because rustfmt's import grouping/sorting (see `rustfmt.toml`) is a
+nightly-only option.
 
-# Auto-fix formatting and lint issues
-bun run lint:fix
+Testing requires a PostgreSQL database with the pg_trgm extension
+available:
+
+```bash
+export DATABASE_URL=postgresql://admin:password@localhost:5432/alac_bot_v2_test
+just test
 ```
 
 ---
 
 ## Database Management
 
-Database migrations are powered by Drizzle ORM:
-
-```bash
-bun run db:generate   # Generate migration SQL files from schema
-bun run db:migrate    # Apply pending migrations to PostgreSQL
-bun run db:push       # Push schema changes directly (dev prototyping)
-bun run db:studio     # Launch Drizzle Studio web UI
-```
+Migrations are embedded in the binary and run automatically at startup
+(`db::migrate`) — no separate migration step is needed. Statements are
+idempotent, so starting against a database already migrated by the previous
+TypeScript deployment is a safe no-op.
 
 ---
 
@@ -229,4 +254,4 @@ This software is strictly intended for **educational, experimental, and research
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+This project is licensed under the MIT License.

@@ -53,7 +53,11 @@ fn load_env() -> Env {
         &mut invalid,
     )
     .unwrap_or_default();
-    let database_url = required("DATABASE_URL", &mut invalid);
+    let database_url = std::env::var("DATABASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        // TS default (`src/env.ts`).
+        .unwrap_or_else(|| "postgresql://admin:password@localhost:5432/alac_bot".to_owned());
     // TS parity (`src/utils/logger.ts`): LOG_LEVEL || RUST_LOG || 'info'.
     let log_level = std::env::var("LOG_LEVEL")
         .or_else(|_| std::env::var("RUST_LOG"))
