@@ -312,7 +312,6 @@ pub async fn run_auto_dump_pipeline(
     triggered_by: &str,
     chat_id: Option<i64>,
     user_id: Option<i64>,
-    reply_message: Option<IncomingMessage>,
 ) -> bool {
     let target_chat = chat_id.unwrap_or(state.admin_id);
     let target_user = user_id.unwrap_or(state.admin_id);
@@ -334,7 +333,6 @@ pub async fn run_auto_dump_pipeline(
         triggered_by,
         target_chat,
         target_user,
-        reply_message,
     )
     .await;
     AUTO_DUMP_RUNNING.store(false, Ordering::SeqCst);
@@ -347,106 +345,37 @@ async fn run_auto_dump_pipeline_inner(
     triggered_by: &str,
     target_chat: i64,
     target_user: i64,
-    reply_message: Option<IncomingMessage>,
 ) -> bool {
     let storefronts = state
         .rip_deps
         .settings_snapshot()
         .auto_dump_storefronts
         .clone();
-    let sf_formatted = storefronts
-        .iter()
-        .map(|sf| sf.to_uppercase())
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let initial_html = format!(
-        "… <b>Scanning Apple Music for new releases</b><br/><br/>\
-<blockquote>• <b>Time Window:</b> Last <code>{days}</code> day(s)<br/>\
-• <b>Storefronts:</b> <code>{sf_formatted}</code><br/>\
-• <b>Triggered By:</b> {triggered_by}<br/>\
-• <b>Mode:</b> Dump Channel Archiver (Cache-Only)</blockquote>"
-    );
-    // Oracle swallows status-send failures and keeps sweeping; the pipeline's
-    // status edits then simply go to a fresh job status message (id 0).
-    let status = match &reply_message {
-        Some(msg) => msg
-            .reply(InputMessage::html(parse_dynamic_html(&initial_html)))
-            .await
-            .ok()
-            .map(|m| m.id()),
-        None => state
-            .client
-            .send_message(
-                PeerRef::from(target_chat),
-                InputMessage::html(parse_dynamic_html(&initial_html)),
-            )
-            .await
-            .ok()
-            .map(|m| m.id()),
-    };
-    let status_peer = status.map(|_| PeerRef::from(target_chat));
-
     let discovery = discover_new_tracks(&state, &storefronts, days).await;
 
     if discovery.total_found == 0 {
-        let empty_html = format!(
-            "✨ <b>Auto-Dump Finished: No New Tracks Found</b><br/><br/>\
-<blockquote>• <b>Time Window:</b> Last <code>{days}</code> day(s)<br/>\
-• <b>Cutoff Date:</b> <code>{}</code><br/>\
-• <b>Storefronts Scanned:</b> <code>{sf_formatted}</code><br/>\
-• <b>Discovered:</b> <code>0 tracks</code></blockquote>",
-            discovery.cutoff_date_string
-        );
-        if let (Some(peer), Some(id)) = (status_peer.clone(), status) {
-            let _ = state
-                .client
-                .edit_message(
-                    peer,
-                    id,
-                    InputMessage::html(parse_dynamic_html(&empty_html)),
-                )
-                .await;
-        }
+        let _ = state
+            .client
+            .send_message(
+                PeerRef::from(state.admin_id),
+                InputMessage::html(parse_dynamic_html(&format!(
+                    "<b>Auto-dump complete</b><br/>No new tracks found in the last <code>{days}</code> day(s)."
+                ))),
+            )
+            .await;
         return true;
     }
 
-    let progress_html = format!(
-        "🚀 <b>Discovered {} New Track(s)!</b><br/><br/>\
-<blockquote>• <b>Time Window:</b> Last <code>{days}</code> day(s)<br/>\
-• <b>Cutoff Date:</b> <code>{}</code><br/>\
-• <b>Storefronts:</b> <code>{sf_formatted}</code><br/>\
-• <b>Status:</b> Enqueuing into dump pipeline...</blockquote><br/>\
-<i>Archiving lossless ALAC tracks directly to the dump channel. Already cached songs will be skipped instantly.</i>",
-        discovery.total_found, discovery.cutoff_date_string
-    );
-    if let (Some(peer), Some(id)) = (status_peer.clone(), status) {
-        let _ = state
-            .client
-            .edit_message(
-                peer,
-                id,
-                InputMessage::html(parse_dynamic_html(&progress_html)),
-            )
-            .await;
-    }
-
-    // Oracle passes statusMessageToReuse: executeRipPipeline first edits the
-    // reused message to the resolving text, then renders progress into it.
-    // Mirror the edit, then hand the id to the collapsed orchestrator (the
-    // event bridge renders the progress lifecycle from here).
-    if let (Some(peer), Some(id)) = (status_peer.clone(), status) {
-        let _ = state
-            .client
-            .edit_message(
-                peer,
-                id,
-                InputMessage::html(parse_dynamic_html(
-                    "… <b>Resolving tracks from Apple Music</b>",
-                )),
-            )
-            .await;
-    }
+    // Discovery has completed; all live rip progress is rendered by the
+    // shared dashboard in the target chat.
+    super::ensure_dashboard(
+        &state,
+        target_chat,
+        target_user,
+        true,
+        PeerRef::from(target_chat),
+    )
+    .await;
 
     let options = engine::orchestrator::types::RipJobOptions {
         chat_id: target_chat,
@@ -467,7 +396,7 @@ async fn run_auto_dump_pipeline_inner(
             })
             .collect(),
         reply_to_message_id: None,
-        status_msg_id: i64::from(status.unwrap_or_default()),
+        status_msg_id: 0,
         is_admin: true,
     };
     let job = state
@@ -512,18 +441,15 @@ async fn run_auto_dump_pipeline_inner(
         }
         Err(error) => {
             tracing::error!(%error, "Auto-dump pipeline execution failed");
-            if let (Some(peer), Some(id)) = (status_peer, status) {
-                let _ = state
-                    .client
-                    .edit_message(
-                        peer,
-                        id,
-                        InputMessage::html(parse_dynamic_html(&format!(
-                            "× <b>Auto-dump failed.</b><br/><code>{error}</code>"
-                        ))),
-                    )
-                    .await;
-            }
+            let _ = state
+                .client
+                .send_message(
+                    PeerRef::from(state.admin_id),
+                    InputMessage::html(parse_dynamic_html(
+                        "<b>Auto-dump failed.</b><br/>The dashboard contains the job outcome.",
+                    )),
+                )
+                .await;
             false
         }
     }
@@ -573,7 +499,6 @@ async fn autodump(state: Arc<BotState>, msg: IncomingMessage) {
         &format!("Admin Command (/dumpnew {days})"),
         Some(marked_chat),
         Some(sender),
-        Some(msg),
     )
     .await;
 }
@@ -595,7 +520,7 @@ pub async fn scheduler_loop(state: Arc<BotState>) {
         }
         tracing::info!("Executing scheduled daily auto-dump sweep");
         let success =
-            run_auto_dump_pipeline(state.clone(), 1, "Daily 24h Scheduler", None, None, None).await;
+            run_auto_dump_pipeline(state.clone(), 1, "Daily 24h Scheduler", None, None).await;
         if !success {
             tracing::error!("Scheduled auto-dump sweep encountered error");
         }

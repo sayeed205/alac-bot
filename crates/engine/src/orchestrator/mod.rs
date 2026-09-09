@@ -1373,6 +1373,10 @@ async fn upload_one<D: OrchestratorDeps>(
                         });
                         shared.lock().expect("job poisoned").job.failed_count = failures.len();
                     }
+                    *texts.upload.lock().expect("texts poisoned") = None;
+                    shared.lock().expect("job poisoned").job.active_action_text = None;
+                    let download_text = texts.download.lock().expect("texts poisoned").clone();
+                    bus.emit_progress(shared, None, download_text.as_deref(), None);
                     return;
                 }
             }
@@ -1381,6 +1385,10 @@ async fn upload_one<D: OrchestratorDeps>(
 
     let Some(outcome) = outcome else {
         // Cancelled mid-retries (TS: break, no failure recorded).
+        *texts.upload.lock().expect("texts poisoned") = None;
+        shared.lock().expect("job poisoned").job.active_action_text = None;
+        let download_text = texts.download.lock().expect("texts poisoned").clone();
+        bus.emit_progress(shared, None, download_text.as_deref(), None);
         return;
     };
 
@@ -1401,6 +1409,10 @@ async fn upload_one<D: OrchestratorDeps>(
                 }
                 tracing::error!(track_id = %track_id, "Track upload failed: no audio media returned");
             }
+            *texts.upload.lock().expect("texts poisoned") = None;
+            shared.lock().expect("job poisoned").job.active_action_text = None;
+            let download_text = texts.download.lock().expect("texts poisoned").clone();
+            bus.emit_progress(shared, None, download_text.as_deref(), None);
             return;
         }
     };
@@ -1474,6 +1486,12 @@ async fn upload_one<D: OrchestratorDeps>(
             let new_count = ripped_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             shared.lock().expect("job poisoned").job.ripped_count = new_count;
 
+            // Publish the completed upload immediately. Without this event a
+            // single-track job could leave the dashboard showing
+            // `Uploading` until the terminal refresh arrived.
+            let download_text = texts.download.lock().expect("texts poisoned").clone();
+            bus.emit_progress(shared, None, download_text.as_deref(), None);
+
             tracing::info!(
                 track = format!("{} - {}", rip_result.title, rip_result.artist),
                 time = format!("{:.1}s", total_duration_ms as f64 / 1000.0),
@@ -1501,6 +1519,8 @@ async fn upload_one<D: OrchestratorDeps>(
                 upload_item.start_time_ms,
             )
             .await;
+            let download_text = texts.download.lock().expect("texts poisoned").clone();
+            bus.emit_progress(shared, None, download_text.as_deref(), None);
         }
     }
 }

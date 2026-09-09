@@ -11,6 +11,7 @@ pub mod mirror_health;
 pub mod presentation;
 pub mod rip_deps;
 pub mod spectrogram;
+pub mod telegram_retry;
 pub mod telegram_sink;
 
 use std::{

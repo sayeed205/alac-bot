@@ -17,6 +17,8 @@ fn job(n: usize, allowed: bool) -> DashboardJob {
         failed: 0,
         total: 10,
         percent: 50,
+        downloading: None,
+        uploading: None,
         is_cancel_allowed_for_viewer: allowed,
     }
 }

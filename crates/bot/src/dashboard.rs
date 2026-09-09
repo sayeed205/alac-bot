@@ -47,6 +47,10 @@ pub struct DashboardJob {
     pub failed: u64,
     pub total: u64,
     pub percent: u8,
+    /// Current per-track activity, if the pipeline is downloading/uploading.
+    /// Values are trusted presentation fragments with dynamic text escaped.
+    pub downloading: Option<String>,
+    pub uploading: Option<String>,
     pub is_cancel_allowed_for_viewer: bool,
 }
 
@@ -100,6 +104,12 @@ pub fn render(
             job.failed,
             job.total
         ));
+        if let Some(activity) = job.downloading.as_deref() {
+            text.push_str(&format!("<i>Downloading</i>: {activity}\n"));
+        }
+        if let Some(activity) = job.uploading.as_deref() {
+            text.push_str(&format!("<i>Uploading</i>: {activity}\n"));
+        }
         // Actions are represented in the keyboard, never as a global control:
         // this keeps a shared dashboard safe in a group chat.
     }
@@ -215,19 +225,23 @@ struct Entry {
     viewer_id: i64,
     viewer_is_admin: bool,
     snapshot: DashboardSnapshot,
-    warning_sent: bool,
     empty_rendered: bool,
     /// Earliest time this entry's message may be edited again by a
     /// non-forced refresh (flood/coalescing per dashboard message).
     next_refresh_at: Option<tokio::time::Instant>,
+    /// Telegram flood deadline. Unlike the normal coalescing window this
+    /// deadline is never bypassed by a forced refresh.
+    flood_until: Option<tokio::time::Instant>,
 }
 pub struct DashboardManager {
     entries: Mutex<HashMap<i64, Entry>>,
 }
 
 /// Progress events can arrive many times per second; dashboards coalesce
-/// them into at most one edit per interval per message.
-const REFRESH_INTERVAL: Duration = Duration::from_millis(2500);
+/// them into at most one edit per interval per message. Ten seconds is the
+/// default safety floor for Telegram traffic; terminal transitions still use
+/// forced edits when they are not inside a flood-wait window.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Recompute per-row cancel permission for a specific viewer. A shared group
 /// dashboard renders only the actions that viewer is allowed to take
@@ -280,9 +294,9 @@ impl DashboardManager {
                 viewer_id,
                 viewer_is_admin,
                 snapshot,
-                warning_sent: false,
                 empty_rendered: empty,
                 next_refresh_at: None,
+                flood_until: None,
             },
         );
         if let Some(old) = old {
@@ -291,28 +305,71 @@ impl DashboardManager {
         Ok(new_id)
     }
 
+    /// Replace the dashboard message for a chat while preserving its
+    /// viewer/sink configuration. This is used when a new job is created so
+    /// the dashboard has a fresh message rather than silently editing the
+    /// previous snapshot in place.
+    pub async fn replace_entry_from(
+        &self,
+        chat: i64,
+        snapshot: DashboardSnapshot,
+    ) -> Result<(), EditError> {
+        let Some((viewer_id, viewer_is_admin, sink)) = ({
+            let entries = self.entries.lock().await;
+            entries.get(&chat).map(|entry| {
+                (
+                    entry.viewer_id,
+                    entry.viewer_is_admin,
+                    Arc::clone(&entry.sink),
+                )
+            })
+        }) else {
+            return Ok(());
+        };
+
+        self.open(chat, viewer_id, viewer_is_admin, sink, snapshot)
+            .await
+            .map(|_| ())
+    }
+
     /// Latest engine snapshot for a chat's dashboard, re-scoped to that
     /// dashboard's viewer. Used by the refresh callback so a stale dashboard
     /// can resynchronize without the event bridge.
     pub async fn refresh_entry_from(&self, chat: i64, snapshot: DashboardSnapshot) {
         let work = {
             let mut entries = self.entries.lock().await;
-            entries.get_mut(&chat).map(|entry| {
+            entries.get_mut(&chat).and_then(|entry| {
                 let mut viewed = snapshot;
                 apply_viewer(&mut viewed, entry.viewer_id, entry.viewer_is_admin);
                 entry.snapshot = viewed.clone();
+                if entry
+                    .flood_until
+                    .is_some_and(|at| at > tokio::time::Instant::now())
+                {
+                    return None;
+                }
                 entry.next_refresh_at = None;
                 let (text, keyboard) = render(&entry.snapshot, entry.page, entry.viewer_is_admin);
-                (Arc::clone(&entry.sink), entry.id, text, keyboard)
+                Some((Arc::clone(&entry.sink), entry.id, text, keyboard))
             })
         };
         if let Some((sink, id, text, keyboard)) = work {
-            // A successful user-driven edit closes any flood episode: the
-            // next flood wait is a new episode and may warn again.
-            if sink.edit(id, &text, keyboard).await.is_ok() {
-                if let Some(entry) = self.entries.lock().await.get_mut(&chat) {
-                    entry.warning_sent = false;
+            // User-driven refreshes use the same flood deadline as background
+            // edits, so a Refresh tap cannot create a second flood episode.
+            match sink.edit(id, &text, keyboard).await {
+                Ok(()) | Err(EditError::NotModified) => {
+                    if let Some(entry) = self.entries.lock().await.get_mut(&chat) {
+                        entry.flood_until = None;
+                    }
                 }
+                Err(EditError::FloodWait(wait)) => {
+                    if let Some(entry) = self.entries.lock().await.get_mut(&chat) {
+                        let until = tokio::time::Instant::now() + wait;
+                        entry.flood_until = Some(until);
+                        entry.next_refresh_at = Some(until);
+                    }
+                }
+                Err(EditError::Other(_)) => {}
             }
         }
     }
@@ -332,6 +389,15 @@ impl DashboardManager {
             entries
                 .iter_mut()
                 .filter_map(|(chat, entry)| {
+                    // A flood deadline is stronger than `force`: terminal
+                    // events must not immediately repeat a request Telegram
+                    // has already rejected.
+                    if entry
+                        .flood_until
+                        .is_some_and(|at| at > tokio::time::Instant::now())
+                    {
+                        return None;
+                    }
                     // Coalesce high-frequency progress events per message.
                     if !force
                         && entry
@@ -354,48 +420,33 @@ impl DashboardManager {
                     entry.next_refresh_at = Some(tokio::time::Instant::now() + REFRESH_INTERVAL);
                     let (text, keyboard) =
                         render(&entry.snapshot, entry.page, entry.viewer_is_admin);
-                    Some((
-                        *chat,
-                        Arc::clone(&entry.sink),
-                        entry.id,
-                        text,
-                        keyboard,
-                        entry.warning_sent,
-                    ))
+                    Some((*chat, Arc::clone(&entry.sink), entry.id, text, keyboard))
                 })
                 .collect::<Vec<_>>()
         };
 
-        for (chat, sink, id, text, keyboard, warning_was_sent) in work {
+        for (chat, sink, id, text, keyboard) in work {
             match sink.edit(id, &text, keyboard).await {
                 Ok(()) => {
                     if let Some(entry) = self.entries.lock().await.get_mut(&chat) {
-                        entry.warning_sent = false;
+                        entry.flood_until = None;
                     }
                 }
                 Err(EditError::NotModified) => {
                     // Telegram treats an identical edit as a benign
                     // condition, not a dashboard failure.
                     if let Some(entry) = self.entries.lock().await.get_mut(&chat) {
-                        entry.warning_sent = false;
+                        entry.flood_until = None;
                     }
                 }
                 Err(EditError::FloodWait(wait)) => {
                     if let Some(entry) = self.entries.lock().await.get_mut(&chat) {
-                        entry.warning_sent = true;
                         // Suppress further edits until the flood deadline.
-                        entry.next_refresh_at =
-                            Some(tokio::time::Instant::now() + wait + REFRESH_INTERVAL);
+                        let until = tokio::time::Instant::now() + wait;
+                        entry.flood_until = Some(until);
+                        entry.next_refresh_at = Some(until);
                     }
-                    if !warning_was_sent {
-                        let _ = sink
-                            .send(
-                    "! Live status updates are temporarily paused; use Refresh to resume.",
-                                None,
-                            )
-                            .await;
-                        tracing::warn!("dashboard updates throttled");
-                    }
+                    tracing::warn!(chat_id = chat, ?wait, "dashboard updates throttled");
                 }
                 Err(EditError::Other(error)) => tracing::warn!(%error, "dashboard update failed"),
             }
@@ -404,23 +455,40 @@ impl DashboardManager {
     pub async fn page(&self, chat: i64, page: usize) {
         let work = {
             let mut entries = self.entries.lock().await;
-            entries.get_mut(&chat).map(|entry| {
+            entries.get_mut(&chat).and_then(|entry| {
                 // Clamp to the real page range so repeated Next taps from
                 // the last page stay on the last page.
+                if entry
+                    .flood_until
+                    .is_some_and(|at| at > tokio::time::Instant::now())
+                {
+                    return None;
+                }
                 let pages = entry.snapshot.jobs.len().div_ceil(5).max(1);
                 let page = page.clamp(1, pages);
                 entry.page = page;
                 let (text, keyboard) = render(&entry.snapshot, page, entry.viewer_is_admin);
-                (Arc::clone(&entry.sink), entry.id, text, keyboard)
+                Some((Arc::clone(&entry.sink), entry.id, text, keyboard))
             })
         };
         if let Some((sink, id, text, keyboard)) = work {
             // Successful user-driven edits close a flood episode, matching
-            // refresh_entry_from.
-            if sink.edit(id, &text, keyboard).await.is_ok() {
-                if let Some(entry) = self.entries.lock().await.get_mut(&chat) {
-                    entry.warning_sent = false;
+            // refresh_entry_from. Flood failures set the same deadline so
+            // repeated page taps remain cheap and bounded.
+            match sink.edit(id, &text, keyboard).await {
+                Ok(()) | Err(EditError::NotModified) => {
+                    if let Some(entry) = self.entries.lock().await.get_mut(&chat) {
+                        entry.flood_until = None;
+                    }
                 }
+                Err(EditError::FloodWait(wait)) => {
+                    if let Some(entry) = self.entries.lock().await.get_mut(&chat) {
+                        let until = tokio::time::Instant::now() + wait;
+                        entry.flood_until = Some(until);
+                        entry.next_refresh_at = Some(until);
+                    }
+                }
+                Err(EditError::Other(_)) => {}
             }
         }
     }
@@ -445,6 +513,8 @@ mod tests {
                 failed: 0,
                 total: 1,
                 percent: 0,
+                downloading: None,
+                uploading: None,
                 is_cancel_allowed_for_viewer: true,
             }],
             ..DashboardSnapshot::default()
@@ -494,6 +564,8 @@ mod tests {
                 failed: 0,
                 total: 1,
                 percent: 0,
+                downloading: None,
+                uploading: None,
                 is_cancel_allowed_for_viewer: false,
             }],
             ..DashboardSnapshot::default()
@@ -519,6 +591,8 @@ mod tests {
                 failed: 0,
                 total: 1,
                 percent: 0,
+                downloading: None,
+                uploading: None,
                 is_cancel_allowed_for_viewer: false,
             })
             .collect();
@@ -530,5 +604,32 @@ mod tests {
         let (text, _) = render(&snapshot, 2, false);
         assert!(text.contains("<i>6. Track 6</i>"));
         assert!(!text.contains("<i>1. Track 1</i>"));
+    }
+
+    #[test]
+    fn dashboard_shows_current_download_and_upload_at_the_end() {
+        let snapshot = DashboardSnapshot {
+            jobs: vec![DashboardJob {
+                id: "job-activity".into(),
+                requester_id: 7,
+                requester_name: "Alice".into(),
+                header: "Track".into(),
+                phase: JobPhase::Processing,
+                queue_position: None,
+                cached: 0,
+                ripped: 0,
+                failed: 0,
+                total: 1,
+                percent: 0,
+                downloading: Some("<b>Song - Artist:</b> <code>1 MB</code>".into()),
+                uploading: Some("<i>Song - Artist</i>".into()),
+                is_cancel_allowed_for_viewer: true,
+            }],
+            ..DashboardSnapshot::default()
+        };
+
+        let (text, _) = render(&snapshot, 1, false);
+        assert!(text.contains("<i>Downloading</i>: <b>Song - Artist:</b> <code>1 MB</code>"));
+        assert!(text.contains("<i>Uploading</i>: <i>Song - Artist</i>"));
     }
 }

@@ -24,6 +24,8 @@ pub struct JobContext {
     pub header: String,
     /// Requester display name (`user_name` from options).
     pub requester_name: String,
+    pub downloading: Option<String>,
+    pub uploading: Option<String>,
 }
 
 impl JobContexts {
@@ -35,6 +37,11 @@ impl JobContexts {
 
     /// Remember a job's rendering context from its latest engine snapshot.
     pub fn remember(&mut self, job: &ActiveRipJob) {
+        let (downloading, uploading) = self
+            .jobs
+            .get(&job.id)
+            .map(|context| (context.downloading.clone(), context.uploading.clone()))
+            .unwrap_or((None, None));
         self.jobs.insert(
             job.id.clone(),
             JobContext {
@@ -43,8 +50,19 @@ impl JobContexts {
                     .user_name
                     .clone()
                     .unwrap_or_else(|| format!("User {}", job.user_id)),
+                downloading,
+                uploading,
             },
         );
+    }
+
+    /// Remember the latest pipeline activity while retaining the job's
+    /// presentation context across subsequent engine snapshots.
+    pub fn remember_progress(&mut self, progress: &RipJobProgress) {
+        if let Some(context) = self.jobs.get_mut(&progress.job_id) {
+            context.downloading = progress.active_download_text.as_deref().map(clean_activity);
+            context.uploading = progress.active_upload_text.as_deref().map(clean_activity);
+        }
     }
 
     /// Drop contexts for finished jobs so the registry cannot grow unbounded.
@@ -83,6 +101,20 @@ pub fn percent_from(progress: &RipJobProgress) -> u8 {
     progress.percent.min(100) as u8
 }
 
+/// Dashboard rows use text labels for routine activity. The pipeline's
+/// progress strings retain arrows for the legacy detailed renderer, so strip
+/// only those leading decorations at this presentation boundary.
+fn clean_activity(text: &str) -> String {
+    let without_arrow = text
+        .strip_prefix("⬇️ ")
+        .or_else(|| text.strip_prefix("⬆️ "))
+        .unwrap_or(text);
+    without_arrow
+        .strip_prefix("<b>Uploading:</b> ")
+        .unwrap_or(without_arrow)
+        .to_owned()
+}
+
 /// Map an engine job snapshot into a dashboard row for a specific viewer.
 ///
 /// Cancel permission is `viewer == requester || viewer_is_admin` (oracle
@@ -115,6 +147,8 @@ pub fn job_to_dashboard(
         total,
         percent,
         is_cancel_allowed_for_viewer: viewer_is_admin || viewer_id == job.user_id,
+        downloading: context.downloading.clone(),
+        uploading: context.uploading.clone(),
     }
 }
 
@@ -130,7 +164,24 @@ pub fn snapshot_from(
     ripping_mode: &str,
     mirror_health: Option<String>,
 ) -> DashboardSnapshot {
-    let jobs = active
+    let mut ordered = active.to_vec();
+    ordered.sort_by(|left, right| {
+        fn key(job: &ActiveRipJob) -> (u8, u64, u64) {
+            match job.phase {
+                // The currently running job is always listed before work
+                // waiting in the queue. Queue positions then order pending
+                // jobs deterministically; start time breaks ties.
+                EnginePhase::Queued => {
+                    (1, job.queue_position.unwrap_or(u64::MAX), job.start_time_ms)
+                }
+                _ => (0, 0, job.start_time_ms),
+            }
+        }
+        key(left)
+            .cmp(&key(right))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let jobs = ordered
         .iter()
         .map(|job| {
             let context = contexts
@@ -142,6 +193,8 @@ pub fn snapshot_from(
                         .user_name
                         .clone()
                         .unwrap_or_else(|| format!("User {}", job.user_id)),
+                    downloading: None,
+                    uploading: None,
                 });
             job_to_dashboard(job, &context, viewer_id, viewer_is_admin)
         })
@@ -197,6 +250,8 @@ mod tests {
         let ctx = JobContext {
             header: job.job_header.clone(),
             requester_name: "Alice".into(),
+            downloading: None,
+            uploading: None,
         };
         let row = job_to_dashboard(&job, &ctx, 7, false);
         assert_eq!(row.phase, JobPhase::Queued);
@@ -227,6 +282,8 @@ mod tests {
         let ctx = JobContext {
             header: "h".into(),
             requester_name: "u".into(),
+            downloading: None,
+            uploading: None,
         };
         let job = engine_job(EnginePhase::Processing, None, 42, Some("Bob"));
         // Requester
@@ -247,6 +304,61 @@ mod tests {
         assert_eq!(snapshot.ripping_mode, "live");
         assert_eq!(snapshot.mirror_health.as_deref(), Some("healthy"));
         assert_eq!(snapshot.jobs[0].requester_name, "A");
+    }
+
+    #[test]
+    fn snapshot_lists_processing_jobs_before_queued_jobs() {
+        let mut processing = engine_job(EnginePhase::Processing, Some(0), 1, Some("Drake"));
+        processing.id = "processing".into();
+        processing.start_time_ms = 20;
+        let mut queued = engine_job(EnginePhase::Queued, Some(1), 2, Some("Hitarashi"));
+        queued.id = "queued".into();
+        queued.start_time_ms = 30;
+
+        let mut contexts = JobContexts::new();
+        contexts.remember(&processing);
+        contexts.remember(&queued);
+        let snapshot = snapshot_from(
+            &[queued, processing],
+            &contexts,
+            1,
+            false,
+            "live",
+            Some("healthy".into()),
+        );
+
+        assert_eq!(snapshot.jobs[0].requester_name, "Drake");
+        assert_eq!(snapshot.jobs[1].requester_name, "Hitarashi");
+    }
+
+    #[test]
+    fn progress_activity_is_preserved_for_dashboard_rows() {
+        let job = engine_job(EnginePhase::Processing, Some(0), 7, Some("Alice"));
+        let mut contexts = JobContexts::new();
+        contexts.remember(&job);
+        contexts.remember_progress(&RipJobProgress {
+            job_id: job.id.clone(),
+            total_tracks: 10,
+            completed_tracks: 2,
+            cached_count: 0,
+            ripped_count: 2,
+            failed_count: 0,
+            skipped_count: 0,
+            percent: 20,
+            active_download_text: Some("⬇️ <b>Song - Artist:</b> <code>1 MB</code>".into()),
+            active_upload_text: Some("⬆️ <b>Uploading:</b> <i>Song - Artist</i>".into()),
+            activity_override: None,
+        });
+
+        let snapshot = snapshot_from(&[job], &contexts, 7, false, "live", None);
+        assert_eq!(
+            snapshot.jobs[0].downloading.as_deref(),
+            Some("<b>Song - Artist:</b> <code>1 MB</code>")
+        );
+        assert_eq!(
+            snapshot.jobs[0].uploading.as_deref(),
+            Some("<i>Song - Artist</i>")
+        );
     }
 
     #[test]

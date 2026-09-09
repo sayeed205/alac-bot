@@ -109,6 +109,13 @@ impl BridgeRegistry {
             .remember(job);
     }
 
+    pub fn remember_progress(&self, progress: &RipJobProgress) {
+        self.contexts
+            .lock()
+            .expect("bridge contexts poisoned")
+            .remember_progress(progress);
+    }
+
     /// Drop a finished job's context and editor so neither registry grows
     /// unbounded.
     pub fn forget(&self, job_id: &str) {
@@ -213,16 +220,17 @@ async fn handle_event(state: Arc<BotState>, event: BridgeEvent) -> Result<(), St
         }
         BridgeEvent::Progress { job, progress } => {
             registry().remember(&job);
-            let _ = progress;
+            registry().remember_progress(&progress);
             refresh_dashboard(state_ref, false).await;
         }
         BridgeEvent::Started { job } => {
             registry().remember(&job);
             refresh_dashboard(state_ref, false).await;
         }
-        BridgeEvent::Completed { job, summary: _ } => {
+        BridgeEvent::Completed { job, summary } => {
             registry().remember(&job);
             registry().forget(&job.id);
+            notify_job_completed(state_ref, &job, &summary).await;
             refresh_dashboard(state_ref, true).await;
         }
         BridgeEvent::Cancelled {
@@ -257,7 +265,14 @@ async fn refresh_dashboard_for_job(state: &BotState, job: &ActiveRipJob) {
     let snapshot = current_snapshot(state).await;
     let manager = dashboard_manager();
     if manager.contains(job.chat_id).await {
-        manager.refresh(snapshot, true).await;
+        if let Err(error) = manager.replace_entry_from(job.chat_id, snapshot).await {
+            tracing::warn!(
+                chat_id = job.chat_id,
+                job_id = %job.id,
+                error = ?error,
+                "failed to replace status dashboard for new job"
+            );
+        }
         return;
     }
 
@@ -279,6 +294,73 @@ async fn refresh_dashboard_for_job(state: &BotState, job: &ActiveRipJob) {
             error = ?error,
             "failed to open status dashboard for new job"
         );
+    }
+}
+
+/// Send one terminal completion notice to the originating chat. Reply to the
+/// command when it still exists; otherwise mention the requester explicitly
+/// so completion remains visible even after message cleanup.
+async fn notify_job_completed(state: &BotState, job: &ActiveRipJob, summary: &RipJobSummary) {
+    let peer = ferogram::PeerRef::from(job.chat_id);
+    let reply_id = job
+        .reply_to_message_id
+        .and_then(|raw| i32::try_from(raw).ok());
+    let reply_id = match reply_id {
+        Some(id) => state
+            .client
+            .get_messages(peer.clone(), &[id])
+            .await
+            .ok()
+            .and_then(|messages| messages.first().map(|_| id)),
+        None => None,
+    };
+
+    let heading = if summary.failed_count == 0 {
+        "Job complete"
+    } else {
+        "Job finished with issues"
+    };
+    let details = format!(
+        "<b>{heading}</b><br/>{}<br/><i>{} cached · {} ripped · {} failed / {} total</i>",
+        summary.job_header,
+        summary.cached_count,
+        summary.ripped_count,
+        summary.failed_count,
+        summary.total_tracks,
+    );
+    let name = job
+        .user_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("User");
+    let mention = if job.user_id > 0 {
+        format!(
+            "<a href=\"tg://user?id={}\">{}</a>",
+            job.user_id,
+            crate::html::escape(name)
+        )
+    } else {
+        crate::html::escape(name)
+    };
+    let fallback = format!("{mention}, {details}");
+
+    let input = ferogram::InputMessage::html(if reply_id.is_some() {
+        details
+    } else {
+        fallback.clone()
+    })
+    .reply_to(reply_id);
+    if let Err(error) = state.client.send_message(peer.clone(), input).await {
+        tracing::warn!(job_id = %job.id, error = %error, "completion notification failed");
+        // The command may have been deleted between the existence check and
+        // the reply. Fall back to a standalone mention so the user still gets
+        // a completion notification.
+        if reply_id.is_some() {
+            let _ = state
+                .client
+                .send_message(peer, ferogram::InputMessage::html(fallback))
+                .await;
+        }
     }
 }
 

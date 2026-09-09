@@ -10,6 +10,10 @@ use tokio::sync::Mutex;
 
 pub type BoxStatusFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
 
+/// Telegram-safe default for detailed status edits. Callers may force a
+/// terminal update, but routine progress never exceeds one edit per 10s.
+const DEFAULT_EDIT_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Small Telegram surface so rendering/throttling can be tested without a
 /// network client.
 pub trait StatusSink: Send + Sync {
@@ -239,8 +243,8 @@ impl StatusEditor {
                 .lock()
                 .await
                 .map(|t| t.elapsed())
-                .unwrap_or(Duration::from_secs(10));
-            if !force && elapsed < Duration::from_secs(10) {
+                .unwrap_or(DEFAULT_EDIT_INTERVAL);
+            if !force && elapsed < DEFAULT_EDIT_INTERVAL {
                 return false;
             }
             *editing = true;
@@ -266,10 +270,6 @@ impl StatusEditor {
     pub async fn final_text(&self, text: String) {
         let _ = self.update(text, true, true).await;
     }
-}
-
-pub fn initial_text() -> &'static str {
-    "… <b>Resolving tracks from Apple Music</b>"
 }
 
 pub fn cancelled_text(target: &str, by: &str, processed: usize, total: usize) -> String {
@@ -345,8 +345,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn initial_and_progress_strings_follow_status_policy() {
-        assert_eq!(initial_text(), "… <b>Resolving tracks from Apple Music</b>");
+    fn progress_strings_follow_status_policy() {
         assert_eq!(progress_bar(1, 2, 12), "[██████░░░░░░] 50%");
         let text = render_progress(
             &ProgressState {

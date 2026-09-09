@@ -125,6 +125,9 @@ async fn main() -> Result<()> {
         .api_hash(env.api_hash.clone())
         .session("bot-data/session")
         .catch_up(true)
+        .retry_policy(Arc::new(
+            bot::telegram_retry::BoundedTelegramRetry::default(),
+        ))
         .connect()
         .await
         .context("connect to Telegram")?;

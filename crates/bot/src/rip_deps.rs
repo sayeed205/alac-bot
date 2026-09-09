@@ -228,7 +228,6 @@ impl OrchestratorDeps for RipDeps {
     }
 
     fn upload_max_retries(&self) -> u32 {
-        // TS: `maxUploadRetries = env.ALAC_MAX_RETRIES` (default 3).
         std::env::var("ALAC_MAX_RETRIES")
             .ok()
             .and_then(|value| value.parse().ok())

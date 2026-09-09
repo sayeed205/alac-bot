@@ -716,22 +716,16 @@ async fn admin_callback(state: Arc<BotState>, query: CallbackQuery, action: Repo
                 .as_ref()
                 .map(super::marked_peer_id)
                 .unwrap_or(query.user_id);
-            // Oracle executeRipPipeline without `msg`/`statusMessageToReuse`
-            // (the report rerip path) sends a FRESH resolving message to the
-            // rip chat and edits that through the pipeline — it never touches
-            // the admin card, which this handler edits separately below.
-            let resolving = state
-                .client
-                .send_message(
-                    PeerRef::from(marked_chat),
-                    InputMessage::html(parse_dynamic_html(
-                        "🔍 <b>Resolving tracks from Apple Music...</b>",
-                    )),
-                )
-                .await;
-            let status_msg_id = resolving
-                .map(|message| i64::from(message.id()))
-                .unwrap_or_default();
+            // The shared dashboard is the only live rip status surface. The
+            // Created event opens/replaces it for this chat.
+            super::ensure_dashboard(
+                &state,
+                marked_chat,
+                query.user_id,
+                true,
+                PeerRef::from(marked_chat),
+            )
+            .await;
             let options = engine::orchestrator::types::RipJobOptions {
                 chat_id: marked_chat,
                 user_id: query.user_id,
@@ -747,7 +741,7 @@ async fn admin_callback(state: Arc<BotState>, query: CallbackQuery, action: Repo
                     storefront: None,
                 }],
                 reply_to_message_id: None,
-                status_msg_id,
+                status_msg_id: 0,
                 is_admin: true,
             };
             match state

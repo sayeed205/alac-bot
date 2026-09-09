@@ -626,16 +626,6 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery, action: Discov
 
             // Oracle delegates to executeRipPipeline in cache-only mode;
             // the collapsed orchestrator takes that path (recorded deviation).
-            let status = state
-                .client
-                .send_message(
-                    peer.clone(),
-                    InputMessage::html(parse_dynamic_html(
-                        "… <b>Resolving tracks from Apple Music</b>",
-                    )),
-                )
-                .await;
-            let status_msg_id = status.map(|m| i64::from(m.id())).unwrap_or_default();
             let options = engine::orchestrator::types::RipJobOptions {
                 chat_id: marked_chat,
                 user_id: query.user_id,
@@ -651,7 +641,8 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery, action: Discov
                     storefront: Some(storefront),
                 }],
                 reply_to_message_id: None,
-                status_msg_id,
+                // The shared dashboard is the only live status surface.
+                status_msg_id: 0,
                 is_admin: true,
             };
             if let Err(error) = state
