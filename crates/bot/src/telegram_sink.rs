@@ -91,7 +91,9 @@ impl TelegramSink for FerogramTelegramSink {
                 .client
                 .send_message(
                     self.dump_peer.clone(),
-                    InputMessage::html(caption_html).copy_media(media),
+                    InputMessage::html(caption_html)
+                        .silent(true)
+                        .copy_media(media),
                 )
                 .await
                 .map_err(|error| SinkError(error.to_string()))?;

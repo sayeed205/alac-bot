@@ -5,12 +5,9 @@
 //! must not perform network I/O (they can run under the job mutex and would
 //! stall the whole queue). The sync subscription only **clones** event data
 //! into a bounded mpsc channel; this module's spawned consumer does the
-//! async rendering: per-request status messages + the global dashboard.
+//! async rendering: one shared status dashboard per chat.
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use engine::orchestrator::{
     deps::OrchestratorDeps,
@@ -21,10 +18,6 @@ use tokio::sync::mpsc;
 use crate::{
     dashboard_manager,
     dashboard_map::{snapshot_from, JobContexts},
-    handlers::rip::status::{
-        cancelled_text, final_summary, render_progress, ProgressState, StatusEditor, StatusSink,
-        SummaryInput, TelegramStatusSink,
-    },
     mirror_health::last_known_health,
     BotState,
 };
@@ -95,8 +88,6 @@ impl BridgeEvent {
 
 /// Job registry shared by the bridge consumer and dashboard renders.
 pub struct BridgeRegistry {
-    /// Status editors keyed by job id (per-request status message lifecycle).
-    editors: Mutex<HashMap<String, Arc<StatusEditor>>>,
     /// Rendering contexts keyed by job id (header/requester name).
     contexts: Mutex<JobContexts>,
 }
@@ -104,7 +95,6 @@ pub struct BridgeRegistry {
 impl BridgeRegistry {
     fn new() -> Self {
         Self {
-            editors: Mutex::new(HashMap::new()),
             contexts: Mutex::new(JobContexts::new()),
         }
     }
@@ -126,25 +116,6 @@ impl BridgeRegistry {
             .lock()
             .expect("bridge contexts poisoned")
             .forget(job_id);
-        self.editors
-            .lock()
-            .expect("bridge editors poisoned")
-            .remove(job_id);
-    }
-
-    fn editor(&self, job_id: &str) -> Option<Arc<StatusEditor>> {
-        self.editors
-            .lock()
-            .expect("bridge editors poisoned")
-            .get(job_id)
-            .cloned()
-    }
-
-    fn insert_editor(&self, job_id: &str, editor: Arc<StatusEditor>) {
-        self.editors
-            .lock()
-            .expect("bridge editors poisoned")
-            .insert(job_id.to_owned(), editor);
     }
 
     /// Copy of all contexts, for whole-dashboard snapshot builds.
@@ -232,149 +203,42 @@ pub async fn current_snapshot(state: &BotState) -> crate::dashboard::DashboardSn
     )
 }
 
-/// Single consumer turn: update per-request status message, refresh dashboard.
+/// Single consumer turn: refresh the shared dashboard for the event.
 async fn handle_event(state: Arc<BotState>, event: BridgeEvent) -> Result<(), String> {
     let state_ref = state.as_ref();
     match event {
         BridgeEvent::Created { job } => {
-            // Register the status editor around the command handler's
-            // initial "Resolving..." message immediately: every later edit
-            // (progress or terminal) goes through this single editor.
             registry().remember(&job);
-            let sink: Arc<dyn StatusSink> = Arc::new(TelegramStatusSink {
-                client: state_ref.client.clone(),
-                peer: ferogram::PeerRef::from(job.chat_id),
-            });
-            registry().insert_editor(
-                &job.id,
-                Arc::new(StatusEditor::new(
-                    sink,
-                    job.status_msg_id as i32,
-                    job.id.clone(),
-                )),
-            );
+            refresh_dashboard(state_ref, true).await;
         }
         BridgeEvent::Progress { job, progress } => {
             registry().remember(&job);
-            update_status_message(state_ref, &job, &progress).await?;
+            let _ = progress;
             refresh_dashboard(state_ref, false).await;
         }
         BridgeEvent::Started { job } => {
             registry().remember(&job);
             refresh_dashboard(state_ref, false).await;
         }
-        BridgeEvent::Completed { job, summary } => {
+        BridgeEvent::Completed { job, summary: _ } => {
             registry().remember(&job);
-            let text = final_summary(&SummaryInput {
-                target: summary.job_header.clone(),
-                total: summary.total_tracks,
-                cached: summary.cached_count,
-                ripped: summary.ripped_count,
-                skipped: summary.skipped_uncached_tracks.len(),
-                failed: summary
-                    .failed_tracks
-                    .iter()
-                    .map(|t| (t.id.clone(), t.error.clone()))
-                    .collect(),
-                elapsed: summary.total_elapsed_sec.clone(),
-                cache_only: summary.is_cache_only,
-                group: summary.is_group,
-                capped: summary.capped_count,
-                cap_limit: summary.max_collection_limit,
-            });
-            finish_status(&job, text).await?;
             registry().forget(&job.id);
             refresh_dashboard(state_ref, true).await;
         }
-        BridgeEvent::Cancelled { job, cancelled_by } => {
+        BridgeEvent::Cancelled {
+            job,
+            cancelled_by: _,
+        } => {
             registry().remember(&job);
-            let text = cancelled_text(
-                &job.job_header,
-                cancelled_by.as_deref().unwrap_or("User"),
-                job.cached_count + job.ripped_count,
-                job.total_tracks,
-            );
-            finish_status(&job, text).await?;
             registry().forget(&job.id);
             refresh_dashboard(state_ref, true).await;
         }
-        BridgeEvent::Failed { job, error } => {
+        BridgeEvent::Failed { job, error: _ } => {
             registry().remember(&job);
-            // Keep provider and transport details in logs; ordinary users get
-            // a stable recovery step instead of internal error text.
-            let text = if error.starts_with("Failed to resolve any tracks") {
-                tracing::warn!(error = %error, "track resolution failed");
-                "! <b>Could not resolve any tracks.</b><br/><i>Check the link and try again.</i>"
-                    .to_owned()
-            } else {
-                tracing::warn!(error = %error, "download failed");
-                "× <b>Download failed.</b><br/><i>Please try again or use /report if the track is corrupt.</i>".to_owned()
-            };
-            finish_status(&job, text).await?;
             registry().forget(&job.id);
             refresh_dashboard(state_ref, true).await;
         }
     }
-    Ok(())
-}
-
-/// Write a terminal status edit; the editor falls back to sending a fresh
-/// message when the original cannot be edited.
-async fn finish_status(job: &ActiveRipJob, text: String) -> Result<(), String> {
-    let Some(editor) = registry().editor(&job.id) else {
-        return Ok(());
-    };
-    editor.final_text(text).await;
-    Ok(())
-}
-
-/// Lazily create the status editor around the initial resolving message and
-/// edit it with the latest progress render.
-async fn update_status_message(
-    state: &BotState,
-    job: &ActiveRipJob,
-    progress: &RipJobProgress,
-) -> Result<(), String> {
-    // While resolving (total unknown), the initial "Resolving..." message
-    // stays untouched — the oracle only begins progress edits once the
-    // header and tracklist are known.
-    if progress.total_tracks == 0 {
-        return Ok(());
-    }
-    let registry = registry();
-    if registry.editor(&job.id).is_none() {
-        let sink: Arc<dyn StatusSink> = Arc::new(TelegramStatusSink {
-            client: state.client.clone(),
-            peer: ferogram::PeerRef::from(job.chat_id),
-        });
-        registry.insert_editor(
-            &job.id,
-            Arc::new(StatusEditor::new(
-                sink,
-                job.status_msg_id as i32,
-                job.id.clone(),
-            )),
-        );
-    }
-    let Some(editor) = registry.editor(&job.id) else {
-        return Ok(());
-    };
-    let text = render_progress(
-        &ProgressState {
-            header: job.job_header.clone(),
-            total: progress.total_tracks,
-            cached: progress.cached_count,
-            ripped: progress.ripped_count,
-            failed: progress.failed_count,
-            skipped: progress.skipped_count,
-            cache_only: job.is_cache_only,
-            group: job.is_group,
-            active_download: progress.active_download_text.clone(),
-            active_upload: progress.active_upload_text.clone(),
-        },
-        progress.activity_override.as_deref(),
-    );
-    editor.update(text, false, false).await;
     Ok(())
 }
 

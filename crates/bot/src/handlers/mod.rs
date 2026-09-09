@@ -72,6 +72,28 @@ pub(crate) fn chat_peer_ref(msg: &ferogram::update::IncomingMessage) -> ferogram
         .unwrap_or(ferogram::PeerRef::from(msg.chat_id()))
 }
 
+/// Open or refresh the single status dashboard owned by a chat. Rip commands
+/// and callback-driven deliveries share this helper so neither path can
+/// accidentally create a per-job progress message or deliver into a group.
+pub(crate) async fn ensure_dashboard(
+    state: &Arc<BotState>,
+    chat: i64,
+    viewer_id: i64,
+    viewer_is_admin: bool,
+    peer: ferogram::PeerRef,
+) {
+    let snapshot = crate::event_bridge::current_snapshot(state).await;
+    let manager = crate::dashboard_manager();
+    if manager.contains(chat).await {
+        manager.refresh_entry_from(chat, snapshot).await;
+    } else {
+        let sink = status::dashboard_sink(state.client.clone(), peer);
+        let _ = manager
+            .open(chat, viewer_id, viewer_is_admin, sink, snapshot)
+            .await;
+    }
+}
+
 /// Peer link parity with the TS oracle's getPeerLink: @name -> t.me link,
 /// user id -> tg://user, group/channel id -> t.me/c/ link.
 pub(crate) fn peer_link(name: &str, id: i64) -> String {

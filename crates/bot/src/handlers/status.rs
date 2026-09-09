@@ -15,9 +15,17 @@ struct TelegramSink {
     peer: PeerRef,
 }
 
+/// Construct the dashboard adapter used by both `/status` and rip commands.
+/// Keeping the adapter here ensures every chat has one consistent message
+/// lifecycle regardless of which command first opens the dashboard.
+pub(crate) fn dashboard_sink(client: ferogram::Client, peer: PeerRef) -> Arc<dyn DashboardSink> {
+    Arc::new(TelegramSink { client, peer })
+}
+
 fn edit_error(error: ferogram::InvocationError) -> EditError {
     match error.kind() {
         ErrorKind::FloodWait(seconds) => EditError::FloodWait(Duration::from_secs(seconds)),
+        ErrorKind::Rpc { name, .. } if name == "MESSAGE_NOT_MODIFIED" => EditError::NotModified,
         _ => EditError::Other(error.to_string()),
     }
 }

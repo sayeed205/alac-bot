@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use bot::{handlers, BotState};
-use ferogram::{filters::Dispatcher, Client, PeerRef};
+use ferogram::{filters::Dispatcher, Client, InputMessage, PeerRef};
 use tokio::{signal, sync::Semaphore};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -93,11 +93,14 @@ fn init_tracing(log_level: &str) {
         log_level
     };
     let filter = format!("warn,bot={level},db={level},engine={level}");
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter)),
-        )
-        .init();
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(filter))
+        .add_directive(
+            "symphonia_core::formats::probe=error"
+                .parse()
+                .expect("static Symphonia log directive is valid"),
+        );
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
 #[tokio::main]
@@ -168,6 +171,17 @@ async fn main() -> Result<()> {
     tokio::spawn(bot::handlers::autodump::scheduler_loop(Arc::clone(&state)));
     let mut dispatcher = Dispatcher::new();
     handlers::register(&mut dispatcher, state);
+
+    if let Err(error) = client
+        .send_message(
+            PeerRef::from(env.admin_id),
+            InputMessage::html("<b>ALAC Bot is up and alive.</b>\nStartup completed successfully."),
+        )
+        .await
+    {
+        tracing::warn!(error = %error, "startup notification to administrator failed");
+    }
+
     let dispatcher = Arc::new(dispatcher);
     let update_slots = Arc::new(Semaphore::new(32));
     let mut updates = client.stream_updates();

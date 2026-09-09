@@ -53,20 +53,25 @@ pub(crate) async fn resolve_target(
             }
         }
     }
-    // 2. Explicit argument: numeric id or @username.
-    let text = msg.text()?.split_whitespace().nth(1)?;
-    if let Ok(id) = text.parse::<i64>() {
-        return Some((id, format!("User {id}"), id > 0));
-    }
-    if text.starts_with('@') {
-        if let Ok(peer) = state
-            .client
-            .resolve(PeerRef::Username(text.to_owned()))
-            .await
-        {
-            let (id, user) = peer_id(&peer);
-            return Some((id, text.to_owned(), user));
+    // 2. Explicit argument: numeric id or @username. Keep the argument
+    // optional so a bare command in a group can target the group itself.
+    if let Some(text) = msg.text().and_then(|text| text.split_whitespace().nth(1)) {
+        if let Ok(id) = text.parse::<i64>() {
+            return Some((id, format!("User {id}"), id > 0));
         }
+        if text.starts_with('@') {
+            if let Ok(peer) = state
+                .client
+                .resolve(PeerRef::Username(text.to_owned()))
+                .await
+            {
+                let (id, user) = peer_id(&peer);
+                return Some((id, text.to_owned(), user));
+            }
+        }
+        // An invalid explicit argument must never fall through to group
+        // authorization. Report usage instead.
+        return None;
     }
     // 3. No argument inside a group: authorize the group chat itself, using
     //    the marked id form the TS oracle stores.

@@ -1,7 +1,7 @@
 //! Live `/alac` command policy and pipeline entry point.
 //!
-//! M5c: the bot owns only preflight policy, input parsing, the initial
-//! resolving status message, and terminal rendering. All rip semantics —
+//! M5c: the bot owns only preflight policy and input parsing. Status is
+//! rendered by one shared dashboard message per chat. All rip semantics —
 //! cache-first maintenance, queue position, retries, circuit breaker — live
 //! in the engine orchestrator (`commands-rip.ts` is the parity oracle).
 
@@ -135,18 +135,10 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
         }
     }
 
-    // Initial resolving status message (engine options carry its id).
-    let status_sink = Arc::new(status::TelegramStatusSink {
-        client: state.client.clone(),
-        peer: super::chat_peer_ref(&msg),
-    }) as Arc<dyn status::StatusSink>;
-    let status_message_id = match status_sink.send(status::initial_text(), None).await {
-        Ok(id) => id,
-        Err(error) => {
-            tracing::warn!(%error, "failed to send rip resolving status");
-            return;
-        }
-    };
+    // Keep one status dashboard message per chat. New jobs are added to the
+    // shared snapshot by the engine's Created event; no per-job progress
+    // message is sent.
+    super::ensure_dashboard(&state, chat, sender, admin, super::chat_peer_ref(&msg)).await;
 
     let options = engine::orchestrator::types::RipJobOptions {
         chat_id: chat,
@@ -159,15 +151,16 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
         single_storefront: parsed.storefront,
         parsed_items: parsed.items,
         reply_to_message_id: Some(i64::from(msg.id())),
-        status_msg_id: i64::from(status_message_id),
+        // Status is rendered by the chat dashboard rather than a per-job
+        // message. The zero sentinel keeps the engine type stable for other
+        // orchestration callers.
+        status_msg_id: 0,
         is_admin: admin,
     };
 
     // Engine owns everything from here: resolution, cache-first, queue,
-    // Engine owns everything from here: resolution, cache-first, queue,
-    // pipeline, terminal events. The bridge renders status + dashboard;
-    // start_job errors are logged only (the bridge renders the failure
-    // text on the Failed event).
+    // pipeline, and terminal events. The bridge refreshes the dashboard;
+    // start_job errors are logged only.
     if let Err(error) = state
         .rip_orchestrator
         .start_job(Arc::clone(&state.rip_deps), &options)

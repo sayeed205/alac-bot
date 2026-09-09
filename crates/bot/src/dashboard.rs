@@ -9,6 +9,7 @@ pub type DashboardFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, EditErro
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditError {
     FloodWait(Duration),
+    NotModified,
     Other(String),
 }
 
@@ -73,14 +74,24 @@ pub fn render(
         esc(&snapshot.ripping_mode),
         esc(health)
     );
-    for job in snapshot.jobs.iter().skip(start).take(5) {
+    for (offset, job) in snapshot.jobs.iter().skip(start).take(5).enumerate() {
+        // Telegram does not consistently render HTML list tags across
+        // clients, so keep the ordered-list marker textual while styling the
+        // complete entry title as secondary dashboard information.
+        let number = start + offset + 1;
         let state = match job.phase {
             JobPhase::Processing => "Processing".to_owned(),
-            JobPhase::Queued => format!("#{}", job.queue_position.unwrap_or(0)),
+            JobPhase::Queued => job.queue_position.map_or_else(
+                || "Queued".to_owned(),
+                |position| format!("Queued · position #{position}"),
+            ),
         };
         text.push_str(&format!(
-            "\n<b>{}</b>\n{} · <i>{}</i>\n{}% · {} cached · {} ripped · {} failed / {} total\n",
-            esc(&job.header),
+            "\n<i>{number}. {}</i>\n{} · <i>{}</i>\n{}% · {} cached · {} ripped · {} failed / {} total\n",
+            // Job headers are presentation HTML produced by the engine with
+            // dynamic values already escaped. Preserve that trusted markup;
+            // escaping it again would display tags such as `<b>` literally.
+            job.header,
             esc(&job.requester_name),
             state,
             job.percent.min(100),
@@ -131,8 +142,9 @@ pub fn render(
     let mut keyboard_builder = ferogram::keyboard::InlineKeyboard::new();
     for job in snapshot.jobs.iter().skip(start).take(5) {
         if job.is_cancel_allowed_for_viewer || viewer_is_admin {
+            let label = truncate(&plain_text(&job.header), 18);
             keyboard_builder = keyboard_builder.row([ferogram::keyboard::Button::callback(
-                format!("Cancel download · {}", truncate(&job.header, 18)),
+                format!("Cancel download · {label}"),
                 crate::interaction::TelegramAction::Cancel {
                     job_id: job.id.clone(),
                 }
@@ -155,6 +167,27 @@ fn truncate(s: &str, max: usize) -> String {
         out.push('…');
     }
     out
+}
+
+/// Convert a trusted presentation fragment into plain text for button labels.
+/// Telegram callback buttons do not parse HTML, so retaining tags here would
+/// expose markup such as `<b>` to users.
+fn plain_text(html: &str) -> String {
+    let mut text = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for ch in html.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            _ if !in_tag => text.push(ch),
+            _ => {}
+        }
+    }
+    text.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
 }
 
 /// IDs for which the current viewer may receive a cancel button.  Kept
@@ -215,6 +248,11 @@ impl DashboardManager {
         Self {
             entries: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Whether this chat already has the single managed dashboard message.
+    pub async fn contains(&self, chat: i64) -> bool {
+        self.entries.lock().await.contains_key(&chat)
     }
 
     /// Sends the replacement before removing the previous dashboard. The
@@ -335,6 +373,13 @@ impl DashboardManager {
                         entry.warning_sent = false;
                     }
                 }
+                Err(EditError::NotModified) => {
+                    // Telegram treats an identical edit as a benign
+                    // condition, not a dashboard failure.
+                    if let Some(entry) = self.entries.lock().await.get_mut(&chat) {
+                        entry.warning_sent = false;
+                    }
+                }
                 Err(EditError::FloodWait(wait)) => {
                     if let Some(entry) = self.entries.lock().await.get_mut(&chat) {
                         entry.warning_sent = true;
@@ -378,5 +423,112 @@ impl DashboardManager {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rich_job_headers_render_as_html_and_plain_button_labels() {
+        let snapshot = DashboardSnapshot {
+            jobs: vec![DashboardJob {
+                id: "job-1".into(),
+                requester_id: 7,
+                requester_name: "Alice".into(),
+                header: "Album: <b>3 Originals</b> by <b>Rick Astley</b>".into(),
+                phase: JobPhase::Processing,
+                queue_position: None,
+                cached: 0,
+                ripped: 0,
+                failed: 0,
+                total: 1,
+                percent: 0,
+                is_cancel_allowed_for_viewer: true,
+            }],
+            ..DashboardSnapshot::default()
+        };
+
+        let (text, markup) = render(&snapshot, 1, false);
+        assert!(text.contains("<i>1. Album: <b>3 Originals</b> by <b>Rick Astley</b></i>"));
+        assert!(text.contains("Album: <b>3 Originals</b> by <b>Rick Astley</b>"));
+        assert!(!text.contains("&lt;b&gt;"));
+
+        let Some(ferogram::tl::enums::ReplyMarkup::ReplyInlineMarkup(markup)) = markup else {
+            panic!("dashboard should include an inline keyboard");
+        };
+        let cancel = markup
+            .rows
+            .iter()
+            .flat_map(|row| match row {
+                ferogram::tl::enums::KeyboardInlineButtonRow::KeyboardInlineButtonRow(row) => {
+                    row.buttons.iter()
+                }
+            })
+            .find_map(|button| match button {
+                ferogram::tl::enums::KeyboardInlineButton::KeyboardInlineButton(button)
+                    if button.text.starts_with("Cancel download") =>
+                {
+                    Some(button)
+                }
+                _ => None,
+            })
+            .expect("cancel button");
+        assert!(!cancel.text.contains('<'));
+        assert!(!cancel.text.contains('>'));
+    }
+
+    #[test]
+    fn queued_jobs_show_an_explicit_queue_state_and_position() {
+        let snapshot = DashboardSnapshot {
+            jobs: vec![DashboardJob {
+                id: "job-queued".into(),
+                requester_id: 7,
+                requester_name: "Alice".into(),
+                header: "Track: <b>Song</b>".into(),
+                phase: JobPhase::Queued,
+                queue_position: Some(2),
+                cached: 0,
+                ripped: 0,
+                failed: 0,
+                total: 1,
+                percent: 0,
+                is_cancel_allowed_for_viewer: false,
+            }],
+            ..DashboardSnapshot::default()
+        };
+        let (text, _) = render(&snapshot, 1, false);
+        assert!(text.contains("<i>1. Track: <b>Song</b></i>"));
+        assert!(text.contains("Queued · position #2"));
+        assert!(!text.contains("<i>#2</i>"));
+    }
+
+    #[test]
+    fn dashboard_numbers_entries_across_pages() {
+        let jobs = (1..=6)
+            .map(|number| DashboardJob {
+                id: format!("job-{number}"),
+                requester_id: 7,
+                requester_name: "Alice".into(),
+                header: format!("Track {number}"),
+                phase: JobPhase::Processing,
+                queue_position: None,
+                cached: 0,
+                ripped: 0,
+                failed: 0,
+                total: 1,
+                percent: 0,
+                is_cancel_allowed_for_viewer: false,
+            })
+            .collect();
+        let snapshot = DashboardSnapshot {
+            jobs,
+            ..DashboardSnapshot::default()
+        };
+
+        let (text, _) = render(&snapshot, 2, false);
+        assert!(text.contains("<i>6. Track 6</i>"));
+        assert!(!text.contains("<i>1. Track 1</i>"));
     }
 }

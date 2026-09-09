@@ -298,7 +298,9 @@ async fn deliver_cached(state: Arc<BotState>, query: CallbackQuery, track_id: St
     if let Err(error) = state
         .rip_deps
         .sink()
-        .send_dump_copy(marked_chat, cached.message_id, None, false)
+        // Search results can be selected from a group. Deliver cached audio
+        // to the requester’s private chat, never back into the group.
+        .send_dump_copy(query.user_id, cached.message_id, None, false)
         .await
     {
         tracing::warn!(track_id, %error, "failed to deliver cached track");
@@ -374,7 +376,9 @@ async fn rip(state: Arc<BotState>, query: CallbackQuery, track_id: String) {
         let _ = state
             .rip_deps
             .sink()
-            .send_dump_copy(marked_chat, cached.message_id, None, false)
+            // Cached selections from a group follow the same DM delivery
+            // rule as live rips.
+            .send_dump_copy(query.user_id, cached.message_id, None, false)
             .await;
         delete_query_message(&state, &query).await;
         return;
@@ -400,25 +404,13 @@ async fn rip(state: Arc<BotState>, query: CallbackQuery, track_id: String) {
         .as_ref()
         .map(|peer| PeerRef::Peer(peer.clone()))
         .unwrap_or_else(|| PeerRef::from(query.user_id));
-    let Ok(status) = state
-        .client
-        .send_message(
-            peer,
-            InputMessage::html(parse_dynamic_html(&format!(
-                "… <b>Queuing track {track_id} for ripping</b>"
-            )))
-            .reply_to(query.message_id),
-        )
-        .await
-    else {
-        return;
-    };
+    super::ensure_dashboard(&state, marked_chat, query.user_id, is_admin, peer).await;
 
     let options = engine::orchestrator::types::RipJobOptions {
         chat_id: marked_chat,
         user_id: query.user_id,
         user_name: Some(format!("User {}", query.user_id)),
-        delivery_chat_id: marked_chat,
+        delivery_chat_id: query.user_id,
         is_group: marked_chat != query.user_id,
         is_force: false,
         is_cache_only: false,
@@ -429,7 +421,7 @@ async fn rip(state: Arc<BotState>, query: CallbackQuery, track_id: String) {
             storefront: None,
         }],
         reply_to_message_id: None,
-        status_msg_id: i64::from(status.id()),
+        status_msg_id: 0,
         is_admin,
     };
     match state
