@@ -18,6 +18,7 @@ reqwest.workspace = true
 indexmap.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+cuid2.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time", "test-util"] }

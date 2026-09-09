@@ -9,6 +9,7 @@ use std::{
 };
 
 use engine::{
+    limits::MAX_DOCUMENT_BYTES,
     parser::{extract_batch_items, parse_alac_input},
     types::ParsedTargetItem,
 };
@@ -76,6 +77,16 @@ pub async fn parse_message(
                     .download_file(&document, &path)
                     .await
                     .map_err(|e| e.to_string())?;
+                let size = tokio::fs::metadata(&path)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .len();
+                if size > MAX_DOCUMENT_BYTES {
+                    return Err(format!(
+                        "text document exceeds the {} MiB limit",
+                        MAX_DOCUMENT_BYTES / (1024 * 1024)
+                    ));
+                }
                 let content = tokio::fs::read_to_string(&path)
                     .await
                     .map_err(|e| e.to_string())?;

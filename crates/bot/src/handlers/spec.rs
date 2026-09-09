@@ -7,6 +7,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use engine::limits::MAX_DOCUMENT_BYTES;
 use ferogram::{filters, filters::Dispatcher, InputMessage, PeerRef};
 
 use crate::{
@@ -70,8 +71,8 @@ fn temp_paths(ext: &str) -> (PathBuf, PathBuf) {
     let unique = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
     let id = format!("{timestamp}_{unique}");
     (
-        PathBuf::from(format!("/tmp/opencode/spec_in_{id}{ext}")),
-        PathBuf::from(format!("/tmp/opencode/spec_out_{id}.png")),
+        std::env::temp_dir().join(format!("spec_in_{id}{ext}")),
+        std::env::temp_dir().join(format!("spec_out_{id}.png")),
     )
 }
 
@@ -162,6 +163,16 @@ async fn handle(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
             )
             .await
             .map_err(|error| error.to_string())?;
+        let size = tokio::fs::metadata(&input_path)
+            .await
+            .map_err(|error| error.to_string())?
+            .len();
+        if size > MAX_DOCUMENT_BYTES {
+            return Err(format!(
+                "audio document exceeds the {} MiB limit",
+                MAX_DOCUMENT_BYTES / (1024 * 1024)
+            ));
+        }
         edit_status(
             &state,
             &peer,

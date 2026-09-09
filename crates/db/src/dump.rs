@@ -9,6 +9,7 @@ use std::{io::Write, time::Instant};
 
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
+use engine::limits::MAX_DOCUMENT_BYTES;
 use flate2::{write::GzEncoder, Compression};
 use serde::{Deserialize, Serialize};
 
@@ -18,6 +19,8 @@ use crate::{
 };
 
 const ARCHIVE_VERSION: u32 = 2;
+const MAX_ARCHIVE_ROWS: usize = 1_000_000;
+const MAX_ARCHIVE_STRING_BYTES: usize = 1 << 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DumpStats {
@@ -39,6 +42,11 @@ pub struct RestoreStats {
 struct Archive {
     format_version: u32,
     generated_at: String,
+    /// The Telegram dump channel this archive belongs to.  Unbound archives
+    /// are retained for the low-level API, but the bot always exports and
+    /// imports channel-bound archives.
+    #[serde(default)]
+    dump_channel_id: Option<i64>,
     users: Vec<UserArchive>,
     tracks: Vec<TrackArchive>,
     requests: Vec<RequestArchive>,
@@ -114,6 +122,20 @@ impl DbDumpService {
     }
 
     pub async fn export_dump(&self) -> Result<(Vec<u8>, DumpStats, String), DbError> {
+        self.export_dump_with_channel(None).await
+    }
+
+    pub async fn export_dump_for_channel(
+        &self,
+        dump_channel_id: i64,
+    ) -> Result<(Vec<u8>, DumpStats, String), DbError> {
+        self.export_dump_with_channel(Some(dump_channel_id)).await
+    }
+
+    async fn export_dump_with_channel(
+        &self,
+        dump_channel_id: Option<i64>,
+    ) -> Result<(Vec<u8>, DumpStats, String), DbError> {
         let started = Instant::now();
         let mut connection = self.pool.connection().await?;
         let users = users::table
@@ -135,6 +157,7 @@ impl DbDumpService {
         let archive = Archive {
             format_version: ARCHIVE_VERSION,
             generated_at: chrono::Utc::now().to_rfc3339(),
+            dump_channel_id,
             users: users.into_iter().map(UserArchive::from).collect(),
             tracks: tracks.into_iter().map(TrackArchive::from).collect(),
             requests: requests.into_iter().map(RequestArchive::from).collect(),
@@ -173,7 +196,29 @@ impl DbDumpService {
     /// before the transaction starts, so malformed input cannot partially
     /// modify the database.
     pub async fn import_dump(&self, gzip_bytes: &[u8]) -> Result<RestoreStats, DbError> {
+        self.import_dump_with_channel(gzip_bytes, None).await
+    }
+
+    pub async fn import_dump_for_channel(
+        &self,
+        gzip_bytes: &[u8],
+        dump_channel_id: i64,
+    ) -> Result<RestoreStats, DbError> {
+        self.import_dump_with_channel(gzip_bytes, Some(dump_channel_id))
+            .await
+    }
+
+    async fn import_dump_with_channel(
+        &self,
+        gzip_bytes: &[u8],
+        expected_channel_id: Option<i64>,
+    ) -> Result<RestoreStats, DbError> {
         let started = Instant::now();
+        if gzip_bytes.len() as u64 > MAX_DOCUMENT_BYTES {
+            return Err(DbError::Row(
+                "database archive exceeds size limit".to_owned(),
+            ));
+        }
         let archive: Archive = serde_json::from_slice(&gunzip(gzip_bytes)?)
             .map_err(|error| DbError::Row(format!("invalid archive: {error}")))?;
         if archive.format_version != ARCHIVE_VERSION {
@@ -182,6 +227,14 @@ impl DbDumpService {
                 archive.format_version
             )));
         }
+        if let Some(expected) = expected_channel_id {
+            if archive.dump_channel_id != Some(expected) {
+                return Err(DbError::Row(
+                    "database archive belongs to a different dump channel".to_owned(),
+                ));
+            }
+        }
+        validate_archive_limits(&archive)?;
         let users_merged = archive.users.len() as u64;
         let tracks_merged = archive.tracks.len() as u64;
         let requests_merged = archive.requests.len() as u64;
@@ -190,45 +243,22 @@ impl DbDumpService {
             .build_transaction()
             .run(|transaction| {
                 Box::pin(async move {
+                    // Import is replacement, not a merge.  Clear every
+                    // archive-owned table inside the same transaction so a
+                    // failed insert leaves the previous database untouched.
+                    diesel::delete(requests::table).execute(transaction).await?;
+                    diesel::delete(tracks::table).execute(transaction).await?;
+                    diesel::delete(users::table).execute(transaction).await?;
+
                     for row in archive.users {
                         diesel::insert_into(users::table)
                             .values(row)
-                            .on_conflict(users::telegram_id)
-                            .do_update()
-                            .set((
-                                users::name.eq(diesel::upsert::excluded(users::name)),
-                                users::created_at.eq(diesel::upsert::excluded(users::created_at)),
-                            ))
                             .execute(transaction)
                             .await?;
                     }
                     for row in archive.tracks {
                         diesel::insert_into(tracks::table)
                             .values(row)
-                            .on_conflict((tracks::provider, tracks::track_id))
-                            .do_update()
-                            .set((
-                                tracks::message_id.eq(diesel::upsert::excluded(tracks::message_id)),
-                                tracks::file_id.eq(diesel::upsert::excluded(tracks::file_id)),
-                                tracks::file_unique_id
-                                    .eq(diesel::upsert::excluded(tracks::file_unique_id)),
-                                tracks::title.eq(diesel::upsert::excluded(tracks::title)),
-                                tracks::artist.eq(diesel::upsert::excluded(tracks::artist)),
-                                tracks::album.eq(diesel::upsert::excluded(tracks::album)),
-                                tracks::duration.eq(diesel::upsert::excluded(tracks::duration)),
-                                tracks::bit_depth.eq(diesel::upsert::excluded(tracks::bit_depth)),
-                                tracks::sample_rate
-                                    .eq(diesel::upsert::excluded(tracks::sample_rate)),
-                                tracks::genre.eq(diesel::upsert::excluded(tracks::genre)),
-                                tracks::release_date
-                                    .eq(diesel::upsert::excluded(tracks::release_date)),
-                                tracks::track_number
-                                    .eq(diesel::upsert::excluded(tracks::track_number)),
-                                tracks::track_count
-                                    .eq(diesel::upsert::excluded(tracks::track_count)),
-                                tracks::created_at.eq(diesel::upsert::excluded(tracks::created_at)),
-                                tracks::updated_at.eq(diesel::upsert::excluded(tracks::updated_at)),
-                            ))
                             .execute(transaction)
                             .await?;
                     }
@@ -338,8 +368,84 @@ fn gunzip(bytes: &[u8]) -> Result<Vec<u8>, DbError> {
     use std::io::Read;
     let mut decoder = flate2::read::GzDecoder::new(bytes);
     let mut out = Vec::new();
-    decoder
-        .read_to_end(&mut out)
-        .map_err(|error| DbError::Row(format!("gunzip failed: {error}")))?;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = decoder
+            .read(&mut buffer)
+            .map_err(|error| DbError::Row(format!("gunzip failed: {error}")))?;
+        if read == 0 {
+            break;
+        }
+        if out.len() as u64 + read as u64 > MAX_DOCUMENT_BYTES {
+            return Err(DbError::Row(
+                "expanded database archive exceeds size limit".to_owned(),
+            ));
+        }
+        out.extend_from_slice(&buffer[..read]);
+    }
     Ok(out)
+}
+
+fn validate_archive_limits(archive: &Archive) -> Result<(), DbError> {
+    let total_rows = archive
+        .users
+        .len()
+        .saturating_add(archive.tracks.len())
+        .saturating_add(archive.requests.len());
+    if total_rows > MAX_ARCHIVE_ROWS {
+        return Err(DbError::Row(format!(
+            "database archive contains too many rows (maximum {MAX_ARCHIVE_ROWS})"
+        )));
+    }
+
+    let too_large = archive.generated_at.len().gt(&MAX_ARCHIVE_STRING_BYTES)
+        || archive.users.iter().any(|row| {
+            row.name
+                .as_ref()
+                .is_some_and(|value| value.len() > MAX_ARCHIVE_STRING_BYTES)
+        })
+        || archive.tracks.iter().any(|row| {
+            [
+                &row.track_id,
+                &row.file_id,
+                &row.file_unique_id,
+                &row.title,
+                &row.artist,
+                &row.album,
+                &row.genre,
+                &row.release_date,
+            ]
+            .into_iter()
+            .any(|value| value.len() > MAX_ARCHIVE_STRING_BYTES)
+        })
+        || archive.requests.iter().any(|row| {
+            [&row.track_id, &row.status]
+                .into_iter()
+                .any(|value| value.len() > MAX_ARCHIVE_STRING_BYTES)
+                || row
+                    .error_reason
+                    .as_ref()
+                    .is_some_and(|value| value.len() > MAX_ARCHIVE_STRING_BYTES)
+        })
+        || archive
+            .settings
+            .ripping_mode
+            .len()
+            .gt(&MAX_ARCHIVE_STRING_BYTES)
+        || archive
+            .settings
+            .auto_dump_storefronts
+            .iter()
+            .any(|value| value.len() > MAX_ARCHIVE_STRING_BYTES);
+    if too_large {
+        return Err(DbError::Row(
+            "database archive contains an oversized field".to_owned(),
+        ));
+    }
+    if archive.settings.id != 1 {
+        return Err(DbError::Row(
+            "database archive contains an invalid settings row".to_owned(),
+        ));
+    }
+    Ok(())
 }

@@ -29,16 +29,24 @@ fn required(name: &str, invalid: &mut Vec<String>) -> String {
 }
 
 fn parse<T: std::str::FromStr>(name: &str, value: String, invalid: &mut Vec<String>) -> Option<T> {
+    if value.trim().is_empty() {
+        if !invalid.iter().any(|item| item == name) {
+            invalid.push(name.to_owned());
+        }
+        return None;
+    }
     match value.parse() {
         Ok(parsed) => Some(parsed),
         Err(_) => {
-            invalid.push(name.to_owned());
+            if !invalid.iter().any(|item| item == name) {
+                invalid.push(name.to_owned());
+            }
             None
         }
     }
 }
 
-fn load_env() -> Env {
+fn load_env() -> Result<Env> {
     let _ = dotenvy::from_filename(".env");
     let mut invalid = Vec::new();
     let api_id =
@@ -53,19 +61,18 @@ fn load_env() -> Env {
         &mut invalid,
     )
     .unwrap_or_default();
-    let database_url = std::env::var("DATABASE_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        // TS default (`src/env.ts`).
-        .unwrap_or_else(|| "postgresql://admin:password@localhost:5432/alac_bot".to_owned());
+    let database_url = required("DATABASE_URL", &mut invalid);
     // TS parity (`src/utils/logger.ts`): LOG_LEVEL || RUST_LOG || 'info'.
     let log_level = std::env::var("LOG_LEVEL")
         .or_else(|_| std::env::var("RUST_LOG"))
         .unwrap_or_else(|_| "info".to_owned());
     if !invalid.is_empty() {
-        panic!("missing or invalid environment variables: {invalid:?}");
+        return Err(anyhow!(
+            "missing or invalid environment variables: {}",
+            invalid.join(", ")
+        ));
     }
-    Env {
+    Ok(Env {
         api_id,
         api_hash,
         bot_token,
@@ -73,7 +80,7 @@ fn load_env() -> Env {
         dump_channel_id,
         database_url,
         log_level,
-    }
+    })
 }
 
 fn init_tracing(log_level: &str) {
@@ -95,7 +102,7 @@ fn init_tracing(log_level: &str) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let env = load_env();
+    let env = load_env().context("invalid startup configuration")?;
     init_tracing(&env.log_level);
 
     info!("Running database migrations...");

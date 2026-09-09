@@ -1,8 +1,11 @@
 //! Database access for the bot.
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
-use diesel_async::{pooled_connection::bb8::Pool, AsyncPgConnection};
+use diesel_async::{pooled_connection::bb8::Pool, AsyncPgConnection, RunQueryDsl};
 
 mod auth;
 mod migrations;
@@ -75,6 +78,33 @@ pub async fn connect(database_url: &str) -> Result<DbPool, DbError> {
         let _connection = database.connection().await?;
     }
     Ok(database)
+}
+
+/// Connect a database integration test to its own PostgreSQL schema. Tests
+/// must opt in explicitly with TEST_DATABASE_URL; production DATABASE_URL is
+/// deliberately never used as a test fallback.
+pub async fn connect_test_isolated() -> Result<DbPool, DbError> {
+    let base_url = std::env::var("TEST_DATABASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| DbError::Row("TEST_DATABASE_URL is required for database tests".into()))?;
+    let base = connect(&base_url).await?;
+    static TEST_SCHEMA_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let sequence = TEST_SCHEMA_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let schema = format!(
+        "test_{}_{}_{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        sequence
+    );
+    let mut connection = base.connection().await?;
+    diesel::sql_query(format!("CREATE SCHEMA {schema}"))
+        .execute(&mut *connection)
+        .await?;
+    drop(connection);
+    let separator = if base_url.contains('?') { '&' } else { '?' };
+    let isolated_url = format!("{base_url}{separator}options=-c%20search_path%3D{schema}%2Cpublic");
+    connect(&isolated_url).await
 }
 
 /// Errors returned by the persistence layer.

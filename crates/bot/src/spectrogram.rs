@@ -1,11 +1,61 @@
 //! Audio probing and spectrogram generation used by the `/spec` command.
 
-use std::{path::Path, process::Stdio};
+use std::{
+    path::Path,
+    process::{ExitStatus, Output, Stdio},
+    sync::{Arc, OnceLock},
+};
 
+use engine::limits::{MAX_PROCESS_OUTPUT_BYTES, PROCESS_TIMEOUT};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::Command,
+    sync::Semaphore,
 };
+
+static SPECTROGRAM_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn spectrogram_slot() -> Arc<Semaphore> {
+    SPECTROGRAM_SLOTS
+        .get_or_init(|| Arc::new(Semaphore::new(2)))
+        .clone()
+}
+
+async fn read_limited<R: tokio::io::AsyncRead + Unpin>(mut reader: R) -> Result<Vec<u8>, String> {
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).await.map_err(|e| e.to_string())?;
+        if read == 0 {
+            return Ok(output);
+        }
+        let remaining = MAX_PROCESS_OUTPUT_BYTES.saturating_sub(output.len());
+        output.extend_from_slice(&buffer[..read.min(remaining)]);
+    }
+}
+
+async fn run_bounded(mut command: Command) -> Result<Output, String> {
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    let stdout = child.stdout.take().ok_or("process stdout unavailable")?;
+    let stderr = child.stderr.take().ok_or("process stderr unavailable")?;
+    let stdout_task = tokio::spawn(read_limited(stdout));
+    let stderr_task = tokio::spawn(read_limited(stderr));
+    let status: ExitStatus = match tokio::time::timeout(PROCESS_TIMEOUT, child.wait()).await {
+        Ok(status) => status.map_err(|e| e.to_string())?,
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err("audio process timed out".to_owned());
+        }
+    };
+    let stdout = stdout_task.await.map_err(|e| e.to_string())??;
+    let stderr = stderr_task.await.map_err(|e| e.to_string())??;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
 
 /// Metadata extracted from the first stream in an audio file.
 #[derive(Clone, Debug, PartialEq)]
@@ -66,7 +116,12 @@ fn tag(
 
 /// Probe audio metadata with ffprobe.
 pub async fn probe_audio(file: &Path) -> Result<AudioProbeResult, String> {
-    let output = Command::new("ffprobe")
+    let _permit = spectrogram_slot()
+        .acquire_owned()
+        .await
+        .map_err(|_| "spectrogram worker unavailable".to_owned())?;
+    let mut command = Command::new("ffprobe");
+    command
         .args([
             "-v",
             "quiet",
@@ -76,9 +131,9 @@ pub async fn probe_audio(file: &Path) -> Result<AudioProbeResult, String> {
             "-show_streams",
         ])
         .arg(file)
-        .output()
-        .await
-        .map_err(|error| error.to_string())?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = run_bounded(command).await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -184,13 +239,17 @@ pub async fn generate_spectrogram(
     comment: Option<&str>,
     duration_secs: f64,
 ) -> Result<(), String> {
+    let _permit = spectrogram_slot()
+        .acquire_owned()
+        .await
+        .map_err(|_| "spectrogram worker unavailable".to_owned())?;
     let args = spectrogram_args("sox", input, output, title, comment, duration_secs);
-    let direct = Command::new(&args[0])
+    let mut direct_command = Command::new(&args[0]);
+    direct_command
         .args(&args[1..])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .await;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let direct = run_bounded(direct_command).await;
     if let Ok(result) = direct {
         if result.status.success() && output.exists() {
             return Ok(());
@@ -209,15 +268,12 @@ pub async fn generate_spectrogram(
         .stdout
         .take()
         .ok_or_else(|| "ffmpeg stdout unavailable".to_owned())?;
-    let mut ffmpeg_stderr = ffmpeg
+    let ffmpeg_stderr = ffmpeg
         .stderr
         .take()
         .ok_or_else(|| "ffmpeg stderr unavailable".to_owned())?;
-    let ffmpeg_stderr_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        let _ = ffmpeg_stderr.read_to_end(&mut bytes).await;
-        bytes
-    });
+    let ffmpeg_stderr_task =
+        tokio::spawn(async move { read_limited(ffmpeg_stderr).await.unwrap_or_default() });
 
     let sox_args = spectrogram_args("sox", Path::new("-"), output, title, comment, duration_secs);
     let mut sox = match Command::new(&sox_args[0])
@@ -238,20 +294,31 @@ pub async fn generate_spectrogram(
         .stdin
         .take()
         .ok_or_else(|| "sox stdin unavailable".to_owned())?;
-    let mut sox_stderr = sox
+    let sox_stderr = sox
         .stderr
         .take()
         .ok_or_else(|| "sox stderr unavailable".to_owned())?;
-    let sox_stderr_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        let _ = sox_stderr.read_to_end(&mut bytes).await;
-        bytes
-    });
+    let sox_stderr_task =
+        tokio::spawn(async move { read_limited(sox_stderr).await.unwrap_or_default() });
 
-    let copy_result = tokio::io::copy(&mut ffmpeg_stdout, &mut sox_stdin).await;
-    let _ = sox_stdin.shutdown().await;
-    let ffmpeg_status = ffmpeg.wait().await.ok();
-    let sox_status = sox.wait().await.ok();
+    let pipeline = async {
+        let copy_result = tokio::io::copy(&mut ffmpeg_stdout, &mut sox_stdin).await;
+        let _ = sox_stdin.shutdown().await;
+        let ffmpeg_status = ffmpeg.wait().await.ok();
+        let sox_status = sox.wait().await.ok();
+        (copy_result, ffmpeg_status, sox_status)
+    };
+    let (copy_result, ffmpeg_status, sox_status) =
+        match tokio::time::timeout(PROCESS_TIMEOUT, pipeline).await {
+            Ok(result) => result,
+            Err(_) => {
+                let _ = ffmpeg.kill().await;
+                let _ = sox.kill().await;
+                let _ = ffmpeg.wait().await;
+                let _ = sox.wait().await;
+                return Err("audio process timed out".to_owned());
+            }
+        };
     let ffmpeg_error = ffmpeg_stderr_task.await.unwrap_or_default();
     let sox_error = sox_stderr_task.await.unwrap_or_default();
 

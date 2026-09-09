@@ -7,7 +7,10 @@ use std::{
 
 use tracing::debug;
 
-use crate::types::TrackMeta;
+use crate::{
+    limits::{MAX_PROCESS_OUTPUT_BYTES, PROCESS_TIMEOUT},
+    types::TrackMeta,
+};
 
 /// Replace filesystem-hostile characters with `_`; empty → `track`.
 pub fn sanitize_filename(name: &str) -> String {
@@ -49,18 +52,52 @@ pub struct ProcessRunner;
 
 impl FfmpegRunner for ProcessRunner {
     async fn run(&self, args: &[String]) -> Result<(), (i32, String)> {
-        let output = tokio::process::Command::new(&args[0])
+        let mut child = tokio::process::Command::new(&args[0])
             .args(&args[1..])
-            .stdout(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
-            .output()
-            .await
+            .spawn()
             .map_err(|error| (-1, error.to_string()))?;
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        if output.status.success() {
+        let mut stderr_pipe = child
+            .stderr
+            .take()
+            .ok_or_else(|| (-1, "ffmpeg stderr unavailable".to_owned()))?;
+        // Keep draining the pipe after the cap so ffmpeg cannot deadlock on a
+        // full stderr pipe, while retaining only bounded diagnostic output.
+        let stderr_task = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut output = Vec::new();
+            let mut buffer = [0_u8; 8192];
+            loop {
+                let read = stderr_pipe.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                let remaining = MAX_PROCESS_OUTPUT_BYTES.saturating_sub(output.len());
+                output.extend_from_slice(&buffer[..read.min(remaining)]);
+            }
+            Ok::<Vec<u8>, std::io::Error>(output)
+        });
+        let status = match tokio::time::timeout(PROCESS_TIMEOUT, child.wait()).await {
+            Ok(result) => result.map_err(|error| (-1, error.to_string()))?,
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let _ = stderr_task.await;
+                return Err((-1, "ffmpeg timed out".to_owned()));
+            }
+        };
+        let stderr = String::from_utf8_lossy(
+            &stderr_task
+                .await
+                .unwrap_or_else(|_| Ok(Vec::new()))
+                .unwrap_or_default(),
+        )
+        .into_owned();
+        if status.success() {
             Ok(())
         } else {
-            Err((output.status.code().unwrap_or(-1), stderr))
+            Err((status.code().unwrap_or(-1), stderr))
         }
     }
 }

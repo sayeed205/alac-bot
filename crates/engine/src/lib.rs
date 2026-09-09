@@ -2,6 +2,7 @@
 //! tagging, lyrics. No Telegram, no database.
 
 pub mod catalog;
+pub mod limits;
 pub mod lyrics;
 pub mod orchestrator;
 pub mod parser;

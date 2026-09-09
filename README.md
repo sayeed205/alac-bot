@@ -118,7 +118,7 @@ Telegram session + download scratch in the `/app/bot-data` volume.
 | `BOT_TOKEN` | Bot token from [@BotFather](https://t.me/BotFather) | *Required* |
 | `ADMIN_ID` | Telegram User ID of the bot owner | *Required* |
 | `DUMP_CHANNEL_ID` | Channel ID (`-100...`) used to store cached audio files | *Required* |
-| `DATABASE_URL` | PostgreSQL connection string | `postgresql://admin:password@localhost:5432/alac_bot` |
+| `DATABASE_URL` | PostgreSQL connection string (required) | — |
 | `LOG_LEVEL` | Tracing log level (`trace`, `debug`, `info`, `warn`, `error`) | `info` |
 | `ALAC_MIRROR_URL` | Optional static mirror URL override | Dynamic manifest |
 | `ALAC_API_KEY` | Optional static mirror API key override | Dynamic manifest |
@@ -207,7 +207,7 @@ just fmt          # format (nightly rustfmt: import grouping/sorting)
 just fmt-check    # CI-style format verification
 just check        # fast workspace type-check
 just clippy       # lint with warnings as errors
-just test         # test suite (needs PostgreSQL; set DATABASE_URL)
+just test         # test suite (needs PostgreSQL; set TEST_DATABASE_URL)
 just build        # debug build
 just release      # optimized build
 just run          # build + run with .env
@@ -222,7 +222,7 @@ Testing requires a PostgreSQL database with the pg_trgm extension
 available:
 
 ```bash
-export DATABASE_URL=postgresql://admin:password@localhost:5432/alac_bot_v2_test
+export TEST_DATABASE_URL=postgresql://admin:password@localhost:5432/alac_bot_v2_test
 just test
 ```
 

@@ -41,7 +41,10 @@ impl RipDeps {
         requests: db::RequestLogRepository,
         settings: db::SettingsStore,
     ) -> Result<Self, SinkError> {
-        settings.init().await;
+        settings
+            .init()
+            .await
+            .map_err(|error| SinkError(format!("load settings: {error}")))?;
 
         let catalog = Catalog::new(ReqwestTransport::new());
         let ripper_catalog = Catalog::new(ReqwestTransport::new());
@@ -69,6 +72,7 @@ impl RipDeps {
         let upload_retry_base_ms = std::env::var("ALAC_RETRY_BASE_MS")
             .ok()
             .and_then(|value| value.parse().ok())
+            .filter(|value| *value <= engine::limits::MAX_RETRY_BASE_MS)
             // TS default: 2000ms (`src/env.ts` ALAC_RETRY_BASE_MS).
             .unwrap_or(2000);
 
@@ -228,6 +232,7 @@ impl OrchestratorDeps for RipDeps {
         std::env::var("ALAC_MAX_RETRIES")
             .ok()
             .and_then(|value| value.parse().ok())
+            .filter(|value| *value <= engine::limits::MAX_RETRIES)
             .unwrap_or(3)
     }
 }

@@ -5,7 +5,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use engine::{
@@ -24,6 +24,8 @@ use crate::{
 };
 
 static INDEXING: AtomicBool = AtomicBool::new(false);
+const INDEX_BATCH_SIZE: i32 = 100;
+const INDEX_BATCH_RETRIES: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IndexSummary {
@@ -195,108 +197,114 @@ async fn index_dump_channel(
         }
     }
 
+    // A probe message with no history is not enough evidence to conclude that
+    // the dump is empty.  Refuse the destructive prune in that case.
+    if max_id <= 1 {
+        return Err("dump channel has no history; refusing to prune the cache".to_owned());
+    }
+
     let mut end = max_id - 1;
+    let mut batches_scanned = 0;
     while end >= 1 {
-        let ids = batch_ids(end, 100);
-        if let Ok(messages) = state
-            .client
-            .get_messages(state.dump_peer.clone(), &ids)
-            .await
-        {
-            for message in messages {
-                scanned += 1;
-                let Some(document) = message.media().and_then(Document::from_media) else {
-                    skipped += 1;
-                    continue;
-                };
-                let Some(audio) =
-                    document
-                        .raw
-                        .attributes
-                        .iter()
-                        .find_map(|attribute| match attribute {
-                            ferogram::tl::enums::DocumentAttribute::Audio(audio)
-                                if !audio.voice =>
-                            {
-                                Some(audio)
-                            }
-                            _ => None,
-                        })
-                else {
-                    skipped += 1;
-                    continue;
-                };
-                let Some(meta) = parse_dump_caption(message.text()) else {
-                    skipped += 1;
-                    continue;
-                };
-
-                let (file_id, file_unique_id) = file_ids(&document);
-                state
-                    .rip_deps
-                    .tracks()
-                    .save_track(&SaveTrackInput {
-                        track_key: meta.track_key.clone(),
-                        message_id: i64::from(message.id()),
-                        file_id,
-                        file_unique_id,
-                        title: if meta.title.is_empty() {
-                            audio.title.as_deref().unwrap_or("Unknown Title").to_owned()
-                        } else {
-                            meta.title
-                        },
-                        artist: if meta.artist.is_empty() {
-                            audio
-                                .performer
-                                .as_deref()
-                                .unwrap_or("Unknown Artist")
-                                .to_owned()
-                        } else {
-                            meta.artist
-                        },
-                        album: if meta.album.is_empty() {
-                            "Unknown Album".to_owned()
-                        } else {
-                            meta.album
-                        },
-                        duration: if meta.duration != 0 {
-                            meta.duration
-                        } else {
-                            i64::from(audio.duration)
-                        },
-                        bit_depth: meta.bit_depth,
-                        sample_rate: meta.sample_rate,
-                        genre: if meta.genre.is_empty() {
-                            "Music".to_owned()
-                        } else {
-                            meta.genre
-                        },
-                        release_date: meta.release_date,
-                        track_number: if meta.track_number != 0 {
-                            meta.track_number
-                        } else {
-                            1
-                        },
-                        track_count: if meta.track_count != 0 {
-                            meta.track_count
-                        } else {
-                            1
-                        },
+        let ids = batch_ids(end, INDEX_BATCH_SIZE);
+        let messages = get_messages_with_retry(state, &ids, end).await?;
+        batches_scanned += 1;
+        for message in messages {
+            scanned += 1;
+            let Some(document) = message.media().and_then(Document::from_media) else {
+                skipped += 1;
+                continue;
+            };
+            let Some(audio) =
+                document
+                    .raw
+                    .attributes
+                    .iter()
+                    .find_map(|attribute| match attribute {
+                        ferogram::tl::enums::DocumentAttribute::Audio(audio) if !audio.voice => {
+                            Some(audio)
+                        }
+                        _ => None,
                     })
-                    .await
-                    .map_err(|error| error.to_string())?;
+            else {
+                skipped += 1;
+                continue;
+            };
+            let Some(meta) = parse_dump_caption(message.text()) else {
+                skipped += 1;
+                continue;
+            };
 
-                valid_track_ids.insert(meta.track_key);
-                synced += 1;
-            }
+            let (file_id, file_unique_id) = file_ids(&document);
+            state
+                .rip_deps
+                .tracks()
+                .save_track(&SaveTrackInput {
+                    track_key: meta.track_key.clone(),
+                    message_id: i64::from(message.id()),
+                    file_id,
+                    file_unique_id,
+                    title: if meta.title.is_empty() {
+                        audio.title.as_deref().unwrap_or("Unknown Title").to_owned()
+                    } else {
+                        meta.title
+                    },
+                    artist: if meta.artist.is_empty() {
+                        audio
+                            .performer
+                            .as_deref()
+                            .unwrap_or("Unknown Artist")
+                            .to_owned()
+                    } else {
+                        meta.artist
+                    },
+                    album: if meta.album.is_empty() {
+                        "Unknown Album".to_owned()
+                    } else {
+                        meta.album
+                    },
+                    duration: if meta.duration != 0 {
+                        meta.duration
+                    } else {
+                        i64::from(audio.duration)
+                    },
+                    bit_depth: meta.bit_depth,
+                    sample_rate: meta.sample_rate,
+                    genre: if meta.genre.is_empty() {
+                        "Music".to_owned()
+                    } else {
+                        meta.genre
+                    },
+                    release_date: meta.release_date,
+                    track_number: if meta.track_number != 0 {
+                        meta.track_number
+                    } else {
+                        1
+                    },
+                    track_count: if meta.track_count != 0 {
+                        meta.track_count
+                    } else {
+                        1
+                    },
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+
+            valid_track_ids.insert(meta.track_key);
+            synced += 1;
         }
         on_progress(scanned, synced);
-        let start = max(1, end - 99);
+        let start = max(1, end - (INDEX_BATCH_SIZE - 1));
         if start == 1 {
             break;
         }
-        end -= 100;
+        end -= INDEX_BATCH_SIZE;
     }
+
+    // A successful API call returning no messages is possible when history is
+    // inaccessible or the channel changed while scanning.  It must never turn
+    // into "all cached tracks are ghosts".
+    validate_scan_for_prune(batches_scanned, scanned, synced)?;
 
     let valid_ids_vec: Vec<TrackKey> = valid_track_ids.into_iter().collect();
     let pruned = state
@@ -313,6 +321,47 @@ async fn index_dump_channel(
         skipped,
         duration_ms: started.elapsed().as_millis(),
     })
+}
+
+fn validate_scan_for_prune(batches_scanned: u64, scanned: u64, synced: u64) -> Result<(), String> {
+    if batches_scanned == 0 || scanned == 0 {
+        return Err(
+            "dump channel scan returned no messages; refusing to prune the cache".to_owned(),
+        );
+    }
+    if synced == 0 {
+        return Err(
+            "dump channel scan found no valid track records; refusing to prune the cache"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+async fn get_messages_with_retry(
+    state: &BotState,
+    ids: &[i32],
+    batch_end: i32,
+) -> Result<Vec<ferogram::update::IncomingMessage>, String> {
+    let mut last_error = String::new();
+    for attempt in 0..INDEX_BATCH_RETRIES {
+        match state
+            .client
+            .get_messages(state.dump_peer.clone(), ids)
+            .await
+        {
+            Ok(messages) => return Ok(messages),
+            Err(error) => {
+                last_error = error.to_string();
+                if attempt + 1 < INDEX_BATCH_RETRIES {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }
+        }
+    }
+    Err(format!(
+        "failed to scan dump channel batch ending at message {batch_end} after {INDEX_BATCH_RETRIES} attempts: {last_error}"
+    ))
 }
 
 fn file_ids(document: &Document) -> (String, String) {
@@ -379,5 +428,12 @@ mod tests {
         let ids = batch_ids(250, 100);
         assert_eq!(ids.len(), 100);
         assert_eq!(ids, (151..=250).rev().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn incomplete_scan_cannot_prune() {
+        assert!(validate_scan_for_prune(0, 0, 0).is_err());
+        assert!(validate_scan_for_prune(1, 10, 0).is_err());
+        assert!(validate_scan_for_prune(1, 10, 1).is_ok());
     }
 }

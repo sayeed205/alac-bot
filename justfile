@@ -24,9 +24,15 @@ clippy:
     cargo clippy --workspace --all-targets -- -D warnings
 
 # Run the test suite (needs a PostgreSQL test database).
-db_url := env_var_or_default('DATABASE_URL', 'postgresql://admin:password@localhost:5432/alac_bot_v2_test')
+test_database_url := env_var_or_default('TEST_DATABASE_URL', '')
 test:
-    DATABASE_URL='{{db_url}}' cargo nextest run
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -z '{{test_database_url}}' ]; then
+        echo 'error: TEST_DATABASE_URL is required for tests' >&2
+        exit 1
+    fi
+    TEST_DATABASE_URL='{{test_database_url}}' cargo nextest run
 
 # Debug build of the bot binary.
 build:

@@ -9,6 +9,7 @@ use super::{
     http::{ByteStream, StreamHttp, StreamHttpError},
     mirror_policy::{MirrorEndpoint, MirrorPolicy},
 };
+use crate::limits::{MAX_AUDIO_BYTES, MAX_ERROR_BODY_BYTES};
 
 pub struct FetchEndpointOptions {
     pub stream_url: String,
@@ -131,6 +132,15 @@ impl<H: StreamHttp> StreamTransport<H> {
         let body = response.body.ok_or_else(|| {
             StreamError::message(format!("Empty body returned from {source_name}"))
         })?;
+        if response
+            .content_length
+            .is_some_and(|length| length > MAX_AUDIO_BYTES)
+        {
+            return Err(StreamError::message(format!(
+                "Audio stream exceeds the {} MiB limit",
+                MAX_AUDIO_BYTES / (1024 * 1024)
+            )));
+        }
         // TS parseInt produces NaN for malformed values. Rust uses the
         // documented defaults instead, a harmless deviation for bad mirrors.
         let bit_depth = response
@@ -270,7 +280,11 @@ async fn collect_body(body: &mut ByteStream) -> String {
     let mut bytes = Vec::new();
     while let Some(chunk) = body.next().await {
         if let Ok(chunk) = chunk {
-            bytes.extend_from_slice(&chunk);
+            let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(bytes.len());
+            bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            if bytes.len() >= MAX_ERROR_BODY_BYTES {
+                break;
+            }
         }
     }
     String::from_utf8_lossy(&bytes).into_owned()

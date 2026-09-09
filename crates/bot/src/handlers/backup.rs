@@ -14,6 +14,7 @@ use crate::{
     html::{escape, parse_dynamic_html},
     BotState,
 };
+use engine::limits::MAX_DOCUMENT_BYTES;
 
 const KB: f64 = 1024.0;
 
@@ -83,7 +84,7 @@ async fn export(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
         .ok();
 
     let dump = db::DbDumpService::new(state.db_client.clone());
-    let result = dump.export_dump().await;
+    let result = dump.export_dump_for_channel(state.dump_channel_id).await;
     let (buffer, stats, _filename) = match result {
         Ok(ok) => ok,
         Err(error) => {
@@ -204,7 +205,19 @@ async fn import(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
     let restore_result = match download_document(&state, &doc, &tmp).await {
         Ok(bytes) => {
             let dump = db::DbDumpService::new(state.db_client.clone());
-            dump.import_dump(&bytes).await.map_err(|e| e.to_string())
+            match dump
+                .import_dump_for_channel(&bytes, state.dump_channel_id)
+                .await
+            {
+                Ok(stats) => state
+                    .rip_deps
+                    .settings()
+                    .reload()
+                    .await
+                    .map(|_| stats)
+                    .map_err(|e| e.to_string()),
+                Err(error) => Err(error.to_string()),
+            }
         }
         Err(error) => Err(error),
     };
@@ -214,9 +227,9 @@ async fn import(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
     let text = match restore_result {
         Ok(stats) => format!(
             "<b>✅ Database Restored Successfully!</b>\n\n\
-• <b>Users Merged:</b> {}\n\
-• <b>Tracks Merged:</b> {}\n\
-• <b>Requests Merged:</b> {}\n\
+• <b>Users Restored:</b> {}\n\
+• <b>Tracks Restored:</b> {}\n\
+• <b>Requests Restored:</b> {}\n\
 • <b>Elapsed Time:</b> {}ms",
             stats.users_merged, stats.tracks_merged, stats.requests_merged, stats.duration_ms
         ),
@@ -248,5 +261,15 @@ async fn download_document(
         .download_media(media, MediaQuality::Original, tmp, None)
         .await
         .map_err(|error| error.to_string())?;
+    let size = tokio::fs::metadata(tmp)
+        .await
+        .map_err(|error| error.to_string())?
+        .len();
+    if size > MAX_DOCUMENT_BYTES {
+        return Err(format!(
+            "database archive exceeds the {} MiB limit",
+            MAX_DOCUMENT_BYTES / (1024 * 1024)
+        ));
+    }
     std::fs::read(tmp).map_err(|error| error.to_string())
 }

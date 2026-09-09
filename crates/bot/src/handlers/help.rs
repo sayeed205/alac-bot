@@ -40,7 +40,7 @@ const ADMIN: &str =
 • <code>/revoke &lt;user_id | reply&gt;</code> — Revoke user access<br/>\
 • <code>/authlist</code> — List authorized users<br/>\
 • <code>/stats</code> — View bot download & cache statistics<br/>\
-• <code>/cleanup</code> — Reconcile DB with Telegram dump channel</blockquote>";
+ • <code>/clean</code> — Remove leftover temporary files from download storage</blockquote>";
 
 pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
     dp.on_message(filters::command("help"), move |msg| {

@@ -3,10 +3,12 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Mutex, OnceLock,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-use db::{connect, migrate, DbPool, RequestLogRepository, SettingsStore, TracksRepository};
+use db::{
+    connect_test_isolated, migrate, DbPool, RequestLogRepository, SettingsStore, TracksRepository,
+};
 use diesel::{sql_query, sql_types::Text};
 use diesel_async::RunQueryDsl;
 use engine::{
@@ -15,28 +17,12 @@ use engine::{
 };
 use serde_json::json;
 
-async fn client() -> Option<DbPool> {
-    let url = std::env::var("TEST_DATABASE_URL")
-        .or_else(|_| std::env::var("DATABASE_URL"))
-        .unwrap_or_else(|_| {
-            "postgresql://admin:password@localhost:5432/alac_bot_v2_test".to_owned()
-        });
-    let client = match tokio::time::timeout(Duration::from_secs(3), connect(&url)).await {
-        Ok(Ok(client)) => client,
-        Ok(Err(error)) => {
-            eprintln!("SKIP db integration test: PostgreSQL unavailable: {error}");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("SKIP db integration test: PostgreSQL connection timed out");
-            return None;
-        }
-    };
-    if let Err(error) = migrate(&client).await {
-        eprintln!("SKIP db integration test: migrations failed: {error}");
-        return None;
-    }
-    Some(client)
+async fn client() -> DbPool {
+    let client = connect_test_isolated()
+        .await
+        .expect("TEST_DATABASE_URL and PostgreSQL are required for db tests");
+    migrate(&client).await.expect("database migrations");
+    client
 }
 
 fn track(id: &str, title: &str) -> SaveTrackInput {
@@ -99,7 +85,7 @@ fn unique_prefix(kind: &str) -> String {
 #[tokio::test]
 async fn track_cache_hit_miss_and_empty_list() {
     let _lock = test_lock();
-    let Some(client) = client().await else { return };
+    let client = client().await;
     let prefix = unique_prefix("cache");
     clean_tracks(&client, &prefix).await;
     let repository = TracksRepository::new(client.clone());
@@ -135,7 +121,7 @@ async fn track_cache_hit_miss_and_empty_list() {
 #[tokio::test]
 async fn save_find_delete_search_and_prune_tracks() {
     let _lock = test_lock();
-    let Some(client) = client().await else { return };
+    let client = client().await;
     let prefix = unique_prefix("ops");
     clean_tracks(&client, &prefix).await;
     let repository = TracksRepository::new(client.clone());
@@ -187,7 +173,7 @@ async fn save_find_delete_search_and_prune_tracks() {
 #[tokio::test]
 async fn request_log_insert() {
     let _lock = test_lock();
-    let Some(client) = client().await else { return };
+    let client = client().await;
     let repository = RequestLogRepository::new(client.clone());
     let id = format!("db-m5b-request-{}", std::process::id());
     execute(
@@ -230,13 +216,13 @@ async fn request_log_insert() {
 #[tokio::test]
 async fn settings_defaults_parsing_and_mutations() {
     let _lock = test_lock();
-    let Some(client) = client().await else { return };
+    let client = client().await;
     // Clean every key this test may write: the parsing probes below AND the
     // toggle mutations later in the test (which persist via set_setting).
     // Without this, a second run against the same DB reads the previous
     // run's toggled rows and fails.
     let store = SettingsStore::new(client.clone());
-    store.init().await;
+    store.init().await.expect("load settings");
     assert_eq!(store.get_settings().max_collection_tracks, 50);
     assert_eq!(store.get_settings().auto_dump_storefronts, vec!["us"]);
 

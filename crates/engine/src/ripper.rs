@@ -15,6 +15,7 @@ use tracing::{debug, warn};
 
 use crate::{
     catalog::{Catalog, CatalogError, ReqwestTransport},
+    limits::MAX_AUDIO_BYTES,
     lyrics::{self, LyricsHttp, LyricsMeta},
     streaming::{
         AudioStreamSource, MirrorEndpoint, MirrorPolicyManager, ProgressCallback, StreamError,
@@ -223,6 +224,8 @@ impl AlacTrackRipper {
 
         let target_dir: &Path = output_dir.unwrap_or(&self.config.default_output_dir);
         tokio::fs::create_dir_all(target_dir).await?;
+        let track_dir = target_dir.join(format!(".track_{}", unique_temp_suffix()));
+        tokio::fs::create_dir_all(&track_dir).await?;
 
         emit_progress(on_progress, "Fetching track metadata...", None, None);
         let meta = deps.track_meta(track_id, storefront).await?;
@@ -309,8 +312,24 @@ impl AlacTrackRipper {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let temp_raw_path = target_dir.join(format!("stream_{track_id}_{unix_ms}.raw"));
-        let final_path = target_dir.join(tagger::build_track_filename(&meta));
+        let safe_track_id: String = track_id
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        // Keep the human-readable track id for diagnostics, but always add a
+        // monotonic/time component. Track ids are external input and must not
+        // be allowed to select a path or collide within one job.
+        let temp_raw_path = track_dir.join(format!(
+            "stream_{safe_track_id}_{unix_ms}_{}.raw",
+            unique_temp_suffix()
+        ));
+        let final_path = track_dir.join(tagger::build_track_filename(&meta));
 
         // Detached-into-the-loop prefetch: lyrics + artwork download while
         // the audio streams (polled in the same select! as the stream so
@@ -326,6 +345,12 @@ impl AlacTrackRipper {
 
         let result: Result<TrackRipResult, RipError> = async {
             let total = stream.content_length.filter(|len| *len > 0);
+            if total.is_some_and(|length| length > MAX_AUDIO_BYTES) {
+                return Err(RipError::Message(format!(
+                    "Audio stream exceeds the {} MiB limit",
+                    MAX_AUDIO_BYTES / (1024 * 1024)
+                )));
+            }
             let mut downloaded_bytes = 0u64;
             // TS starts at 0 → the first chunk always emits a progress event.
             let mut last_progress_update = std::time::Instant::now()
@@ -362,6 +387,13 @@ impl AlacTrackRipper {
                         None => break,
                     },
                 };
+
+                if downloaded_bytes.saturating_add(chunk.len() as u64) > MAX_AUDIO_BYTES {
+                    return Err(RipError::Message(format!(
+                        "Audio stream exceeds the {} MiB limit",
+                        MAX_AUDIO_BYTES / (1024 * 1024)
+                    )));
+                }
 
                 file.write_all(&chunk).await?;
                 downloaded_bytes += chunk.len() as u64;
@@ -457,6 +489,9 @@ impl AlacTrackRipper {
 
         // TS finally: temp raw removed in all paths; prefetch tasks reaped.
         let _ = tokio::fs::remove_file(&temp_raw_path).await;
+        if result.is_err() {
+            let _ = tokio::fs::remove_dir_all(&track_dir).await;
+        }
         result
     }
 }
@@ -494,6 +529,12 @@ fn jitter_fraction() -> f64 {
     state ^= state << 17;
     STATE.store(state, Ordering::Relaxed);
     (state >> 11) as f64 / (1u64 << 53) as f64
+}
+
+fn unique_temp_suffix() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Production dependency bundle wiring catalog, mirror policy, stream

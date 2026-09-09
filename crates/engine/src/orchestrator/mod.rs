@@ -45,6 +45,8 @@ pub enum OrchestratorError {
     DependenciesNotSet,
     Message(String),
     ResolutionFailed { failures: Vec<ResolutionFailure> },
+    AdmissionLimit,
+    UserAdmissionLimit,
 }
 
 impl std::fmt::Display for OrchestratorError {
@@ -67,6 +69,10 @@ impl std::fmt::Display for OrchestratorError {
                     }
                 }
                 Ok(())
+            }
+            Self::AdmissionLimit => write!(f, "job admission limit reached"),
+            Self::UserAdmissionLimit => {
+                write!(f, "user already has the maximum number of active jobs")
             }
         }
     }
@@ -131,6 +137,11 @@ struct EventBus {
     subscribers: Arc<Mutex<Vec<EventCallback>>>,
 }
 
+#[derive(Default)]
+struct Admissions {
+    jobs: HashMap<String, (i64, bool)>,
+}
+
 impl EventBus {
     fn new() -> Self {
         Self {
@@ -193,6 +204,7 @@ pub struct RipOrchestrator {
     bus: EventBus,
     jobs: Arc<Mutex<HashMap<String, Arc<Mutex<JobShared>>>>>,
     queue: SequentialRipQueue,
+    admissions: Arc<Mutex<Admissions>>,
 }
 
 impl Default for RipOrchestrator {
@@ -207,6 +219,7 @@ impl RipOrchestrator {
             bus: EventBus::new(),
             jobs: Arc::new(Mutex::new(HashMap::new())),
             queue: SequentialRipQueue::new(),
+            admissions: Arc::new(Mutex::new(Admissions::default())),
         }
     }
 
@@ -304,6 +317,7 @@ impl RipOrchestrator {
         drop(guard);
 
         self.jobs.lock().expect("jobs poisoned").remove(id);
+        self.release_admission(id);
         self.bus
             .emit(&OrchestratorEvent::Cancelled(&event_job, &by));
         true
@@ -316,13 +330,14 @@ impl RipOrchestrator {
         deps: Arc<D>,
         options: &RipJobOptions,
     ) -> Result<RipJobSummary, OrchestratorError> {
+        let job_id = cuid2::create_id();
+        self.admit(&job_id, options)?;
+
         // Settings are a snapshot.  The live-availability decision is made
         // after resolution and cache delivery, not as an early gate.
         let settings = deps.get_settings().await;
 
         let job_controller = CancellationToken::new();
-        let job_id = format!("job_{}_{}", now_ms(), random36(4));
-
         // Step 5: initial job header from the parsed targets.
         let mut job_header = "Apple Music Lossless Rip".to_string();
         if options.parsed_items.len() == 1 {
@@ -401,7 +416,38 @@ impl RipOrchestrator {
             }
         }
         self.jobs.lock().expect("jobs poisoned").remove(&job_id);
+        self.release_admission(&job_id);
         result
+    }
+
+    fn admit(&self, job_id: &str, options: &RipJobOptions) -> Result<(), OrchestratorError> {
+        let mut admissions = self.admissions.lock().expect("admissions poisoned");
+        if admissions.jobs.len() >= 16 {
+            return Err(OrchestratorError::AdmissionLimit);
+        }
+        let user_jobs = admissions
+            .jobs
+            .values()
+            .filter(|(user_id, is_admin)| {
+                *user_id == options.user_id && (*is_admin == options.is_admin || !options.is_admin)
+            })
+            .count();
+        let user_limit = if options.is_admin { 2 } else { 1 };
+        if user_jobs >= user_limit {
+            return Err(OrchestratorError::UserAdmissionLimit);
+        }
+        admissions
+            .jobs
+            .insert(job_id.to_owned(), (options.user_id, options.is_admin));
+        Ok(())
+    }
+
+    fn release_admission(&self, job_id: &str) {
+        self.admissions
+            .lock()
+            .expect("admissions poisoned")
+            .jobs
+            .remove(job_id);
     }
 
     /// Steps 8-18 of the TS `startJob` flow.
@@ -888,9 +934,8 @@ async fn run_pipeline<D: OrchestratorDeps>(
 ) -> RipJobSummary {
     tracing::debug!("Rip job started from queue");
 
-    // Rip job temp dir (TS: os.tmpdir()/rip_job_{ts}_{rand36}).
     let rip_job_dir: PathBuf =
-        std::env::temp_dir().join(format!("rip_job_{}_{}", now_ms(), random36(4)));
+        std::env::temp_dir().join(format!("rip_job_{id}", id = cuid2::create_id()));
     let _ = tokio::fs::create_dir_all(&rip_job_dir).await;
 
     let ripped_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1439,20 +1484,72 @@ fn kind_str(kind: TargetKind) -> &'static str {
     }
 }
 
-/// TS `Math.random().toString(36).slice(2, 6)` — 4 base36 chars.
-fn random36(len: usize) -> String {
-    let mut out = String::new();
-    let mut state = now_ms() ^ (std::process::id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    for _ in 0..len {
-        state = state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        let idx = (state >> 33) % 36;
-        out.push(b"abcdefghijklmnopqrstuvwxyz0123456789"[idx as usize] as char);
-    }
-    out
-}
-
 async fn delete_file_if_exists(path: &str) {
     let _ = tokio::fs::remove_file(std::path::Path::new(path)).await;
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    fn options(user_id: i64, is_admin: bool) -> RipJobOptions {
+        RipJobOptions {
+            chat_id: user_id,
+            user_id,
+            user_name: None,
+            delivery_chat_id: user_id,
+            is_group: false,
+            is_force: false,
+            is_cache_only: false,
+            single_storefront: None,
+            parsed_items: Vec::new(),
+            reply_to_message_id: None,
+            status_msg_id: 0,
+            is_admin,
+        }
+    }
+
+    #[test]
+    fn job_ids_are_cuid2_and_fit_callbacks() {
+        let id = cuid2::create_id();
+        let next_id = cuid2::create_id();
+        assert!(cuid2::is_cuid2(&id));
+        assert_ne!(id, next_id);
+        assert_eq!(id.len(), 24);
+        let callback_data = format!("cancel:{id}");
+        assert!(callback_data.len() <= 64);
+        assert_eq!(
+            callback_data.strip_prefix("cancel:").map(str::trim),
+            Some(id.as_str())
+        );
+    }
+
+    #[test]
+    fn admission_limits_users_and_global_jobs() {
+        let orchestrator = RipOrchestrator::new();
+        let user = options(1, false);
+        orchestrator.admit("u1", &user).expect("first user job");
+        assert!(matches!(
+            orchestrator.admit("u2", &user),
+            Err(OrchestratorError::UserAdmissionLimit)
+        ));
+
+        let admin = options(2, true);
+        orchestrator.admit("a1", &admin).expect("first admin job");
+        orchestrator.admit("a2", &admin).expect("second admin job");
+        assert!(matches!(
+            orchestrator.admit("a3", &admin),
+            Err(OrchestratorError::UserAdmissionLimit)
+        ));
+
+        for user_id in 3..=15 {
+            orchestrator
+                .admit(&format!("j{user_id}"), &options(user_id, false))
+                .expect("global capacity");
+        }
+        assert!(matches!(
+            orchestrator.admit("overflow", &options(100, false)),
+            Err(OrchestratorError::AdmissionLimit)
+        ));
+    }
 }

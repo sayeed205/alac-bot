@@ -23,15 +23,19 @@ impl SettingsStore {
         }
     }
 
-    pub async fn init(&self) {
-        let result = self.load().await;
+    pub async fn init(&self) -> Result<(), DbError> {
+        self.reload().await
+    }
+
+    /// Reload the cache from PostgreSQL.  This is intentionally fallible: a
+    /// stale in-memory snapshot is unsafe after a restore or a reconnect.
+    pub async fn reload(&self) -> Result<(), DbError> {
+        let result = self.load().await?;
         *self
             .cached_settings
             .write()
-            .expect("settings lock poisoned") = result.unwrap_or_else(|error| {
-            tracing::error!(%error, "failed to load settings; using defaults");
-            default_settings()
-        });
+            .expect("settings lock poisoned") = result;
+        Ok(())
     }
 
     async fn load(&self) -> Result<BotSettings, DbError> {
@@ -63,15 +67,14 @@ impl SettingsStore {
         if !apply_value(&mut next, key, &value) {
             return next;
         }
-        {
-            *self
-                .cached_settings
-                .write()
-                .expect("settings lock poisoned") = next.clone();
-        }
         if let Err(error) = self.persist(&next).await {
             tracing::error!(%error, setting = key, "failed to persist setting");
+            return self.get_settings();
         }
+        *self
+            .cached_settings
+            .write()
+            .expect("settings lock poisoned") = next.clone();
         next
     }
 
@@ -98,8 +101,9 @@ impl SettingsStore {
 
     pub async fn cycle_ripping_mode(&self) -> RippingMode {
         let next = self.get_settings().cycled_mode();
-        self.set_setting("ripping_mode", json!(next.as_str())).await;
-        next
+        self.set_setting("ripping_mode", json!(next.as_str()))
+            .await
+            .ripping_mode
     }
 
     pub async fn toggle_album(&self) -> bool {
@@ -131,15 +135,24 @@ impl SettingsStore {
             "auto_dump_enabled" => !current.auto_dump_enabled,
             _ => !current.multi_link_rip_enabled,
         };
-        self.set_setting(key, json!(value)).await;
-        value
+        let settings = self.set_setting(key, json!(value)).await;
+        match key {
+            "album_rip_enabled" => settings.album_rip_enabled,
+            "playlist_rip_enabled" => settings.playlist_rip_enabled,
+            "artist_rip_enabled" => settings.artist_rip_enabled,
+            "txt_rip_enabled" => settings.txt_rip_enabled,
+            "auto_dump_enabled" => settings.auto_dump_enabled,
+            _ => settings.multi_link_rip_enabled,
+        }
     }
 
     pub async fn set_max_collection_tracks(&self, limit: i64) -> u32 {
-        let value = u32::try_from(limit.max(0)).unwrap_or(u32::MAX);
+        let value = u32::try_from(limit.max(0))
+            .unwrap_or(engine::limits::MAX_COLLECTION_TRACKS)
+            .min(engine::limits::MAX_COLLECTION_TRACKS);
         self.set_setting("max_collection_tracks", json!(value))
-            .await;
-        value
+            .await
+            .max_collection_tracks
     }
 
     pub async fn add_auto_dump_storefront(&self, storefront: &str) -> Vec<String> {
@@ -195,7 +208,10 @@ fn from_row(row: SettingsRow) -> BotSettings {
         artist_rip_enabled: row.artist_rip_enabled,
         txt_rip_enabled: row.txt_rip_enabled,
         multi_link_rip_enabled: row.multi_link_rip_enabled,
-        max_collection_tracks: u32::try_from(row.max_collection_tracks).unwrap_or(50),
+        max_collection_tracks: u32::try_from(row.max_collection_tracks)
+            .ok()
+            .filter(|value| engine::limits::validate_collection_limit(*value))
+            .unwrap_or(50),
         auto_dump_enabled: row.auto_dump_enabled,
         auto_dump_storefronts: if row.auto_dump_storefronts.is_empty() {
             vec!["us".to_owned()]
@@ -250,6 +266,7 @@ fn apply_value(settings: &mut BotSettings, key: &str, value: &Value) -> bool {
         "max_collection_tracks" => value
             .as_u64()
             .and_then(|v| u32::try_from(v).ok())
+            .filter(|v| engine::limits::validate_collection_limit(*v))
             .map(|v| settings.max_collection_tracks = v)
             .is_some(),
         "auto_dump_enabled" => value
