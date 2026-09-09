@@ -241,51 +241,52 @@ impl DbDumpService {
         let mut connection = self.pool.connection().await?;
         connection
             .build_transaction()
-            .run(|transaction| {
-                Box::pin(async move {
-                    // Import is replacement, not a merge.  Clear every
-                    // archive-owned table inside the same transaction so a
-                    // failed insert leaves the previous database untouched.
-                    diesel::delete(requests::table).execute(transaction).await?;
-                    diesel::delete(tracks::table).execute(transaction).await?;
-                    diesel::delete(users::table).execute(transaction).await?;
+            .run(async |transaction| {
+                diesel::delete(requests::table)
+                    .execute(&mut *transaction)
+                    .await?;
+                diesel::delete(tracks::table)
+                    .execute(&mut *transaction)
+                    .await?;
+                diesel::delete(users::table)
+                    .execute(&mut *transaction)
+                    .await?;
 
-                    for row in archive.users {
-                        diesel::insert_into(users::table)
-                            .values(row)
-                            .execute(transaction)
-                            .await?;
-                    }
-                    for row in archive.tracks {
-                        diesel::insert_into(tracks::table)
-                            .values(row)
-                            .execute(transaction)
-                            .await?;
-                    }
-                    for row in archive.requests {
-                        diesel::insert_into(requests::table)
-                            .values(row)
-                            .execute(transaction)
-                            .await?;
-                    }
-                    let row = archive.settings;
-                    diesel::update(settings::table.filter(settings::id.eq(1_i16)))
-                        .set((
-                            settings::ripping_mode.eq(row.ripping_mode),
-                            settings::album_rip_enabled.eq(row.album_rip_enabled),
-                            settings::playlist_rip_enabled.eq(row.playlist_rip_enabled),
-                            settings::artist_rip_enabled.eq(row.artist_rip_enabled),
-                            settings::txt_rip_enabled.eq(row.txt_rip_enabled),
-                            settings::multi_link_rip_enabled.eq(row.multi_link_rip_enabled),
-                            settings::max_collection_tracks.eq(row.max_collection_tracks),
-                            settings::auto_dump_enabled.eq(row.auto_dump_enabled),
-                            settings::auto_dump_storefronts.eq(row.auto_dump_storefronts),
-                            settings::updated_at.eq(row.updated_at),
-                        ))
-                        .execute(transaction)
+                for row in archive.users {
+                    diesel::insert_into(users::table)
+                        .values(row)
+                        .execute(&mut *transaction)
                         .await?;
-                    Ok::<(), diesel::result::Error>(())
-                })
+                }
+                for row in archive.tracks {
+                    diesel::insert_into(tracks::table)
+                        .values(row)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+                for row in archive.requests {
+                    diesel::insert_into(requests::table)
+                        .values(row)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+                let row = archive.settings;
+                diesel::update(settings::table.filter(settings::id.eq(1_i16)))
+                    .set((
+                        settings::ripping_mode.eq(row.ripping_mode),
+                        settings::album_rip_enabled.eq(row.album_rip_enabled),
+                        settings::playlist_rip_enabled.eq(row.playlist_rip_enabled),
+                        settings::artist_rip_enabled.eq(row.artist_rip_enabled),
+                        settings::txt_rip_enabled.eq(row.txt_rip_enabled),
+                        settings::multi_link_rip_enabled.eq(row.multi_link_rip_enabled),
+                        settings::max_collection_tracks.eq(row.max_collection_tracks),
+                        settings::auto_dump_enabled.eq(row.auto_dump_enabled),
+                        settings::auto_dump_storefronts.eq(row.auto_dump_storefronts),
+                        settings::updated_at.eq(row.updated_at),
+                    ))
+                    .execute(&mut *transaction)
+                    .await?;
+                Ok::<(), diesel::result::Error>(())
             })
             .await?;
         let stats = RestoreStats {

@@ -9,9 +9,9 @@ license = "MIT"
 
 [workspace.dependencies]
 ferogram = { git = "https://github.com/ankit-chaubey/ferogram", branch = "main", features = ["html"] }
-diesel = { version = "=2.2.12", features = ["postgres", "chrono", "serde_json"] }
-diesel-async = { version = "=0.5.2", features = ["postgres", "bb8", "async-connection-wrapper"] }
-diesel_migrations = "=2.2.0"
+diesel = { version = "2", features = ["postgres", "chrono", "serde_json"] }
+diesel-async = { version = "0.9", features = ["postgres", "bb8", "async-connection-wrapper"] }
+diesel_migrations = "2"
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
 tokio-util = "0.7"
@@ -26,9 +26,9 @@ serde_json = "1"
 dotenvy = "0.15"
 regex = "1"
 flate2 = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 indexmap = "2"
-cuid2 = "0.1.6"
+cuid2 = "0.1"
 
 [profile.release]
 lto = "thin"

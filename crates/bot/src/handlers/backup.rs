@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use engine::limits::MAX_DOCUMENT_BYTES;
 use ferogram::{filters, filters::Dispatcher, InputMessage, PeerRef};
 
 use crate::{
@@ -14,7 +15,6 @@ use crate::{
     html::{escape, parse_dynamic_html},
     BotState,
 };
-use engine::limits::MAX_DOCUMENT_BYTES;
 
 const KB: f64 = 1024.0;
 

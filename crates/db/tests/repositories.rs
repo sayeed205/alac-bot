@@ -1,8 +1,5 @@
 use std::{
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Mutex, OnceLock,
-    },
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -46,7 +43,7 @@ fn track(id: &str, title: &str) -> SaveTrackInput {
 
 async fn clean_tracks(client: &DbPool, prefix: &str) {
     let mut connection = client.connection().await.expect("connection");
-    sql_query(&format!(
+    sql_query(format!(
         "DELETE FROM tracks WHERE track_id LIKE '{}%'",
         prefix.replace('\'', "''")
     ))
@@ -64,14 +61,6 @@ async fn execute(client: &DbPool, statement: &str) {
 }
 
 static PREFIX_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-    TEST_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("database test lock poisoned")
-}
 
 fn unique_prefix(kind: &str) -> String {
     let stamp = SystemTime::now()
@@ -84,7 +73,6 @@ fn unique_prefix(kind: &str) -> String {
 
 #[tokio::test]
 async fn track_cache_hit_miss_and_empty_list() {
-    let _lock = test_lock();
     let client = client().await;
     let prefix = unique_prefix("cache");
     clean_tracks(&client, &prefix).await;
@@ -120,7 +108,6 @@ async fn track_cache_hit_miss_and_empty_list() {
 
 #[tokio::test]
 async fn save_find_delete_search_and_prune_tracks() {
-    let _lock = test_lock();
     let client = client().await;
     let prefix = unique_prefix("ops");
     clean_tracks(&client, &prefix).await;
@@ -172,7 +159,6 @@ async fn save_find_delete_search_and_prune_tracks() {
 
 #[tokio::test]
 async fn request_log_insert() {
-    let _lock = test_lock();
     let client = client().await;
     let repository = RequestLogRepository::new(client.clone());
     let id = format!("db-m5b-request-{}", std::process::id());
@@ -215,7 +201,6 @@ async fn request_log_insert() {
 
 #[tokio::test]
 async fn settings_defaults_parsing_and_mutations() {
-    let _lock = test_lock();
     let client = client().await;
     // Clean every key this test may write: the parsing probes below AND the
     // toggle mutations later in the test (which persist via set_setting).
