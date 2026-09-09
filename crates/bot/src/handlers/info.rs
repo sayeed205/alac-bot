@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use engine::parser::parse_alac_input;
+use engine::{parser::parse_alac_input, Provider, TrackKey};
 use ferogram::{filters, filters::Dispatcher, InputMessage, PeerRef};
 
 use crate::{
@@ -55,13 +55,14 @@ async fn info(msg: ferogram::update::IncomingMessage, state: Arc<BotState>) {
             .fetch_track_meta(&track_id, parsed.storefront.as_deref().unwrap_or("us"))
             .await
             .map_err(|error| error.to_string())?;
+        let track_key = TrackKey::new(Provider::Apple, track_id.clone());
         let cached = state
             .rip_deps
             .tracks()
-            .find_cached_tracks(std::slice::from_ref(&track_id))
+            .find_cached_tracks(std::slice::from_ref(&track_key))
             .await
             .map_err(|error| error.to_string())?
-            .remove(&track_id);
+            .remove(&track_key);
         // The orchestration projection contains the dump id and display
         // fields; fetch the full row only to render the quality columns that
         // the info command exposes.
@@ -75,7 +76,7 @@ async fn info(msg: ferogram::update::IncomingMessage, state: Arc<BotState>) {
                 .and_then(|tracks| {
                     tracks
                         .into_iter()
-                        .find(|track| track.apple_track_id == track_id)
+                        .find(|track| track.provider == track_key.provider && track.track_id == track_key.track_id)
                 })
         } else {
             None

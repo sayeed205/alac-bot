@@ -1,19 +1,19 @@
 use std::borrow::Borrow;
 
+use diesel_async::RunQueryDsl;
 use engine::orchestrator::deps::RequestLog;
-use welds::connections::{Client, Param};
 
-use crate::DbError;
+use crate::{models::NewRequest, schema::requests, DbError, DbPool};
 
 /// Append-only request log repository.
 #[derive(Clone)]
 pub struct RequestLogRepository {
-    client: welds::connections::postgres::PostgresClient,
+    pool: DbPool,
 }
 
 impl RequestLogRepository {
-    pub fn new(client: welds::connections::postgres::PostgresClient) -> Self {
-        Self { client }
+    pub fn new(pool: DbPool) -> Self {
+        Self { pool }
     }
 
     pub async fn log_request<I>(&self, data: I) -> Result<(), DbError>
@@ -25,20 +25,19 @@ impl RequestLogRepository {
             .duration_ms
             .map(|value| i32::try_from(value).map_err(|error| DbError::Row(error.to_string())))
             .transpose()?;
-        let params: [&(dyn Param + Sync); 7] = [
-            &data.telegram_id,
-            &data.chat_id,
-            &data.apple_track_id,
-            &data.is_cache_hit,
-            &duration_ms,
-            &data.status,
-            &data.error_reason,
-        ];
-        self.client
-            .execute(
-                "INSERT INTO requests (telegram_id, chat_id, apple_track_id, is_cache_hit, duration_ms, status, error_reason) VALUES ($1,$2,$3,$4,$5,$6,$7)",
-                &params,
-            )
+        let mut connection = self.pool.connection().await?;
+        diesel::insert_into(requests::table)
+            .values(NewRequest {
+                telegram_id: data.telegram_id,
+                chat_id: data.chat_id,
+                provider: data.track_key.provider,
+                track_id: &data.track_key.track_id,
+                is_cache_hit: data.is_cache_hit,
+                duration_ms,
+                status: &data.status,
+                error_reason: data.error_reason.as_deref(),
+            })
+            .execute(&mut *connection)
             .await?;
         Ok(())
     }

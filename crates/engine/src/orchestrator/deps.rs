@@ -14,7 +14,7 @@ use crate::{
     playlist::PlaylistData,
     ripper::{RipError, RipProgressCallback},
     settings::BotSettings,
-    types::{AlbumTracks, ArtistTracks, TrackRipResult},
+    types::{AlbumTracks, ArtistTracks, Provider, TrackKey, TrackRipResult},
 };
 
 /// `(uploaded_bytes, total_bytes)` for upload progress callbacks.
@@ -24,7 +24,7 @@ pub type UploadProgressCallback = std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>
 /// orchestrator reads).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CachedTrack {
-    pub apple_track_id: String,
+    pub track_key: TrackKey,
     pub message_id: i64,
     pub file_id: String,
     pub file_unique_id: String,
@@ -36,7 +36,7 @@ pub struct CachedTrack {
 /// TS `SaveTrackInput`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SaveTrackInput {
-    pub apple_track_id: String,
+    pub track_key: TrackKey,
     pub message_id: i64,
     pub file_id: String,
     pub file_unique_id: String,
@@ -63,7 +63,7 @@ impl SaveTrackInput {
         file_unique_id: &str,
     ) -> Self {
         Self {
-            apple_track_id: track_id.to_string(),
+            track_key: TrackKey::new(Provider::Apple, track_id),
             message_id,
             file_id: file_id.to_string(),
             file_unique_id: file_unique_id.to_string(),
@@ -86,7 +86,7 @@ impl SaveTrackInput {
 pub struct RequestLog {
     pub telegram_id: i64,
     pub chat_id: i64,
-    pub apple_track_id: String,
+    pub track_key: TrackKey,
     pub is_cache_hit: bool,
     pub duration_ms: Option<i64>,
     pub status: String,
@@ -156,12 +156,12 @@ pub trait OrchestratorDeps: Send + Sync + 'static {
     // ── store (IAlacService subset; string errors = TS messages) ────────
     fn find_cached_tracks(
         &self,
-        ids: &[String],
-    ) -> impl Future<Output = Result<HashMap<String, CachedTrack>, String>> + Send;
+        keys: &[TrackKey],
+    ) -> impl Future<Output = Result<HashMap<TrackKey, CachedTrack>, String>> + Send;
     fn save_track(&self, input: SaveTrackInput) -> impl Future<Output = Result<(), String>> + Send;
     fn delete_track(
         &self,
-        apple_track_id: &str,
+        track_key: &TrackKey,
     ) -> impl Future<Output = Result<bool, String>> + Send;
     fn log_request(&self, log: RequestLog) -> impl Future<Output = Result<(), String>> + Send;
 

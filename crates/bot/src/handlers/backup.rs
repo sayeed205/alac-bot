@@ -1,4 +1,4 @@
-//! `/export` + `/import` — gzipped SQL database backup/restore
+//! `/export` + `/import` — gzipped typed database archive backup/restore
 //! (oracle: `src/modules/alac/commands/backup.ts`, service
 //! `src/db/dump.ts` → `db::DbDumpService`).
 //!
@@ -29,7 +29,7 @@ fn export_caption(users: i64, tracks: i64, requests: i64, bytes: usize) -> Strin
     )
 }
 
-/// Extract the `.sql.gz` (or `.gz`) document from the replied-to message.
+/// Extract the `.json.gz` (or `.gz`) document from the replied-to message.
 async fn replied_document(
     state: &BotState,
     msg: &ferogram::update::IncomingMessage,
@@ -103,7 +103,7 @@ async fn export(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
 
     // Write to a temp file, upload as a document, then clean up.
     let tmp = std::env::temp_dir().join(format!(
-        "alac_export_{}.sql.gz",
+        "alac_export_{}.json.gz",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -172,15 +172,15 @@ async fn import(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
     let Some((doc, file_name)) = replied_document(&state, &msg).await else {
         let _ = msg
             .reply(InputMessage::html(parse_dynamic_html(
-                "⚠️ Please reply to a valid <code>.sql.gz</code> database dump document with <code>/import</code> to restore.",
+                "⚠️ Please reply to a valid <code>.json.gz</code> database archive with <code>/import</code> to restore.",
             )))
             .await;
         return;
     };
-    if !file_name.ends_with(".sql.gz") && !file_name.ends_with(".gz") {
+    if !file_name.ends_with(".json.gz") && !file_name.ends_with(".gz") {
         let _ = msg
             .reply(InputMessage::html(parse_dynamic_html(
-                "⚠️ The replied file must be a <code>.sql.gz</code> database dump.",
+                "⚠️ The replied file must be a <code>.json.gz</code> database archive.",
             )))
             .await;
         return;
@@ -194,7 +194,7 @@ async fn import(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
         .ok();
 
     let tmp = std::env::temp_dir().join(format!(
-        "alac_import_{}.sql.gz",
+        "alac_import_{}.json.gz",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())

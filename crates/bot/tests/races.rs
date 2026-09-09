@@ -19,7 +19,7 @@ use engine::{
     },
     playlist::{PlaylistData, PlaylistError},
     settings::BotSettings,
-    types::{AlbumTracks, ArtistTracks, ParsedTargetItem, TargetKind},
+    types::{AlbumTracks, ArtistTracks, ParsedTargetItem, TargetKind, TrackKey},
 };
 
 /// Fake deps whose rip can be held mid-flight from the test.
@@ -37,14 +37,14 @@ impl OrchestratorDeps for RaceDeps {
     }
     async fn find_cached_tracks(
         &self,
-        _ids: &[String],
-    ) -> Result<HashMap<String, CachedTrack>, String> {
+        _keys: &[TrackKey],
+    ) -> Result<HashMap<TrackKey, CachedTrack>, String> {
         Ok(HashMap::new())
     }
     async fn save_track(&self, _input: SaveTrackInput) -> Result<(), String> {
         Ok(())
     }
-    async fn delete_track(&self, _id: &str) -> Result<bool, String> {
+    async fn delete_track(&self, _key: &TrackKey) -> Result<bool, String> {
         Ok(true)
     }
     async fn log_request(&self, _log: RequestLog) -> Result<(), String> {

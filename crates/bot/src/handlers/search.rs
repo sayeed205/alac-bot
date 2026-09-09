@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use engine::{
     orchestrator::deps::OrchestratorDeps,
-    types::{ParsedTargetItem, TargetKind, TrackMeta},
+    types::{ParsedTargetItem, Provider, TargetKind, TrackKey, TrackMeta},
 };
 use ferogram::{
     filters::{self, Dispatcher},
@@ -179,7 +179,7 @@ async fn search(state: Arc<BotState>, msg: IncomingMessage) {
     }
 
     let cached_ids: std::collections::HashSet<&str> =
-        cached.iter().map(|t| t.apple_track_id.as_str()).collect();
+        cached.iter().map(|t| t.track_id.as_str()).collect();
     let uncached_live: Vec<&TrackMeta> = live
         .iter()
         .filter(|t| !cached_ids.contains(t.id.as_str()))
@@ -204,7 +204,7 @@ async fn search(state: Arc<BotState>, msg: IncomingMessage) {
     let keyboard = build_results_keyboard(
         &cached
             .iter()
-            .map(|t| (t.apple_track_id.clone(), t.title.clone(), t.artist.clone()))
+            .map(|t| (t.track_id.clone(), t.title.clone(), t.artist.clone()))
             .collect::<Vec<_>>(),
         &uncached_live
             .iter()
@@ -234,6 +234,7 @@ async fn close(state: Arc<BotState>, query: CallbackQuery) {
 }
 
 async fn deliver_cached(state: Arc<BotState>, query: CallbackQuery, track_id: String) {
+    let track_key = TrackKey::new(Provider::Apple, track_id.clone());
     let marked_chat = query
         .chat_peer
         .as_ref()
@@ -263,10 +264,10 @@ async fn deliver_cached(state: Arc<BotState>, query: CallbackQuery, track_id: St
     }
     let cached = state
         .rip_deps
-        .find_cached_tracks(std::slice::from_ref(&track_id))
+        .find_cached_tracks(std::slice::from_ref(&track_key))
         .await
         .ok()
-        .and_then(|mut map| map.remove(&track_id));
+        .and_then(|mut map| map.remove(&track_key));
     let Some(cached) = cached else {
         let _ = query
             .answer()
@@ -300,7 +301,7 @@ async fn deliver_cached(state: Arc<BotState>, query: CallbackQuery, track_id: St
         .log_request(engine::orchestrator::deps::RequestLog {
             telegram_id: query.user_id,
             chat_id: marked_chat,
-            apple_track_id: track_id,
+            track_key: track_key.clone(),
             is_cache_hit: true,
             duration_ms: Some(100),
             status: "completed".to_owned(),
@@ -310,6 +311,7 @@ async fn deliver_cached(state: Arc<BotState>, query: CallbackQuery, track_id: St
 }
 
 async fn rip(state: Arc<BotState>, query: CallbackQuery, track_id: String) {
+    let track_key = TrackKey::new(Provider::Apple, track_id.clone());
     let marked_chat = query
         .chat_peer
         .as_ref()
@@ -332,10 +334,10 @@ async fn rip(state: Arc<BotState>, query: CallbackQuery, track_id: String) {
 
     let cached = state
         .rip_deps
-        .find_cached_tracks(std::slice::from_ref(&track_id))
+        .find_cached_tracks(std::slice::from_ref(&track_key))
         .await
         .ok()
-        .and_then(|mut map| map.remove(&track_id));
+        .and_then(|mut map| map.remove(&track_key));
     if let Some(cached) = cached {
         if !state.rip_deps.settings_snapshot().can_serve_cache(is_admin) {
             let _ = query

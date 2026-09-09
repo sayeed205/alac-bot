@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use engine::parser::parse_alac_input;
+use engine::{parser::parse_alac_input, Provider, TrackKey};
 use ferogram::{filters, filters::Dispatcher, InputMessage, PeerRef};
 
 use crate::{
@@ -43,14 +43,15 @@ async fn delete(msg: ferogram::update::IncomingMessage, state: Arc<BotState>) {
         return;
     };
     let track_id = parsed.track_id;
+    let track_key = TrackKey::new(Provider::Apple, track_id.clone());
 
     let cached = match state
         .rip_deps
         .tracks()
-        .find_cached_tracks(std::slice::from_ref(&track_id))
+        .find_cached_tracks(std::slice::from_ref(&track_key))
         .await
     {
-        Ok(mut tracks) => tracks.remove(&track_id),
+        Ok(mut tracks) => tracks.remove(&track_key),
         Err(error) => {
             tracing::warn!(%error, "failed to find cached track for deletion");
             return;
@@ -78,7 +79,7 @@ async fn delete(msg: ferogram::update::IncomingMessage, state: Arc<BotState>) {
         }
     }
 
-    if let Err(error) = state.rip_deps.tracks().delete_track(&track_id).await {
+    if let Err(error) = state.rip_deps.tracks().delete_track(&track_key).await {
         tracing::warn!(%error, track_id, "failed to delete cached track");
         return;
     }

@@ -9,7 +9,7 @@ use std::{
 
 use engine::{
     orchestrator::deps::CachedTrack,
-    types::{ParsedTargetItem, TargetKind},
+    types::{ParsedTargetItem, Provider, TargetKind, TrackKey},
 };
 use ferogram::{
     filters::{self, Dispatcher},
@@ -130,7 +130,7 @@ fn document_file_unique_id(document: &ferogram::media::Document) -> String {
 
 fn cached_from_track(track: db::Track) -> CachedTrack {
     CachedTrack {
-        apple_track_id: track.apple_track_id,
+        track_key: TrackKey::new(track.provider, track.track_id),
         message_id: i64::from(track.message_id),
         file_id: track.file_id,
         file_unique_id: track.file_unique_id,
@@ -141,14 +141,15 @@ fn cached_from_track(track: db::Track) -> CachedTrack {
 }
 
 async fn find_cached_track(state: &BotState, track_id: &str) -> Option<CachedTrack> {
-    let ids = [track_id.to_owned()];
+    let key = TrackKey::new(Provider::Apple, track_id);
+    let ids = [key.clone()];
     state
         .rip_deps
         .tracks()
         .find_cached_tracks(&ids)
         .await
         .ok()
-        .and_then(|mut tracks| tracks.remove(track_id))
+        .and_then(|mut tracks| tracks.remove(&key))
 }
 
 async fn find_by_file_unique_id(state: &BotState, file_unique_id: &str) -> Option<CachedTrack> {
@@ -243,7 +244,7 @@ async fn dispatch_report(
 ) -> TrackReport {
     let report = TrackReport {
         id: random_report_id(),
-        track_id: track.apple_track_id.clone(),
+        track_id: track.track_key.track_id.clone(),
         reporter_user_id,
         reporter_chat_id,
         reporter_name,
@@ -371,7 +372,7 @@ async fn handle_command(state: Arc<BotState>, msg: IncomingMessage) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .reports_by_track
-        .contains_key(&track.apple_track_id)
+        .contains_key(&track.track_key.track_id)
     {
         let text = format!(
             "ℹ️ <b>Already Under Review</b><br/><br/><blockquote>The track <b>{}</b> has already been reported and is currently under review by the administrator. Thank you for your report!</blockquote>",
@@ -419,7 +420,7 @@ async fn handle_command(state: Arc<BotState>, msg: IncomingMessage) {
         let _ = msg
             .reply(
                 InputMessage::html(parse_dynamic_html(&text))
-                    .reply_markup(reason_keyboard(&track.apple_track_id)),
+                    .reply_markup(reason_keyboard(&track.track_key.track_id)),
             )
             .await;
     }
@@ -594,7 +595,11 @@ async fn admin_callback(state: Arc<BotState>, query: CallbackQuery, parts: &[&st
                     delete_message(&state, state.dump_peer.clone(), message_id).await;
                 }
             }
-            let _ = state.rip_deps.tracks().delete_track(track_id).await;
+            let _ = state
+                .rip_deps
+                .tracks()
+                .delete_track(&TrackKey::new(Provider::Apple, track_id))
+                .await;
             {
                 let mut registry = report_state()
                     .lock()

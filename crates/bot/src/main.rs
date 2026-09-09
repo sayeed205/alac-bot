@@ -79,7 +79,7 @@ fn load_env() -> Env {
 fn init_tracing(log_level: &str) {
     // Our crates honor LOG_LEVEL (default info); external crates are pinned
     // to warn so their internal chatter (ferogram session/connection logs,
-    // sqlx, etc.) stays quiet unless something is actually wrong.
+    // etc.) stays quiet unless something is actually wrong.
     let level = if log_level.eq_ignore_ascii_case("critical") {
         "error"
     } else {
@@ -99,12 +99,11 @@ async fn main() -> Result<()> {
     init_tracing(&env.log_level);
 
     info!("Running database migrations...");
-    let database = welds::connections::postgres::connect(&env.database_url)
+    let database = db::connect(&env.database_url)
         .await
         .context("connect to PostgreSQL")?;
     db::migrate(&database)
         .await
-        .map_err(|e| anyhow!(e))
         .context("run database migrations")?;
     info!("Migrations completed successfully!");
     let auth = db::Auth::new(database.clone(), env.admin_id);

@@ -8,7 +8,10 @@ use std::{
     time::Instant,
 };
 
-use engine::orchestrator::{caption::parse_dump_caption, deps::SaveTrackInput};
+use engine::{
+    orchestrator::{caption::parse_dump_caption, deps::SaveTrackInput},
+    TrackKey,
+};
 use ferogram::{
     filters::{self, Dispatcher},
     media::Document,
@@ -233,7 +236,7 @@ async fn index_dump_channel(
                     .rip_deps
                     .tracks()
                     .save_track(&SaveTrackInput {
-                        apple_track_id: meta.apple_track_id.clone(),
+                        track_key: meta.track_key.clone(),
                         message_id: i64::from(message.id()),
                         file_id,
                         file_unique_id,
@@ -283,7 +286,7 @@ async fn index_dump_channel(
                     .await
                     .map_err(|error| error.to_string())?;
 
-                valid_track_ids.insert(meta.apple_track_id);
+                valid_track_ids.insert(meta.track_key);
                 synced += 1;
             }
         }
@@ -295,7 +298,7 @@ async fn index_dump_channel(
         end -= 100;
     }
 
-    let valid_ids_vec: Vec<String> = valid_track_ids.into_iter().collect();
+    let valid_ids_vec: Vec<TrackKey> = valid_track_ids.into_iter().collect();
     let pruned = state
         .rip_deps
         .tracks()

@@ -2,7 +2,7 @@
 
 A high-performance Telegram bot for downloading Apple Music lossless (ALAC) audio tracks, albums, and playlists with synchronized lyrics, embedded high-resolution artwork, and smart channel caching.
 
-Built in Rust: [ferogram](https://github.com/ankit-chaubey/ferogram) (Telegram MTProto), tokio, and welds/PostgreSQL.
+Built in Rust: [ferogram](https://github.com/ankit-chaubey/ferogram) (Telegram MTProto), tokio, and Diesel/PostgreSQL.
 
 > **Migration note**: this codebase is the Rust port of the original Bun/TypeScript bot. The TypeScript implementation is preserved on the `typescript` branch; the migration history and per-milestone parity records live in [docs/](docs/).
 
@@ -30,7 +30,7 @@ Built in Rust: [ferogram](https://github.com/ankit-chaubey/ferogram) (Telegram M
 - **Access Control**: Granular user and group authorization system (`/auth`, `/revoke`, `/authlist`).
 - **Resilient Mirror Architecture**: Automatic mirror manifest resolution, health checks, 30s connection timeout, 45s streaming chunk inactivity reset, and circuit breakers against mirror outages.
 - **Auto-Dump Scheduler**: Daily 24h sweep that discovers new Apple Music releases and archives them straight to the dump channel.
-- **Database Backup & Restore**: Export and import compressed database snapshots (`.sql.gz`) directly via Telegram DM.
+- **Database Backup & Restore**: Export and import compressed, versioned database archives (`.json.gz`) directly via Telegram DM.
 
 ---
 
@@ -82,8 +82,9 @@ ALAC_WRAPPER_URL=http://127.0.0.1:12340
 
 ### 2. Start the Bot
 
-Database migrations run automatically at startup (idempotent — safe against
-both fresh and pre-existing databases).
+The canonical database migration runs automatically at startup for a fresh
+database. Existing databases are not upgraded or adopted; reset the database
+before starting the bot when changing schema generations.
 
 ```bash
 # Development (debug build)
@@ -192,8 +193,8 @@ ALAC_WRAPPER_API_KEY=your_secret_api_key
 | `/dumpnew <days>` / `/autodump` | Auto-dump new releases from Apple Music (also runs daily on a 24h scheduler) |
 | `/cache <link>` / `/dump` | Pre-cache/seed tracks directly into dump channel without sending audio |
 | `/random` | Interactive random album discovery & dump |
-| `/export` | Export a compressed PostgreSQL database backup (`.sql.gz`) via DM |
-| `/import` | Restore database by replying to a `.sql.gz` backup file |
+| `/export` | Export a compressed PostgreSQL database archive (`.json.gz`) via DM |
+| `/import` | Restore database by replying to a `.json.gz` archive file |
 
 ---
 
@@ -229,10 +230,10 @@ just test
 
 ## Database Management
 
-Migrations are embedded in the binary and run automatically at startup
-(`db::migrate`) — no separate migration step is needed. Statements are
-idempotent, so starting against a database already migrated by the previous
-TypeScript deployment is a safe no-op.
+The canonical Diesel migration is embedded in the binary and runs
+automatically at startup (`db::migrate`) — no separate migration step is
+needed. This is a clean-slate schema: it intentionally provides no upgrade
+path from older database schemas.
 
 ---
 

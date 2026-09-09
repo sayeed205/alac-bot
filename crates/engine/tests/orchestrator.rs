@@ -20,7 +20,10 @@ use engine::{
     playlist::{PlaylistData, PlaylistError, PlaylistTrack},
     ripper::{RipError, RipProgressCallback},
     settings::{default_settings, BotSettings, RippingMode},
-    types::{AlbumTracks, ArtistTracks, ParsedTargetItem, TargetKind, TrackMeta, TrackRipResult},
+    types::{
+        AlbumTracks, ArtistTracks, ParsedTargetItem, TargetKind, TrackKey, TrackMeta,
+        TrackRipResult,
+    },
 };
 use tokio_util::sync::CancellationToken;
 
@@ -59,7 +62,7 @@ impl DepsState {
 struct FakeDeps {
     state: Arc<Mutex<DepsState>>,
     settings: Mutex<BotSettings>,
-    cache: Mutex<HashMap<String, CachedTrack>>,
+    cache: Mutex<HashMap<TrackKey, CachedTrack>>,
     rip_scripts: Mutex<HashMap<String, RipScript>>,
     albums: Mutex<HashMap<String, AlbumTracks>>,
     artists: Mutex<HashMap<String, ArtistTracks>>,
@@ -95,9 +98,9 @@ impl FakeDeps {
 
     fn cache_track(&self, id: &str, message_id: i64) {
         self.cache.lock().unwrap().insert(
-            id.to_string(),
+            TrackKey::apple(id),
             CachedTrack {
-                apple_track_id: id.to_string(),
+                track_key: TrackKey::apple(id),
                 message_id,
                 file_id: format!("file_{id}"),
                 file_unique_id: format!("uniq_{id}"),
@@ -247,14 +250,14 @@ impl OrchestratorDeps for FakeDeps {
 
     fn find_cached_tracks(
         &self,
-        ids: &[String],
-    ) -> impl Future<Output = Result<HashMap<String, CachedTrack>, String>> + Send {
-        let cache: HashMap<String, CachedTrack> = self
+        keys: &[TrackKey],
+    ) -> impl Future<Output = Result<HashMap<TrackKey, CachedTrack>, String>> + Send {
+        let cache: HashMap<TrackKey, CachedTrack> = self
             .cache
             .lock()
             .unwrap()
             .iter()
-            .filter(|(id, _)| ids.contains(id))
+            .filter(|(key, _)| keys.contains(key))
             .map(|(id, t)| (id.clone(), t.clone()))
             .collect();
         let delay_ms = *self.cache_delay_ms.lock().unwrap();
@@ -280,14 +283,14 @@ impl OrchestratorDeps for FakeDeps {
 
     fn delete_track(
         &self,
-        apple_track_id: &str,
+        track_key: &TrackKey,
     ) -> impl Future<Output = Result<bool, String>> + Send {
         self.state
             .lock()
             .unwrap()
             .deleted_tracks
-            .push(apple_track_id.to_string());
-        self.cache.lock().unwrap().remove(apple_track_id);
+            .push(track_key.track_id.clone());
+        self.cache.lock().unwrap().remove(track_key);
         async move { Ok(true) }
     }
 
@@ -493,7 +496,7 @@ async fn happy_path_single_track() {
     assert_eq!(st.rip_calls, vec!["1440828878".to_string()]);
     assert_eq!(st.saved_tracks.len(), 1);
     let saved = &st.saved_tracks[0];
-    assert_eq!(saved.apple_track_id, "1440828878");
+    assert_eq!(saved.track_key, TrackKey::apple("1440828878"));
     assert_eq!(saved.message_id, 777);
     assert_eq!(saved.title, "Night Song");
     assert_eq!(saved.bit_depth, 24);
@@ -884,7 +887,7 @@ async fn rip_failure_logs_and_continues() {
         .filter(|l| l.status == "failed")
         .collect();
     assert_eq!(failed_logs.len(), 1);
-    assert_eq!(failed_logs[0].apple_track_id, "bad");
+    assert_eq!(failed_logs[0].track_key, TrackKey::apple("bad"));
     assert_eq!(failed_logs[0].error_reason.as_deref(), Some("CDN error"));
 }
 

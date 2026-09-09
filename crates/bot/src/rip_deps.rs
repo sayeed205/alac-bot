@@ -10,7 +10,7 @@ use engine::{
     playlist::{PlaylistClient, PlaylistData, PlaylistError, ReqwestPlaylistHttp},
     ripper::{AlacTrackRipper, EngineRipperDeps, RipError, RipProgressCallback, RipperConfig},
     settings::BotSettings,
-    types::{AlbumTracks, ArtistTracks, TrackRipResult},
+    types::{AlbumTracks, ArtistTracks, TrackKey, TrackRipResult},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -139,10 +139,10 @@ impl OrchestratorDeps for RipDeps {
 
     async fn find_cached_tracks(
         &self,
-        ids: &[String],
-    ) -> Result<HashMap<String, CachedTrack>, String> {
+        keys: &[TrackKey],
+    ) -> Result<HashMap<TrackKey, CachedTrack>, String> {
         self.tracks
-            .find_cached_tracks(ids)
+            .find_cached_tracks(keys)
             .await
             .map_err(|error| error.to_string())
     }
@@ -155,9 +155,9 @@ impl OrchestratorDeps for RipDeps {
             .map_err(|error| error.to_string())
     }
 
-    async fn delete_track(&self, apple_track_id: &str) -> Result<bool, String> {
+    async fn delete_track(&self, track_key: &TrackKey) -> Result<bool, String> {
         self.tracks
-            .delete_track(apple_track_id)
+            .delete_track(track_key)
             .await
             .map_err(|error| error.to_string())
     }

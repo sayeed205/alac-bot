@@ -3,6 +3,98 @@
 //! Field-level parity with the TS oracle (`src/modules/alac/types.ts`) matters:
 //! these values flow into Telegram replies, DB rows, and ffmpeg tags.
 
+use diesel::{deserialize::FromSql, pg::Pg, serialize::ToSql};
+use serde::{Deserialize, Serialize};
+
+/// A catalog/cache provider supported by the bot.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    diesel::AsExpression,
+    diesel::FromSqlRow,
+)]
+#[diesel(sql_type = diesel::sql_types::VarChar)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    Apple,
+    Spotify,
+    Amazon,
+}
+
+impl Provider {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Apple => "apple",
+            Self::Spotify => "spotify",
+            Self::Amazon => "amazon",
+        }
+    }
+}
+
+impl std::fmt::Display for Provider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Provider {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "apple" => Ok(Self::Apple),
+            "spotify" => Ok(Self::Spotify),
+            "amazon" => Ok(Self::Amazon),
+            other => Err(format!("unknown provider: {other}")),
+        }
+    }
+}
+
+impl ToSql<diesel::sql_types::VarChar, Pg> for Provider {
+    fn to_sql<'b>(
+        &'b self,
+        out: &mut diesel::serialize::Output<'b, '_, Pg>,
+    ) -> diesel::serialize::Result {
+        <str as ToSql<diesel::sql_types::Text, Pg>>::to_sql(self.as_str(), out)
+    }
+}
+
+impl FromSql<diesel::sql_types::VarChar, Pg> for Provider {
+    fn from_sql(
+        bytes: <Pg as diesel::backend::Backend>::RawValue<'_>,
+    ) -> diesel::deserialize::Result<Self> {
+        <String as FromSql<diesel::sql_types::Text, Pg>>::from_sql(bytes)?
+            .parse()
+            .map_err(Into::into)
+    }
+}
+
+/// A globally unique track identity. The provider is part of the identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TrackKey {
+    pub provider: Provider,
+    pub track_id: String,
+}
+
+impl TrackKey {
+    pub fn new(provider: Provider, track_id: impl Into<String>) -> Self {
+        Self {
+            provider,
+            track_id: track_id.into(),
+        }
+    }
+
+    pub fn apple(track_id: impl Into<String>) -> Self {
+        Self::new(Provider::Apple, track_id)
+    }
+}
+
 /// The kind of Apple Music target a parsed link/id refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TargetKind {

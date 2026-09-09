@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 bytes.workspace = true
+diesel.workspace = true
 futures-util.workspace = true
 regex.workspace = true
 serde.workspace = true

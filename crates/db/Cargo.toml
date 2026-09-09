@@ -1,19 +1,21 @@
 [package]
 name = "db"
-description = "Persistence layer: welds models, migrations, repositories. All welds types stay inside this crate."
+description = "Persistence layer: Diesel models, migrations, and repositories."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-welds.workspace = true
+diesel.workspace = true
+diesel-async.workspace = true
+diesel_migrations.workspace = true
 engine = { path = "../engine" }
 chrono.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-sqlx.workspace = true
 flate2.workspace = true
 
 [dev-dependencies]

@@ -22,6 +22,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 dotenvy.workspace = true
-welds.workspace = true
 reqwest.workspace = true
 chrono.workspace = true

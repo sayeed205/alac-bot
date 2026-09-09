@@ -8,10 +8,10 @@ edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
-# pinned deliberately: young crates, churn risk contained behind crate seams
-# ferogram from git (docs track main; Cargo.lock pins the exact rev)
 ferogram = { git = "https://github.com/ankit-chaubey/ferogram", branch = "main", features = ["html"] }
-welds = { version = "=0.5.1", features = ["postgres", "migrations"] }
+diesel = { version = "=2.2.12", features = ["postgres", "chrono", "serde_json"] }
+diesel-async = { version = "=0.5.2", features = ["postgres", "bb8", "async-connection-wrapper"] }
+diesel_migrations = "=2.2.0"
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
 tokio-util = "0.7"
@@ -28,7 +28,6 @@ regex = "1"
 flate2 = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 indexmap = "2"
-sqlx = { version = "=0.9.0", features = ["runtime-tokio", "chrono"] }
 
 [profile.release]
 lto = "thin"

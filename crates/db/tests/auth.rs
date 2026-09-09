@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use db::Auth;
+use db::{connect, migrate, Auth};
 
 #[tokio::test]
 async fn authorization_and_migration_parity() {
@@ -9,28 +9,23 @@ async fn authorization_and_migration_parity() {
         .unwrap_or_else(|_| {
             "postgresql://admin:password@localhost:5432/alac_bot_v2_test".to_owned()
         });
-    let client = match tokio::time::timeout(
-        Duration::from_secs(3),
-        welds::connections::postgres::connect(&url),
-    )
-    .await
-    {
+    let client = match tokio::time::timeout(Duration::from_secs(3), connect(&url)).await {
         Ok(Ok(client)) => client,
         Ok(Err(error)) => {
             eprintln!("skipping db integration tests: PostgreSQL unreachable: {error}");
-            std::process::exit(0);
+            return;
         }
         Err(_) => {
             eprintln!("skipping db integration tests: PostgreSQL connection timed out");
-            std::process::exit(0);
+            return;
         }
     };
 
-    if let Err(error) = db::migrate(&client).await {
+    if let Err(error) = migrate(&client).await {
         eprintln!("skipping db integration tests: migrations failed: {error}");
-        std::process::exit(0);
+        return;
     }
-    db::migrate(&client).await.expect("migration is idempotent");
+    migrate(&client).await.expect("migration is idempotent");
 
     let auth = Auth::new(client.clone(), 900_000_001);
     let user = 900_000_002;

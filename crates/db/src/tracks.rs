@@ -1,46 +1,22 @@
-use std::{borrow::Borrow, collections::HashMap};
+use std::{
+    borrow::Borrow,
+    collections::{HashMap, HashSet},
+};
 
-use chrono::{DateTime, Utc};
+use diesel::{
+    dsl::now,
+    prelude::*,
+    sql_query,
+    sql_types::{Integer, Text},
+};
+use diesel_async::RunQueryDsl;
 use engine::orchestrator::deps::{CachedTrack, SaveTrackInput};
-use welds::connections::{Client, Param};
 
-use crate::{DbError, Track};
-
-fn row_value<
-    T: Send + 'static + for<'a> sqlx::Decode<'a, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>,
->(
-    row: &welds::connections::Row,
-    column: &str,
-) -> Result<T, DbError> {
-    row.get(column)
-        .map_err(|error| DbError::Row(error.to_string()))
-}
-
-fn track_from_row(row: &welds::connections::Row) -> Result<Track, DbError> {
-    Ok(Track {
-        id: row_value(row, "id")?,
-        apple_track_id: row_value(row, "apple_track_id")?,
-        message_id: row_value(row, "message_id")?,
-        file_id: row_value(row, "file_id")?,
-        file_unique_id: row_value(row, "file_unique_id")?,
-        title: row_value(row, "title")?,
-        artist: row_value(row, "artist")?,
-        album: row_value(row, "album")?,
-        duration: row_value(row, "duration")?,
-        bit_depth: row_value(row, "bit_depth")?,
-        sample_rate: row_value(row, "sample_rate")?,
-        genre: row_value(row, "genre")?,
-        release_date: row_value(row, "release_date")?,
-        track_number: row_value(row, "track_number")?,
-        track_count: row_value(row, "track_count")?,
-        created_at: row_value(row, "created_at")?,
-        updated_at: row_value(row, "updated_at")?,
-    })
-}
+use crate::{models::NewTrack, schema::tracks, DbError, DbPool, Track};
 
 fn cached_track(track: Track) -> CachedTrack {
     CachedTrack {
-        apple_track_id: track.apple_track_id,
+        track_key: engine::TrackKey::new(track.provider, track.track_id),
         message_id: i64::from(track.message_id),
         file_id: track.file_id,
         file_unique_id: track.file_unique_id,
@@ -53,57 +29,61 @@ fn cached_track(track: Track) -> CachedTrack {
 /// Database repository for the Telegram audio cache.
 #[derive(Clone)]
 pub struct TracksRepository {
-    client: welds::connections::postgres::PostgresClient,
+    pool: DbPool,
 }
 
 impl TracksRepository {
-    pub fn new(client: welds::connections::postgres::PostgresClient) -> Self {
-        Self { client }
+    pub fn new(pool: DbPool) -> Self {
+        Self { pool }
     }
 
     pub async fn find_cached_tracks(
         &self,
-        apple_track_ids: &[String],
-    ) -> Result<HashMap<String, CachedTrack>, DbError> {
-        let unique_ids: Vec<String> = apple_track_ids
+        track_keys: &[engine::TrackKey],
+    ) -> Result<HashMap<engine::TrackKey, CachedTrack>, DbError> {
+        let unique_keys: Vec<engine::TrackKey> = track_keys
             .iter()
-            .filter(|id| !id.is_empty())
+            .filter(|key| !key.track_id.is_empty())
             .cloned()
-            .collect::<std::collections::HashSet<_>>()
+            .collect::<HashSet<_>>()
             .into_iter()
             .collect();
-        if unique_ids.is_empty() {
+        if unique_keys.is_empty() {
             return Ok(HashMap::new());
         }
-
-        let rows = self
-            .client
-            .fetch_rows(
-                "SELECT * FROM tracks WHERE apple_track_id = ANY($1)",
-                &[&unique_ids as &(dyn Param + Sync)],
-            )
-            .await?;
-        let mut result = HashMap::with_capacity(rows.len());
-        for row in rows {
-            let track = track_from_row(&row)?;
-            result.insert(track.apple_track_id.clone(), cached_track(track));
+        let mut connection = self.pool.connection().await?;
+        let mut query = tracks::table.into_boxed();
+        for key in &unique_keys {
+            query = query.or_filter(
+                tracks::provider
+                    .eq(key.provider)
+                    .and(tracks::track_id.eq(&key.track_id)),
+            );
         }
-        Ok(result)
+        let rows = query
+            .select(Track::as_select())
+            .load::<Track>(&mut *connection)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|track| {
+                let key = engine::TrackKey::new(track.provider, track.track_id.clone());
+                (key, cached_track(track))
+            })
+            .collect())
     }
 
     pub async fn find_track_by_file_unique_id(
         &self,
         file_unique_id: &str,
     ) -> Result<Option<Track>, DbError> {
-        let file_unique_id = file_unique_id.to_owned();
-        let rows = self
-            .client
-            .fetch_rows(
-                "SELECT * FROM tracks WHERE file_unique_id = $1 LIMIT 1",
-                &[&file_unique_id as &(dyn Param + Sync)],
-            )
-            .await?;
-        rows.first().map(track_from_row).transpose()
+        let mut connection = self.pool.connection().await?;
+        Ok(tracks::table
+            .filter(tracks::file_unique_id.eq(file_unique_id))
+            .select(Track::as_select())
+            .first::<Track>(&mut *connection)
+            .await
+            .optional()?)
     }
 
     pub async fn save_track<I>(&self, input: I) -> Result<Track, DbError>
@@ -123,44 +103,65 @@ impl TracksRepository {
             .map_err(|error| DbError::Row(format!("track_number out of range: {error}")))?;
         let track_count = i32::try_from(input.track_count)
             .map_err(|error| DbError::Row(format!("track_count out of range: {error}")))?;
-        let params: [&(dyn Param + Sync); 14] = [
-            &input.apple_track_id,
-            &message_id,
-            &input.file_id,
-            &input.file_unique_id,
-            &input.title,
-            &input.artist,
-            &input.album,
-            &duration,
-            &bit_depth,
-            &sample_rate,
-            &input.genre,
-            &input.release_date,
-            &track_number,
-            &track_count,
-        ];
-        let rows = self
-            .client
-            .fetch_rows(
-                "INSERT INTO tracks (apple_track_id, message_id, file_id, file_unique_id, title, artist, album, duration, bit_depth, sample_rate, genre, release_date, track_number, track_count) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *",
-                &params,
-            )
+        let mut connection = self.pool.connection().await?;
+        let new_track = NewTrack {
+            provider: input.track_key.provider,
+            track_id: &input.track_key.track_id,
+            message_id,
+            file_id: &input.file_id,
+            file_unique_id: &input.file_unique_id,
+            title: &input.title,
+            artist: &input.artist,
+            album: &input.album,
+            duration,
+            bit_depth,
+            sample_rate,
+            genre: &input.genre,
+            release_date: &input.release_date,
+            track_number,
+            track_count,
+        };
+        diesel::insert_into(tracks::table)
+            .values(new_track)
+            .on_conflict((tracks::provider, tracks::track_id))
+            .do_update()
+            .set((
+                tracks::message_id.eq(message_id),
+                tracks::file_id.eq(&input.file_id),
+                tracks::file_unique_id.eq(&input.file_unique_id),
+                tracks::title.eq(&input.title),
+                tracks::artist.eq(&input.artist),
+                tracks::album.eq(&input.album),
+                tracks::duration.eq(duration),
+                tracks::bit_depth.eq(bit_depth),
+                tracks::sample_rate.eq(sample_rate),
+                tracks::genre.eq(&input.genre),
+                tracks::release_date.eq(&input.release_date),
+                tracks::track_number.eq(track_number),
+                tracks::track_count.eq(track_count),
+                tracks::updated_at.eq(now),
+            ))
+            .execute(&mut *connection)
             .await?;
-        rows.first()
-            .ok_or_else(|| DbError::Row("track insert returned no row".to_owned()))
-            .and_then(track_from_row)
+        tracks::table
+            .filter(tracks::provider.eq(input.track_key.provider))
+            .filter(tracks::track_id.eq(&input.track_key.track_id))
+            .select(Track::as_select())
+            .first::<Track>(&mut *connection)
+            .await
+            .map_err(DbError::from)
     }
 
-    pub async fn delete_track(&self, apple_track_id: &str) -> Result<bool, DbError> {
-        let apple_track_id = apple_track_id.to_owned();
-        let result = self
-            .client
-            .execute(
-                "DELETE FROM tracks WHERE apple_track_id = $1",
-                &[&apple_track_id as &(dyn Param + Sync)],
-            )
-            .await?;
-        Ok(result.rows_affected() > 0)
+    pub async fn delete_track(&self, track_key: &engine::TrackKey) -> Result<bool, DbError> {
+        let mut connection = self.pool.connection().await?;
+        Ok(diesel::delete(
+            tracks::table
+                .filter(tracks::provider.eq(track_key.provider))
+                .filter(tracks::track_id.eq(&track_key.track_id)),
+        )
+        .execute(&mut *connection)
+        .await?
+            > 0)
     }
 
     pub async fn search_cached_tracks(
@@ -173,52 +174,46 @@ impl TracksRepository {
             return Ok(Vec::new());
         }
         let pattern = format!("%{trimmed}%");
-        let trimmed = trimmed.to_owned();
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        // TS parity (track.repository.ts): id equality, per-column ILIKE, and
-        // a pg_trgm `word_similarity` fuzzy clause over the concatenated
-        // title/artist/album, ordered by match class then similarity.
-        let rows = self
-            .client
-            .fetch_rows(
-                "SELECT * FROM tracks WHERE apple_track_id = $1 OR title ILIKE $2 OR artist ILIKE $2 OR album ILIKE $2 OR word_similarity($1, title || ' ' || artist || ' ' || album) >= 0.35 ORDER BY CASE WHEN apple_track_id = $1 THEN 3 WHEN (title ILIKE $2 OR artist ILIKE $2 OR album ILIKE $2) THEN 2 ELSE 1 END DESC, word_similarity($1, title || ' ' || artist || ' ' || album) DESC LIMIT $3",
-                &[
-                    &trimmed as &(dyn Param + Sync),
-                    &pattern as &(dyn Param + Sync),
-                    &limit as &(dyn Param + Sync),
-                ],
-            )
-            .await?;
-        rows.iter().map(track_from_row).collect()
+        let limit = i32::try_from(limit).unwrap_or(i32::MAX);
+        let mut connection = self.pool.connection().await?;
+        Ok(sql_query("SELECT * FROM tracks WHERE (provider = 'apple' AND track_id = $1) OR title ILIKE $2 OR artist ILIKE $2 OR album ILIKE $2 OR word_similarity($1, title || ' ' || artist || ' ' || album) >= 0.35 ORDER BY CASE WHEN provider = 'apple' AND track_id = $1 THEN 3 WHEN (title ILIKE $2 OR artist ILIKE $2 OR album ILIKE $2) THEN 2 ELSE 1 END DESC, word_similarity($1, title || ' ' || artist || ' ' || album) DESC LIMIT $3")
+            .bind::<Text, _>(trimmed)
+            .bind::<Text, _>(&pattern)
+            .bind::<Integer, _>(limit)
+            .load::<Track>(&mut *connection)
+            .await?)
     }
 
-    pub async fn get_all_track_ids(&self) -> Result<Vec<String>, DbError> {
-        let rows = self
-            .client
-            .fetch_rows("SELECT apple_track_id FROM tracks", &[])
+    pub async fn get_all_track_ids(&self) -> Result<Vec<engine::TrackKey>, DbError> {
+        let mut connection = self.pool.connection().await?;
+        let rows = tracks::table
+            .select((tracks::provider, tracks::track_id))
+            .load::<(engine::Provider, String)>(&mut *connection)
             .await?;
-        rows.iter()
-            .map(|row| row_value(row, "apple_track_id"))
-            .collect()
+        Ok(rows
+            .into_iter()
+            .map(|(provider, track_id)| engine::TrackKey::new(provider, track_id))
+            .collect())
     }
 
-    pub async fn delete_tracks_not_in(&self, valid_track_ids: &[String]) -> Result<u64, DbError> {
-        let result = if valid_track_ids.is_empty() {
-            self.client.execute("DELETE FROM tracks", &[]).await?
-        } else {
-            let valid_track_ids = valid_track_ids.to_vec();
-            self.client
-                .execute(
-                    "DELETE FROM tracks WHERE NOT (apple_track_id = ANY($1))",
-                    &[&valid_track_ids as &(dyn Param + Sync)],
-                )
-                .await?
-        };
-        Ok(result.rows_affected())
+    pub async fn delete_tracks_not_in(
+        &self,
+        valid_track_keys: &[engine::TrackKey],
+    ) -> Result<u64, DbError> {
+        let mut connection = self.pool.connection().await?;
+        let valid: HashSet<_> = valid_track_keys.iter().cloned().collect();
+        let rows = tracks::table
+            .select((tracks::id, tracks::provider, tracks::track_id))
+            .load::<(i32, engine::Provider, String)>(&mut *connection)
+            .await?;
+        let mut count = 0_u64;
+        for (id, provider, track_id) in rows {
+            if !valid.contains(&engine::TrackKey::new(provider, track_id)) {
+                count += diesel::delete(tracks::table.filter(tracks::id.eq(id)))
+                    .execute(&mut *connection)
+                    .await? as u64;
+            }
+        }
+        Ok(count)
     }
 }
-
-// Keep these imports in this module's type-check surface: the model's timestamp
-// fields intentionally mirror the schema's timestamptz columns.
-#[allow(dead_code)]
-fn _timestamp_type_check(_: DateTime<Utc>) {}

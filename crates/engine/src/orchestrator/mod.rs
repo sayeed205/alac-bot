@@ -35,7 +35,7 @@ use crate::{
     queue::{EnqueueOptions, SequentialRipQueue},
     ripper::RipProgressCallback,
     settings::BotSettings,
-    types::{AlbumTracks, ArtistTracks, TargetKind, TrackRipResult},
+    types::{AlbumTracks, ArtistTracks, Provider, TargetKind, TrackKey, TrackRipResult},
 };
 
 /// All orchestrator failures surface as messages (TS `new Error(msg)`), while
@@ -603,7 +603,10 @@ impl RipOrchestrator {
         self.set_phase(&shared, JobPhase::CheckingCache);
         self.bus
             .emit_progress(&shared, Some("Checking local cache..."), None, None);
-        let requested_ids: Vec<String> = tracks_to_process.iter().map(|t| t.id.clone()).collect();
+        let requested_ids: Vec<TrackKey> = tracks_to_process
+            .iter()
+            .map(|t| TrackKey::new(Provider::Apple, t.id.clone()))
+            .collect();
         let mut existing_tracks_map = deps
             .find_cached_tracks(&requested_ids)
             .await
@@ -613,10 +616,14 @@ impl RipOrchestrator {
         if options.is_force && options.is_admin {
             let mut old_message_ids: Vec<i64> = Vec::new();
             for item in &tracks_to_process {
-                if let Some(cached) = existing_tracks_map.remove(&item.id) {
+                if let Some(cached) =
+                    existing_tracks_map.remove(&TrackKey::new(Provider::Apple, item.id.clone()))
+                {
                     old_message_ids.push(cached.message_id);
                     // TS: deleteTrack per item, errors swallowed.
-                    let _ = deps.delete_track(&item.id).await;
+                    let _ = deps
+                        .delete_track(&TrackKey::new(Provider::Apple, item.id.clone()))
+                        .await;
                 }
             }
             if !old_message_ids.is_empty() {
@@ -641,7 +648,9 @@ impl RipOrchestrator {
                 ));
             }
 
-            let Some(cached) = existing_tracks_map.get(&item.id) else {
+            let Some(cached) =
+                existing_tracks_map.get(&TrackKey::new(Provider::Apple, item.id.clone()))
+            else {
                 uncached_items.push(item.clone());
                 continue;
             };
@@ -671,7 +680,7 @@ impl RipOrchestrator {
                     deps.log_request(RequestLog {
                         telegram_id: options.user_id,
                         chat_id: options.chat_id,
-                        apple_track_id: item.id.clone(),
+                        track_key: TrackKey::new(Provider::Apple, item.id.clone()),
                         is_cache_hit: true,
                         duration_ms: Some(0),
                         status: "completed".to_string(),
@@ -1020,7 +1029,7 @@ async fn run_pipeline<D: OrchestratorDeps>(
                         .log_request(RequestLog {
                             telegram_id: options.user_id,
                             chat_id: options.chat_id,
-                            apple_track_id: item.track_id.clone(),
+                            track_key: TrackKey::new(Provider::Apple, item.track_id.clone()),
                             is_cache_hit: false,
                             duration_ms: Some(duration_ms),
                             status: "failed".to_string(),
@@ -1152,7 +1161,7 @@ async fn upload_one<D: OrchestratorDeps>(
     };
 
     let caption = format_dump_caption(&DumpCaptionMetadata {
-        apple_track_id: &track_id,
+        track_key: TrackKey::new(Provider::Apple, track_id.clone()),
         title: &rip_result.title,
         artist: &rip_result.artist,
         album: &rip_result.album,
@@ -1334,7 +1343,7 @@ async fn upload_one<D: OrchestratorDeps>(
         deps.log_request(RequestLog {
             telegram_id: options.user_id,
             chat_id: options.chat_id,
-            apple_track_id: track_id.clone(),
+            track_key: TrackKey::new(Provider::Apple, track_id.clone()),
             is_cache_hit: false,
             duration_ms: Some(total_duration_ms),
             status: "completed".to_string(),
@@ -1410,7 +1419,7 @@ async fn record_failure<D: OrchestratorDeps>(
         .log_request(RequestLog {
             telegram_id: options.user_id,
             chat_id: options.chat_id,
-            apple_track_id: track_id.to_string(),
+            track_key: TrackKey::new(Provider::Apple, track_id),
             is_cache_hit: false,
             duration_ms: Some((now_ms() - start_time_ms) as i64),
             status: "failed".to_string(),

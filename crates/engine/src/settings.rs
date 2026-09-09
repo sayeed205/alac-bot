@@ -1,8 +1,8 @@
 //! Bot settings: ripping mode + feature flags (port of
 //! `src/modules/settings/types.ts` + the pure logic of `service.ts`).
 //!
-//! The DB-backed `SettingsService` (key-value rows, write-through cache)
-//! lives in the db crate (M5b); this module carries the domain types,
+//! The DB-backed `SettingsStore` (typed singleton, write-through cache)
+//! lives in the db crate; this module carries the domain types,
 //! defaults, and permission logic with exact TS parity.
 
 /// Whether the bot rips live, serves cache only, or is paused.

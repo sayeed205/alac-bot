@@ -103,8 +103,8 @@ fn format_stats_html(stats: &db::AlacStats) -> String {
                 format!(
                     "{}. <a href=\"https://music.apple.com/song/{}\"><code>{}</code></a> — <b>{}</b> request{}",
                     index + 1,
-                    track.apple_track_id,
-                    track.apple_track_id,
+                    track.track_key.track_id,
+                    track.track_key.track_id,
                     track.request_count,
                     if track.request_count > 1 { "s" } else { "" }
                 )
@@ -335,7 +335,7 @@ mod tests {
             avg_cache_duration_ms: 12,
             total_failed_requests: 1,
             top_tracks: vec![db::TopTrackStat {
-                apple_track_id: "123".to_owned(),
+                track_key: engine::TrackKey::apple("123"),
                 request_count: 2,
             }],
         };

@@ -31,7 +31,7 @@ pub struct BotState {
     pub stats: Option<db::StatsRepository>,
     /// Raw DB client for the dump service (`/export`, `/import`) — cheap
     /// Arc-pool clone shared with the repositories.
-    pub db_client: welds::connections::postgres::PostgresClient,
+    pub db_client: db::DbPool,
     /// Process start, for `/health` uptime (oracle process.uptime()).
     pub started_at: Instant,
 }

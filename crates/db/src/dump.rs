@@ -1,18 +1,24 @@
-//! Database dump export/import (oracle: `src/db/dump.ts`).
+//! Versioned, typed database archive export/import.
 //!
-//! Export: SELECT all rows → build transactional upsert SQL statements →
-//! gzip → `.sql.gz` document. Import: gunzip → execute every statement in
-//! one transaction (rollback on failure). Statement counting mirrors the
-//! oracle's "merged" numbers.
+//! The wire format is JSON compressed with gzip.  JSON's explicit null and
+//! string escaping rules make this safe for names, error messages, and other
+//! values containing newlines or SQL punctuation; no SQL is generated or
+//! parsed during restore.
 
-use std::time::Instant;
+use std::{io::Write, time::Instant};
 
+use diesel::prelude::*;
+use diesel_async::RunQueryDsl;
 use flate2::{write::GzEncoder, Compression};
-use welds::connections::{transaction::Transaction, Client, TransactStart};
+use serde::{Deserialize, Serialize};
 
-use crate::DbError;
+use crate::{
+    schema::{requests, settings, tracks, users},
+    DbError, DbPool, Request, SettingsRow, Track, User,
+};
 
-/// Oracle DumpStats.
+const ARCHIVE_VERSION: u32 = 2;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DumpStats {
     pub users_count: i64,
@@ -21,7 +27,6 @@ pub struct DumpStats {
     pub bytes: usize,
 }
 
-/// Oracle RestoreStats.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoreStats {
     pub users_merged: u64,
@@ -30,262 +35,303 @@ pub struct RestoreStats {
     pub duration_ms: u128,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct Archive {
+    format_version: u32,
+    generated_at: String,
+    users: Vec<UserArchive>,
+    tracks: Vec<TrackArchive>,
+    requests: Vec<RequestArchive>,
+    settings: SettingsArchive,
+}
+
+#[derive(Debug, Serialize, Deserialize, Insertable)]
+#[diesel(table_name = users)]
+struct UserArchive {
+    telegram_id: i64,
+    name: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Insertable)]
+#[diesel(table_name = tracks)]
+struct TrackArchive {
+    provider: engine::Provider,
+    track_id: String,
+    message_id: i32,
+    file_id: String,
+    file_unique_id: String,
+    title: String,
+    artist: String,
+    album: String,
+    duration: i32,
+    bit_depth: i32,
+    sample_rate: i32,
+    genre: String,
+    release_date: String,
+    track_number: i32,
+    track_count: i32,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Insertable)]
+#[diesel(table_name = requests)]
+struct RequestArchive {
+    telegram_id: i64,
+    chat_id: i64,
+    provider: engine::Provider,
+    track_id: String,
+    is_cache_hit: bool,
+    duration_ms: Option<i32>,
+    status: String,
+    error_reason: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SettingsArchive {
+    id: i16,
+    ripping_mode: String,
+    album_rip_enabled: bool,
+    playlist_rip_enabled: bool,
+    artist_rip_enabled: bool,
+    txt_rip_enabled: bool,
+    multi_link_rip_enabled: bool,
+    max_collection_tracks: i32,
+    auto_dump_enabled: bool,
+    auto_dump_storefronts: Vec<String>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
 pub struct DbDumpService {
-    client: welds::connections::postgres::PostgresClient,
+    pool: DbPool,
 }
 
 impl DbDumpService {
-    pub fn new(client: welds::connections::postgres::PostgresClient) -> Self {
-        Self { client }
+    pub fn new(pool: DbPool) -> Self {
+        Self { pool }
     }
 
-    /// Export the users/tracks/requests tables as a gzipped SQL dump.
     pub async fn export_dump(&self) -> Result<(Vec<u8>, DumpStats, String), DbError> {
         let started = Instant::now();
-        let mut lines: Vec<String> = Vec::new();
-        // Oracle header lines.
-        lines.push("-- ALAC Telegram Bot Database Dump".to_owned());
-        lines.push(format!(
-            "-- Generated: {}",
-            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-        ));
-        lines.push("-- Format: SQL-GZ Transactional Upsert Dump".to_owned());
-        lines.push(String::new());
-
-        let users = self
-            .client
-            .fetch_rows("SELECT telegram_id, name, created_at FROM users", &[])
+        let mut connection = self.pool.connection().await?;
+        let users = users::table
+            .select(User::as_select())
+            .load::<User>(&mut *connection)
             .await?;
-        let users_count = users.len() as i64;
-        for row in users {
-            let telegram_id: i64 = row
-                .get("telegram_id")
-                .map_err(|error| DbError::Row(error.to_string()))?;
-            let name: Option<String> = row
-                .get("name")
-                .map_err(|error| DbError::Row(error.to_string()))?;
-            let created_at: chrono::NaiveDateTime = row
-                .get("created_at")
-                .map_err(|error| DbError::Row(error.to_string()))?;
-            lines.push(format!(
-                "INSERT INTO users (telegram_id, name, created_at) VALUES ({}, {}, '{}') ON CONFLICT (telegram_id) DO UPDATE SET name = EXCLUDED.name, created_at = LEAST(users.created_at, EXCLUDED.created_at);",
-                telegram_id,
-                escape_sql_string(name.as_deref().unwrap_or("")),
-                created_at
-            ));
-        }
-
-        let tracks = self.client.fetch_rows("SELECT * FROM tracks", &[]).await?;
-        let tracks_count = tracks.len() as i64;
-        for row in tracks {
-            let apple_track_id: String = row
-                .get("apple_track_id")
-                .map_err(|error| DbError::Row(error.to_string()))?;
-            let message_id: i32 = row
-                .get("message_id")
-                .map_err(|error| DbError::Row(error.to_string()))?;
-            let file_id: String = row
-                .get("file_id")
-                .map_err(|error| DbError::Row(error.to_string()))?;
-            let file_unique_id: String = row
-                .get("file_unique_id")
-                .map_err(|error| DbError::Row(error.to_string()))?;
-            let title: String = row
-                .get("title")
-                .map_err(|error| DbError::Row(error.to_string()))?;
-            let artist: String = row
-                .get("artist")
-                .map_err(|error| DbError::Row(error.to_string()))?;
-            let album: String = row
-                .get("album")
-                .map_err(|error| DbError::Row(error.to_string()))?;
-            let duration: i32 = row
-                .get("duration")
-                .map_err(|error| DbError::Row(error.to_string()))?;
-            let bit_depth: i32 = row
-                .get("bit_depth")
-                .map_err(|error| DbError::Row(error.to_string()))?;
-            let sample_rate: i32 = row
-                .get("sample_rate")
-                .map_err(|error| DbError::Row(error.to_string()))?;
-            let genre: String = row
-                .get("genre")
-                .map_err(|error| DbError::Row(error.to_string()))?;
-            let release_date: String = row
-                .get("release_date")
-                .map_err(|error| DbError::Row(error.to_string()))?;
-            let track_number: i32 = row
-                .get("track_number")
-                .map_err(|error| DbError::Row(error.to_string()))?;
-            let track_count: i32 = row
-                .get("track_count")
-                .map_err(|error| DbError::Row(error.to_string()))?;
-            let created_at: chrono::NaiveDateTime = row
-                .get("created_at")
-                .map_err(|error| DbError::Row(error.to_string()))?;
-            let updated_at: chrono::NaiveDateTime = row
-                .get("updated_at")
-                .map_err(|error| DbError::Row(error.to_string()))?;
-            lines.push(format!(
-                "INSERT INTO tracks (apple_track_id, message_id, file_id, file_unique_id, title, artist, album, duration, bit_depth, sample_rate, genre, release_date, track_number, track_count, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, '{}', '{}') ON CONFLICT (apple_track_id) DO UPDATE SET message_id = EXCLUDED.message_id, file_id = EXCLUDED.file_id, file_unique_id = EXCLUDED.file_unique_id, title = EXCLUDED.title, artist = EXCLUDED.artist, album = EXCLUDED.album, duration = EXCLUDED.duration, bit_depth = EXCLUDED.bit_depth, sample_rate = EXCLUDED.sample_rate, genre = EXCLUDED.genre, release_date = EXCLUDED.release_date, track_number = EXCLUDED.track_number, track_count = EXCLUDED.track_count, updated_at = GREATEST(tracks.updated_at, EXCLUDED.updated_at);",
-                escape_sql_string(&apple_track_id),
-                message_id,
-                escape_sql_string(&file_id),
-                escape_sql_string(&file_unique_id),
-                escape_sql_string(&title),
-                escape_sql_string(&artist),
-                escape_sql_string(&album),
-                duration,
-                bit_depth,
-                sample_rate,
-                escape_sql_string(&genre),
-                escape_sql_string(&release_date),
-                track_number,
-                track_count,
-                created_at,
-                updated_at
-            ));
-        }
-
-        let requests = self
-            .client
-            .fetch_rows("SELECT * FROM requests", &[])
+        let tracks = tracks::table
+            .select(Track::as_select())
+            .load::<Track>(&mut *connection)
             .await?;
-        let requests_count = requests.len() as i64;
-        for row in requests {
-            let telegram_id: i64 = row
-                .get("telegram_id")
-                .map_err(|error| DbError::Row(error.to_string()))?;
-            let chat_id: i64 = row
-                .get("chat_id")
-                .map_err(|error| DbError::Row(error.to_string()))?;
-            let apple_track_id: String = row
-                .get("apple_track_id")
-                .map_err(|error| DbError::Row(error.to_string()))?;
-            let is_cache_hit: bool = row
-                .get("is_cache_hit")
-                .map_err(|error| DbError::Row(error.to_string()))?;
-            let duration_ms: Option<i32> = row
-                .get("duration_ms")
-                .map_err(|error| DbError::Row(error.to_string()))?;
-            let status: String = row
-                .get("status")
-                .map_err(|error| DbError::Row(error.to_string()))?;
-            let error_reason: Option<String> = row
-                .get("error_reason")
-                .map_err(|error| DbError::Row(error.to_string()))?;
-            let created_at: chrono::NaiveDateTime = row
-                .get("created_at")
-                .map_err(|error| DbError::Row(error.to_string()))?;
-            lines.push(format!(
-                "INSERT INTO requests (telegram_id, chat_id, apple_track_id, is_cache_hit, duration_ms, status, error_reason, created_at) VALUES ({}, {}, {}, {}, {}, {}, {}, '{}');",
-                telegram_id,
-                chat_id,
-                escape_sql_string(&apple_track_id),
-                if is_cache_hit { "TRUE" } else { "FALSE" },
-                duration_ms.map(|v| v.to_string()).unwrap_or_else(|| "NULL".to_owned()),
-                escape_sql_string(&status),
-                escape_sql_string(error_reason.as_deref().unwrap_or("")),
-                created_at
-            ));
-        }
-
-        lines.push(
-            "SELECT setval(pg_get_serial_sequence('tracks', 'id'), COALESCE((SELECT MAX(id) FROM tracks), 1), (SELECT MAX(id) IS NOT NULL FROM tracks));"
-                .to_owned(),
-        );
-        lines.push(
-            "SELECT setval(pg_get_serial_sequence('requests', 'id'), COALESCE((SELECT MAX(id) FROM requests), 1), (SELECT MAX(id) IS NOT NULL FROM requests));"
-                .to_owned(),
-        );
-
-        let sql_content = lines.join("\n");
+        let requests = requests::table
+            .select(Request::as_select())
+            .load::<Request>(&mut *connection)
+            .await?;
+        let settings = settings::table
+            .select(SettingsRow::as_select())
+            .first::<SettingsRow>(&mut *connection)
+            .await?;
+        let archive = Archive {
+            format_version: ARCHIVE_VERSION,
+            generated_at: chrono::Utc::now().to_rfc3339(),
+            users: users.into_iter().map(UserArchive::from).collect(),
+            tracks: tracks.into_iter().map(TrackArchive::from).collect(),
+            requests: requests.into_iter().map(RequestArchive::from).collect(),
+            settings: SettingsArchive::from(settings),
+        };
+        let json = serde_json::to_vec(&archive)
+            .map_err(|error| DbError::Row(format!("archive encode failed: {error}")))?;
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        std::io::Write::write_all(&mut encoder, sql_content.as_bytes())
+        encoder
+            .write_all(&json)
             .map_err(|error| DbError::Row(format!("gzip encode failed: {error}")))?;
         let compressed = encoder
             .finish()
             .map_err(|error| DbError::Row(format!("gzip finish failed: {error}")))?;
-
-        // Oracle: ISO timestamp with : and . replaced by -, first 19 chars.
-        let bytes = compressed.len();
-        let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        let timestamp_str: String = timestamp
-            .chars()
-            .map(|c| if c == ':' || c == '.' { '-' } else { c })
-            .take(19)
-            .collect();
-        let filename = format!("alac_dump_{timestamp_str}.sql.gz");
-
-        tracing::info!(
-            users = users_count,
-            tracks = tracks_count,
-            requests = requests_count,
-            elapsed_ms = started.elapsed().as_millis(),
-            "database dump exported"
+        let filename = format!(
+            "alac_dump_{}.json.gz",
+            chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S")
         );
-
-        Ok((
-            compressed,
-            DumpStats {
-                users_count,
-                tracks_count,
-                requests_count,
-                bytes,
-            },
-            filename,
-        ))
+        let stats = DumpStats {
+            users_count: archive.users.len() as i64,
+            tracks_count: archive.tracks.len() as i64,
+            requests_count: archive.requests.len() as i64,
+            bytes: compressed.len(),
+        };
+        tracing::info!(
+            users = stats.users_count,
+            tracks = stats.tracks_count,
+            requests = stats.requests_count,
+            elapsed_ms = started.elapsed().as_millis(),
+            "database archive exported"
+        );
+        Ok((compressed, stats, filename))
     }
 
-    /// Restore a gzipped SQL dump inside one transaction.
+    /// Restore a typed archive inside one transaction. Every row is decoded
+    /// before the transaction starts, so malformed input cannot partially
+    /// modify the database.
     pub async fn import_dump(&self, gzip_bytes: &[u8]) -> Result<RestoreStats, DbError> {
         let started = Instant::now();
-        let decompressed = gunzip(gzip_bytes)?;
-        let sql_text = String::from_utf8(decompressed)
-            .map_err(|error| DbError::Row(format!("dump is not valid UTF-8: {error}")))?;
-
-        let statements: Vec<&str> = sql_text
-            .split('\n')
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with("--"))
-            .collect();
-
-        let mut users_merged = 0u64;
-        let mut tracks_merged = 0u64;
-        let mut requests_merged = 0u64;
-        for stmt in &statements {
-            if stmt.starts_with("INSERT INTO users") {
-                users_merged += 1;
-            } else if stmt.starts_with("INSERT INTO tracks") {
-                tracks_merged += 1;
-            } else if stmt.starts_with("INSERT INTO requests") {
-                requests_merged += 1;
-            }
+        let archive: Archive = serde_json::from_slice(&gunzip(gzip_bytes)?)
+            .map_err(|error| DbError::Row(format!("invalid archive: {error}")))?;
+        if archive.format_version != ARCHIVE_VERSION {
+            return Err(DbError::Row(format!(
+                "unsupported archive version {}",
+                archive.format_version
+            )));
         }
-
-        let tx: Transaction<'_> = self.client.begin().await?;
-        for stmt in &statements {
-            if let Err(error) = tx.execute(stmt, &[]).await {
-                tx.rollback().await.ok();
-                return Err(DbError::Database(error));
-            }
-        }
-        tx.commit().await?;
-
+        let users_merged = archive.users.len() as u64;
+        let tracks_merged = archive.tracks.len() as u64;
+        let requests_merged = archive.requests.len() as u64;
+        let mut connection = self.pool.connection().await?;
+        connection
+            .build_transaction()
+            .run(|transaction| {
+                Box::pin(async move {
+                    for row in archive.users {
+                        diesel::insert_into(users::table)
+                            .values(row)
+                            .on_conflict(users::telegram_id)
+                            .do_update()
+                            .set((
+                                users::name.eq(diesel::upsert::excluded(users::name)),
+                                users::created_at.eq(diesel::upsert::excluded(users::created_at)),
+                            ))
+                            .execute(transaction)
+                            .await?;
+                    }
+                    for row in archive.tracks {
+                        diesel::insert_into(tracks::table)
+                            .values(row)
+                            .on_conflict((tracks::provider, tracks::track_id))
+                            .do_update()
+                            .set((
+                                tracks::message_id.eq(diesel::upsert::excluded(tracks::message_id)),
+                                tracks::file_id.eq(diesel::upsert::excluded(tracks::file_id)),
+                                tracks::file_unique_id
+                                    .eq(diesel::upsert::excluded(tracks::file_unique_id)),
+                                tracks::title.eq(diesel::upsert::excluded(tracks::title)),
+                                tracks::artist.eq(diesel::upsert::excluded(tracks::artist)),
+                                tracks::album.eq(diesel::upsert::excluded(tracks::album)),
+                                tracks::duration.eq(diesel::upsert::excluded(tracks::duration)),
+                                tracks::bit_depth.eq(diesel::upsert::excluded(tracks::bit_depth)),
+                                tracks::sample_rate
+                                    .eq(diesel::upsert::excluded(tracks::sample_rate)),
+                                tracks::genre.eq(diesel::upsert::excluded(tracks::genre)),
+                                tracks::release_date
+                                    .eq(diesel::upsert::excluded(tracks::release_date)),
+                                tracks::track_number
+                                    .eq(diesel::upsert::excluded(tracks::track_number)),
+                                tracks::track_count
+                                    .eq(diesel::upsert::excluded(tracks::track_count)),
+                                tracks::created_at.eq(diesel::upsert::excluded(tracks::created_at)),
+                                tracks::updated_at.eq(diesel::upsert::excluded(tracks::updated_at)),
+                            ))
+                            .execute(transaction)
+                            .await?;
+                    }
+                    for row in archive.requests {
+                        diesel::insert_into(requests::table)
+                            .values(row)
+                            .execute(transaction)
+                            .await?;
+                    }
+                    let row = archive.settings;
+                    diesel::update(settings::table.filter(settings::id.eq(1_i16)))
+                        .set((
+                            settings::ripping_mode.eq(row.ripping_mode),
+                            settings::album_rip_enabled.eq(row.album_rip_enabled),
+                            settings::playlist_rip_enabled.eq(row.playlist_rip_enabled),
+                            settings::artist_rip_enabled.eq(row.artist_rip_enabled),
+                            settings::txt_rip_enabled.eq(row.txt_rip_enabled),
+                            settings::multi_link_rip_enabled.eq(row.multi_link_rip_enabled),
+                            settings::max_collection_tracks.eq(row.max_collection_tracks),
+                            settings::auto_dump_enabled.eq(row.auto_dump_enabled),
+                            settings::auto_dump_storefronts.eq(row.auto_dump_storefronts),
+                            settings::updated_at.eq(row.updated_at),
+                        ))
+                        .execute(transaction)
+                        .await?;
+                    Ok::<(), diesel::result::Error>(())
+                })
+            })
+            .await?;
         let stats = RestoreStats {
             users_merged,
             tracks_merged,
             requests_merged,
             duration_ms: started.elapsed().as_millis(),
         };
-        tracing::info!(?stats, "database dump imported");
+        tracing::info!(?stats, "database archive imported");
         Ok(stats)
     }
 }
 
-/// Oracle escapeSqlString: wrap in single quotes, doubling embedded quotes.
-fn escape_sql_string(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+impl From<User> for UserArchive {
+    fn from(row: User) -> Self {
+        Self {
+            telegram_id: row.telegram_id,
+            name: row.name,
+            created_at: row.created_at,
+        }
+    }
+}
+impl From<Track> for TrackArchive {
+    fn from(row: Track) -> Self {
+        Self {
+            provider: row.provider,
+            track_id: row.track_id,
+            message_id: row.message_id,
+            file_id: row.file_id,
+            file_unique_id: row.file_unique_id,
+            title: row.title,
+            artist: row.artist,
+            album: row.album,
+            duration: row.duration,
+            bit_depth: row.bit_depth,
+            sample_rate: row.sample_rate,
+            genre: row.genre,
+            release_date: row.release_date,
+            track_number: row.track_number,
+            track_count: row.track_count,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
+}
+impl From<Request> for RequestArchive {
+    fn from(row: Request) -> Self {
+        Self {
+            telegram_id: row.telegram_id,
+            chat_id: row.chat_id,
+            provider: row.provider,
+            track_id: row.track_id,
+            is_cache_hit: row.is_cache_hit,
+            duration_ms: row.duration_ms,
+            status: row.status,
+            error_reason: row.error_reason,
+            created_at: row.created_at,
+        }
+    }
+}
+impl From<SettingsRow> for SettingsArchive {
+    fn from(row: SettingsRow) -> Self {
+        Self {
+            id: row.id,
+            ripping_mode: row.ripping_mode,
+            album_rip_enabled: row.album_rip_enabled,
+            playlist_rip_enabled: row.playlist_rip_enabled,
+            artist_rip_enabled: row.artist_rip_enabled,
+            txt_rip_enabled: row.txt_rip_enabled,
+            multi_link_rip_enabled: row.multi_link_rip_enabled,
+            max_collection_tracks: row.max_collection_tracks,
+            auto_dump_enabled: row.auto_dump_enabled,
+            auto_dump_storefronts: row.auto_dump_storefronts,
+            updated_at: row.updated_at,
+        }
+    }
 }
 
 fn gunzip(bytes: &[u8]) -> Result<Vec<u8>, DbError> {
@@ -296,36 +342,4 @@ fn gunzip(bytes: &[u8]) -> Result<Vec<u8>, DbError> {
         .read_to_end(&mut out)
         .map_err(|error| DbError::Row(format!("gunzip failed: {error}")))?;
     Ok(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn escape_sql_string_doubles_quotes() {
-        assert_eq!(escape_sql_string("plain"), "'plain'");
-        assert_eq!(escape_sql_string("it's"), "'it''s'");
-        assert_eq!(escape_sql_string(""), "''");
-    }
-
-    #[test]
-    fn gzip_round_trip() {
-        use std::io::Write;
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(b"hello dump").unwrap();
-        let compressed = encoder.finish().unwrap();
-        assert_eq!(gunzip(&compressed).unwrap(), b"hello dump");
-    }
-
-    #[test]
-    fn dump_filename_format_matches_oracle() {
-        let timestamp = "2026-09-08T12:34:56.789Z";
-        let mapped: String = timestamp
-            .chars()
-            .map(|c| if c == ':' || c == '.' { '-' } else { c })
-            .take(19)
-            .collect();
-        assert_eq!(mapped, "2026-09-08T12-34-56");
-    }
 }
