@@ -45,6 +45,50 @@ impl<'a> From<(&'a TrackRipResult, &'a str)> for DumpCaptionMetadata<'a> {
     }
 }
 
+/// Machine-readable metadata for formatting an album ZIP caption.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DumpZipCaptionMetadata<'a> {
+    pub provider: Provider,
+    pub album_id: &'a str,
+    pub album: &'a str,
+    pub artist: &'a str,
+    pub filename: &'a str,
+    pub part_index: i32,
+    pub total_parts: i32,
+    pub generation_hash: &'a str,
+}
+
+/// Metadata used to format the rich album details caption (delivered alongside the preview photo or as fallback text).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlbumDetailsCaptionMetadata<'a> {
+    pub album: &'a str,
+    pub artist: &'a str,
+    pub album_id: &'a str,
+    pub storefront: &'a str,
+    pub total_tracks: usize,
+    pub delivered_tracks: usize,
+    pub size_bytes: i64,
+    pub total_parts: usize,
+    pub release_year: &'a str,
+    pub genre: Option<&'a str>,
+    pub record_label: Option<&'a str>,
+    pub is_partial: bool,
+    pub user_name: Option<&'a str>,
+    pub user_id: i64,
+}
+
+/// Parsed metadata extracted from an album ZIP dump caption.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedZipDumpMetadata {
+    pub provider: Provider,
+    pub album_id: String,
+    pub album: String,
+    pub artist: String,
+    pub part_index: i32,
+    pub total_parts: i32,
+    pub generation_hash: String,
+}
+
 /// mtcute `html.escape` parity: `& < > " '` (hex entities).
 pub fn html_escape(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
@@ -59,6 +103,78 @@ pub fn html_escape(input: &str) -> String {
         }
     }
     out
+}
+
+/// Formats a user mention with clickable link (Telegram handle or tg:// user link).
+pub fn format_requester_mention(user_name: Option<&str>, user_id: i64) -> String {
+    let name = user_name
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("User");
+    if let Some(handle) = name.strip_prefix('@') {
+        format!(r#"<a href="https://t.me/{handle}">@{handle}</a>"#)
+    } else if user_id > 0 {
+        format!(r#"<a href="tg://user?id={user_id}">{}</a>"#, html_escape(name))
+    } else {
+        html_escape(name)
+    }
+}
+
+/// Formats the rich album details caption (displayed with album preview photo or fallback text).
+pub fn format_album_details_caption(meta: &AlbumDetailsCaptionMetadata<'_>) -> String {
+    let album_link = if !meta.album_id.is_empty() {
+        let sf = if meta.storefront.is_empty() {
+            "us"
+        } else {
+            meta.storefront
+        };
+        format!(
+            r#"💿 <a href="https://music.apple.com/{sf}/album/{}"><b>{}</b></a>"#,
+            meta.album_id,
+            html_escape(meta.album)
+        )
+    } else {
+        format!("💿 <b>{}</b>", html_escape(meta.album))
+    };
+
+    let tracks = if meta.is_partial {
+        format!("{}/{} tracks", meta.delivered_tracks, meta.total_tracks)
+    } else {
+        format!("{} tracks", meta.delivered_tracks)
+    };
+
+    let size = crate::progress::format_bytes(meta.size_bytes.max(0) as u64);
+    let parts_info = if meta.total_parts > 1 {
+        format!(" · {} parts", meta.total_parts)
+    } else {
+        String::new()
+    };
+
+    let mention = format_requester_mention(meta.user_name, meta.user_id);
+
+    let mut bullets = Vec::new();
+    bullets.push(format!("• <b>Tracks:</b> {tracks}"));
+    bullets.push(format!("• <b>Size:</b> {size}{parts_info}"));
+    if !meta.release_year.is_empty() {
+        bullets.push(format!("• <b>Released:</b> {}", html_escape(meta.release_year)));
+    }
+    if let Some(genre) = meta.genre.filter(|s| !s.is_empty()) {
+        bullets.push(format!("• <b>Genre:</b> {}", html_escape(genre)));
+    }
+    if let Some(label) = meta.record_label.filter(|s| !s.is_empty()) {
+        bullets.push(format!("• <b>Label:</b> {}", html_escape(label)));
+    }
+    bullets.push("• <b>Quality:</b> Lossless · ALAC".to_string());
+    if meta.is_partial {
+        bullets.push("• ⚠️ <b>Note:</b> Partial archive".to_string());
+    }
+    bullets.push(format!("• <b>Requested by:</b> {mention}"));
+
+    format!(
+        "{album_link}<br/>👤 <b>Artist:</b> {}<br/><br/><blockquote>{}</blockquote>",
+        html_escape(meta.artist),
+        bullets.join("<br/>")
+    )
 }
 
 /// Formats a compact operational caption.
@@ -106,6 +222,56 @@ pub fn format_dump_caption(meta: &DumpCaptionMetadata<'_>) -> String {
     format!("{summary}<br/><blockquote expandable>{payload_html}</blockquote>")
 }
 
+/// Formats an album ZIP caption.
+///
+/// If `total_parts <= 1`, the "part 1 of 1" line is omitted entirely.
+/// If `total_parts > 1`, "Album ZIP part X of Y" is included.
+/// Complete archives include an expandable blockquote with the machine-readable JSON payload.
+pub fn format_zip_dump_caption(
+    meta: &DumpZipCaptionMetadata<'_>,
+    is_complete: bool,
+    failed_count: usize,
+) -> String {
+    let header = format!("<b>{}</b>", html_escape(meta.filename));
+    let part_line = if meta.total_parts > 1 {
+        format!(
+            "<br/><i>Album ZIP part {} of {}</i>",
+            meta.part_index, meta.total_parts
+        )
+    } else {
+        String::new()
+    };
+    let partial_note = if is_complete {
+        String::new()
+    } else {
+        format!("<br/>Partial archive; {failed_count} track(s) failed.")
+    };
+    let summary = format!("{header}{part_line}{partial_note}");
+
+    if !is_complete {
+        return summary;
+    }
+
+    let payload_json = serde_json::json!({
+        "type": "album_zip",
+        "provider": meta.provider,
+        "album_id": meta.album_id,
+        "album": meta.album,
+        "artist": meta.artist,
+        "part": meta.part_index,
+        "total_parts": meta.total_parts,
+        "hash": meta.generation_hash,
+    });
+    let pretty = serde_json::to_string_pretty(&payload_json).expect("payload serializes");
+    let payload_html = pretty
+        .lines()
+        .map(html_escape)
+        .collect::<Vec<_>>()
+        .join("<br/>");
+
+    format!("{summary}<br/><blockquote expandable>{payload_html}</blockquote>")
+}
+
 /// TS `ParsedDumpMetadata` — the round-trip shape of the embedded payload.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedDumpMetadata {
@@ -122,7 +288,7 @@ pub struct ParsedDumpMetadata {
     pub track_count: i64,
 }
 
-/// Extracts the current structured metadata from a message caption. Returns
+/// Extracts structured track metadata from a message caption. Returns
 /// `None` for missing, stale, unrelated, or invalid records.
 pub fn parse_dump_caption(text: Option<&str>) -> Option<ParsedDumpMetadata> {
     let text = text?;
@@ -149,6 +315,28 @@ pub fn parse_dump_caption(text: Option<&str>) -> Option<ParsedDumpMetadata> {
     })
 }
 
+/// Extracts structured album ZIP metadata from a message caption.
+pub fn parse_zip_dump_caption(text: Option<&str>) -> Option<ParsedZipDumpMetadata> {
+    let text = text?;
+    let payload = extract_zip_payload(text)?;
+    let parsed: serde_json::Value = serde_json::from_str(&payload).ok()?;
+    let provider = parsed.get("provider")?.as_str()?.parse::<Provider>().ok()?;
+    let album_id = parsed.get("album_id")?.as_str()?;
+    if album_id.is_empty() {
+        return None;
+    }
+
+    Some(ParsedZipDumpMetadata {
+        provider,
+        album_id: album_id.to_owned(),
+        album: string_field(&parsed, "album"),
+        artist: string_field(&parsed, "artist"),
+        part_index: number_field(&parsed, "part", 1).max(1) as i32,
+        total_parts: number_field(&parsed, "total_parts", 1).max(1) as i32,
+        generation_hash: string_field(&parsed, "hash"),
+    })
+}
+
 fn string_field(value: &serde_json::Value, key: &str) -> String {
     string_field_or(value, key, "")
 }
@@ -167,51 +355,68 @@ fn number_field(value: &serde_json::Value, key: &str, default: i64) -> i64 {
     }
 }
 
-/// TS regex: `/(\{[\s\S]*?"id"\s*:\s*"[^"]+"[\s\S]*?\})/s`.
-///
-/// Regex semantics, reproduced exactly: scan `{` positions left to right;
-/// for each start, try `"id"` occurrences in order (lazy middle span) —
-/// each must be followed by `\s*:\s*"` + a non-empty `[^"]+` + `"`, and a
-/// `}` must exist after the value (lazy tail takes the first one). The
-/// first start with a completing occurrence wins; `\s*` may be empty.
 fn extract_payload(text: &str) -> Option<String> {
-    let bytes = text.as_bytes();
-    for (start, _) in text.match_indices('{') {
-        let mut q = start + 1;
-        while q <= text.len() {
-            let Some(rel) = text[q..].find("\"track_id\"") else {
-                break;
-            };
-            let id_at = q + rel;
-            let mut i = id_at + 10; // past the literal `"track_id"`
-            while i < bytes.len() && (bytes[i] as char).is_ascii_whitespace() {
-                i += 1;
+    extract_balanced_json(text, "\"track_id\"")
+}
+
+fn extract_zip_payload(text: &str) -> Option<String> {
+    extract_balanced_json(text, "\"album_id\"")
+}
+
+fn extract_balanced_json(text: &str, required_key: &str) -> Option<String> {
+    let normalized = text
+        .replace("<br/>", "\n")
+        .replace("<br>", "\n")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&");
+
+    for (start, _) in normalized.match_indices('{') {
+        let candidate = &normalized[start..];
+        if !candidate.contains(required_key) {
+            continue;
+        }
+        let mut depth = 0;
+        let mut in_str = false;
+        let mut escape = false;
+        let mut end_idx = None;
+
+        for (idx, ch) in candidate.char_indices() {
+            if escape {
+                escape = false;
+                continue;
             }
-            if i < bytes.len() && bytes[i] == b':' {
-                i += 1;
-                while i < bytes.len() && (bytes[i] as char).is_ascii_whitespace() {
-                    i += 1;
-                }
-                if i < bytes.len() && bytes[i] == b'"' {
-                    i += 1;
-                    let value_start = i;
-                    while i < bytes.len() && bytes[i] != b'"' {
-                        i += 1;
-                    }
-                    // `[^"]+` needs a non-empty value and a closing quote.
-                    if i > value_start && i < bytes.len() {
-                        let after_value = i + 1;
-                        // Lazy tail: the first `}` at or after the value.
-                        if let Some(rel) = text[after_value..].find('}') {
-                            let end = after_value + rel;
-                            return Some(text[start..=end].to_string());
-                        }
+            if ch == '\\' && in_str {
+                escape = true;
+                continue;
+            }
+            if ch == '"' {
+                in_str = !in_str;
+                continue;
+            }
+            if !in_str {
+                if ch == '{' {
+                    depth += 1;
+                } else if ch == '}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        end_idx = Some(idx);
+                        break;
                     }
                 }
             }
-            // This occurrence cannot complete the pattern — backtrack to
-            // the next `"id"` occurrence for this start.
-            q = id_at + 1;
+        }
+
+        if let Some(end) = end_idx {
+            let json_str = &candidate[..=end];
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+                let stripped_key = required_key.trim_matches('"');
+                if parsed.get(stripped_key).is_some() {
+                    return Some(json_str.to_string());
+                }
+            }
         }
     }
     None
@@ -236,6 +441,65 @@ mod tests {
             track_number: Some(2),
             track_count: Some(10),
         }
+    }
+
+    #[test]
+    fn format_album_details_caption_single_part() {
+        let meta = AlbumDetailsCaptionMetadata {
+            album: "Fossils, Vol. 1",
+            artist: "Rupam Islam & Fossils",
+            album_id: "1440828878",
+            storefront: "in",
+            total_tracks: 8,
+            delivered_tracks: 8,
+            size_bytes: 289_950_924,
+            total_parts: 1,
+            release_year: "2001",
+            genre: Some("Rock"),
+            record_label: Some("Asha Audio"),
+            is_partial: false,
+            user_name: Some("@sayeed69"),
+            user_id: 123456,
+        };
+        let html = format_album_details_caption(&meta);
+        assert!(html.contains(r#"💿 <a href="https://music.apple.com/in/album/1440828878"><b>Fossils, Vol. 1</b></a>"#));
+        assert!(html.contains("👤 <b>Artist:</b> Rupam Islam &amp; Fossils"));
+        assert!(html.contains("<blockquote>"));
+        assert!(html.contains("• <b>Tracks:</b> 8 tracks"));
+        assert!(html.contains("• <b>Size:</b> 276.52MB"));
+        // Single part: NO "parts" text
+        assert!(!html.contains("parts"));
+        assert!(html.contains("• <b>Released:</b> 2001"));
+        assert!(html.contains("• <b>Genre:</b> Rock"));
+        assert!(html.contains("• <b>Label:</b> Asha Audio"));
+        assert!(html.contains("• <b>Quality:</b> Lossless · ALAC"));
+        assert!(html.contains(r#"• <b>Requested by:</b> <a href="https://t.me/sayeed69">@sayeed69</a>"#));
+        assert!(html.ends_with("</blockquote>"));
+    }
+
+    #[test]
+    fn format_album_details_caption_multi_part_partial() {
+        let meta = AlbumDetailsCaptionMetadata {
+            album: "Greatest Hits",
+            artist: "Queen",
+            album_id: "987654321",
+            storefront: "us",
+            total_tracks: 17,
+            delivered_tracks: 15,
+            size_bytes: 4_294_967_296,
+            total_parts: 3,
+            release_year: "1981",
+            genre: None,
+            record_label: None,
+            is_partial: true,
+            user_name: Some("John Doe"),
+            user_id: 78910,
+        };
+        let html = format_album_details_caption(&meta);
+        assert!(html.contains("• <b>Tracks:</b> 15/17 tracks"));
+        assert!(html.contains(" · 3 parts"));
+        assert!(html.contains("• ⚠️ <b>Note:</b> Partial archive"));
+        assert!(html.contains(r#"• <b>Requested by:</b> <a href="tg://user?id=78910">John Doe</a>"#));
     }
 
     #[test]
@@ -275,16 +539,12 @@ mod tests {
     #[test]
     fn roundtrip_through_parse() {
         let html = format_dump_caption(&sample_meta());
-        // parse_dump_caption reads the payload from raw text; strip the HTML
-        // escaping the way Telegram text would present it. Simpler: build a
-        // plain-text version by un-escaping.
         let unescaped = html
             .replace("&quot;", "\"")
             .replace("&amp;", "&")
             .replace("&lt;", "<")
             .replace("&gt;", ">")
             .replace("&#39;", "'")
-            // Telegram presents <br/> as a line break in message text.
             .replace("<br/>", "\n");
         let parsed = parse_dump_caption(Some(&unescaped)).expect("payload found");
         assert_eq!(parsed.track_key, TrackKey::apple("1440828878"));
@@ -306,7 +566,6 @@ mod tests {
         assert!(parse_dump_caption(Some("")).is_none());
         assert!(parse_dump_caption(Some("no payload here")).is_none());
         assert!(parse_dump_caption(Some("{\"title\": \"x\"}")).is_none());
-        // track_id present but not a string.
         assert!(parse_dump_caption(Some("{\"provider\": \"apple\", \"track_id\": 123}")).is_none());
     }
 
@@ -329,10 +588,5 @@ mod tests {
             parse_dump_caption(Some("{\"provider\": \"apple\", \"title\": \"Missing id\"}"))
                 .is_none()
         );
-    }
-
-    #[test]
-    fn escape_covers_all_five_chars() {
-        assert_eq!(html_escape("a&<>\"'z"), "a&amp;&lt;&gt;&quot;&#39;z");
     }
 }

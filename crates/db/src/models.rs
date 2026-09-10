@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use engine::types::Provider;
 
-use crate::schema::{requests, settings, tracks, users};
+use crate::schema::{albums, requests, settings, tracks, users};
 
 #[derive(Debug, Clone, Default, Queryable, Selectable)]
 #[diesel(table_name = users)]
@@ -84,6 +84,23 @@ pub struct SettingsRow {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Queryable, Selectable)]
+#[diesel(table_name = albums)]
+pub struct Album {
+    pub id: i32,
+    pub provider: Provider,
+    pub album_id: String,
+    pub part_index: i32,
+    pub total_parts: i32,
+    pub message_id: i32,
+    pub file_id: String,
+    pub file_unique_id: String,
+    pub file_size: i64,
+    pub file_name: String,
+    pub generation_hash: String,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Insertable)]
 #[diesel(table_name = users)]
 pub struct NewUser<'a> {
@@ -122,4 +139,19 @@ pub struct NewRequest<'a> {
     pub duration_ms: Option<i32>,
     pub status: &'a str,
     pub error_reason: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = albums)]
+pub struct NewAlbum<'a> {
+    pub provider: Provider,
+    pub album_id: &'a str,
+    pub part_index: i32,
+    pub total_parts: i32,
+    pub message_id: i32,
+    pub file_id: &'a str,
+    pub file_unique_id: &'a str,
+    pub file_size: i64,
+    pub file_name: &'a str,
+    pub generation_hash: &'a str,
 }

@@ -5,12 +5,14 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 use engine::{
     catalog::{Catalog, ReqwestTransport},
     orchestrator::deps::{
-        CachedTrack, OrchestratorDeps, RequestLog, SaveTrackInput, SinkError, TelegramSink,
+        AlbumUpload, BoxFuture, CachedAlbum, CachedTrack, OrchestratorDeps, RequestLog,
+        SaveTrackInput, SinkError, TelegramSink,
     },
     playlist::{PlaylistClient, PlaylistData, PlaylistError, ReqwestPlaylistHttp},
     ripper::{AlacTrackRipper, EngineRipperDeps, RipError, RipProgressCallback, RipperConfig},
     settings::BotSettings,
     types::{AlbumTracks, ArtistTracks, TrackKey, TrackRipResult},
+    Provider,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -19,6 +21,7 @@ use crate::telegram_sink::FerogramTelegramSink;
 /// All environment-owned production dependencies used by the orchestrator.
 pub struct RipDeps {
     sink: FerogramTelegramSink,
+    albums: db::AlbumsRepository,
     tracks: db::TracksRepository,
     requests: db::RequestLogRepository,
     settings: db::SettingsStore,
@@ -41,6 +44,7 @@ impl RipDeps {
         tracks: db::TracksRepository,
         requests: db::RequestLogRepository,
         settings: db::SettingsStore,
+        database: db::DbPool,
     ) -> Result<Self, SinkError> {
         settings
             .init()
@@ -85,8 +89,12 @@ impl RipDeps {
         ripper_config.base_delay_ms = retry_base_ms;
         ripper_config.max_retries = max_retries;
 
+        let albums = db::AlbumsRepository::new(database);
+        let sink = FerogramTelegramSink::new(client, dump_peer).await?;
+
         Ok(Self {
-            sink: FerogramTelegramSink::new(client, dump_peer).await?,
+            sink,
+            albums,
             tracks,
             requests,
             settings,
@@ -99,15 +107,7 @@ impl RipDeps {
             max_retries,
         })
     }
-}
 
-fn env_option(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-}
-
-impl RipDeps {
     /// Probe mirror health for the status dashboard (oracle
     /// `commands/health.ts:47-61`). Uses a clone of the ripper's policy
     /// manager, so circuit state and the endpoint cache stay coherent
@@ -130,20 +130,40 @@ impl RipDeps {
         self.settings.get_settings()
     }
 
-    /// Track cache repository (find-by-id, file-unique-id, delete).
+    /// Exposes the mirror policy for the bot's health probes (dashboard, etc.).
+    pub fn mirror_policy(
+        &self,
+    ) -> &engine::streaming::MirrorPolicyManager<engine::streaming::ReqwestHttp> {
+        &self.mirror_policy
+    }
+
+    /// Read-only database access for handlers that need direct queries
+    /// outside the orchestrator seam.
     pub fn tracks(&self) -> &db::TracksRepository {
         &self.tracks
     }
 
-    /// Apple Music catalog for track metadata lookups (`/info`).
+    pub fn albums(&self) -> &db::AlbumsRepository {
+        &self.albums
+    }
+
+    pub fn requests(&self) -> &db::RequestLogRepository {
+        &self.requests
+    }
+
     pub fn catalog(&self) -> &Catalog<ReqwestTransport> {
         &self.catalog
     }
 
-    /// Apple Music playlist client (autodump's developer-token + catalog API).
     pub fn playlist(&self) -> &PlaylistClient<ReqwestPlaylistHttp> {
         &self.playlist
     }
+}
+
+fn env_option(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 impl OrchestratorDeps for RipDeps {
@@ -181,6 +201,67 @@ impl OrchestratorDeps for RipDeps {
             .log_request(&log)
             .await
             .map_err(|error| error.to_string())
+    }
+
+    fn save_album<'a>(&'a self, upload: AlbumUpload) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let new_album = db::NewAlbum {
+                provider: upload.provider,
+                album_id: &upload.album_id,
+                part_index: upload.part_index,
+                total_parts: upload.total_parts,
+                message_id: i32::try_from(upload.message_id).map_err(|e| e.to_string())?,
+                file_id: &upload.file_id,
+                file_unique_id: &upload.file_unique_id,
+                file_size: upload.file_size,
+                file_name: &upload.file_name,
+                generation_hash: &upload.generation_hash,
+            };
+            self.albums
+                .save_album(&new_album)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn find_albums<'a>(
+        &'a self,
+        provider: Provider,
+        album_id: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<CachedAlbum>, String>> {
+        Box::pin(async move {
+            let rows = self
+                .albums
+                .find_albums(provider, album_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(rows
+                .into_iter()
+                .map(|r| CachedAlbum {
+                    part_index: r.part_index,
+                    total_parts: r.total_parts,
+                    message_id: i64::from(r.message_id),
+                    file_unique_id: r.file_unique_id,
+                    generation_hash: r.generation_hash,
+                    file_size: r.file_size,
+                })
+                .collect())
+        })
+    }
+
+    fn delete_albums<'a>(
+        &'a self,
+        provider: Provider,
+        album_id: &'a str,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            self.albums
+                .delete_albums(provider, album_id)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
     }
 
     async fn fetch_album_tracks(&self, id: &str, storefront: &str) -> Result<AlbumTracks, String> {
@@ -227,6 +308,12 @@ impl OrchestratorDeps for RipDeps {
                 output_dir,
             )
             .await
+    }
+
+    fn fetch_artwork<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Option<Vec<u8>>> {
+        Box::pin(async move {
+            self.ripper_deps.fetch_artwork_bytes(url).await
+        })
     }
 
     fn sink(&self) -> &dyn TelegramSink {

@@ -105,14 +105,7 @@ pub fn percent_from(progress: &RipJobProgress) -> u8 {
 /// progress strings retain arrows for the legacy detailed renderer, so strip
 /// only those leading decorations at this presentation boundary.
 fn clean_activity(text: &str) -> String {
-    let without_arrow = text
-        .strip_prefix("⬇️ ")
-        .or_else(|| text.strip_prefix("⬆️ "))
-        .unwrap_or(text);
-    without_arrow
-        .strip_prefix("<b>Uploading:</b> ")
-        .unwrap_or(without_arrow)
-        .to_owned()
+    text.to_owned()
 }
 
 /// Map an engine job snapshot into a dashboard row for a specific viewer.
@@ -181,6 +174,22 @@ pub fn snapshot_from(
             .cmp(&key(right))
             .then_with(|| left.id.cmp(&right.id))
     });
+    let current_activity = ordered.iter().find_map(|job| {
+        if job.phase == EnginePhase::Queued {
+            return None;
+        }
+        let ctx = contexts.get(&job.id);
+        if let Some(uploading) = ctx.and_then(|c| c.uploading.as_ref()) {
+            return Some(uploading.clone());
+        }
+        if let Some(downloading) = ctx.and_then(|c| c.downloading.as_ref()) {
+            return Some(downloading.clone());
+        }
+        if let Some(action) = job.active_action_text.as_ref() {
+            return Some(action.clone());
+        }
+        None
+    });
     let jobs = ordered
         .iter()
         .map(|job| {
@@ -202,6 +211,7 @@ pub fn snapshot_from(
     DashboardSnapshot {
         ripping_mode: ripping_mode.to_owned(),
         mirror_health,
+        current_activity,
         jobs,
     }
 }
@@ -220,6 +230,7 @@ mod tests {
         ActiveRipJob {
             id: "job_1".into(),
             chat_id: 100,
+            delivery_chat_id: 100,
             user_id: user,
             user_name: user_name.map(str::to_owned),
             job_header: "Album: <b>X</b> by <b>Y</b>".into(),
@@ -353,11 +364,15 @@ mod tests {
         let snapshot = snapshot_from(&[job], &contexts, 7, false, "live", None);
         assert_eq!(
             snapshot.jobs[0].downloading.as_deref(),
-            Some("<b>Song - Artist:</b> <code>1 MB</code>")
+            Some("⬇️ <b>Song - Artist:</b> <code>1 MB</code>")
         );
         assert_eq!(
             snapshot.jobs[0].uploading.as_deref(),
-            Some("<i>Song - Artist</i>")
+            Some("⬆️ <b>Uploading:</b> <i>Song - Artist</i>")
+        );
+        assert_eq!(
+            snapshot.current_activity.as_deref(),
+            Some("⬆️ <b>Uploading:</b> <i>Song - Artist</i>")
         );
     }
 

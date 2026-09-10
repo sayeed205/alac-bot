@@ -14,6 +14,7 @@ pub mod settings;
 pub mod streaming;
 pub mod tagger;
 pub mod types;
+pub mod zip;
 
 pub use parser::{extract_batch_items, parse_alac_input, parse_single_item};
 pub use types::{

@@ -58,13 +58,14 @@ pub struct DashboardJob {
 pub struct DashboardSnapshot {
     pub ripping_mode: String,
     pub mirror_health: Option<String>,
+    pub current_activity: Option<String>,
     pub jobs: Vec<DashboardJob>,
 }
 
 pub fn render(
     snapshot: &DashboardSnapshot,
     page: usize,
-    viewer_is_admin: bool,
+    _viewer_is_admin: bool,
 ) -> (String, Option<ferogram::tl::enums::ReplyMarkup>) {
     if snapshot.jobs.is_empty() {
         return ("<b>No active downloads.</b>".into(), None);
@@ -78,10 +79,10 @@ pub fn render(
         esc(&snapshot.ripping_mode),
         esc(health)
     );
+    if let Some(activity) = snapshot.current_activity.as_deref() {
+        text.push_str(&format!("<b>Activity:</b> {activity}\n"));
+    }
     for (offset, job) in snapshot.jobs.iter().skip(start).take(5).enumerate() {
-        // Telegram does not consistently render HTML list tags across
-        // clients, so keep the ordered-list marker textual while styling the
-        // complete entry title as secondary dashboard information.
         let number = start + offset + 1;
         let state = match job.phase {
             JobPhase::Processing => "Processing".to_owned(),
@@ -90,28 +91,41 @@ pub fn render(
                 |position| format!("Queued · position #{position}"),
             ),
         };
-        text.push_str(&format!(
-            "\n<i>{number}. {}</i>\n{} · <i>{}</i>\n{}% · {} cached · {} ripped · {} failed / {} total\n",
-            // Job headers are presentation HTML produced by the engine with
-            // dynamic values already escaped. Preserve that trusted markup;
-            // escaping it again would display tags such as `<b>` literally.
-            job.header,
-            esc(&job.requester_name),
-            state,
-            job.percent.min(100),
-            job.cached,
-            job.ripped,
-            job.failed,
-            job.total
-        ));
-        if let Some(activity) = job.downloading.as_deref() {
-            text.push_str(&format!("<i>Downloading</i>: {activity}\n"));
-        }
-        if let Some(activity) = job.uploading.as_deref() {
-            text.push_str(&format!("<i>Uploading</i>: {activity}\n"));
-        }
-        // Actions are represented in the keyboard, never as a global control:
-        // this keeps a shared dashboard safe in a group chat.
+        let pct = job.percent.min(100) as f64;
+        let lines = [
+            format!("<i>{number}.</i> {}", job.header),
+            format!(
+                "┃ <code>{}</code>",
+                crate::presentation::box_progress_bar(pct)
+            ),
+            format!("┝ Status: {}", esc(&state)),
+            format!(
+                "┝ Processed: {} of {} tracks",
+                (job.cached + job.ripped + job.failed).min(job.total),
+                job.total
+            ),
+            format!(
+                "┝ Cache: {} hit · {} ripped · {} failed",
+                job.cached, job.ripped, job.failed
+            ),
+            format!("┝ Cancel: /cancel_{}", job.id),
+            {
+                let by_mention = if job.requester_name.starts_with('@') {
+                    let handle = job.requester_name.trim_start_matches('@');
+                    format!("<a href=\"https://t.me/{handle}\">@{handle}</a>")
+                } else if job.requester_id > 0 {
+                    format!(
+                        "<a href=\"tg://user?id={}\">{}</a>",
+                        job.requester_id,
+                        esc(&job.requester_name)
+                    )
+                } else {
+                    esc(&job.requester_name)
+                };
+                format!("┕ By: {by_mention}")
+            },
+        ];
+        text.push_str(&format!("\n{}<br/>", lines.join("<br/>")));
     }
     text.push_str(&format!(
         "\n<i>Page {page}/{pages} • {} active</i>",
@@ -149,21 +163,9 @@ pub fn render(
             .into_bytes(),
         ));
     }
-    let mut keyboard_builder = ferogram::keyboard::InlineKeyboard::new();
-    for job in snapshot.jobs.iter().skip(start).take(5) {
-        if job.is_cancel_allowed_for_viewer || viewer_is_admin {
-            let label = truncate(&plain_text(&job.header), 18);
-            keyboard_builder = keyboard_builder.row([ferogram::keyboard::Button::callback(
-                format!("Cancel download · {label}"),
-                crate::interaction::TelegramAction::Cancel {
-                    job_id: job.id.clone(),
-                }
-                .encode()
-                .into_bytes(),
-            )]);
-        }
-    }
-    let keyboard = keyboard_builder.row(nav).into_markup();
+    let keyboard = ferogram::keyboard::InlineKeyboard::new()
+        .row(nav)
+        .into_markup();
     (text, Some(keyboard))
 }
 
@@ -171,37 +173,6 @@ fn esc(s: &str) -> String {
     crate::html::escape(s)
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    let mut out = s.chars().take(max).collect::<String>();
-    if s.chars().count() > max {
-        out.push('…');
-    }
-    out
-}
-
-/// Convert a trusted presentation fragment into plain text for button labels.
-/// Telegram callback buttons do not parse HTML, so retaining tags here would
-/// expose markup such as `<b>` to users.
-fn plain_text(html: &str) -> String {
-    let mut text = String::with_capacity(html.len());
-    let mut in_tag = false;
-    for ch in html.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' if in_tag => in_tag = false,
-            _ if !in_tag => text.push(ch),
-            _ => {}
-        }
-    }
-    text.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-}
-
-/// IDs for which the current viewer may receive a cancel button.  Kept
-/// separate from Telegram markup so adapters can audit actions and test it.
 pub fn cancelable_job_ids(
     snapshot: &DashboardSnapshot,
     page: usize,
@@ -521,32 +492,11 @@ mod tests {
         };
 
         let (text, markup) = render(&snapshot, 1, false);
-        assert!(text.contains("<i>1. Album: <b>3 Originals</b> by <b>Rick Astley</b></i>"));
+        assert!(text.contains("<i>1.</i> Album: <b>3 Originals</b> by <b>Rick Astley</b>"));
         assert!(text.contains("Album: <b>3 Originals</b> by <b>Rick Astley</b>"));
+        assert!(text.contains("/cancel_job-1"));
         assert!(!text.contains("&lt;b&gt;"));
-
-        let Some(ferogram::tl::enums::ReplyMarkup::ReplyInlineMarkup(markup)) = markup else {
-            panic!("dashboard should include an inline keyboard");
-        };
-        let cancel = markup
-            .rows
-            .iter()
-            .flat_map(|row| match row {
-                ferogram::tl::enums::KeyboardInlineButtonRow::KeyboardInlineButtonRow(row) => {
-                    row.buttons.iter()
-                }
-            })
-            .find_map(|button| match button {
-                ferogram::tl::enums::KeyboardInlineButton::KeyboardInlineButton(button)
-                    if button.text.starts_with("Cancel download") =>
-                {
-                    Some(button)
-                }
-                _ => None,
-            })
-            .expect("cancel button");
-        assert!(!cancel.text.contains('<'));
-        assert!(!cancel.text.contains('>'));
+        assert!(markup.is_some());
     }
 
     #[test]
@@ -571,7 +521,7 @@ mod tests {
             ..DashboardSnapshot::default()
         };
         let (text, _) = render(&snapshot, 1, false);
-        assert!(text.contains("<i>1. Track: <b>Song</b></i>"));
+        assert!(text.contains("<i>1.</i> Track: <b>Song</b>"));
         assert!(text.contains("Queued · position #2"));
         assert!(!text.contains("<i>#2</i>"));
     }
@@ -602,8 +552,8 @@ mod tests {
         };
 
         let (text, _) = render(&snapshot, 2, false);
-        assert!(text.contains("<i>6. Track 6</i>"));
-        assert!(!text.contains("<i>1. Track 1</i>"));
+        assert!(text.contains("<i>6.</i> Track 6"));
+        assert!(!text.contains("<i>1.</i> Track 1"));
     }
 
     #[test]
@@ -625,11 +575,12 @@ mod tests {
                 uploading: Some("<i>Song - Artist</i>".into()),
                 is_cancel_allowed_for_viewer: true,
             }],
+            current_activity: Some("⬇️ Downloading: <b>Song</b>".into()),
             ..DashboardSnapshot::default()
         };
 
         let (text, _) = render(&snapshot, 1, false);
-        assert!(text.contains("<i>Downloading</i>: <b>Song - Artist:</b> <code>1 MB</code>"));
-        assert!(text.contains("<i>Uploading</i>: <i>Song - Artist</i>"));
+        assert!(text.contains("<b>Activity:</b> ⬇️ Downloading: <b>Song</b>"));
+        assert!(text.contains("/cancel_job-activity"));
     }
 }

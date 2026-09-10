@@ -22,7 +22,7 @@ use crate::BotState;
 
 pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
     for alias in [
-        "alac", "rip", "batch", "dl", "download", "rerip", "cache", "dump",
+        "alac", "rip", "batch", "dl", "download", "rerip", "cache", "dump", "zip",
     ] {
         let state = Arc::clone(&state);
         dp.on_message(filters::command(alias), move |msg| {
@@ -30,11 +30,25 @@ pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
             async move { handle_command(state, msg).await }
         });
     }
-    let state = Arc::clone(&state);
+    let state_cancel = Arc::clone(&state);
     dp.on_message(filters::command("cancel"), move |msg| {
-        let state = Arc::clone(&state);
+        let state = Arc::clone(&state_cancel);
         async move { handle_cancel_command(state, msg).await }
     });
+    let state_cancel_id = Arc::clone(&state);
+    dp.on_message(
+        filters::custom(|msg| {
+            msg.text().is_some_and(|t| {
+                let cmd = t.split_whitespace().next().unwrap_or("");
+                let base = cmd.split('@').next().unwrap_or(cmd);
+                base.starts_with("/cancel_") && base.len() > "/cancel_".len()
+            })
+        }),
+        move |msg| {
+            let state = Arc::clone(&state_cancel_id);
+            async move { handle_cancel_id_command(state, msg).await }
+        },
+    );
 }
 
 async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
@@ -59,9 +73,24 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
         return;
     }
     let parsed = input::parse_message(&state.client, &msg, command == "rerip").await;
+    let zip_command = command == "zip";
+    let explicit_zip_valid =
+        parsed.items.len() == 1 && parsed.items[0].kind == engine::types::TargetKind::Album;
+    let zip_requested = command == "dump"
+        || (zip_command && explicit_zip_valid)
+        || (parsed.zip && explicit_zip_valid);
     if parsed.items.is_empty() {
         reply(&msg, gates::usage(is_cache)).await;
         return;
+    }
+    if (parsed.zip || zip_command)
+        && (parsed.items.len() != 1 || parsed.items[0].kind != engine::types::TargetKind::Album)
+    {
+        reply(
+            &msg,
+            "ZIP packaging is available for albums with more than one track. The request will continue without ZIP packaging.",
+        )
+        .await;
     }
     if let Some(text) = gates::force_gate(parsed.force, admin) {
         reply(&msg, text).await;
@@ -77,20 +106,19 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
     let user = msg.sender_user().await.ok().flatten();
     let display_name = user
         .as_ref()
-        .map(|u| {
-            let first = u.first_name().unwrap_or_default().trim();
-            match u.last_name().map(str::trim).filter(|l| !l.is_empty()) {
-                Some(last) if !first.is_empty() => format!("{first} {last}"),
-                Some(last) => last.to_owned(),
-                None if !first.is_empty() => first.to_owned(),
-                None => String::new(),
-            }
+        .and_then(|u| u.username().filter(|n| !n.trim().is_empty()).map(|n| format!("@{n}")))
+        .or_else(|| {
+            user.as_ref().map(|u| {
+                let first = u.first_name().unwrap_or_default().trim();
+                match u.last_name().map(str::trim).filter(|l| !l.is_empty()) {
+                    Some(last) if !first.is_empty() => format!("{first} {last}"),
+                    Some(last) => last.to_owned(),
+                    None if !first.is_empty() => first.to_owned(),
+                    None => String::new(),
+                }
+            })
         })
         .filter(|name| !name.is_empty())
-        .or_else(|| {
-            user.as_ref()
-                .and_then(|u| u.username().map(|n| format!("@{n}")))
-        })
         .unwrap_or_else(|| format!("User {sender}"));
 
     let is_group = chat != sender;
@@ -148,6 +176,8 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
         is_group,
         is_force: parsed.force,
         is_cache_only: is_cache,
+        zip: zip_requested,
+        zip_explicit: zip_command || parsed.zip,
         single_storefront: parsed.storefront,
         parsed_items: parsed.items,
         reply_to_message_id: Some(i64::from(msg.id())),
@@ -178,6 +208,31 @@ async fn handle_cancel_command(state: Arc<BotState>, msg: ferogram::update::Inco
         reply(&msg, cancel::COMMAND_ACK).await;
     } else {
         reply(&msg, cancel::NO_ACTIVE).await;
+    }
+}
+
+async fn handle_cancel_id_command(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
+    let text = msg.text().unwrap_or_default();
+    let first_word = text.split_whitespace().next().unwrap_or("");
+    let raw_cmd = first_word.split('@').next().unwrap_or(first_word);
+    let Some(job_id) = raw_cmd.strip_prefix("/cancel_") else {
+        return;
+    };
+    if job_id.is_empty() {
+        return;
+    }
+    let caller = msg.sender_user_id().unwrap_or_default();
+    let admin = state.auth.is_admin(caller);
+    match cancel::cancel_inline(&state, job_id, caller, admin) {
+        cancel::CancelResult::Cancelled => {
+            reply(&msg, cancel::COMMAND_ACK).await;
+        }
+        cancel::CancelResult::Unauthorized => {
+            reply(&msg, cancel::CALLBACK_UNAUTHORIZED).await;
+        }
+        cancel::CancelResult::Expired => {
+            reply(&msg, cancel::CALLBACK_EXPIRED).await;
+        }
     }
 }
 

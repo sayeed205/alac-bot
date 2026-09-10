@@ -734,6 +734,8 @@ async fn admin_callback(state: Arc<BotState>, query: CallbackQuery, action: Repo
                 is_group: marked_chat != query.user_id,
                 is_force: true,
                 is_cache_only: true,
+                zip: false,
+                zip_explicit: false,
                 single_storefront: None,
                 parsed_items: vec![ParsedTargetItem {
                     id: track_id.to_owned(),

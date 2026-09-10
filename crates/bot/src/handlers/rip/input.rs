@@ -21,6 +21,7 @@ pub struct ParsedCommand {
     pub force: bool,
     pub storefront: Option<String>,
     pub document: bool,
+    pub zip: bool,
 }
 
 pub fn command_name(text: &str) -> Option<String> {
@@ -37,11 +38,16 @@ pub fn has_force_token(text: &str) -> bool {
     text.split_whitespace().any(|t| t == "-f" || t == "--force")
 }
 
+pub fn has_zip_token(text: &str) -> bool {
+    text.split_whitespace().any(|t| t == "-z" || t == "--zip")
+}
+
 pub fn parse_text(text: &str, reply: Option<&str>, rerip: bool) -> Option<ParsedCommand> {
     let parsed = parse_alac_input(text, reply)?;
     Some(ParsedCommand {
         items: parsed.items,
         force: rerip || parsed.force,
+        zip: parsed.zip,
         storefront: parsed.storefront,
         document: false,
     })
@@ -98,6 +104,7 @@ pub async fn parse_message(
                 return ParsedCommand {
                     items: extract_batch_items(&content),
                     force: rerip || message.text().is_some_and(has_force_token),
+                    zip: message.text().is_some_and(has_zip_token),
                     storefront: None,
                     document: true,
                 };
@@ -114,6 +121,7 @@ pub async fn parse_message(
         force: rerip,
         storefront: None,
         document: false,
+        zip: false,
     })
 }
 
@@ -124,5 +132,6 @@ mod tests {
     fn aliases_and_flags_are_case_insensitive() {
         assert_eq!(command_name("/ALAC@bot 1"), Some("alac".into()));
         assert!(has_force_token("/alac --force 1"));
+        assert!(has_zip_token("/alac --zip 1"));
     }
 }

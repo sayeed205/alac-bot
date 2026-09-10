@@ -1,8 +1,10 @@
 //! Production Telegram sink used by the orchestration engine.
 
-use std::{sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
-use engine::orchestrator::deps::{DumpUpload, SinkError, TelegramSink, UploadProgressCallback};
+use engine::orchestrator::deps::{
+    BoxFuture, DumpUpload, SinkError, TelegramSink, UploadProgressCallback,
+};
 use ferogram::{InputMessage, PeerRef, TransferHandle};
 
 /// Ferogram-backed implementation of the engine's Telegram port.
@@ -37,6 +39,21 @@ impl FerogramTelegramSink {
             format!("mtproto:document:{}", document.id()),
         )
     }
+
+    async fn upload_thumbnail(
+        &self,
+        thumb_path: &str,
+    ) -> Result<ferogram::tl::enums::InputFile, SinkError> {
+        let uploaded = self
+            .client
+            .upload_file(thumb_path)
+            .await
+            .map_err(|error| SinkError(format!("thumbnail upload failed: {error}")))?;
+        let ferogram::tl::enums::InputMedia::UploadedPhoto(photo) = uploaded.as_photo_media() else {
+            return Err(SinkError("uploaded thumb did not yield photo media".into()));
+        };
+        Ok(photo.file)
+    }
 }
 
 impl TelegramSink for FerogramTelegramSink {
@@ -48,9 +65,7 @@ impl TelegramSink for FerogramTelegramSink {
         duration: i64,
         caption_html: &'a str,
         on_upload_progress: Option<&'a UploadProgressCallback>,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Option<DumpUpload>, SinkError>> + Send + 'a>,
-    > {
+    ) -> BoxFuture<'a, Result<Option<DumpUpload>, SinkError>> {
         Box::pin(async move {
             let handle = TransferHandle::new();
             let progress_task = on_upload_progress.map(|callback| {
@@ -134,14 +149,213 @@ impl TelegramSink for FerogramTelegramSink {
         })
     }
 
+    fn send_document_to_dump<'a>(
+        &'a self,
+        file_path: &'a str,
+        thumb_path: Option<&'a str>,
+        caption_html: &'a str,
+        on_upload_progress: Option<&'a UploadProgressCallback>,
+    ) -> BoxFuture<'a, Result<Option<DumpUpload>, SinkError>> {
+        Box::pin(async move {
+            let handle = TransferHandle::new();
+            let progress_task = on_upload_progress.map(|callback| {
+                let callback = Arc::clone(callback);
+                let handle = handle.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let progress = handle.progress();
+                        callback(progress.done, progress.total);
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                })
+            });
+
+            let upload_result = self.client.upload_file(file_path).handle(&handle).await;
+            if let Some(task) = progress_task {
+                task.abort();
+            }
+            let uploaded = upload_result.map_err(|error| SinkError(error.to_string()))?;
+            let mut media = uploaded.as_document_media();
+            if let Some(thumb_path) = thumb_path {
+                match self.upload_thumbnail(thumb_path).await {
+                    Ok(thumb) => {
+                        if let ferogram::tl::enums::InputMedia::UploadedDocument(document) =
+                            &mut media
+                        {
+                            document.thumb = Some(thumb);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "ZIP thumbnail upload failed; sending without");
+                    }
+                }
+            }
+
+            let message = self
+                .client
+                .send_message(
+                    self.dump_peer.clone(),
+                    InputMessage::html(caption_html)
+                        .silent(true)
+                        .copy_media(media),
+                )
+                .await
+                .map_err(|error| SinkError(error.to_string()))?;
+
+            let Some(document) = message.document() else {
+                tracing::warn!(
+                    message_id = message.id(),
+                    "Dump document upload returned no document"
+                );
+                return Ok(None);
+            };
+
+            let (file_id, file_unique_id) = Self::file_ids(&document);
+            Ok(Some(DumpUpload {
+                message_id: i64::from(message.id()),
+                file_id,
+                file_unique_id,
+            }))
+        })
+    }
+
+    fn send_document_to_chat<'a>(
+        &'a self,
+        chat_id: i64,
+        file_path: &'a str,
+        thumb_path: Option<&'a str>,
+        caption_html: &'a str,
+        on_upload_progress: Option<&'a UploadProgressCallback>,
+    ) -> BoxFuture<'a, Result<(), SinkError>> {
+        Box::pin(async move {
+            let handle = TransferHandle::new();
+            let progress_task = on_upload_progress.map(|callback| {
+                let callback = Arc::clone(callback);
+                let handle = handle.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let progress = handle.progress();
+                        callback(progress.done, progress.total);
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                })
+            });
+
+            let upload_result = self.client.upload_file(file_path).handle(&handle).await;
+            if let Some(task) = progress_task {
+                task.abort();
+            }
+            let uploaded = upload_result.map_err(|error| SinkError(error.to_string()))?;
+            let mut media = uploaded.as_document_media();
+            if let Some(thumb_path) = thumb_path {
+                match self.upload_thumbnail(thumb_path).await {
+                    Ok(thumb) => {
+                        if let ferogram::tl::enums::InputMedia::UploadedDocument(document) =
+                            &mut media
+                        {
+                            document.thumb = Some(thumb);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "ZIP thumbnail upload failed; sending without");
+                    }
+                }
+            }
+
+            self.client
+                .send_message(
+                    PeerRef::from(chat_id),
+                    InputMessage::html(caption_html).copy_media(media),
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| SinkError(error.to_string()))
+        })
+    }
+
+    fn send_photo_to_chat<'a>(
+        &'a self,
+        chat_id: i64,
+        image_bytes: &'a [u8],
+        caption_html: &'a str,
+    ) -> BoxFuture<'a, Result<(), SinkError>> {
+        Box::pin(async move {
+            let uploaded = self
+                .client
+                .upload(std::io::Cursor::new(image_bytes), "cover.jpg")
+                .await
+                .map_err(|error| SinkError(error.to_string()))?;
+            let media = uploaded.as_photo_media();
+            self.client
+                .send_message(
+                    PeerRef::from(chat_id),
+                    InputMessage::html(caption_html).copy_media(media),
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| SinkError(error.to_string()))
+        })
+    }
+
+    fn download_dump_file<'a>(
+        &'a self,
+        message_id: i64,
+        destination: &'a Path,
+        on_download_progress: Option<&'a UploadProgressCallback>,
+    ) -> BoxFuture<'a, Result<(), SinkError>> {
+        Box::pin(async move {
+            let message_id = i32::try_from(message_id)
+                .map_err(|error| SinkError(format!("message_id out of range: {error}")))?;
+            let source = self
+                .client
+                .get_messages(self.dump_peer.clone(), &[message_id])
+                .await
+                .map_err(|error| SinkError(error.to_string()))?
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    SinkError("download_dump_file: source message not found or inaccessible".into())
+                })?;
+
+            let document = source.document().ok_or_else(|| {
+                SinkError("download_dump_file: source message has no document".into())
+            })?;
+
+            let handle = TransferHandle::new();
+            let progress_task = on_download_progress.map(|callback| {
+                let callback = Arc::clone(callback);
+                let handle = handle.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let progress = handle.progress();
+                        callback(progress.done, progress.total);
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                })
+            });
+
+            let download_result = self
+                .client
+                .download_file(&document, destination)
+                .handle(&handle)
+                .await;
+
+            if let Some(task) = progress_task {
+                task.abort();
+            }
+
+            download_result.map_err(|error| SinkError(error.to_string()))?;
+            Ok(())
+        })
+    }
+
     fn send_dump_copy<'a>(
         &'a self,
         to_chat_id: i64,
         message_id: i64,
         reply_to: Option<i64>,
         silent: bool,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SinkError>> + Send + 'a>>
-    {
+    ) -> BoxFuture<'a, Result<(), SinkError>> {
         Box::pin(async move {
             let message_id = i32::try_from(message_id)
                 .map_err(|error| SinkError(format!("message_id out of range: {error}")))?;
@@ -153,7 +367,7 @@ impl TelegramSink for FerogramTelegramSink {
             // re-attached by reference, no forward attribution, empty text.
             //
             // ferogram's `copy_message` caption-override path implements
-            // exactly this (fetch → re-attach → send as a fresh message),
+            // exactly this (fetch -> re-attach -> send as a fresh message),
             // but instantiating it trips a rustc layout cycle (its body
             // monomorphizes `copy_messages<T, T>`, whose body re-monomorphizes
             // `copy_message<T, T>`), so we reproduce the fetch-and-resend
@@ -194,8 +408,7 @@ impl TelegramSink for FerogramTelegramSink {
     fn delete_dump_messages<'a>(
         &'a self,
         message_ids: &'a [i64],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SinkError>> + Send + 'a>>
-    {
+    ) -> BoxFuture<'a, Result<(), SinkError>> {
         Box::pin(async move {
             let ids: Vec<i32> = message_ids
                 .iter()

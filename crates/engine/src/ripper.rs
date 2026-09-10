@@ -573,6 +573,12 @@ impl EngineRipperDeps {
             media: media::MediaProcessor::new(),
         }
     }
+
+    /// Public artwork passthrough for callers outside the rip pipeline
+    /// (album ZIP covers). Same transport and timeout as the ripper path.
+    pub async fn fetch_artwork_bytes(&self, url: &str) -> Option<Vec<u8>> {
+        RipperDeps::fetch_artwork(self, url).await
+    }
 }
 
 /// reqwest adapter for the lyrics seam.

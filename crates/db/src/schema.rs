@@ -60,4 +60,21 @@ diesel::table! {
     }
 }
 
-diesel::allow_tables_to_appear_in_same_query!(users, tracks, requests, settings);
+diesel::table! {
+    albums (id) {
+        id -> Integer,
+        provider -> Varchar,
+        album_id -> Text,
+        part_index -> Integer,
+        total_parts -> Integer,
+        message_id -> Integer,
+        file_id -> Text,
+        file_unique_id -> Text,
+        file_size -> BigInt,
+        file_name -> Text,
+        generation_hash -> Varchar,
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::allow_tables_to_appear_in_same_query!(users, tracks, requests, settings, albums);

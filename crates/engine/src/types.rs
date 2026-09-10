@@ -119,6 +119,8 @@ pub struct ParsedAlacInput {
     pub items: Vec<ParsedTargetItem>,
     pub track_id: String,
     pub force: bool,
+    /// Explicit request to package an album as a ZIP (`-z`/`--zip`).
+    pub zip: bool,
     pub is_album: bool,
     pub is_playlist: bool,
     pub is_artist: bool,

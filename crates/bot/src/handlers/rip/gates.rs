@@ -71,7 +71,7 @@ pub fn usage(is_cache_only: bool) -> &'static str {
     if is_cache_only {
         "<b>Apple Music lossless cacher (admin)</b><br/><br/><blockquote><b>Usage:</b><br/>• <code>/cache &lt;link | id&gt;</code><br/>• Send multiple links or attach a <code>.txt</code> file<br/>• Alias: <code>/dump</code><br/>• Option: <code>-f</code> (force re-rip)<br/><i>Seeds lossless audio into the dump channel and database.</i></blockquote>"
     } else {
-        "<b>Apple Music lossless downloader</b><br/><br/><blockquote><b>Supported inputs:</b><br/>• <code>/alac &lt;link | id&gt;</code><br/>• Send multiple links or attach a <code>.txt</code> file<br/>• Aliases: <code>/rip</code>, <code>/batch</code>, <code>/dl</code>, <code>/download</code><br/>• Cancel with <code>/cancel</code> or the Cancel download button<br/>• Option: <code>-f</code> (force re-rip)</blockquote>"
+        "<b>Apple Music lossless downloader</b><br/><br/><blockquote><b>Supported inputs:</b><br/>• <code>/alac &lt;link | id&gt;</code><br/>• Send multiple links or attach a <code>.txt</code> file<br/>• Aliases: <code>/rip</code>, <code>/batch</code>, <code>/dl</code>, <code>/download</code><br/>• Album ZIP: <code>-z</code> or <code>--zip</code><br/>• Cancel with <code>/cancel</code> or the Cancel download button<br/>• Option: <code>-f</code> (force re-rip)</blockquote>"
     }
 }
 

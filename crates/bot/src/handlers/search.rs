@@ -406,14 +406,17 @@ async fn rip(state: Arc<BotState>, query: CallbackQuery, track_id: String) {
         .unwrap_or_else(|| PeerRef::from(query.user_id));
     super::ensure_dashboard(&state, marked_chat, query.user_id, is_admin, peer).await;
 
+    let user_display = crate::presentation::resolve_user_display_name(&state.client, query.user_id).await;
     let options = engine::orchestrator::types::RipJobOptions {
         chat_id: marked_chat,
         user_id: query.user_id,
-        user_name: Some(format!("User {}", query.user_id)),
+        user_name: Some(user_display),
         delivery_chat_id: query.user_id,
         is_group: marked_chat != query.user_id,
         is_force: false,
         is_cache_only: false,
+        zip: false,
+        zip_explicit: false,
         single_storefront: None,
         parsed_items: vec![ParsedTargetItem {
             id: track_id.clone(),

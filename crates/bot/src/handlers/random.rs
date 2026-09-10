@@ -369,31 +369,70 @@ async fn fetch_candidate_by_source(
     }
 }
 
-/// Oracle album enrichment via fetchAlbumTracks, errors swallowed.
-async fn enrich_from_catalog(state: &BotState, candidate: &mut RandomAlbumCandidate) {
-    let Ok(full) = state
-        .rip_deps
-        .catalog()
-        .fetch_album_tracks(&candidate.id, &candidate.storefront)
-        .await
-    else {
-        return;
-    };
-    candidate.track_count = Some(full.tracks.len());
-    if !full.album.title.is_empty() {
-        candidate.title = full.album.title.clone();
+/// Pick and validate a candidate album, ensuring it has tracks available.
+async fn discover_valid_candidate(
+    state: &BotState,
+    http: &reqwest::Client,
+    source: &str,
+    storefront: &str,
+    rng: &mut u64,
+) -> Result<RandomAlbumCandidate, String> {
+    const MAX_ATTEMPTS: usize = 5;
+    let mut last_err = String::new();
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        match fetch_candidate_by_source(state, http, source, storefront, rng).await {
+            Ok(mut candidate) => {
+                match state
+                    .rip_deps
+                    .catalog()
+                    .fetch_album_tracks(&candidate.id, &candidate.storefront)
+                    .await
+                {
+                    Ok(full) if !full.tracks.is_empty() => {
+                        candidate.track_count = Some(full.tracks.len());
+                        if !full.album.title.is_empty() {
+                            candidate.title = full.album.title;
+                        }
+                        if !full.album.artist.is_empty() {
+                            candidate.artist = full.album.artist;
+                        }
+                        if let Some(genre) = full.album.genre.filter(|g| !g.is_empty()) {
+                            candidate.genre = Some(genre);
+                        }
+                        if !full.album.release_date.is_empty() {
+                            candidate.release_date = Some(full.album.release_date);
+                        }
+                        return Ok(candidate);
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            album_id = %candidate.id,
+                            attempt,
+                            "Random album candidate has 0 tracks on iTunes, retrying..."
+                        );
+                        last_err = format!("Album {} has 0 tracks on iTunes", candidate.id);
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            album_id = %candidate.id,
+                            attempt,
+                            error = %err,
+                            "Random album candidate track lookup failed, retrying..."
+                        );
+                        last_err = err.to_string();
+                    }
+                }
+            }
+            Err(err) => {
+                last_err = err;
+            }
+        }
     }
-    if !full.album.artist.is_empty() {
-        candidate.artist = full.album.artist.clone();
-    }
-    // Oracle `fullAlbum.album.genre || candidate.genre`: an empty/absent
-    // catalog genre falls back to the candidate's own value.
-    if let Some(genre) = full.album.genre.clone().filter(|g| !g.is_empty()) {
-        candidate.genre = Some(genre);
-    }
-    if !full.album.release_date.is_empty() {
-        candidate.release_date = Some(full.album.release_date.clone());
-    }
+
+    Err(format!(
+        "Failed to find an album with available tracks after {MAX_ATTEMPTS} attempts: {last_err}"
+    ))
 }
 
 fn urlencode(value: &str) -> String {
@@ -476,10 +515,9 @@ async fn random(state: Arc<BotState>, msg: IncomingMessage) {
     let http = http_client();
     let peer = super::chat_peer_ref(&msg);
     let result =
-        fetch_candidate_by_source(&state, &http, &source_arg, &storefront_arg, &mut rng).await;
+        discover_valid_candidate(&state, &http, &source_arg, &storefront_arg, &mut rng).await;
     match result {
-        Ok(mut candidate) => {
-            enrich_from_catalog(&state, &mut candidate).await;
+        Ok(candidate) => {
             let text = build_preview_text(&candidate);
             let keyboard = preview_keyboard(&candidate.id, &candidate.storefront, &source_arg);
             let _ = state
@@ -582,9 +620,8 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery, action: Discov
 
             let mut rng = now_seed();
             let http = http_client();
-            match fetch_candidate_by_source(&state, &http, &source, &storefront, &mut rng).await {
-                Ok(mut candidate) => {
-                    enrich_from_catalog(&state, &mut candidate).await;
+            match discover_valid_candidate(&state, &http, &source, &storefront, &mut rng).await {
+                Ok(candidate) => {
                     let text = build_preview_text(&candidate);
                     let keyboard = preview_keyboard(&candidate.id, &candidate.storefront, &source);
                     let _ = state
@@ -626,14 +663,17 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery, action: Discov
 
             // Oracle delegates to executeRipPipeline in cache-only mode;
             // the collapsed orchestrator takes that path (recorded deviation).
+            let user_display = crate::presentation::resolve_user_display_name(&state.client, query.user_id).await;
             let options = engine::orchestrator::types::RipJobOptions {
                 chat_id: marked_chat,
                 user_id: query.user_id,
-                user_name: Some(format!("User {}", query.user_id)),
+                user_name: Some(user_display),
                 delivery_chat_id: marked_chat,
                 is_group: marked_chat != query.user_id,
                 is_force: false,
                 is_cache_only: true,
+                zip: true,
+                zip_explicit: false,
                 single_storefront: Some(storefront.clone()),
                 parsed_items: vec![ParsedTargetItem {
                     id: album_id,
@@ -645,12 +685,24 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery, action: Discov
                 status_msg_id: 0,
                 is_admin: true,
             };
+            super::ensure_dashboard(&state, marked_chat, query.user_id, true, peer.clone()).await;
+
             if let Err(error) = state
                 .rip_orchestrator
                 .start_job(Arc::clone(&state.rip_deps), &options)
                 .await
             {
                 tracing::warn!(%error, "random album dump job failed to start");
+                let _ = state
+                    .client
+                    .send_message(
+                        peer,
+                        InputMessage::html(format!(
+                            "! <b>Could not dump album:</b><br/><code>{}</code>",
+                            crate::html::escape(&error.to_string())
+                        )),
+                    )
+                    .await;
             }
         }
     }

@@ -320,29 +320,87 @@ async fn notify_job_completed(state: &BotState, job: &ActiveRipJob, summary: &Ri
     } else {
         "Job finished with issues"
     };
-    let details = format!(
-        "<b>{heading}</b><br/>{}<br/><i>{} cached · {} ripped · {} failed / {} total</i>",
-        summary.job_header,
-        summary.cached_count,
-        summary.ripped_count,
-        summary.failed_count,
-        summary.total_tracks,
-    );
+    // JOB DONE box (mirror-leech style): title, ┃, fact lines, ┖ By.
+    // Format user mention for origin chat
     let name = job
         .user_name
         .as_deref()
         .filter(|name| !name.trim().is_empty())
         .unwrap_or("User");
-    let mention = if job.user_id > 0 {
+    let mention = if name.starts_with('@') {
+        let handle = name.trim_start_matches('@');
         format!(
-            "<a href=\"tg://user?id={}\">{}</a>",
+            r#"<a href="https://t.me/{handle}">@{handle}</a>"#
+        )
+    } else if job.user_id > 0 {
+        format!(
+            r#"<a href="tg://user?id={}">{}</a>"#,
             job.user_id,
             crate::html::escape(name)
         )
     } else {
         crate::html::escape(name)
     };
+
+    // JOB DONE box (mirror-leech style): title, ┃, fact lines, ┗ Done.
+    let elapsed = summary
+        .total_elapsed_sec
+        .parse::<f64>()
+        .map(|seconds| crate::presentation::readable_time_compact(seconds as u64))
+        .unwrap_or_else(|_| summary.total_elapsed_sec.clone());
+    let mut lines = vec![
+        format!("<b>{heading}</b>"),
+        summary.job_header.clone(),
+        "┃".to_owned(),
+        format!(
+            "┣ Tracks: {} ({} cached · {} ripped · {} failed)",
+            summary.total_tracks, summary.cached_count, summary.ripped_count, summary.failed_count
+        ),
+        format!("┣ Elapsed: {elapsed}"),
+        format!("┣ By: {mention}"),
+    ];
+    // Engine-authored plain-text notes (e.g. single-track ZIP skip). Escaped
+    // because they can embed album names.
+    for warning in &summary.warnings {
+        lines.push(format!("┣ ⚠️ {}", crate::html::escape(warning)));
+    }
+    lines.push("┗ Done".to_owned());
+    let details = lines.join("<br/>");
     let fallback = format!("{mention}, {details}");
+
+    // ZIP jobs: the album preview photo + rich details caption was delivered
+    // alongside the ZIP files. If the photo could not be delivered, fall back
+    // to sending the rich album details as a text message (no webpage preview).
+    if let Some(zip) = summary.zip_delivery.as_ref() {
+        if !summary.is_cache_only && zip.total_parts > 0 && !zip.photo_delivered {
+            let caption_meta = engine::orchestrator::caption::AlbumDetailsCaptionMetadata {
+                album: &zip.album,
+                artist: &zip.artist,
+                album_id: &zip.album_id,
+                storefront: &zip.storefront,
+                total_tracks: zip.total_tracks,
+                delivered_tracks: zip.delivered_tracks,
+                size_bytes: zip.size_bytes,
+                total_parts: zip.total_parts,
+                release_year: &zip.release_year,
+                genre: zip.genre.as_deref(),
+                record_label: zip.record_label.as_deref(),
+                is_partial: zip.is_partial,
+                user_name: job.user_name.as_deref(),
+                user_id: job.user_id,
+            };
+            let details_html =
+                engine::orchestrator::caption::format_album_details_caption(&caption_meta);
+            let details_msg = ferogram::InputMessage::html(details_html).no_webpage(true);
+            if let Err(error) = state
+                .client
+                .send_message(ferogram::PeerRef::from(job.delivery_chat_id), details_msg)
+                .await
+            {
+                tracing::warn!(job_id = %job.id, error = %error, "ZIP details message failed");
+            }
+        }
+    }
 
     let input = ferogram::InputMessage::html(if reply_id.is_some() {
         details
@@ -375,6 +433,7 @@ mod tests {
         ActiveRipJob {
             id: id.into(),
             chat_id: 100,
+            delivery_chat_id: 100,
             user_id: 7,
             user_name: Some("Alice".into()),
             job_header: "Album: <b>X</b>".into(),

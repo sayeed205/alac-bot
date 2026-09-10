@@ -11,8 +11,8 @@ use std::{
 use engine::{
     orchestrator::{
         deps::{
-            CachedTrack, DumpUpload, OrchestratorDeps, RequestLog, SaveTrackInput, SinkError,
-            TelegramSink, UploadProgressCallback,
+            AlbumUpload, CachedAlbum, CachedTrack, DumpUpload, OrchestratorDeps, RequestLog,
+            SaveTrackInput, SinkError, TelegramSink, UploadProgressCallback,
         },
         types::{JobPhase, OrchestratorEvent, RipJobOptions, RipJobSummary},
         OrchestratorError, RipOrchestrator,
@@ -33,6 +33,8 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 enum RipScript {
     Ok,
+    /// Rip succeeds and the fake writes a real file (for ZIP staging tests).
+    OkWithFile(Vec<u8>),
     Fail(&'static str),
 }
 
@@ -51,6 +53,17 @@ struct DepsState {
     /// Message ids whose dump copy fails (once).
     copies_fail_ids: Vec<i64>,
     rip_calls: Vec<String>,
+    // ── album ZIP (T2/T4) ──────────────────────────────────────────────────
+    saved_albums: Vec<AlbumUpload>,
+    deleted_album_zip_ids: Vec<String>,
+    found_albums: HashMap<String, Vec<CachedAlbum>>,
+    sent_documents: Vec<String>, // dump + direct document upload paths
+    uploaded_document_bytes: Vec<u8>, // captured at upload time (workspace is deleted after)
+    /// Thumbnail paths passed to document sends (may repeat per part).
+    sent_thumbs: Vec<String>,
+    sent_photos: Vec<(i64, usize, String)>, // (chat, byte len, caption)
+    fetch_artwork_urls: Vec<String>,
+    artwork_bytes: Option<Vec<u8>>,
 }
 
 impl DepsState {
@@ -241,6 +254,84 @@ impl TelegramSink for FakeSink {
             Ok(())
         })
     }
+
+    fn send_document_to_dump<'a>(
+        &'a self,
+        file_path: &'a str,
+        thumb_path: Option<&'a str>,
+        _caption_html: &'a str,
+        _on_upload_progress: Option<&'a UploadProgressCallback>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<DumpUpload>, SinkError>> + Send + 'a>> {
+        let state = Arc::clone(&self.state);
+        let path = file_path.to_owned();
+        let thumb = thumb_path.map(str::to_owned);
+        Box::pin(async move {
+            // Read the bytes now: the orchestrator deletes the workspace
+            // right after the upload returns.
+            let bytes = std::fs::read(&path).unwrap_or_default();
+            let mut st = state.lock().unwrap();
+            st.sent_documents.push(path);
+            st.uploaded_document_bytes = bytes;
+            st.sent_thumbs.extend(thumb);
+            Ok(Some(DumpUpload {
+                message_id: 900,
+                file_id: "zip_file".into(),
+                file_unique_id: "zip_uniq".into(),
+            }))
+        })
+    }
+
+    fn send_document_to_chat<'a>(
+        &'a self,
+        _chat_id: i64,
+        file_path: &'a str,
+        thumb_path: Option<&'a str>,
+        _caption_html: &'a str,
+        _on_upload_progress: Option<&'a UploadProgressCallback>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        let state = Arc::clone(&self.state);
+        let path = file_path.to_owned();
+        let thumb = thumb_path.map(str::to_owned);
+        Box::pin(async move {
+            let bytes = std::fs::read(&path).unwrap_or_default();
+            let mut st = state.lock().unwrap();
+            st.sent_documents.push(path);
+            st.uploaded_document_bytes = bytes;
+            st.sent_thumbs.extend(thumb);
+            Ok(())
+        })
+    }
+
+    fn send_photo_to_chat<'a>(
+        &'a self,
+        chat_id: i64,
+        image_bytes: &'a [u8],
+        caption_html: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            state.lock().unwrap().sent_photos.push((
+                chat_id,
+                image_bytes.len(),
+                caption_html.to_string(),
+            ));
+            Ok(())
+        })
+    }
+
+    fn download_dump_file<'a>(
+        &'a self,
+        _message_id: i64,
+        destination: &'a std::path::Path,
+        _on_download_progress: Option<&'a UploadProgressCallback>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(async move {
+            // Materialize a deterministic fake audio file so ZIP staging has
+            // real bytes to archive.
+            std::fs::write(destination, b"cached-audio-bytes")
+                .map_err(|error| SinkError(error.to_string()))
+        })
+    }
 }
 
 impl FakeSink {
@@ -306,6 +397,56 @@ impl OrchestratorDeps for FakeDeps {
         async move { Ok(()) }
     }
 
+    fn save_album<'a>(
+        &'a self,
+        upload: AlbumUpload,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        self.state.lock().unwrap().saved_albums.push(upload);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn find_albums<'a>(
+        &'a self,
+        _provider: engine::types::Provider,
+        album_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<CachedAlbum>, String>> + Send + 'a>> {
+        let rows = self
+            .state
+            .lock()
+            .unwrap()
+            .found_albums
+            .get(album_id)
+            .cloned()
+            .unwrap_or_default();
+        Box::pin(async move { Ok(rows) })
+    }
+
+    fn delete_albums<'a>(
+        &'a self,
+        _provider: engine::types::Provider,
+        album_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        self.state
+            .lock()
+            .unwrap()
+            .deleted_album_zip_ids
+            .push(album_id.to_string());
+        Box::pin(async { Ok(()) })
+    }
+
+    fn fetch_artwork<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send + 'a>> {
+        self.state
+            .lock()
+            .unwrap()
+            .fetch_artwork_urls
+            .push(url.into());
+        let bytes = self.state.lock().unwrap().artwork_bytes.clone();
+        Box::pin(async move { bytes })
+    }
+
     fn fetch_album_tracks(
         &self,
         id: &str,
@@ -344,7 +485,7 @@ impl OrchestratorDeps for FakeDeps {
         _on_progress: Option<&RipProgressCallback>,
         _storefront: &str,
         _signal: CancellationToken,
-        _output_dir: Option<&std::path::Path>,
+        output_dir: Option<&std::path::Path>,
     ) -> impl Future<Output = Result<TrackRipResult, RipError>> + Send {
         self.state
             .lock()
@@ -360,6 +501,19 @@ impl OrchestratorDeps for FakeDeps {
             }
             match script {
                 Some(RipScript::Fail(msg)) => Err(RipError::Message(msg.to_string())),
+                Some(RipScript::OkWithFile(bytes)) => {
+                    // Write a real file so the ZIP staging path has actual
+                    // bytes to copy into the archive workspace.
+                    let dir = output_dir
+                        .map(std::path::Path::to_path_buf)
+                        .unwrap_or_else(|| std::env::temp_dir().join(format!("fake_rip_{id}")));
+                    let path = dir.join(format!("{id}.m4a"));
+                    std::fs::write(&path, &bytes).map_err(|e| RipError::Message(e.to_string()))?;
+                    Ok(TrackRipResult {
+                        file_path: path.to_string_lossy().into_owned(),
+                        ..Self::rip_result(&id)
+                    })
+                }
                 _ => Ok(Self::rip_result(&id)),
             }
         }
@@ -428,6 +582,8 @@ fn options(items: Vec<ParsedTargetItem>, is_admin: bool) -> RipJobOptions {
         is_group: false,
         is_force: false,
         is_cache_only: false,
+        zip: false,
+        zip_explicit: false,
         single_storefront: None,
         parsed_items: items,
         reply_to_message_id: Some(555),
@@ -571,7 +727,7 @@ async fn album_resolution_refines_header_and_lists_tracks() {
     assert_eq!(summary.total_tracks, 2);
     assert_eq!(
         summary.job_header,
-        "Album: <b>Album</b> by <b>Nils Frahm</b>"
+        "Album: <a href=\"https://music.apple.com/us/album/alb.1\"><b>Album</b></a> by <b>Nils Frahm</b>"
     );
     let st = state.lock().unwrap();
     assert_eq!(st.rip_calls.len(), 2);
@@ -1308,4 +1464,431 @@ async fn empty_tracks_after_cap_edge() {
         .expect("job succeeds");
     assert_eq!(summary.total_tracks, 2, "0 disables the cap");
     assert_eq!(summary.capped_count, 0);
+}
+
+// ── album ZIP: generation-hash reuse, cover, single-track warning ─────────
+
+/// Builds a zip-enabled RipJobOptions for a single album item.
+fn zip_options(album: &str, cache_only: bool, explicit: bool, force: bool) -> RipJobOptions {
+    RipJobOptions {
+        chat_id: 100,
+        user_id: 42,
+        user_name: Some("tester".into()),
+        delivery_chat_id: 100,
+        is_group: false,
+        is_force: force,
+        is_cache_only: cache_only,
+        zip: true,
+        zip_explicit: explicit,
+        single_storefront: None,
+        parsed_items: vec![album_item(album)],
+        reply_to_message_id: Some(555),
+        status_msg_id: 999,
+        is_admin: true,
+    }
+}
+
+/// Computes the generation hash the orchestrator will derive for a faked
+/// album, matching `album_generation_hash("apple", album, ids)`.
+fn expected_generation_hash(album: &str, ids: &[&str]) -> String {
+    engine::zip::album_generation_hash("apple", album, ids)
+}
+
+fn cached_zip_row(album: &str, part: i32, total: i32, hash: &str) -> CachedAlbum {
+    CachedAlbum {
+        part_index: part,
+        total_parts: total,
+        message_id: 5000 + i64::from(part),
+        file_unique_id: format!("zip_uniq_{album}_{part}"),
+        generation_hash: hash.to_owned(),
+        file_size: 512,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zip_only_delivery_skips_individual_track_copies() {
+    // Ripped track on a user ZIP job: staged for the archive, dumped for the
+    // cache, but never copied to the requester as an individual file.
+    let (orch, deps, state, _) = setup();
+    let meta = |id: &str| FakeDeps::track_meta(id, "Track", "Artist");
+    deps.albums.lock().unwrap().insert(
+        "alb.rip".into(),
+        FakeDeps::album(vec![meta("t1"), meta("t2")]),
+    );
+    deps.rip_scripts
+        .lock()
+        .unwrap()
+        .insert("t1".into(), RipScript::OkWithFile(vec![1, 2, 3]));
+    deps.rip_scripts
+        .lock()
+        .unwrap()
+        .insert("t2".into(), RipScript::OkWithFile(vec![4, 5, 6]));
+    {
+        let mut st = state.lock().unwrap();
+        for _ in 0..2 {
+            st.send_audio_results.push_back(FakeDeps::upload_ok());
+        }
+    }
+
+    let summary = run_async(&orch, &deps, &zip_options("alb.rip", false, true, false))
+        .await
+        .expect("job succeeds");
+
+    let st = state.lock().unwrap();
+    // Both tracks were ripped and cached to the dump.
+    assert_eq!(summary.ripped_count, 2);
+    assert_eq!(st.sent_audio.len(), 2, "audio cached to dump");
+    // ZIP-only: copies to the requester are the ZIP part alone (msg 900 is
+    // the fake dump-upload message id), never the individual tracks.
+    let per_track_copies: Vec<i64> = st
+        .copies
+        .iter()
+        .filter(|(to, _, _, _)| *to == 100)
+        .map(|(_, msg, _, _)| *msg)
+        .collect();
+    assert!(
+        per_track_copies.iter().all(|msg| *msg == 900),
+        "individual tracks must not be delivered on ZIP jobs: {per_track_copies:?}"
+    );
+    assert_eq!(st.sent_documents.len(), 1, "complete archive published");
+    let delivery = summary
+        .zip_delivery
+        .as_ref()
+        .expect("rebuild delivery metadata present");
+    assert_eq!(delivery.delivered_tracks, 2);
+    assert_eq!(delivery.total_parts, 1);
+    assert!(!delivery.is_partial);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zip_cached_without_reuse_rows_stages_and_rebuilds() {
+    // Fully cached album, no reusable ZIP rows: staging downloads run, the
+    // archive is rebuilt from the cached files, and no individual track
+    // copies are delivered.
+    let (orch, deps, state, _) = setup();
+    let meta = |id: &str| FakeDeps::track_meta(id, "Track", "Artist");
+    deps.albums.lock().unwrap().insert(
+        "alb.stage".into(),
+        FakeDeps::album(vec![meta("t1"), meta("t2")]),
+    );
+    deps.cache_track("t1", 101);
+    deps.cache_track("t2", 102);
+
+    let summary = run_async(&orch, &deps, &zip_options("alb.stage", false, true, false))
+        .await
+        .expect("job succeeds");
+
+    let st = state.lock().unwrap();
+    assert_eq!(summary.cached_count, 2, "both tracks served from cache");
+    assert!(st.rip_calls.is_empty(), "nothing re-ripped");
+    assert_eq!(
+        st.sent_documents.len(),
+        1,
+        "rebuilt from staged cache files"
+    );
+    // Request log still written for ZIP jobs' cached hits.
+    assert_eq!(
+        st.request_logs
+            .iter()
+            .filter(|log| log.is_cache_hit && log.status == "completed")
+            .count(),
+        2,
+        "cache-hit requests logged for staged tracks: {:?}",
+        st.request_logs
+    );
+    // No individual track copies.
+    let per_track_copies: Vec<i64> = st
+        .copies
+        .iter()
+        .filter(|(to, _, _, _)| *to == 100)
+        .map(|(_, msg, _, _)| *msg)
+        .collect();
+    assert!(
+        per_track_copies.iter().all(|msg| *msg == 900),
+        "no individual copies on ZIP jobs: {per_track_copies:?}"
+    );
+    assert!(
+        summary
+            .zip_delivery
+            .as_ref()
+            .is_some_and(|d| !d.is_partial && d.delivered_tracks == 2),
+        "delivery metadata present"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zip_partial_delivery_marks_zip_delivery_partial() {
+    // One of two tracks fails to rip → user gets a partial archive and the
+    // delivery metadata reflects it.
+    let (orch, deps, state, _) = setup();
+    let meta = |id: &str| FakeDeps::track_meta(id, "Track", "Artist");
+    deps.albums.lock().unwrap().insert(
+        "alb.part".into(),
+        FakeDeps::album(vec![meta("t1"), meta("t2")]),
+    );
+    deps.rip_scripts
+        .lock()
+        .unwrap()
+        .insert("t1".into(), RipScript::OkWithFile(vec![1, 2, 3]));
+    deps.rip_scripts
+        .lock()
+        .unwrap()
+        .insert("t2".into(), RipScript::Fail("mirror exploded"));
+    {
+        let mut st = state.lock().unwrap();
+        st.send_audio_results.push_back(FakeDeps::upload_ok());
+    }
+
+    let summary = run_async(&orch, &deps, &zip_options("alb.part", false, true, false))
+        .await
+        .expect("job succeeds");
+
+    assert_eq!(summary.failed_count, 1);
+    let delivery = summary
+        .zip_delivery
+        .as_ref()
+        .expect("partial delivery still reports metadata");
+    assert!(delivery.is_partial, "delivery flagged partial");
+    assert_eq!(delivery.delivered_tracks, 1, "one track in the archive");
+    assert_eq!(delivery.total_tracks, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zip_reuse_delivers_cached_parts_without_rebuild() {
+    let (orch, deps, state, _) = setup();
+    let meta = |id: &str| FakeDeps::track_meta(id, "Track", "Artist");
+    deps.albums.lock().unwrap().insert(
+        "alb.zip".into(),
+        FakeDeps::album(vec![meta("t1"), meta("t2")]),
+    );
+    deps.cache_track("t1", 101);
+    deps.cache_track("t2", 102);
+    let hash = expected_generation_hash("alb.zip", &["t1", "t2"]);
+    state.lock().unwrap().found_albums.insert(
+        "alb.zip".into(),
+        vec![
+            cached_zip_row("alb.zip", 1, 2, &hash),
+            cached_zip_row("alb.zip", 2, 2, &hash),
+        ],
+    );
+
+    let summary = run_async(&orch, &deps, &zip_options("alb.zip", false, true, false))
+        .await
+        .expect("job succeeds");
+
+    let st = state.lock().unwrap();
+    // ZIP-only delivery: the requester gets the cached parts alone — the
+    // individual track copies must NOT be sent for ZIP jobs.
+    let zip_copies: Vec<i64> = st
+        .copies
+        .iter()
+        .filter(|(to, _, _, _)| *to == 100)
+        .map(|(_, msg, _, _)| *msg)
+        .collect();
+    assert_eq!(zip_copies, vec![5001, 5002]);
+    // No rebuild: no document uploads, no new ZIP rows, no purges.
+    assert!(st.sent_documents.is_empty());
+    assert!(st.saved_albums.is_empty());
+    assert!(st.deleted_album_zip_ids.is_empty());
+    // The per-track staging downloads never ran (reuse skips them).
+    assert!(st.rip_calls.is_empty());
+    assert_eq!(summary.cached_count, 2);
+    assert!(summary.warnings.is_empty());
+    let delivery = summary
+        .zip_delivery
+        .as_ref()
+        .expect("reuse delivery metadata present");
+    assert_eq!(delivery.total_parts, 2);
+    assert!(!delivery.is_partial);
+    assert_eq!(delivery.size_bytes, 2 * 512);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zip_hash_mismatch_rebuilds() {
+    let (orch, deps, state, _) = setup();
+    let meta = |id: &str| FakeDeps::track_meta(id, "Track", "Artist");
+    deps.albums.lock().unwrap().insert(
+        "alb.zip".into(),
+        FakeDeps::album(vec![meta("t1"), meta("t2")]),
+    );
+    deps.cache_track("t1", 101);
+    deps.cache_track("t2", 102);
+    // Rows exist but under a stale generation hash.
+    state.lock().unwrap().found_albums.insert(
+        "alb.zip".into(),
+        vec![cached_zip_row("alb.zip", 1, 1, "deadbeef")],
+    );
+
+    let summary = run_async(&orch, &deps, &zip_options("alb.zip", true, false, false))
+        .await
+        .expect("job succeeds");
+
+    let st = state.lock().unwrap();
+    // Stale rows purged before republishing the fresh complete set.
+    assert!(st.deleted_album_zip_ids.contains(&"alb.zip".to_owned()));
+    assert_eq!(
+        st.sent_documents.len(),
+        1,
+        "rebuilt archive published to dump"
+    );
+    assert_eq!(st.saved_albums.len(), 1, "fresh row persisted");
+    assert_eq!(
+        st.saved_albums[0].generation_hash,
+        expected_generation_hash("alb.zip", &["t1", "t2"]),
+        "republished under the current hash"
+    );
+    assert_eq!(summary.cached_count, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zip_force_disables_reuse() {
+    let (orch, deps, state, _) = setup();
+    let meta = |id: &str| FakeDeps::track_meta(id, "Track", "Artist");
+    deps.albums.lock().unwrap().insert(
+        "alb.zip".into(),
+        FakeDeps::album(vec![meta("t1"), meta("t2")]),
+    );
+    deps.cache_track("t1", 101);
+    deps.cache_track("t2", 102);
+    let hash = expected_generation_hash("alb.zip", &["t1", "t2"]);
+    state.lock().unwrap().found_albums.insert(
+        "alb.zip".into(),
+        vec![cached_zip_row("alb.zip", 1, 1, &hash)],
+    );
+
+    let summary = run_async(&orch, &deps, &zip_options("alb.zip", false, true, true))
+        .await
+        .expect("job succeeds");
+
+    let st = state.lock().unwrap();
+    // Force purges the cache (delete_track) and re-rips; matching cached
+    // rows must NOT short-circuit delivery of a rebuilt archive set.
+    assert!(!st.deleted_tracks.is_empty(), "force purges cached tracks");
+    assert_eq!(st.rip_calls.len(), 2, "both tracks re-ripped");
+    assert!(summary.warnings.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zip_single_track_album_warns_when_explicit() {
+    let (orch, deps, _, _) = setup();
+    let meta = |id: &str| FakeDeps::track_meta(id, "Solo", "Artist");
+    deps.albums
+        .lock()
+        .unwrap()
+        .insert("alb.solo".into(), FakeDeps::album(vec![meta("t1")]));
+
+    let summary = run_async(&orch, &deps, &zip_options("alb.solo", false, true, false))
+        .await
+        .expect("job succeeds");
+
+    assert_eq!(summary.total_tracks, 1);
+    assert_eq!(summary.warnings.len(), 1, "explicit single-track ZIP warns");
+    assert!(summary.warnings[0].contains("single track"));
+
+    // Implicit auto-attempt (cache-only dump) never warns.
+    let (orch2, deps2, _, _) = setup();
+    deps2
+        .albums
+        .lock()
+        .unwrap()
+        .insert("alb.solo".into(), FakeDeps::album(vec![meta("t1")]));
+    let summary2 = run_async(&orch2, &deps2, &zip_options("alb.solo", true, false, false))
+        .await
+        .expect("job succeeds");
+    assert!(summary2.warnings.is_empty(), "implicit attempt stays quiet");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zip_build_includes_cover_and_real_generation_hash() {
+    let (orch, deps, state, _) = setup();
+    let meta = |id: &str| FakeDeps::track_meta(id, "Track", "Artist");
+    deps.albums.lock().unwrap().insert(
+        "alb.zip".into(),
+        FakeDeps::album(vec![meta("t1"), meta("t2")]),
+    );
+    // Album artwork present → cover fetch + preview + cover.jpg entry.
+    {
+        let mut albums = deps.albums.lock().unwrap();
+        let mut album = albums.get("alb.zip").cloned().unwrap();
+        album.album.artwork_url = "https://example.test/cover/3000x3000bb.jpg".into();
+        album.album.release_date = "2021-06-04".into();
+        albums.insert("alb.zip".into(), album);
+    }
+    deps.rip_scripts
+        .lock()
+        .unwrap()
+        .insert("t1".into(), RipScript::OkWithFile(vec![1, 2, 3]));
+    deps.rip_scripts
+        .lock()
+        .unwrap()
+        .insert("t2".into(), RipScript::OkWithFile(vec![4, 5, 6]));
+    {
+        let mut st = state.lock().unwrap();
+        st.artwork_bytes = Some(vec![9, 9, 9]);
+        for _ in 0..2 {
+            st.send_audio_results.push_back(FakeDeps::upload_ok());
+        }
+    }
+
+    let summary = run_async(&orch, &deps, &zip_options("alb.zip", false, true, false))
+        .await
+        .expect("job succeeds");
+
+    let st = state.lock().unwrap();
+    // Complete rebuild published the archive to the dump.
+    assert_eq!(st.sent_documents.len(), 1, "one archive part uploaded");
+    assert_eq!(st.saved_albums.len(), 1, "one row persisted");
+    let saved = &st.saved_albums[0];
+    assert_eq!(saved.part_index, 1);
+    assert_eq!(
+        saved.generation_hash,
+        expected_generation_hash("alb.zip", &["t1", "t2"]),
+        "real generation hash persisted"
+    );
+    // ZIP-only delivery: no per-track dump copies for the individual
+    // tracks (only the ZIP part DM copy may occur).
+    let per_track_copies: Vec<i64> = st
+        .copies
+        .iter()
+        .filter(|(to, _, _, _)| *to == 100)
+        .map(|(_, msg, _, _)| *msg)
+        .collect();
+    assert!(
+        per_track_copies.iter().all(|msg| *msg == 900),
+        "only the ZIP part copy is delivered, got {per_track_copies:?}"
+    );
+    // Cover + thumbnail fetched, preview sent to the requester.
+    assert_eq!(
+        st.fetch_artwork_urls.len(),
+        2,
+        "cover + 320px thumbnail fetched: {:?}",
+        st.fetch_artwork_urls
+    );
+    assert_eq!(st.sent_photos.len(), 1);
+    assert_eq!(st.sent_photos[0].0, 100);
+    assert_eq!(st.sent_thumbs.len(), 1, "thumbnail attached to the part");
+    // Filename carries the release year.
+    assert!(
+        saved.file_name.contains("(2021)"),
+        "file was {}",
+        saved.file_name
+    );
+    // The uploaded archive really contains cover.jpg + hashed manifest.
+    // Bytes were captured at upload time — the workspace is gone now.
+    let archive_dir = std::env::temp_dir().join(format!("zip_assert_{}", std::process::id()));
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    let archive_path = archive_dir.join("uploaded.zip");
+    std::fs::write(&archive_path, &st.uploaded_document_bytes).unwrap();
+    let file = std::fs::File::open(&archive_path).unwrap();
+    let mut archive = zip::ZipArchive::new(file).unwrap();
+    assert!(archive.by_name("cover.jpg").is_ok());
+    assert!(archive.by_name("manifest.json").is_ok());
+    let mut manifest_file = archive.by_name("manifest.json").unwrap();
+    let mut manifest_bytes = Vec::new();
+    std::io::Read::read_to_end(&mut manifest_file, &mut manifest_bytes).unwrap();
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+    assert!(manifest["cover_sha256"].is_string());
+    assert!(manifest["tracks"][0]["sha256"].is_string());
+    let _ = std::fs::remove_dir_all(&archive_dir);
+    assert!(summary.warnings.is_empty());
 }

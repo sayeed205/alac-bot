@@ -146,10 +146,13 @@ pub fn parse_alac_input(raw_text: &str, reply_text: Option<&str>) -> Option<Pars
     }
 
     let mut force = false;
+    let mut zip = false;
     let mut filtered: Vec<&str> = Vec::new();
     for token in tokens {
         if token == "-f" || token == "--force" {
             force = true;
+        } else if token == "-z" || token == "--zip" {
+            zip = true;
         } else {
             filtered.push(token);
         }
@@ -183,6 +186,7 @@ pub fn parse_alac_input(raw_text: &str, reply_text: Option<&str>) -> Option<Pars
     Some(ParsedAlacInput {
         track_id: first.id.clone(),
         force,
+        zip,
         is_album: first.kind == TargetKind::Album,
         is_playlist: first.kind == TargetKind::Playlist,
         is_artist: first.kind == TargetKind::Artist,

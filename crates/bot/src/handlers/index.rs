@@ -9,7 +9,10 @@ use std::{
 };
 
 use engine::{
-    orchestrator::{caption::parse_dump_caption, deps::SaveTrackInput},
+    orchestrator::{
+        caption::{parse_dump_caption, parse_zip_dump_caption},
+        deps::SaveTrackInput,
+    },
     TrackKey,
 };
 use ferogram::{
@@ -180,6 +183,7 @@ async fn index_dump_channel(
     let mut synced = 0;
     let mut skipped = 0;
     let mut valid_track_ids = HashSet::new();
+    let mut valid_zip_msg_ids: HashSet<i32> = HashSet::new();
 
     let probe = state
         .client
@@ -207,7 +211,7 @@ async fn index_dump_channel(
                 skipped += 1;
                 continue;
             };
-            let Some(audio) =
+            let maybe_audio =
                 document
                     .raw
                     .attributes
@@ -217,73 +221,107 @@ async fn index_dump_channel(
                             Some(audio)
                         }
                         _ => None,
+                    });
+
+            if let Some(audio) = maybe_audio {
+                let Some(meta) = parse_dump_caption(message.text()) else {
+                    skipped += 1;
+                    continue;
+                };
+
+                let (file_id, file_unique_id) = file_ids(&document);
+                state
+                    .rip_deps
+                    .tracks()
+                    .save_track(&SaveTrackInput {
+                        track_key: meta.track_key.clone(),
+                        message_id: i64::from(message.id()),
+                        file_id,
+                        file_unique_id,
+                        title: if meta.title.is_empty() {
+                            audio.title.as_deref().unwrap_or("Unknown Title").to_owned()
+                        } else {
+                            meta.title
+                        },
+                        artist: if meta.artist.is_empty() {
+                            audio
+                                .performer
+                                .as_deref()
+                                .unwrap_or("Unknown Artist")
+                                .to_owned()
+                        } else {
+                            meta.artist
+                        },
+                        album: if meta.album.is_empty() {
+                            "Unknown Album".to_owned()
+                        } else {
+                            meta.album
+                        },
+                        duration: if meta.duration != 0 {
+                            meta.duration
+                        } else {
+                            i64::from(audio.duration)
+                        },
+                        bit_depth: meta.bit_depth,
+                        sample_rate: meta.sample_rate,
+                        genre: if meta.genre.is_empty() {
+                            "Music".to_owned()
+                        } else {
+                            meta.genre
+                        },
+                        release_date: meta.release_date,
+                        track_number: if meta.track_number != 0 {
+                            meta.track_number
+                        } else {
+                            1
+                        },
+                        track_count: if meta.track_count != 0 {
+                            meta.track_count
+                        } else {
+                            1
+                        },
                     })
-            else {
-                skipped += 1;
-                continue;
-            };
-            let Some(meta) = parse_dump_caption(message.text()) else {
-                skipped += 1;
-                continue;
-            };
+                    .await
+                    .map_err(|error| error.to_string())?;
 
-            let (file_id, file_unique_id) = file_ids(&document);
-            state
-                .rip_deps
-                .tracks()
-                .save_track(&SaveTrackInput {
-                    track_key: meta.track_key.clone(),
-                    message_id: i64::from(message.id()),
-                    file_id,
-                    file_unique_id,
-                    title: if meta.title.is_empty() {
-                        audio.title.as_deref().unwrap_or("Unknown Title").to_owned()
-                    } else {
-                        meta.title
-                    },
-                    artist: if meta.artist.is_empty() {
-                        audio
-                            .performer
-                            .as_deref()
-                            .unwrap_or("Unknown Artist")
-                            .to_owned()
-                    } else {
-                        meta.artist
-                    },
-                    album: if meta.album.is_empty() {
-                        "Unknown Album".to_owned()
-                    } else {
-                        meta.album
-                    },
-                    duration: if meta.duration != 0 {
-                        meta.duration
-                    } else {
-                        i64::from(audio.duration)
-                    },
-                    bit_depth: meta.bit_depth,
-                    sample_rate: meta.sample_rate,
-                    genre: if meta.genre.is_empty() {
-                        "Music".to_owned()
-                    } else {
-                        meta.genre
-                    },
-                    release_date: meta.release_date,
-                    track_number: if meta.track_number != 0 {
-                        meta.track_number
-                    } else {
-                        1
-                    },
-                    track_count: if meta.track_count != 0 {
-                        meta.track_count
-                    } else {
-                        1
-                    },
-                })
-                .await
-                .map_err(|error| error.to_string())?;
+                valid_track_ids.insert(meta.track_key);
+                synced += 1;
+                continue;
+            }
 
-            valid_track_ids.insert(meta.track_key);
-            synced += 1;
+            if let Some(zip_meta) = parse_zip_dump_caption(message.text()) {
+                let (file_id, file_unique_id) = file_ids(&document);
+                let file_name = document.file_name().unwrap_or(&zip_meta.album).to_owned();
+                let file_size = document.raw.size;
+                let zip_repo = db::AlbumsRepository::new(state.db_client.clone());
+                let save_res = zip_repo
+                    .save_album(&db::NewAlbum {
+                        provider: zip_meta.provider,
+                        album_id: &zip_meta.album_id,
+                        part_index: zip_meta.part_index,
+                        total_parts: zip_meta.total_parts,
+                        message_id: message.id(),
+                        file_id: &file_id,
+                        file_unique_id: &file_unique_id,
+                        file_size,
+                        file_name: &file_name,
+                        generation_hash: &zip_meta.generation_hash,
+                    })
+                    .await;
+                match save_res {
+                    Ok(_) => {
+                        valid_zip_msg_ids.insert(message.id());
+                        synced += 1;
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "failed to index album ZIP part");
+                        skipped += 1;
+                    }
+                }
+                continue;
+            }
+
+            skipped += 1;
         }
         on_progress(scanned, synced);
         let start = max(1, end - (INDEX_BATCH_SIZE - 1));
@@ -294,12 +332,24 @@ async fn index_dump_channel(
     }
 
     let valid_ids_vec: Vec<TrackKey> = valid_track_ids.into_iter().collect();
-    let pruned = state
+    let mut pruned = state
         .rip_deps
         .tracks()
         .delete_tracks_not_in(&valid_ids_vec)
         .await
         .map_err(|error| error.to_string())?;
+
+    // ZIP rows are derived from dump-channel documents and must not survive
+    // manual channel cleanup. Reconcile them during the same index pass.
+    let zip_repo = db::AlbumsRepository::new(state.db_client.clone());
+    if let Ok(zip_rows) = zip_repo.list_albums().await {
+        for row in zip_rows {
+            if !valid_zip_msg_ids.contains(&row.message_id) {
+                let _ = zip_repo.delete_albums(row.provider, &row.album_id).await;
+                pruned += 1;
+            }
+        }
+    }
 
     Ok(IndexSummary {
         scanned,

@@ -385,6 +385,8 @@ async fn run_auto_dump_pipeline_inner(
         is_group: target_chat != target_user,
         is_force: false,
         is_cache_only: true,
+        zip: true,
+        zip_explicit: false,
         single_storefront: None,
         parsed_items: discovery
             .tracks

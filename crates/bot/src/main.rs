@@ -149,6 +149,7 @@ async fn main() -> Result<()> {
             db::TracksRepository::new(database.clone()),
             db::RequestLogRepository::new(database.clone()),
             db::SettingsStore::new(database.clone()),
+            database.clone(),
         )
         .await
         .map_err(|error| anyhow!(error))

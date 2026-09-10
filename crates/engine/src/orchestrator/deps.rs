@@ -101,12 +101,41 @@ pub struct DumpUpload {
     pub file_unique_id: String,
 }
 
+/// Metadata persisted for a completed album ZIP part.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlbumUpload {
+    pub provider: Provider,
+    pub album_id: String,
+    pub part_index: i32,
+    pub total_parts: i32,
+    pub message_id: i64,
+    pub file_id: String,
+    pub file_unique_id: String,
+    pub file_size: i64,
+    pub file_name: String,
+    /// SHA-256 generation identity of the resolved track set. Empty string
+    /// = unknown generation; never reused, forces one rebuild.
+    pub generation_hash: String,
+}
+
+/// One cached album ZIP part read back for reuse decisions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedAlbum {
+    pub part_index: i32,
+    pub total_parts: i32,
+    pub message_id: i64,
+    pub file_unique_id: String,
+    pub generation_hash: String,
+    /// Bytes of the stored archive part; powers the ZIP details message.
+    pub file_size: i64,
+}
+
 /// Telegram-side failures (surface as messages like TS).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
 pub struct SinkError(pub String);
 
-type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Telegram-side operations the orchestrator performs (implemented by the
 /// bot crate via ferogram in M5b). Boxed futures keep the trait
@@ -128,6 +157,55 @@ pub trait TelegramSink: Send + Sync {
         caption_html: &'a str,
         on_upload_progress: Option<&'a UploadProgressCallback>,
     ) -> BoxFuture<'a, Result<Option<DumpUpload>, SinkError>>;
+
+    /// Uploads a generated archive as a silent document in the dump channel.
+    /// `thumb_path` attaches a Telegram document thumbnail when present
+    /// (best-effort: implementations may drop it on failure).
+    /// Implementations that do not support album archives can retain the
+    /// default unsupported result (useful for narrow test adapters).
+    fn send_document_to_dump<'a>(
+        &'a self,
+        _file_path: &'a str,
+        _thumb_path: Option<&'a str>,
+        _caption_html: &'a str,
+        _on_upload_progress: Option<&'a UploadProgressCallback>,
+    ) -> BoxFuture<'a, Result<Option<DumpUpload>, SinkError>> {
+        Box::pin(async { Err(SinkError("ZIP document upload is unavailable".into())) })
+    }
+
+    /// Sends a generated archive directly to a chat without caching it.
+    /// `thumb_path` attaches a Telegram document thumbnail when present.
+    fn send_document_to_chat<'a>(
+        &'a self,
+        _chat_id: i64,
+        _file_path: &'a str,
+        _thumb_path: Option<&'a str>,
+        _caption_html: &'a str,
+        _on_upload_progress: Option<&'a UploadProgressCallback>,
+    ) -> BoxFuture<'a, Result<(), SinkError>> {
+        Box::pin(async { Err(SinkError("direct ZIP upload is unavailable".into())) })
+    }
+
+    /// Sends a preview image (album cover) to a chat. Best-effort; the
+    /// caller treats failures as non-fatal.
+    fn send_photo_to_chat<'a>(
+        &'a self,
+        _chat_id: i64,
+        _image_bytes: &'a [u8],
+        _caption_html: &'a str,
+    ) -> BoxFuture<'a, Result<(), SinkError>> {
+        Box::pin(async { Err(SinkError("photo send is unavailable".into())) })
+    }
+
+    /// Materializes a cached dump document for archive creation.
+    fn download_dump_file<'a>(
+        &'a self,
+        _message_id: i64,
+        _destination: &'a Path,
+        _on_download_progress: Option<&'a UploadProgressCallback>,
+    ) -> BoxFuture<'a, Result<(), SinkError>> {
+        Box::pin(async { Err(SinkError("cached file download is unavailable".into())) })
+    }
 
     /// TS `sendDumpCopy` — copy a dump message to a chat with the caption
     /// stripped, optional replyTo, optional silent.
@@ -164,6 +242,37 @@ pub trait OrchestratorDeps: Send + Sync + 'static {
         track_key: &TrackKey,
     ) -> impl Future<Output = Result<bool, String>> + Send;
     fn log_request(&self, log: RequestLog) -> impl Future<Output = Result<(), String>> + Send;
+
+    /// Persists a completed ZIP part. Partial archives intentionally never
+    /// call this method.
+    fn save_album<'a>(&'a self, _upload: AlbumUpload) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Lists cached ZIP parts for an album, ordered by part_index ascending.
+    fn find_albums<'a>(
+        &'a self,
+        _provider: Provider,
+        _album_id: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<CachedAlbum>, String>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// Deletes all cached ZIP parts for an album before a rebuild republishes
+    /// a possibly different part count.
+    fn delete_albums<'a>(
+        &'a self,
+        _provider: Provider,
+        _album_id: &'a str,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Fetches album artwork bytes for the ZIP cover (3000x3000 URL form).
+    /// `None` = no artwork; failures degrade to a coverless archive.
+    fn fetch_artwork<'a>(&'a self, _url: &'a str) -> BoxFuture<'a, Option<Vec<u8>>> {
+        Box::pin(async { None })
+    }
 
     // ── catalog resolution ───────────────────────────────────────────────
     fn fetch_album_tracks(

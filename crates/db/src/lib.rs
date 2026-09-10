@@ -7,6 +7,7 @@ use std::sync::{
 
 use diesel_async::{pooled_connection::bb8::Pool, AsyncPgConnection, RunQueryDsl};
 
+mod albums;
 mod auth;
 mod migrations;
 mod models;
@@ -18,6 +19,7 @@ mod tracks;
 pub mod dump;
 mod stats;
 
+pub use albums::AlbumsRepository;
 pub use auth::{Auth, AuthedPeer};
 pub use dump::{DbDumpService, DumpStats, RestoreStats};
 pub use engine::{
@@ -25,7 +27,7 @@ pub use engine::{
     Provider, TrackKey,
 };
 pub use migrations::migrate;
-pub use models::{Request, SettingsRow, Track, User};
+pub use models::{Album, NewAlbum, Request, SettingsRow, Track, User};
 pub use requests::RequestLogRepository;
 pub use settings::SettingsStore;
 pub use stats::{AlacStats, StatsRepository, TopTrackStat};

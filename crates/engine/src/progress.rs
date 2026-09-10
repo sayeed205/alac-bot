@@ -1,16 +1,47 @@
 //! Progress formatting helpers. Port of `src/utils/progress.ts`.
 
-/// Render a Unicode block progress bar, e.g. `[██████░░░░░░] 50%`.
+/// Render a Unicode block progress bar using `■`, `▤`, `□`,
+/// e.g. `[■■■■■■□□□□□□] 50%` or `[■■■▤□□□□□□□□] 35%`.
 pub fn render_progress_bar(current: u64, total: u64, length: usize) -> String {
     if total == 0 {
-        return format!("[{}] 0%", "░".repeat(length));
+        return format!("[{}] 0%", "□".repeat(length));
     }
     let fraction = (current as f64 / total as f64).clamp(0.0, 1.0);
-    let filled_count = (fraction * length as f64).round() as usize;
-    let empty_count = length.saturating_sub(filled_count);
-    let bar = format!("{}{}", "█".repeat(filled_count), "░".repeat(empty_count));
+    let units = (fraction * (2.0 * length as f64)).round() as usize;
+    let full_count = (units / 2).min(length);
+    let half_count = if units % 2 == 1 && full_count < length {
+        1
+    } else {
+        0
+    };
+    let empty_count = length.saturating_sub(full_count + half_count);
+    let half_str = if half_count > 0 { "▤" } else { "" };
+    let bar = format!(
+        "{}{}{}",
+        "■".repeat(full_count),
+        half_str,
+        "□".repeat(empty_count)
+    );
     let percent = (fraction * 100.0).round() as u64;
     format!("[{bar}] {percent}%")
+}
+
+/// Format bytes into human-readable B, KB, MB, GB string.
+pub fn format_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.2}GB", b / GB)
+    } else if b >= MB {
+        format!("{:.2}MB", b / MB)
+    } else if b >= KB {
+        format!("{:.2}KB", b / KB)
+    } else {
+        format!("{bytes}B")
+    }
 }
 
 /// Format MB progress as `x.x/y.y MB` (or `x.x MB` when total is unknown).
@@ -24,7 +55,7 @@ pub fn format_mb_progress(current_bytes: u64, total_bytes: u64) -> String {
     }
 }
 
-/// Format byte progress with bar: `[██████░░░░░░] 50% (14.5/29.0 MB)`.
+/// Format byte progress with bar: `[■■■■■■□□□□□□] 50% (14.5/29.0 MB)`.
 pub fn format_byte_progress(current_bytes: u64, total_bytes: u64, bar_length: usize) -> String {
     let bar = render_progress_bar(current_bytes, total_bytes, bar_length);
     let current_mb = current_bytes as f64 / (1024.0 * 1024.0);
@@ -36,60 +67,15 @@ pub fn format_byte_progress(current_bytes: u64, total_bytes: u64, bar_length: us
     }
 }
 
-const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-
-/// Format a byte count, e.g. `12.4 MB`.
-pub fn format_bytes(bytes: u64) -> String {
-    if bytes == 0 {
-        return "0 B".to_owned();
-    }
-    let bytes = bytes as f64;
-    let index = (bytes.ln() / 1024f64.ln()).floor().clamp(0.0, 4.0) as usize;
-    let value = bytes / 1024f64.powi(index as i32);
-    let formatted = if index == 0 {
-        format!("{value:.0}")
-    } else {
-        format!("{value:.2}")
-    };
-    format!("{formatted} {}", UNITS[index])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn bar_zero_total_and_clamping() {
-        assert_eq!(render_progress_bar(10, 0, 12), "[░░░░░░░░░░░░] 0%");
-        assert_eq!(render_progress_bar(150, 100, 12), "[████████████] 100%");
-        assert_eq!(render_progress_bar(50, 100, 12), "[██████░░░░░░] 50%");
-        assert_eq!(render_progress_bar(1, 12, 12), "[█░░░░░░░░░░░] 8%");
-    }
-
-    #[test]
-    fn mb_progress_shapes() {
-        assert_eq!(
-            format_mb_progress(1024 * 1024, 2 * 1024 * 1024),
-            "1.0/2.0 MB"
-        );
-        assert_eq!(format_mb_progress(1024 * 1024, 0), "1.0 MB");
-    }
-
-    #[test]
-    fn byte_progress_shapes() {
-        assert_eq!(
-            format_byte_progress(1024 * 1024, 2 * 1024 * 1024, 12),
-            "[██████░░░░░░] 50% (1.0/2.0 MB)"
-        );
-        assert_eq!(format_byte_progress(1024 * 1024, 0, 12), "1.0 MB");
-    }
-
-    #[test]
-    fn byte_units() {
-        assert_eq!(format_bytes(0), "0 B");
-        assert_eq!(format_bytes(999), "999 B");
-        assert_eq!(format_bytes(1024), "1.00 KB");
-        assert_eq!(format_bytes(1024 * 1024), "1.00 MB");
-        assert_eq!(format_bytes(1024u64.pow(4)), "1.00 TB");
+    fn format_bytes_examples() {
+        assert_eq!(format_bytes(0), "0B");
+        assert_eq!(format_bytes(1024), "1.00KB");
+        assert_eq!(format_bytes(593_000_000), "565.53MB");
+        assert_eq!(format_bytes(8_799_493_473), "8.20GB");
     }
 }

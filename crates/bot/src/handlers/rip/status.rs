@@ -113,69 +113,53 @@ impl ProgressState {
     }
 }
 
-pub fn progress_bar(current: usize, total: usize, length: usize) -> String {
-    let fraction = if total == 0 {
-        0.0
-    } else {
-        (current as f64 / total as f64).clamp(0.0, 1.0)
-    };
-    let filled = (fraction * length as f64).round() as usize;
-    format!(
-        "[{}{}] {}%",
-        "█".repeat(filled),
-        "░".repeat(length - filled),
-        (fraction * 100.0).round() as u32
-    )
-}
-
 pub fn render_progress(s: &ProgressState, override_text: Option<&str>) -> String {
     let completed = s.cached + s.ripped + s.failed + s.skipped;
-    let status = if s.cache_only {
-        format!("<b>Status:</b> {} cached · {} seeded", s.cached, s.ripped)
+    let state = if s.active_upload.is_some() {
+        "Uploading"
+    } else if s.active_download.is_some() {
+        "Downloading"
     } else {
-        format!("<b>Status:</b> {} cached · {} ripped", s.cached, s.ripped)
+        "Processing"
     };
-    let mut activity = String::new();
-    if let Some(download) = &s.active_download {
-        activity.push_str("<br/>");
-        activity.push_str(download);
-    }
-    if let Some(upload) = &s.active_upload {
-        activity.push_str("<br/>");
-        activity.push_str(upload);
-    }
-    if activity.is_empty() {
-        if let Some(override_text) = override_text {
-            activity = format!("<br/><b>Current:</b> {override_text}");
-        }
-    }
+    let pct = if s.total == 0 {
+        0.0
+    } else {
+        (completed as f64 / s.total as f64) * 100.0
+    };
+    let mode = if s.cache_only { "#Cache" } else { "#Rip" };
     let mut out = format!(
-        "{} <b>{}</b><br/><b>Progress:</b> <code>{} {}/{} ({}%)</code><br/>{status}",
-        if s.cache_only {
-            "Caching"
-        } else {
-            "Downloading"
-        },
+        "<b>{}</b><br/>┃ <code>{}</code><br/>┠ Status: {}<br/>┠ Processed: {} of {} tracks",
         s.header,
-        progress_bar(completed, s.total, 10),
+        crate::presentation::box_progress_bar(pct),
+        state,
         completed,
         s.total,
-        if s.total == 0 {
-            0
-        } else {
-            ((completed as f64 / s.total as f64) * 100.0).round() as usize
-        }
     );
     if s.skipped > 0 {
-        out.push_str(&format!(" · {} skipped", s.skipped));
+        out.push_str(&format!("<br/>┠ ⚠️ {} skipped", s.skipped));
     }
     if s.failed > 0 {
-        out.push_str(&format!(" · {} failed", s.failed));
+        out.push_str(&format!("<br/>┠ ⚠️ {} failed", s.failed));
     }
-    out.push_str(&activity);
+    if let Some(download) = &s.active_download {
+        out.push_str("<br/>┠ ");
+        out.push_str(download);
+    }
+    if let Some(upload) = &s.active_upload {
+        out.push_str("<br/>┠ ");
+        out.push_str(upload);
+    }
+    if s.active_download.is_none() && s.active_upload.is_none() {
+        if let Some(override_text) = override_text {
+            out.push_str(&format!("<br/>┠ Current: {override_text}"));
+        }
+    }
+    out.push_str(&format!("<br/>┠ Mode: {mode}"));
     if s.group && !s.cache_only {
-        out.push_str("<br/><i>Files delivered to your private chat.</i>");
+        out.push_str("<br/>┠ <i>Files delivered to your private chat.</i>");
     }
+    out.push_str("<br/>┖ Progress updates here");
     out
 }
 
@@ -345,8 +329,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn progress_strings_follow_status_policy() {
-        assert_eq!(progress_bar(1, 2, 12), "[██████░░░░░░] 50%");
+    fn progress_box_follows_status_policy() {
         let text = render_progress(
             &ProgressState {
                 header: "Track ID: <code>1</code>".into(),
@@ -357,8 +340,30 @@ mod tests {
             },
             None,
         );
-        assert!(text.contains("1 cached · 0 ripped"));
-        assert!(text.ends_with("<br/><i>Files delivered to your private chat.</i>"));
+        // Box shape: title, bar line under ┃, status/processed lines.
+        assert!(text.contains("┃ <code>"));
+        assert!(text.contains("┠ Status: Processing"));
+        assert!(text.contains("┠ Processed: 1 of 2 tracks"));
+        assert!(text.contains("┠ Mode: #Rip"));
+        assert!(text.contains("<i>Files delivered to your private chat.</i>"));
+        assert!(text.ends_with("┖ Progress updates here"));
+    }
+
+    #[test]
+    fn progress_box_reports_active_upload_state() {
+        let text = render_progress(
+            &ProgressState {
+                header: "Album: <b>X</b>".into(),
+                total: 4,
+                cached: 2,
+                active_upload: Some("⬆️ <b>Uploading:</b> <code>45%</code>".into()),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(text.contains("┠ Status: Uploading"));
+        assert!(text.contains("┠ ⬆️ <b>Uploading:</b> <code>45%</code>"));
+        assert!(!text.contains("┠ Mode: #Cache"));
     }
 
     #[test]

@@ -28,7 +28,14 @@ pub const COMMANDS: &[CommandDescriptor] = &[
         aliases: &["rip", "batch", "dl", "download"],
         role: CommandRole::User,
         summary: "Download a track, album, playlist, or artist",
-        usage: "/alac <link | id>",
+        usage: "/alac <link | id> [--zip]",
+    },
+    CommandDescriptor {
+        name: "zip",
+        aliases: &[],
+        role: CommandRole::User,
+        summary: "Package a multi-track album as a ZIP",
+        usage: "/zip <album link | id>",
     },
     CommandDescriptor {
         name: "search",

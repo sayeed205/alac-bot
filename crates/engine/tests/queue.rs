@@ -197,6 +197,7 @@ async fn on_start_fires_in_execution_order() {
                 .await
                 .unwrap();
         }));
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     release.notify_one();
     first.await.unwrap();

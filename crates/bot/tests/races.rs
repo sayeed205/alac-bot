@@ -108,6 +108,8 @@ fn race_options() -> RipJobOptions {
         is_group: false,
         is_force: false,
         is_cache_only: false,
+        zip: false,
+        zip_explicit: false,
         single_storefront: None,
         parsed_items: vec![ParsedTargetItem {
             id: "track1".to_owned(),

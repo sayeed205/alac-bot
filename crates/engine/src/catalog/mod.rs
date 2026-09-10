@@ -137,6 +137,15 @@ fn format_artwork_url(url: Option<&str>) -> String {
     re.replace(url, "3000x3000bb").into_owned()
 }
 
+/// Re-point an artwork URL at a different square size (for example 320 for
+/// Telegram document thumbnails).
+pub fn artwork_url_at_size(url: &str, size: u16) -> String {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"\d+x\d+bb").expect("artwork size regex"));
+    let replacement = format!("{size}x{size}bb");
+    re.replace(url, replacement.as_str()).into_owned()
+}
+
 /// Map a raw iTunes item to [`TrackMeta`], retaining both the legacy core
 /// fields and any richer provider metadata present in the response.
 /// Note: TS `String(x || '')` maps `0` → `''` (JS falsy), so ids of `0`

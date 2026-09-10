@@ -34,6 +34,9 @@ pub type JobTerminalState = TerminalJobState;
 pub struct ActiveRipJob {
     pub id: String,
     pub chat_id: i64,
+    /// Chat the delivered copies target (group jobs retarget to the user's
+    /// DM); the bridge uses it to send ZIP details to the right chat.
+    pub delivery_chat_id: i64,
     pub user_id: i64,
     pub user_name: Option<String>,
     pub job_header: String,
@@ -73,6 +76,14 @@ pub struct RipJobOptions {
     pub is_group: bool,
     pub is_force: bool,
     pub is_cache_only: bool,
+    /// Request album ZIP packaging. Cache-only `/dump` jobs may set this to
+    /// automatically publish a complete ZIP, but never deliver it to users.
+    pub zip: bool,
+    /// The user explicitly asked for ZIP packaging (`/zip` command or the
+    /// `-z`/`--zip` token). The engine uses this only to warn when the
+    /// album turns out to have a single track; implicit auto-attempts
+    /// (cache-only `/dump`) never warn.
+    pub zip_explicit: bool,
     pub single_storefront: Option<String>,
     pub parsed_items: Vec<ParsedTargetItem>,
     pub reply_to_message_id: Option<i64>,
@@ -119,6 +130,36 @@ pub struct RipJobSummary {
     pub max_collection_limit: u32,
     pub is_cache_only: bool,
     pub is_group: bool,
+    /// User-facing notes appended to the completion message (plain text;
+    /// the bridge escapes them). Empty in the common case.
+    pub warnings: Vec<String>,
+    /// Metadata about a user-delivered album ZIP, rendered as the details
+    /// message in the delivery chat. `None` for cache-only jobs and
+    /// non-ZIP jobs.
+    pub zip_delivery: Option<ZipDeliveryInfo>,
+}
+
+/// Album details for a delivered ZIP, powering the post-ZIP info message.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ZipDeliveryInfo {
+    pub album: String,
+    pub artist: String,
+    /// First four characters of the album release date, may be empty.
+    pub release_year: String,
+    pub total_tracks: usize,
+    /// Tracks actually present in the delivered archive.
+    pub delivered_tracks: usize,
+    pub total_parts: usize,
+    /// Total delivered archive bytes.
+    pub size_bytes: i64,
+    pub is_partial: bool,
+    pub album_id: String,
+    pub storefront: String,
+    pub artwork_url: Option<String>,
+    pub genre: Option<String>,
+    pub record_label: Option<String>,
+    pub copyright: Option<String>,
+    pub photo_delivered: bool,
 }
 
 /// A target which could not be resolved.  The engine deliberately keeps this
