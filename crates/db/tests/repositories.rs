@@ -4,7 +4,8 @@ use std::{
 };
 
 use db::{
-    connect_test_isolated, migrate, AlbumsRepository, DbPool, NewAlbum, RequestLogRepository, SettingsStore, TracksRepository,
+    connect_test_isolated, migrate, AlbumsRepository, DbPool, NewAlbum, RequestLogRepository,
+    SettingsStore, TracksRepository,
 };
 use diesel::{sql_query, sql_types::Text};
 use diesel_async::RunQueryDsl;
@@ -284,7 +285,7 @@ async fn albums_repository_save_find_delete() {
     let client = client().await;
     let repo = AlbumsRepository::new(client.clone());
     let album_id = format!("test-alb-{}", std::process::id());
-    
+
     let _ = repo.delete_albums(Provider::Apple, &album_id).await;
 
     let uid1 = format!("uniq1-{}", std::process::id());
@@ -318,14 +319,23 @@ async fn albums_repository_save_find_delete() {
     repo.save_album(&new_part1).await.expect("save part 1");
     repo.save_album(&new_part2).await.expect("save part 2");
 
-    let parts = repo.find_albums(Provider::Apple, &album_id).await.expect("find albums");
+    let parts = repo
+        .find_albums(Provider::Apple, &album_id)
+        .await
+        .expect("find albums");
     assert_eq!(parts.len(), 2);
     assert_eq!(parts[0].part_index, 1);
     assert_eq!(parts[1].part_index, 2);
 
-    let deleted = repo.delete_albums(Provider::Apple, &album_id).await.expect("delete");
+    let deleted = repo
+        .delete_albums(Provider::Apple, &album_id)
+        .await
+        .expect("delete");
     assert_eq!(deleted.len(), 2);
 
-    let parts_after = repo.find_albums(Provider::Apple, &album_id).await.expect("find after delete");
+    let parts_after = repo
+        .find_albums(Provider::Apple, &album_id)
+        .await
+        .expect("find after delete");
     assert_eq!(parts_after.len(), 0);
 }

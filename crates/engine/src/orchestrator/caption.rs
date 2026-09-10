@@ -114,7 +114,10 @@ pub fn format_requester_mention(user_name: Option<&str>, user_id: i64) -> String
     if let Some(handle) = name.strip_prefix('@') {
         format!(r#"<a href="https://t.me/{handle}">@{handle}</a>"#)
     } else if user_id > 0 {
-        format!(r#"<a href="tg://user?id={user_id}">{}</a>"#, html_escape(name))
+        format!(
+            r#"<a href="tg://user?id={user_id}">{}</a>"#,
+            html_escape(name)
+        )
     } else {
         html_escape(name)
     }
@@ -156,7 +159,10 @@ pub fn format_album_details_caption(meta: &AlbumDetailsCaptionMetadata<'_>) -> S
     bullets.push(format!("• <b>Tracks:</b> {tracks}"));
     bullets.push(format!("• <b>Size:</b> {size}{parts_info}"));
     if !meta.release_year.is_empty() {
-        bullets.push(format!("• <b>Released:</b> {}", html_escape(meta.release_year)));
+        bullets.push(format!(
+            "• <b>Released:</b> {}",
+            html_escape(meta.release_year)
+        ));
     }
     if let Some(genre) = meta.genre.filter(|s| !s.is_empty()) {
         bullets.push(format!("• <b>Genre:</b> {}", html_escape(genre)));
@@ -462,7 +468,9 @@ mod tests {
             user_id: 123456,
         };
         let html = format_album_details_caption(&meta);
-        assert!(html.contains(r#"💿 <a href="https://music.apple.com/in/album/1440828878"><b>Fossils, Vol. 1</b></a>"#));
+        assert!(html.contains(
+            r#"💿 <a href="https://music.apple.com/in/album/1440828878"><b>Fossils, Vol. 1</b></a>"#
+        ));
         assert!(html.contains("👤 <b>Artist:</b> Rupam Islam &amp; Fossils"));
         assert!(html.contains("<blockquote>"));
         assert!(html.contains("• <b>Tracks:</b> 8 tracks"));
@@ -473,7 +481,8 @@ mod tests {
         assert!(html.contains("• <b>Genre:</b> Rock"));
         assert!(html.contains("• <b>Label:</b> Asha Audio"));
         assert!(html.contains("• <b>Quality:</b> Lossless · ALAC"));
-        assert!(html.contains(r#"• <b>Requested by:</b> <a href="https://t.me/sayeed69">@sayeed69</a>"#));
+        assert!(html
+            .contains(r#"• <b>Requested by:</b> <a href="https://t.me/sayeed69">@sayeed69</a>"#));
         assert!(html.ends_with("</blockquote>"));
     }
 
@@ -499,7 +508,9 @@ mod tests {
         assert!(html.contains("• <b>Tracks:</b> 15/17 tracks"));
         assert!(html.contains(" · 3 parts"));
         assert!(html.contains("• ⚠️ <b>Note:</b> Partial archive"));
-        assert!(html.contains(r#"• <b>Requested by:</b> <a href="tg://user?id=78910">John Doe</a>"#));
+        assert!(
+            html.contains(r#"• <b>Requested by:</b> <a href="tg://user?id=78910">John Doe</a>"#)
+        );
     }
 
     #[test]

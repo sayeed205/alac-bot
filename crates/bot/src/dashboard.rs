@@ -92,39 +92,39 @@ pub fn render(
             ),
         };
         let pct = job.percent.min(100) as f64;
-        let lines = [
+        let mut lines = vec![
             format!("<i>{number}.</i> {}", job.header),
             format!(
                 "┃ <code>{}</code>",
                 crate::presentation::box_progress_bar(pct)
             ),
-            format!("┝ Status: {}", esc(&state)),
-            format!(
-                "┝ Processed: {} of {} tracks",
-                (job.cached + job.ripped + job.failed).min(job.total),
-                job.total
-            ),
-            format!(
-                "┝ Cache: {} hit · {} ripped · {} failed",
-                job.cached, job.ripped, job.failed
-            ),
-            format!("┝ Cancel: /cancel_{}", job.id),
-            {
-                let by_mention = if job.requester_name.starts_with('@') {
-                    let handle = job.requester_name.trim_start_matches('@');
-                    format!("<a href=\"https://t.me/{handle}\">@{handle}</a>")
-                } else if job.requester_id > 0 {
-                    format!(
-                        "<a href=\"tg://user?id={}\">{}</a>",
-                        job.requester_id,
-                        esc(&job.requester_name)
-                    )
-                } else {
-                    esc(&job.requester_name)
-                };
-                format!("┕ By: {by_mention}")
-            },
         ];
+        if job.phase != JobPhase::Processing {
+            lines.push(format!("┝ Status: {}", esc(&state)));
+        }
+        lines.push(format!(
+            "┝ Processed: {} of {} tracks",
+            (job.cached + job.ripped + job.failed).min(job.total),
+            job.total
+        ));
+        lines.push(format!(
+            "┝ Cache: {} hit · {} ripped · {} failed",
+            job.cached, job.ripped, job.failed
+        ));
+        lines.push(format!("┝ Cancel: /cancel_{}", job.id));
+        let by_mention = if job.requester_name.starts_with('@') {
+            let handle = job.requester_name.trim_start_matches('@');
+            format!("<a href=\"https://t.me/{handle}\">@{handle}</a>")
+        } else if job.requester_id > 0 {
+            format!(
+                "<a href=\"tg://user?id={}\">{}</a>",
+                job.requester_id,
+                esc(&job.requester_name)
+            )
+        } else {
+            esc(&job.requester_name)
+        };
+        lines.push(format!("┕ By: {by_mention}"));
         text.push_str(&format!("\n{}<br/>", lines.join("<br/>")));
     }
     text.push_str(&format!(

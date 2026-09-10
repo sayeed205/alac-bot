@@ -26,14 +26,12 @@ use crate::{
     catalog::artwork_url_at_size,
     orchestrator::{
         caption::{
-            format_dump_caption, format_zip_dump_caption, html_escape, DumpCaptionMetadata,
-            DumpZipCaptionMetadata,
-            AlbumDetailsCaptionMetadata,
-            format_album_details_caption,
+            format_album_details_caption, format_dump_caption, format_zip_dump_caption,
+            html_escape, AlbumDetailsCaptionMetadata, DumpCaptionMetadata, DumpZipCaptionMetadata,
         },
         deps::{
-            AlbumUpload, CachedAlbum, DumpUpload, OrchestratorDeps, RequestLog,
-            SaveTrackInput, UploadProgressCallback,
+            AlbumUpload, CachedAlbum, DumpUpload, OrchestratorDeps, RequestLog, SaveTrackInput,
+            UploadProgressCallback,
         },
         types::{
             ActiveRipJob, EventCallback, FailedTrack, JobPhase, OrchestratorEvent,
@@ -767,6 +765,7 @@ impl RipOrchestrator {
         let mut uncached_items: Vec<ResolvedTrackItem> = Vec::new();
         let mut cached_count = 0usize;
         let is_multi_track = tracks_to_process.len() > 1;
+        let mut first_delivered_msg_id: Option<i32> = None;
 
         // T2: ZIP reuse precondition. Cached parts recorded under the same
         // generation hash can serve this job directly — but only when every
@@ -955,8 +954,9 @@ impl RipOrchestrator {
                 let reply_to = (options.delivery_chat_id == options.chat_id)
                     .then_some(options.reply_to_message_id)
                     .flatten();
-                let outcome = async {
-                    deps.sink()
+                let outcome: Result<i32, String> = async {
+                    let sent_id = deps
+                        .sink()
                         .send_dump_copy(
                             options.delivery_chat_id,
                             cached.message_id,
@@ -975,11 +975,15 @@ impl RipOrchestrator {
                         error_reason: None,
                     })
                     .await
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| e.to_string())?;
+                    Ok(sent_id)
                 }
                 .await;
                 match outcome {
-                    Ok(()) => {
+                    Ok(sent_id) => {
+                        if first_delivered_msg_id.is_none() {
+                            first_delivered_msg_id = Some(sent_id);
+                        }
                         tracing::info!(track_id = %item.id, time = "0ms", "Cache hit: delivered");
                         cached_count += 1;
                         shared.lock().expect("job poisoned").job.cached_count = cached_count;
@@ -1023,7 +1027,8 @@ impl RipOrchestrator {
                        failed: Vec<FailedTrack>,
                        skipped: Vec<String>,
                        elapsed: &str,
-                       zip_delivery: Option<ZipDeliveryInfo>| {
+                       zip_delivery: Option<ZipDeliveryInfo>,
+                       first_msg_id: Option<i32>| {
             let guard = shared.lock().expect("job poisoned");
             RipJobSummary {
                 job_id: guard.job.id.clone(),
@@ -1041,6 +1046,7 @@ impl RipOrchestrator {
                 is_group: options.is_group,
                 warnings: warnings.clone(),
                 zip_delivery,
+                first_delivered_msg_id: first_msg_id,
             }
         };
 
@@ -1059,6 +1065,7 @@ impl RipOrchestrator {
                 Vec::new(),
                 &elapsed,
                 zip_delivery,
+                first_delivered_msg_id,
             ));
         }
 
@@ -1075,7 +1082,7 @@ impl RipOrchestrator {
                     let total_parts = rows.len();
                     let mut delivered_all = true;
                     for row in rows {
-                        if let Err(error) = deps
+                        match deps
                             .sink()
                             .send_dump_copy(
                                 options.delivery_chat_id,
@@ -1085,9 +1092,16 @@ impl RipOrchestrator {
                             )
                             .await
                         {
-                            tracing::warn!(%error, "cached ZIP part delivery failed");
-                            delivered_all = false;
-                            break;
+                            Ok(sent_id) => {
+                                if first_delivered_msg_id.is_none() {
+                                    first_delivered_msg_id = Some(sent_id);
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "cached ZIP part delivery failed");
+                                delivered_all = false;
+                                break;
+                            }
                         }
                     }
                     if !delivered_all {
@@ -1131,7 +1145,11 @@ impl RipOrchestrator {
                             if let Some(bytes) = deps.fetch_artwork(artwork_url).await {
                                 if let Err(error) = deps
                                     .sink()
-                                    .send_photo_to_chat(options.delivery_chat_id, &bytes, &details_caption)
+                                    .send_photo_to_chat(
+                                        options.delivery_chat_id,
+                                        &bytes,
+                                        &details_caption,
+                                    )
                                     .await
                                 {
                                     tracing::warn!(%error, "cover preview send failed");
@@ -1172,6 +1190,7 @@ impl RipOrchestrator {
                     Vec::new(),
                     &elapsed,
                     zip_delivery,
+                    first_delivered_msg_id,
                 ));
             }
         }
@@ -1201,6 +1220,7 @@ impl RipOrchestrator {
                 skipped,
                 &elapsed,
                 zip_delivery,
+                first_delivered_msg_id,
             ));
         }
 
@@ -1276,6 +1296,7 @@ impl RipOrchestrator {
             callback_bus.emit(&OrchestratorEvent::Started(&guard.job));
         });
 
+        let task_first_delivered_msg_id = first_delivered_msg_id;
         let task = move |queue_signal: CancellationToken| {
             Box::pin(async move {
                 run_pipeline(
@@ -1305,6 +1326,7 @@ impl RipOrchestrator {
                     task_zip_artwork,
                     task_zip_release_date,
                     task_warnings,
+                    task_first_delivered_msg_id,
                 )
                 .await
             })
@@ -1366,8 +1388,11 @@ async fn run_pipeline<D: OrchestratorDeps>(
     zip_artwork_url: Option<String>,
     zip_release_date: String,
     warnings: Vec<String>,
+    first_delivered_msg_id: Option<i32>,
 ) -> RipJobSummary {
     tracing::debug!("Rip job started from queue");
+
+    let first_delivered_msg_id = Arc::new(Mutex::new(first_delivered_msg_id));
 
     // Set by the ZIP block below when parts are delivered to the user.
     let mut zip_delivery: Option<ZipDeliveryInfo> = None;
@@ -1601,6 +1626,7 @@ async fn run_pipeline<D: OrchestratorDeps>(
                 is_multi_track,
                 zip_enabled,
                 &upload_item,
+                &first_delivered_msg_id,
             )
             .await;
 
@@ -1716,8 +1742,7 @@ async fn run_pipeline<D: OrchestratorDeps>(
                 // rows so a shrinking part count cannot leave stale parts
                 // behind. The upsert below re-saves each fresh part.
                 if complete {
-                    if let Err(error) = deps.delete_albums(Provider::Apple, &zip_album_id).await
-                    {
+                    if let Err(error) = deps.delete_albums(Provider::Apple, &zip_album_id).await {
                         tracing::warn!(%error, "failed to purge stale album ZIP rows");
                     }
                 }
@@ -1888,7 +1913,8 @@ async fn run_pipeline<D: OrchestratorDeps>(
                                     )
                                     .await
                             } else {
-                                deps.sink()
+                                let res = deps
+                                    .sink()
                                     .send_document_to_chat(
                                         options.delivery_chat_id,
                                         &output_path,
@@ -1896,8 +1922,17 @@ async fn run_pipeline<D: OrchestratorDeps>(
                                         &caption,
                                         Some(&on_zip_upload),
                                     )
-                                    .await
-                                    .map(|_| None)
+                                    .await;
+                                match res {
+                                    Ok(sent_id) => {
+                                        let mut guard = first_delivered_msg_id.lock().unwrap();
+                                        if guard.is_none() {
+                                            *guard = Some(sent_id);
+                                        }
+                                        Ok(None)
+                                    }
+                                    Err(err) => Err(err),
+                                }
                             };
 
                             *texts.upload.lock().expect("texts poisoned") = None;
@@ -1914,7 +1949,7 @@ async fn run_pipeline<D: OrchestratorDeps>(
                                             } else {
                                                 None
                                             };
-                                        if let Err(error) = deps
+                                        match deps
                                             .sink()
                                             .send_dump_copy(
                                                 options.delivery_chat_id,
@@ -1924,7 +1959,16 @@ async fn run_pipeline<D: OrchestratorDeps>(
                                             )
                                             .await
                                         {
-                                            tracing::warn!(%error, "ZIP DM delivery failed");
+                                            Ok(sent_id) => {
+                                                let mut guard =
+                                                    first_delivered_msg_id.lock().unwrap();
+                                                if guard.is_none() {
+                                                    *guard = Some(sent_id);
+                                                }
+                                            }
+                                            Err(error) => {
+                                                tracing::warn!(%error, "ZIP DM delivery failed");
+                                            }
                                         }
                                     }
                                     let _ = deps
@@ -1978,7 +2022,11 @@ async fn run_pipeline<D: OrchestratorDeps>(
                             if let Some(bytes) = &cover_bytes {
                                 if let Err(error) = deps
                                     .sink()
-                                    .send_photo_to_chat(options.delivery_chat_id, bytes, &details_caption)
+                                    .send_photo_to_chat(
+                                        options.delivery_chat_id,
+                                        bytes,
+                                        &details_caption,
+                                    )
                                     .await
                                 {
                                     tracing::warn!(%error, "cover preview send failed");
@@ -2020,6 +2068,7 @@ async fn run_pipeline<D: OrchestratorDeps>(
     // Build the summary (TS: after Promise.all, inside the queue task).
     let total_elapsed_sec = format!("{:.1}", (now_ms() - queue_start_time_ms) as f64 / 1000.0);
     let failed = failed_tracks.lock().expect("failures poisoned").clone();
+    let first_msg_id = *first_delivered_msg_id.lock().unwrap();
     let guard = shared.lock().expect("job poisoned");
     RipJobSummary {
         job_id: guard.job.id.clone(),
@@ -2037,6 +2086,7 @@ async fn run_pipeline<D: OrchestratorDeps>(
         is_group: options.is_group,
         warnings,
         zip_delivery,
+        first_delivered_msg_id: first_msg_id,
     }
 }
 
@@ -2079,6 +2129,7 @@ async fn upload_one<D: OrchestratorDeps>(
     is_multi_track: bool,
     zip_enabled: bool,
     upload_item: &PipelineRipResult,
+    first_delivered_msg_id: &Arc<Mutex<Option<i32>>>,
 ) -> bool {
     let track_id = upload_item.track_id.clone();
     let rip_result = &upload_item.rip_result;
@@ -2286,7 +2337,8 @@ async fn upload_one<D: OrchestratorDeps>(
             let reply_to = (options.delivery_chat_id == options.chat_id)
                 .then_some(options.reply_to_message_id)
                 .flatten();
-            deps.sink()
+            let sent_id = deps
+                .sink()
                 .send_dump_copy(
                     options.delivery_chat_id,
                     dump_upload.message_id,
@@ -2295,6 +2347,10 @@ async fn upload_one<D: OrchestratorDeps>(
                 )
                 .await
                 .map_err(|e| e.to_string())?;
+            let mut guard = first_delivered_msg_id.lock().unwrap();
+            if guard.is_none() {
+                *guard = Some(sent_id);
+            }
         }
 
         if is_cancelled() {

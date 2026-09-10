@@ -29,6 +29,8 @@ pub struct BotState {
     /// `env.DUMP_CHANNEL_ID`). `dump_peer` is the TL-level peer used for
     /// sends/queries; `dump_channel_id` is the raw id for link building.
     pub admin_id: i64,
+    pub bot_id: i64,
+    pub bot_username: Option<String>,
     pub dump_channel_id: i64,
     pub dump_peer: ferogram::PeerRef,
     /// Stats aggregation for `/stats` (lazy-initialized in main).

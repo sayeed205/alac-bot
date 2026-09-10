@@ -406,7 +406,8 @@ async fn rip(state: Arc<BotState>, query: CallbackQuery, track_id: String) {
         .unwrap_or_else(|| PeerRef::from(query.user_id));
     super::ensure_dashboard(&state, marked_chat, query.user_id, is_admin, peer).await;
 
-    let user_display = crate::presentation::resolve_user_display_name(&state.client, query.user_id).await;
+    let user_display =
+        crate::presentation::resolve_user_display_name(&state.client, query.user_id).await;
     let options = engine::orchestrator::types::RipJobOptions {
         chat_id: marked_chat,
         user_id: query.user_id,

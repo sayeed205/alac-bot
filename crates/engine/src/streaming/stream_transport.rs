@@ -236,35 +236,56 @@ impl<H: StreamHttp> StreamTransport<H> {
                 errors.join("; ")
             )));
         };
-        if let Some(on_progress) = on_progress {
+        if let Some(on_progress) = on_progress.as_ref() {
             on_progress("Primary mirror unavailable. Connecting to fallback wrapper...");
         }
 
-        for endpoint in [
-            format!("{clean_wrapper}/api/stream/{track_id}"),
-            format!("{clean_wrapper}/stream/{track_id}"),
-        ] {
-            if signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
-                errors.push(format!(
-                    "Wrapper candidate ({endpoint}) failed: Download was cancelled"
-                ));
-                continue;
-            }
-            match self
-                .fetch_endpoint(FetchEndpointOptions {
-                    stream_url: endpoint.clone(),
-                    api_key: wrapper_api_key.clone(),
-                    source_name: format!("wrapper ({clean_wrapper})"),
-                    signal: signal.clone(),
-                    timeout: self.default_timeout,
-                })
+        // 1. If wrapper URL is a wrapper-lite instance (default port 12340 or contains "lite"),
+        // use native Rust wrapper-lite engine with Temari FairPlay decryption directly.
+        let is_wrapper_lite = clean_wrapper.contains("12340")
+            || clean_wrapper.ends_with("/lite")
+            || clean_wrapper.contains("wrapper-lite");
+        if is_wrapper_lite {
+            let wrapper_engine =
+                crate::wrapper::WrapperEngine::new(clean_wrapper, wrapper_api_key.as_deref());
+            match wrapper_engine
+                .rip_track(&track_id, signal.clone(), on_progress.clone())
                 .await
             {
-                Ok(stream) => return Ok(stream),
-                Err(error) => errors.push(format!(
-                    "Wrapper candidate ({endpoint}) failed: {}",
-                    error.into_message()
-                )),
+                Ok(source) => return Ok(source),
+                Err(err) => {
+                    let msg = err.into_message();
+                    errors.push(format!("Native wrapper engine failed: {msg}"));
+                }
+            }
+        } else {
+            // 2. Otherwise try candidate stream proxy endpoints (standard HTTP stream proxies)
+            for endpoint in [
+                format!("{clean_wrapper}/api/stream/{track_id}"),
+                format!("{clean_wrapper}/stream/{track_id}"),
+            ] {
+                if signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                    errors.push(format!(
+                        "Wrapper candidate ({endpoint}) failed: Download was cancelled"
+                    ));
+                    continue;
+                }
+                match self
+                    .fetch_endpoint(FetchEndpointOptions {
+                        stream_url: endpoint.clone(),
+                        api_key: wrapper_api_key.clone(),
+                        source_name: format!("wrapper ({clean_wrapper})"),
+                        signal: signal.clone(),
+                        timeout: self.default_timeout,
+                    })
+                    .await
+                {
+                    Ok(stream) => return Ok(stream),
+                    Err(error) => errors.push(format!(
+                        "Wrapper candidate ({endpoint}) failed: {}",
+                        error.into_message()
+                    )),
+                }
             }
         }
 

@@ -125,6 +125,10 @@ async fn main() -> Result<()> {
         .api_hash(env.api_hash.clone())
         .session("bot-data/session")
         .catch_up(true)
+        .experimental_features(ferogram::ExperimentalFeatures {
+            allow_zero_hash: true,
+            ..Default::default()
+        })
         .retry_policy(Arc::new(
             bot::telegram_retry::BoundedTelegramRetry::default(),
         ))
@@ -163,6 +167,8 @@ async fn main() -> Result<()> {
         rip_deps,
         rip_orchestrator: orchestrator,
         admin_id: env.admin_id,
+        bot_id: me.id,
+        bot_username: me.username.clone(),
         dump_channel_id: env.dump_channel_id,
         dump_peer: PeerRef::from(env.dump_channel_id),
         stats: Some(db::StatsRepository::new(database.clone())),

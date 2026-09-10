@@ -12,6 +12,7 @@ use ferogram::{
     filters,
     filters::Dispatcher,
     keyboard::{Button, InlineKeyboard},
+    tl,
     update::CallbackQuery,
     InputMessage, PeerRef,
 };
@@ -72,6 +73,18 @@ fn confirmation_keyboard(token: &str) -> ferogram::tl::enums::ReplyMarkup {
 }
 
 async fn reply_text(msg: &ferogram::update::IncomingMessage, state: &BotState) -> Option<String> {
+    let reply_header = match &msg.raw {
+        tl::enums::Message::Message(m) => m.reply_to.as_ref(),
+        tl::enums::Message::Service(m) => m.reply_to.as_ref(),
+        _ => None,
+    };
+    if let Some(tl::enums::MessageReplyHeader::MessageReplyHeader(h)) = reply_header {
+        if let Some(ref quote) = h.quote_text {
+            if !quote.trim().is_empty() {
+                return Some(quote.clone());
+            }
+        }
+    }
     let reply_id = msg.reply_to_message_id()?;
     let peer = msg.peer_id()?.clone();
     let messages = state

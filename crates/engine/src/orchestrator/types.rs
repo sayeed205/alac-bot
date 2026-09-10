@@ -137,6 +137,8 @@ pub struct RipJobSummary {
     /// message in the delivery chat. `None` for cache-only jobs and
     /// non-ZIP jobs.
     pub zip_delivery: Option<ZipDeliveryInfo>,
+    /// Telegram message ID of the first delivered track or ZIP in the delivery chat.
+    pub first_delivered_msg_id: Option<i32>,
 }
 
 /// Album details for a delivered ZIP, powering the post-ZIP info message.

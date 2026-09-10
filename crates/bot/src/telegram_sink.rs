@@ -49,7 +49,8 @@ impl FerogramTelegramSink {
             .upload_file(thumb_path)
             .await
             .map_err(|error| SinkError(format!("thumbnail upload failed: {error}")))?;
-        let ferogram::tl::enums::InputMedia::UploadedPhoto(photo) = uploaded.as_photo_media() else {
+        let ferogram::tl::enums::InputMedia::UploadedPhoto(photo) = uploaded.as_photo_media()
+        else {
             return Err(SinkError("uploaded thumb did not yield photo media".into()));
         };
         Ok(photo.file)
@@ -226,7 +227,7 @@ impl TelegramSink for FerogramTelegramSink {
         thumb_path: Option<&'a str>,
         caption_html: &'a str,
         on_upload_progress: Option<&'a UploadProgressCallback>,
-    ) -> BoxFuture<'a, Result<(), SinkError>> {
+    ) -> BoxFuture<'a, Result<i32, SinkError>> {
         Box::pin(async move {
             let handle = TransferHandle::new();
             let progress_task = on_upload_progress.map(|callback| {
@@ -268,7 +269,7 @@ impl TelegramSink for FerogramTelegramSink {
                     InputMessage::html(caption_html).copy_media(media),
                 )
                 .await
-                .map(|_| ())
+                .map(|msg| msg.id())
                 .map_err(|error| SinkError(error.to_string()))
         })
     }
@@ -355,7 +356,7 @@ impl TelegramSink for FerogramTelegramSink {
         message_id: i64,
         reply_to: Option<i64>,
         silent: bool,
-    ) -> BoxFuture<'a, Result<(), SinkError>> {
+    ) -> BoxFuture<'a, Result<i32, SinkError>> {
         Box::pin(async move {
             let message_id = i32::try_from(message_id)
                 .map_err(|error| SinkError(format!("message_id out of range: {error}")))?;
@@ -400,7 +401,7 @@ impl TelegramSink for FerogramTelegramSink {
             self.client
                 .send_message(PeerRef::from(to_chat_id), input)
                 .await
-                .map(|_| ())
+                .map(|msg| msg.id())
                 .map_err(|error| SinkError(error.to_string()))
         })
     }

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use engine::{parser::parse_alac_input, Provider, TrackKey};
-use ferogram::{filters, filters::Dispatcher, InputMessage, PeerRef};
+use ferogram::{filters, filters::Dispatcher, tl, InputMessage, PeerRef};
 
 use crate::{
     html::{escape, parse_dynamic_html},
@@ -11,6 +11,18 @@ use crate::{
 const USAGE: &str = "<b>Track info usage</b><br/><br/><blockquote>• <code>/info &lt;apple_music_link | id&gt;</code><br/>• Reply to an Apple Music link with <code>/info</code></blockquote>";
 
 async fn reply_text(msg: &ferogram::update::IncomingMessage, state: &BotState) -> Option<String> {
+    let reply_header = match &msg.raw {
+        tl::enums::Message::Message(m) => m.reply_to.as_ref(),
+        tl::enums::Message::Service(m) => m.reply_to.as_ref(),
+        _ => None,
+    };
+    if let Some(tl::enums::MessageReplyHeader::MessageReplyHeader(h)) = reply_header {
+        if let Some(ref quote) = h.quote_text {
+            if !quote.trim().is_empty() {
+                return Some(quote.clone());
+            }
+        }
+    }
     let reply_id = msg.reply_to_message_id()?;
     let peer = msg.peer_id()?.clone();
     let messages = state

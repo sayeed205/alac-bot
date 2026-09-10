@@ -182,7 +182,7 @@ pub trait TelegramSink: Send + Sync {
         _thumb_path: Option<&'a str>,
         _caption_html: &'a str,
         _on_upload_progress: Option<&'a UploadProgressCallback>,
-    ) -> BoxFuture<'a, Result<(), SinkError>> {
+    ) -> BoxFuture<'a, Result<i32, SinkError>> {
         Box::pin(async { Err(SinkError("direct ZIP upload is unavailable".into())) })
     }
 
@@ -208,14 +208,14 @@ pub trait TelegramSink: Send + Sync {
     }
 
     /// TS `sendDumpCopy` — copy a dump message to a chat with the caption
-    /// stripped, optional replyTo, optional silent.
+    /// stripped, optional replyTo, optional silent. Returns the sent message ID.
     fn send_dump_copy<'a>(
         &'a self,
         to_chat_id: i64,
         message_id: i64,
         reply_to: Option<i64>,
         silent: bool,
-    ) -> BoxFuture<'a, Result<(), SinkError>>;
+    ) -> BoxFuture<'a, Result<i32, SinkError>>;
 
     /// TS `tg.deleteMessagesById(env.DUMP_CHANNEL_ID, ids)` — errors
     /// swallowed by the caller.

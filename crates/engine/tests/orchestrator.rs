@@ -227,7 +227,7 @@ impl TelegramSink for FakeSink {
         message_id: i64,
         reply_to: Option<i64>,
         silent: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<i32, SinkError>> + Send + 'a>> {
         let state = Arc::clone(&self.state);
         Box::pin(async move {
             let mut st = state.lock().unwrap();
@@ -236,7 +236,7 @@ impl TelegramSink for FakeSink {
                 st.copies_fail_ids.retain(|id| *id != message_id);
                 return Err(SinkError("copy failed".into()));
             }
-            Ok(())
+            Ok(message_id as i32)
         })
     }
 
@@ -288,7 +288,7 @@ impl TelegramSink for FakeSink {
         thumb_path: Option<&'a str>,
         _caption_html: &'a str,
         _on_upload_progress: Option<&'a UploadProgressCallback>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<i32, SinkError>> + Send + 'a>> {
         let state = Arc::clone(&self.state);
         let path = file_path.to_owned();
         let thumb = thumb_path.map(str::to_owned);
@@ -298,7 +298,7 @@ impl TelegramSink for FakeSink {
             st.sent_documents.push(path);
             st.uploaded_document_bytes = bytes;
             st.sent_thumbs.extend(thumb);
-            Ok(())
+            Ok(200)
         })
     }
 

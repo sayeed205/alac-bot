@@ -40,8 +40,10 @@ fn empty_dashboard_is_exact_and_pages_are_mobile_friendly() {
         jobs,
     };
     let (text, keyboard) = render(&snapshot, 1, false);
-    assert!(text.contains("Requester 0") && text.contains("Processing") && text.contains("1."));
-    assert!(text.contains("Page 1/2") && keyboard.is_some());
+    assert!(
+        text.contains("Requester 0") && !text.contains("Status: Processing") && text.contains("1.")
+    );
+    assert!(text.contains("Status: Queued") && text.contains("Page 1/2") && keyboard.is_some());
 }
 
 #[test]

@@ -663,7 +663,8 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery, action: Discov
 
             // Oracle delegates to executeRipPipeline in cache-only mode;
             // the collapsed orchestrator takes that path (recorded deviation).
-            let user_display = crate::presentation::resolve_user_display_name(&state.client, query.user_id).await;
+            let user_display =
+                crate::presentation::resolve_user_display_name(&state.client, query.user_id).await;
             let options = engine::orchestrator::types::RipJobOptions {
                 chat_id: marked_chat,
                 user_id: query.user_id,

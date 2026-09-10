@@ -134,6 +134,13 @@ pub struct TrackTags {
     pub explicit: Option<bool>,
     pub advisory: Option<AdvisoryKind>,
     pub media_kind: Option<MediaKind>,
+    pub compilation: Option<bool>,
+    pub gapless: Option<bool>,
+    pub genre_id: Option<u32>,
+    pub storefront_id: Option<u32>,
+    pub encoder: Option<String>,
+    pub comment: Option<String>,
+    pub description: Option<String>,
 }
 
 /// Parental-control rating represented by the iTunes `rtng` atom.
@@ -906,9 +913,11 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 fn write_extended_metadata(tag: &mut mp4ameta::Tag, tags: &TrackTags) {
     if let Some(value) = non_empty(tags.isrc.as_deref()) {
         tag.set_isrc(value);
+        set_freeform_text(tag, "ISRC", value);
     }
     if let Some(value) = non_empty(tags.label.as_deref()) {
         tag.set_label(value);
+        set_freeform_text(tag, "LABEL", value);
     }
     if let Some(value) = non_empty(tags.copyright.as_deref()) {
         tag.set_copyright(value);
@@ -934,6 +943,41 @@ fn write_extended_metadata(tag: &mut mp4ameta::Tag, tags: &TrackTags) {
     }
     if let Some(value) = tags.artist_id.and_then(to_u32) {
         set_numeric_atom(tag, *b"atID", value);
+    }
+    if let Some(value) = tags.genre_id {
+        set_numeric_atom(tag, *b"geID", value);
+    }
+    if let Some(value) = tags.storefront_id {
+        set_numeric_atom(tag, *b"sfID", value);
+    }
+
+    if tags.compilation == Some(true) {
+        tag.set_data(
+            mp4ameta::ident::COMPILATION,
+            mp4ameta::Data::BeSigned(vec![1]),
+        );
+    }
+    if tags.gapless == Some(true) {
+        tag.set_data(
+            mp4ameta::Fourcc(*b"pgap"),
+            mp4ameta::Data::BeSigned(vec![1]),
+        );
+    }
+    if let Some(value) = non_empty(tags.encoder.as_deref()) {
+        tag.set_data(
+            mp4ameta::Fourcc(*b"\xa9too"),
+            mp4ameta::Data::Utf8(value.to_owned()),
+        );
+        tag.set_data(
+            mp4ameta::ident::ENCODER,
+            mp4ameta::Data::Utf8(value.to_owned()),
+        );
+    }
+    if let Some(value) = non_empty(tags.comment.as_deref()) {
+        tag.set_comment(value);
+    }
+    if let Some(value) = non_empty(tags.description.as_deref()) {
+        tag.set_description(value);
     }
 
     if let Some(advisory) = tags.advisory.or_else(|| {
@@ -1153,6 +1197,16 @@ mod tests {
         assert_eq!(
             tag.strings_of(&performer).next(),
             Some("Featured Performer")
+        );
+        let isrc_freeform = mp4ameta::FreeformIdent::new_borrowed("com.apple.iTunes", "ISRC");
+        assert_eq!(
+            tag.strings_of(&isrc_freeform).next(),
+            Some("US-AAA-24-00001")
+        );
+        let label_freeform = mp4ameta::FreeformIdent::new_borrowed("com.apple.iTunes", "LABEL");
+        assert_eq!(
+            tag.strings_of(&label_freeform).next(),
+            Some("Example Records")
         );
     }
 }

@@ -36,6 +36,7 @@ realfft = "3"
 png = "0.18"
 mp4ameta = "0.13"
 font8x8 = "0.3"
+temari = { git = "https://github.com/WorldObservationLog/Temari" }
 
 [profile.release]
 lto = "thin"

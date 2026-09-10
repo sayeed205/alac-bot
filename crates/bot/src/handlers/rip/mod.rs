@@ -72,7 +72,7 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
         reply(&msg, text).await;
         return;
     }
-    let parsed = input::parse_message(&state.client, &msg, command == "rerip").await;
+    let parsed = input::parse_message(&state.client, &msg, chat, command == "rerip").await;
     let zip_command = command == "zip";
     let explicit_zip_valid =
         parsed.items.len() == 1 && parsed.items[0].kind == engine::types::TargetKind::Album;
@@ -106,7 +106,11 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
     let user = msg.sender_user().await.ok().flatten();
     let display_name = user
         .as_ref()
-        .and_then(|u| u.username().filter(|n| !n.trim().is_empty()).map(|n| format!("@{n}")))
+        .and_then(|u| {
+            u.username()
+                .filter(|n| !n.trim().is_empty())
+                .map(|n| format!("@{n}"))
+        })
         .or_else(|| {
             user.as_ref().map(|u| {
                 let first = u.first_name().unwrap_or_default().trim();

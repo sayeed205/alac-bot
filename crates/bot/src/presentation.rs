@@ -133,7 +133,6 @@ pub fn box_progress_bar(pct: f64) -> String {
     )
 }
 
-
 /// Resolve a user display name or username for mentions.
 /// Prefers `@username` if present, then display name ("First Last" or "First"),
 /// falling back to "User {user_id}".

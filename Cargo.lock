@@ -579,6 +579,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "temari",
  "tempfile",
  "thiserror",
  "tokio",
@@ -2555,6 +2556,11 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "temari"
+version = "0.3.1"
+source = "git+https://github.com/WorldObservationLog/Temari#85c67622adb339142a1dc22841a09e0b81373694"
 
 [[package]]
 name = "tempfile"

@@ -23,28 +23,30 @@ use crate::{
 };
 
 /// Owned copies of engine events, safe to move across an mpsc channel.
+/// `job` is boxed: `ActiveRipJob` is large enough that six inline copies
+/// would bloat every `BridgeEvent` to the size of the biggest variant.
 #[derive(Debug, Clone)]
 pub enum BridgeEvent {
     Created {
-        job: ActiveRipJob,
+        job: Box<ActiveRipJob>,
     },
     Progress {
-        job: ActiveRipJob,
-        progress: RipJobProgress,
+        job: Box<ActiveRipJob>,
+        progress: Box<RipJobProgress>,
     },
     Started {
-        job: ActiveRipJob,
+        job: Box<ActiveRipJob>,
     },
     Completed {
-        job: ActiveRipJob,
-        summary: RipJobSummary,
+        job: Box<ActiveRipJob>,
+        summary: Box<RipJobSummary>,
     },
     Cancelled {
-        job: ActiveRipJob,
+        job: Box<ActiveRipJob>,
         cancelled_by: Option<String>,
     },
     Failed {
-        job: ActiveRipJob,
+        job: Box<ActiveRipJob>,
         error: String,
     },
 }
@@ -61,25 +63,25 @@ impl BridgeEvent {
     pub fn from_engine(event: &OrchestratorEvent<'_>) -> Option<Self> {
         Some(match event {
             OrchestratorEvent::Created(job) => BridgeEvent::Created {
-                job: (*job).clone(),
+                job: Box::new((*job).clone()),
             },
             OrchestratorEvent::Started(job) => BridgeEvent::Started {
-                job: (*job).clone(),
+                job: Box::new((*job).clone()),
             },
             OrchestratorEvent::Progress(job, progress) => BridgeEvent::Progress {
-                job: (*job).clone(),
-                progress: (*progress).clone(),
+                job: Box::new((*job).clone()),
+                progress: Box::new((*progress).clone()),
             },
             OrchestratorEvent::Completed(job, summary) => BridgeEvent::Completed {
-                job: (*job).clone(),
-                summary: (*summary).clone(),
+                job: Box::new((*job).clone()),
+                summary: Box::new((*summary).clone()),
             },
             OrchestratorEvent::Cancelled(job, by) => BridgeEvent::Cancelled {
-                job: (*job).clone(),
+                job: Box::new((*job).clone()),
                 cancelled_by: (*by).clone(),
             },
             OrchestratorEvent::Failed(job, error) => BridgeEvent::Failed {
-                job: (*job).clone(),
+                job: Box::new((*job).clone()),
                 error: error.to_string(),
             },
         })
@@ -315,12 +317,6 @@ async fn notify_job_completed(state: &BotState, job: &ActiveRipJob, summary: &Ri
         None => None,
     };
 
-    let heading = if summary.failed_count == 0 {
-        "Job complete"
-    } else {
-        "Job finished with issues"
-    };
-    // JOB DONE box (mirror-leech style): title, ┃, fact lines, ┖ By.
     // Format user mention for origin chat
     let name = job
         .user_name
@@ -329,9 +325,7 @@ async fn notify_job_completed(state: &BotState, job: &ActiveRipJob, summary: &Ri
         .unwrap_or("User");
     let mention = if name.starts_with('@') {
         let handle = name.trim_start_matches('@');
-        format!(
-            r#"<a href="https://t.me/{handle}">@{handle}</a>"#
-        )
+        format!(r#"<a href="https://t.me/{handle}">@{handle}</a>"#)
     } else if job.user_id > 0 {
         format!(
             r#"<a href="tg://user?id={}">{}</a>"#,
@@ -342,14 +336,12 @@ async fn notify_job_completed(state: &BotState, job: &ActiveRipJob, summary: &Ri
         crate::html::escape(name)
     };
 
-    // JOB DONE box (mirror-leech style): title, ┃, fact lines, ┗ Done.
     let elapsed = summary
         .total_elapsed_sec
         .parse::<f64>()
         .map(|seconds| crate::presentation::readable_time_compact(seconds as u64))
         .unwrap_or_else(|_| summary.total_elapsed_sec.clone());
     let mut lines = vec![
-        format!("<b>{heading}</b>"),
         summary.job_header.clone(),
         "┃".to_owned(),
         format!(
@@ -357,16 +349,35 @@ async fn notify_job_completed(state: &BotState, job: &ActiveRipJob, summary: &Ri
             summary.total_tracks, summary.cached_count, summary.ripped_count, summary.failed_count
         ),
         format!("┣ Elapsed: {elapsed}"),
-        format!("┣ By: {mention}"),
     ];
     // Engine-authored plain-text notes (e.g. single-track ZIP skip). Escaped
     // because they can embed album names.
     for warning in &summary.warnings {
         lines.push(format!("┣ ⚠️ {}", crate::html::escape(warning)));
     }
-    lines.push("┗ Done".to_owned());
+    lines.push(format!("┗ By: {mention}"));
     let details = lines.join("<br/>");
-    let fallback = format!("{mention}, {details}");
+
+    let keyboard = if job.delivery_chat_id != job.chat_id {
+        summary.first_delivered_msg_id.map(|msg_id| {
+            let url = if state.bot_id > 0 {
+                format!(
+                    "tg://openmessage?user_id={}&message_id={msg_id}",
+                    state.bot_id
+                )
+            } else {
+                format!(
+                    "https://t.me/{}",
+                    state.bot_username.as_deref().unwrap_or("alac_bot")
+                )
+            };
+            ferogram::keyboard::InlineKeyboard::new()
+                .row([ferogram::keyboard::Button::url("View", url)])
+                .into_markup()
+        })
+    } else {
+        None
+    };
 
     // ZIP jobs: the album preview photo + rich details caption was delivered
     // alongside the ZIP files. If the photo could not be delivered, fall back
@@ -402,22 +413,23 @@ async fn notify_job_completed(state: &BotState, job: &ActiveRipJob, summary: &Ri
         }
     }
 
-    let input = ferogram::InputMessage::html(if reply_id.is_some() {
-        details
-    } else {
-        fallback.clone()
-    })
-    .reply_to(reply_id);
+    let mut input = ferogram::InputMessage::html(details.clone())
+        .no_webpage(true)
+        .reply_to(reply_id);
+    if let Some(k) = keyboard.clone() {
+        input = input.reply_markup(k);
+    }
     if let Err(error) = state.client.send_message(peer.clone(), input).await {
         tracing::warn!(job_id = %job.id, error = %error, "completion notification failed");
         // The command may have been deleted between the existence check and
-        // the reply. Fall back to a standalone mention so the user still gets
+        // the reply. Fall back to sending without reply_to so the user still gets
         // a completion notification.
         if reply_id.is_some() {
-            let _ = state
-                .client
-                .send_message(peer, ferogram::InputMessage::html(fallback))
-                .await;
+            let mut fb_msg = ferogram::InputMessage::html(details).no_webpage(true);
+            if let Some(k) = keyboard {
+                fb_msg = fb_msg.reply_markup(k);
+            }
+            let _ = state.client.send_message(peer, fb_msg).await;
         }
     }
 }

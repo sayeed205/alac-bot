@@ -730,6 +730,16 @@ impl RipperDeps for EngineRipperDeps {
                 None => media::AdvisoryKind::Inoffensive,
             }),
             media_kind: Some(media::MediaKind::Music),
+            compilation: Some(
+                meta.album_artist.eq_ignore_ascii_case("Various Artists")
+                    || meta.artist.eq_ignore_ascii_case("Various Artists"),
+            ),
+            gapless: Some(true),
+            genre_id: None,
+            storefront_id: None,
+            encoder: Some("alac-bot".to_string()),
+            comment: None,
+            description: None,
         };
         let cancellation = CancellationToken::new();
         self.media

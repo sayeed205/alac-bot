@@ -64,11 +64,25 @@ fn temp_path() -> PathBuf {
 /// Parse a command, resolving a replied-to message and an attached `.txt`
 /// document. Failed document downloads deliberately fall back to normal text,
 /// just as the live bot does.
+///
+/// `chat_id` is the Bot-API marked chat id (negative for channels/supergroups).
+/// It is used to prime the peer cache before fetching the reply message, so
+/// `channels.getMessages` works even immediately after a fresh bot start.
 pub async fn parse_message(
     client: &ferogram::Client,
     message: &IncomingMessage,
+    chat_id: i64,
     rerip: bool,
 ) -> ParsedCommand {
+    // Prime the peer cache for this chat so channels.getMessages has a valid
+    // access_hash. On a cache hit this is a no-op (just a local map read);
+    // on a cache miss (fresh start) it does one cheap RPC to fetch the chat.
+    if message.reply_to_message_id().is_some() {
+        if let Err(e) = client.resolve(ferogram::PeerRef::Id(chat_id)).await {
+            tracing::warn!(chat_id, error = %e, "rip: could not prime peer cache for chat");
+        }
+    }
+
     let reply = message.get_reply_with(client).await.ok().flatten();
     let document = message
         .document()
@@ -78,7 +92,7 @@ pub async fn parse_message(
         let mime = document.mime_type().to_ascii_lowercase();
         if name.ends_with(".txt") || mime == "text/plain" || mime.contains("text/plain") {
             let path = temp_path();
-            let result = async {
+            let result: Result<String, String> = async {
                 client
                     .download_file(&document, &path)
                     .await
@@ -93,10 +107,15 @@ pub async fn parse_message(
                         MAX_DOCUMENT_BYTES / (1024 * 1024)
                     ));
                 }
-                let content = tokio::fs::read_to_string(&path)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                Ok::<_, String>(content)
+                let bytes = tokio::fs::read(&path).await.map_err(|e| e.to_string())?;
+                let content = if let Ok(s) = std::str::from_utf8(&bytes) {
+                    s.trim_start_matches('\u{FEFF}').to_owned()
+                } else {
+                    String::from_utf8_lossy(&bytes)
+                        .trim_start_matches('\u{FEFF}')
+                        .to_owned()
+                };
+                Ok(content)
             }
             .await;
             let _ = tokio::fs::remove_file(&path).await;

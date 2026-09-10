@@ -85,9 +85,11 @@ impl RipDeps {
             .and_then(|value| value.parse().ok())
             .filter(|value| *value <= engine::limits::MAX_RETRIES)
             .unwrap_or(3);
-        let mut ripper_config = RipperConfig::default();
-        ripper_config.base_delay_ms = retry_base_ms;
-        ripper_config.max_retries = max_retries;
+        let ripper_config = RipperConfig {
+            base_delay_ms: retry_base_ms,
+            max_retries,
+            ..Default::default()
+        };
 
         let albums = db::AlbumsRepository::new(database);
         let sink = FerogramTelegramSink::new(client, dump_peer).await?;
@@ -311,9 +313,7 @@ impl OrchestratorDeps for RipDeps {
     }
 
     fn fetch_artwork<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Option<Vec<u8>>> {
-        Box::pin(async move {
-            self.ripper_deps.fetch_artwork_bytes(url).await
-        })
+        Box::pin(async move { self.ripper_deps.fetch_artwork_bytes(url).await })
     }
 
     fn sink(&self) -> &dyn TelegramSink {
