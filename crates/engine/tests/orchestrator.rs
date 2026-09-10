@@ -1278,16 +1278,16 @@ async fn progress_percent_math() {
     assert_eq!(summary.ripped_count, 2);
 
     let ev = events.snapshot();
-    // TS parity: the uploader's success path never emits progress (it only
-    // mutates the job counters), so the final progress event is track 2's
-    // download activity at 1/2 completed — never 100%.
+    // Upload completion publishes a fresh progress snapshot after clearing
+    // the active upload text, so the dashboard reaches 100% before the
+    // terminal event.
     let last_progress = ev
         .iter()
         .rev()
         .find(|e| e.starts_with("progress:"))
         .expect("progress events exist");
     assert!(
-        last_progress.starts_with("progress:50:"),
+        last_progress.starts_with("progress:100:"),
         "got {last_progress}"
     );
 }

@@ -30,6 +30,7 @@ pub struct RipDeps {
     /// and cache state the ripper uses.
     mirror_policy: engine::streaming::MirrorPolicyManager<engine::streaming::ReqwestHttp>,
     upload_retry_base_ms: u64,
+    max_retries: u32,
 }
 
 impl RipDeps {
@@ -69,12 +70,20 @@ impl RipDeps {
             wrapper_url,
             wrapper_api_key,
         );
-        let upload_retry_base_ms = std::env::var("ALAC_RETRY_BASE_MS")
+        let retry_base_ms = std::env::var("ALAC_RETRY_BASE_MS")
             .ok()
             .and_then(|value| value.parse().ok())
             .filter(|value| *value <= engine::limits::MAX_RETRY_BASE_MS)
             // TS default: 2000ms (`src/env.ts` ALAC_RETRY_BASE_MS).
             .unwrap_or(2000);
+        let max_retries = std::env::var("ALAC_MAX_RETRIES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value <= engine::limits::MAX_RETRIES)
+            .unwrap_or(3);
+        let mut ripper_config = RipperConfig::default();
+        ripper_config.base_delay_ms = retry_base_ms;
+        ripper_config.max_retries = max_retries;
 
         Ok(Self {
             sink: FerogramTelegramSink::new(client, dump_peer).await?,
@@ -83,10 +92,11 @@ impl RipDeps {
             settings,
             catalog,
             playlist: PlaylistClient::new(ReqwestPlaylistHttp::new()),
-            ripper: AlacTrackRipper::new(RipperConfig::default()),
+            ripper: AlacTrackRipper::new(ripper_config),
             ripper_deps,
             mirror_policy: probe_policy,
-            upload_retry_base_ms,
+            upload_retry_base_ms: retry_base_ms,
+            max_retries,
         })
     }
 }
@@ -228,10 +238,6 @@ impl OrchestratorDeps for RipDeps {
     }
 
     fn upload_max_retries(&self) -> u32 {
-        std::env::var("ALAC_MAX_RETRIES")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .filter(|value| *value <= engine::limits::MAX_RETRIES)
-            .unwrap_or(3)
+        self.max_retries
     }
 }
