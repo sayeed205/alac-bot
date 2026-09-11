@@ -9,10 +9,10 @@ pub fn escape(value: &str) -> String {
 }
 
 /// Prepare the dynamic HTML used by the TypeScript bot for ferogram's parser.
-/// Ferogram's parser understands all the tags the TS oracle emits, including
+/// Ferogram's parser understands all the tags the emits, including
 /// `<br>`, `<blockquote>`, and `<blockquote expandable>`, natively, so the
 /// content passes through unchanged. This helper is kept as the single place
-/// where TS-vs-ferogram HTML dialect differences are reconciled.
+/// where Telegram-HTML dialect differences are reconciled.
 pub fn parse_dynamic_html(content: &str) -> String {
     // Presentation policy: decorative emoji are not used to carry meaning.
     // Keep the semantic ASCII markers used by the new renderer (✓, !, ×, …)

@@ -1,4 +1,4 @@
-//! Apple Music link/id parser. Exact port of `src/modules/alac/parser.ts`.
+//! Apple Music link/id parser.
 //!
 //! Order of regex checks matters: playlist URL → bare playlist → artist URL →
 //! bare artist → album URL with `?i=` → direct song URL → album URL → bare
@@ -23,7 +23,7 @@ fn regexes() -> &'static [Regex; 8] {
         // 3. music.apple.com/…/artist/<slug>/<id> (also itunes.apple.com)
         let artist = Regex::new(r"(?i)(?:music|itunes)\.apple\.com/(?:([a-z]{2})/)?artist/(?:[^/]+/)?(\d+)")
             .expect("artist regex");
-        // 4. bare artist:123 / artist/123 — case-insensitive like the TS oracle.
+        // 4. bare artist:123 / artist/123 — case-insensitive.
         let bare_artist =
             Regex::new(r"(?i)^artist[:/](\d+)$").expect("bare artist regex");
         // 5. album URL with ?i=<track id>
@@ -320,7 +320,7 @@ mod tests {
 
     #[test]
     fn bare_artist_prefix_is_case_insensitive() {
-        // TS oracle's BARE_ARTIST_ID_RE carries the /i flag.
+        // The bare-artist-id pattern is case-insensitive.
         let res = parse_alac_input("/alac Artist/159260351", None).unwrap();
         assert_eq!(res.items, vec![artist("159260351", None)]);
         assert!(res.is_artist);

@@ -1,8 +1,7 @@
 //! `/export` + `/import` — gzipped typed database archive backup/restore
-//! (oracle: `src/modules/alac/commands/backup.ts`, service
-//! `src/db/dump.ts` → `db::DbDumpService`).
+//! .
 //!
-//! Both commands are admin-only AND DM-only (the oracle silently returns
+//! Both commands are admin-only AND DM-only (the silently returns
 //! outside a private chat).
 
 use std::{
@@ -80,7 +79,7 @@ fn confirmation_keyboard(token: &str) -> ferogram::tl::enums::ReplyMarkup {
         .into_markup()
 }
 
-/// Oracle caption: "Compressed Size" in KB with one decimal.
+/// caption: "Compressed Size" in KB with one decimal.
 fn export_caption(users: i64, tracks: i64, requests: i64, bytes: usize) -> String {
     format!(
         "<b>📦 Database Dump Exported</b>\n\n\
@@ -218,7 +217,7 @@ async fn export(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
             .await;
     }
 
-    // Oracle deletes the "Generating..." status message in a finally.
+    // deletes the "Generating..." status message in a finally.
     if let Some(status) = status {
         let _ = status.delete().await;
     }

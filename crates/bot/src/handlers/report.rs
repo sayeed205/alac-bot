@@ -107,9 +107,9 @@ fn now_ms() -> u128 {
 }
 
 fn random_report_id() -> String {
-    // Math.random().toString(36).slice(2, 10) is deliberately opaque in the
-    // oracle. A timestamp and process-local counter give the same eight
-    // lowercase base-36 characters without adding a random dependency.
+    // Report ids are eight opaque lowercase base-36 characters.
+    // A timestamp and process-local counter give the same shape without
+    // adding a random dependency.
     let value = now_ms() as u64 ^ REPORT_COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut value = value;
     let mut result = String::with_capacity(8);

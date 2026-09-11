@@ -3,7 +3,7 @@
 //! M5c: the bot owns only preflight policy and input parsing. Status is
 //! rendered by one shared dashboard message per chat. All rip semantics —
 //! cache-first maintenance, queue position, retries, circuit breaker — live
-//! in the engine orchestrator (`commands-rip.ts` is the parity oracle).
+//! in the engine orchestrator.
 
 pub mod cancel;
 pub mod gates;
@@ -67,7 +67,7 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
     let is_cache = command == "cache" || command == "dump";
     let admin = state.auth.is_admin(sender);
 
-    // Preflight gates (oracle commands-rip.ts:216-307).
+    // Preflight gates .
     if let Some(text) = gates::cache_gate(is_cache, admin) {
         reply(&msg, text).await;
         return;
@@ -102,7 +102,7 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
         return;
     }
 
-    // Requester display name (oracle: displayName || sender.displayName || @username || User id).
+    // Requester display name .
     let user = msg.sender_user().await.ok().flatten();
     let display_name = user
         .as_ref()
@@ -127,7 +127,7 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
 
     let is_group = chat != sender;
 
-    // Group DM preflight (oracle commands-rip.ts:471-519): for non-cache
+    // Group DM preflight : for non-cache
     // group requests, verify the requester can receive DMs before queueing
     // anything. A failure prompts them to start the bot in DM and stops the
     // job; on success delivery is retargeted to the DM.

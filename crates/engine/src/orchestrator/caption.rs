@@ -8,7 +8,7 @@
 
 use crate::types::{Provider, TrackKey, TrackRipResult};
 
-/// TS `DumpCaptionMetadata` — everything optional the TS type marks optional,
+/// Everything the dump caption builder takes; `None` fields are simply
 /// everything else required.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DumpCaptionMetadata<'a> {
@@ -89,7 +89,7 @@ pub struct ParsedZipDumpMetadata {
     pub generation_hash: String,
 }
 
-/// mtcute `html.escape` parity: `& < > " '` (hex entities).
+/// Escape `& < > " '` with hex entities (mtcute-compatible).
 pub fn html_escape(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
@@ -189,12 +189,12 @@ pub fn format_album_details_caption(meta: &AlbumDetailsCaptionMetadata<'_>) -> S
 /// expandable block contains the single canonical machine record consumed by
 /// the indexer; human-readable metadata is intentionally not repeated there.
 pub fn format_dump_caption(meta: &DumpCaptionMetadata<'_>) -> String {
-    let m = meta.duration / 60;
-    let s = format!("{:02}", meta.duration % 60);
+    let minutes = meta.duration / 60;
+    let seconds = format!("{:02}", meta.duration % 60);
     let track_number = meta.track_number.unwrap_or(1);
     let track_count = meta.track_count.unwrap_or(1);
     let summary = format!(
-        "<b>{}</b> — {}<br/><i>{}</i> · <code>{track_number}/{track_count}</code><br/><code>ALAC · {}-bit · {:.1} kHz · {m}:{s}</code>",
+        "<b>{}</b> — {}<br/><i>{}</i> · <code>{track_number}/{track_count}</code><br/><code>ALAC · {}-bit · {:.1} kHz · {minutes}:{seconds}</code>",
         html_escape(meta.title),
         html_escape(meta.artist),
         html_escape(meta.album),
@@ -202,7 +202,7 @@ pub fn format_dump_caption(meta: &DumpCaptionMetadata<'_>) -> String {
         meta.sample_rate as f64 / 1000.0,
     );
 
-    // Machine payload. TS: JSON.stringify(payload, null, 2), each line
+    // Machine payload: JSON with 2-space indentation, each line
     // escaped, joined with <br/>.
     let payload_json = serde_json::json!({
         "provider": meta.track_key.provider,
@@ -278,7 +278,7 @@ pub fn format_zip_dump_caption(
     format!("{summary}<br/><blockquote expandable>{payload_html}</blockquote>")
 }
 
-/// TS `ParsedDumpMetadata` — the round-trip shape of the embedded payload.
+/// The round-trip shape of the caption's embedded payload.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedDumpMetadata {
     pub track_key: TrackKey,

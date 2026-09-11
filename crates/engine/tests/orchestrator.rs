@@ -1,5 +1,5 @@
 //! Integration tests for the rip orchestrator (offline — every dependency
-//! is a fake; parity with `rip-orchestrator.ts` behavior).
+//! is a fake).
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -27,8 +27,7 @@ use engine::{
 };
 use tokio_util::sync::CancellationToken;
 
-// ── fakes ────────────────────────────────────────────────────────────────
-
+// fakes
 /// What the fake ripper should do for a given track id.
 #[derive(Clone)]
 enum RipScript {
@@ -53,7 +52,7 @@ struct DepsState {
     /// Message ids whose dump copy fails (once).
     copies_fail_ids: Vec<i64>,
     rip_calls: Vec<String>,
-    // ── album ZIP (T2/T4) ──────────────────────────────────────────────────
+    // album ZIP
     saved_albums: Vec<AlbumUpload>,
     deleted_album_zip_ids: Vec<String>,
     found_albums: HashMap<String, Vec<CachedAlbum>>,
@@ -64,6 +63,10 @@ struct DepsState {
     sent_photos: Vec<(i64, usize, String)>, // (chat, byte len, caption)
     fetch_artwork_urls: Vec<String>,
     artwork_bytes: Option<Vec<u8>>,
+    /// When set, `send_audio_to_dump` waits for this token before returning
+    /// — used to hold lane 2 open deterministically (cancel-during-upload
+    /// tests).
+    gate_uploads: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl DepsState {
@@ -208,6 +211,13 @@ impl TelegramSink for FakeSink {
     ) -> Pin<Box<dyn Future<Output = Result<Option<DumpUpload>, SinkError>> + Send + 'a>> {
         let state = Arc::clone(&self.state);
         Box::pin(async move {
+            let gate = {
+                let st = state.lock().unwrap();
+                st.gate_uploads.clone()
+            };
+            if let Some(gate) = gate {
+                gate.cancelled().await;
+            }
             let mut st = state.lock().unwrap();
             st.sent_audio.push((
                 file_path.to_string(),
@@ -532,8 +542,7 @@ impl OrchestratorDeps for FakeDeps {
     }
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────
-
+// helpers
 #[derive(Clone)]
 struct EventLog {
     records: Arc<Mutex<Vec<String>>>,
@@ -636,8 +645,7 @@ async fn run_async(
     orch.start_job(Arc::clone(deps), opts).await
 }
 
-// ── tests ────────────────────────────────────────────────────────────────
-
+// tests
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn happy_path_single_track() {
     let (orch, deps, state, events) = setup();
@@ -1214,7 +1222,7 @@ async fn upload_retries_exhausted_records_failure() {
     assert_eq!(summary.failed_tracks[0].error, "flood");
     let st = state.lock().unwrap();
     assert_eq!(st.sent_audio.len(), 4, "max_retries=4 attempts");
-    // TS throws before any request log — the deviation records no log either.
+    // No request log is written for an upload-exhausted track.
     assert!(st.request_logs.is_empty());
 }
 
@@ -1305,7 +1313,7 @@ async fn queue_position_field_defaults_none() {
     run_async(&orch, &deps, &options(vec![track_item("t1")], true))
         .await
         .expect("job succeeds");
-    // The command handler (M5b) sets queue_position; startJob never does,
+    // The command handler sets queue_position; the job flow never does,
     // and the job map is empty after completion.
     assert!(orch.get_active_jobs().is_empty());
 }
@@ -1450,7 +1458,7 @@ async fn progress_percent_math() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_tracks_after_cap_edge() {
-    // maxCollectionTracks = 0 means "no cap" in TS (limit > 0 check).
+    // max_collection_tracks = 0 means "no cap" (limit > 0 check).
     let (orch, deps, _, _) = setup();
     let meta = |id: &str| FakeDeps::track_meta(id, "Says", "Nils Frahm");
     deps.albums.lock().unwrap().insert(
@@ -1466,8 +1474,7 @@ async fn empty_tracks_after_cap_edge() {
     assert_eq!(summary.capped_count, 0);
 }
 
-// ── album ZIP: generation-hash reuse, cover, single-track warning ─────────
-
+// album ZIP: generation-hash reuse, cover, single-track warning
 /// Builds a zip-enabled RipJobOptions for a single album item.
 fn zip_options(album: &str, cache_only: bool, explicit: bool, force: bool) -> RipJobOptions {
     RipJobOptions {
@@ -1891,4 +1898,240 @@ async fn zip_build_includes_cover_and_real_generation_hash() {
     assert!(manifest["tracks"][0]["sha256"].is_string());
     let _ = std::fs::remove_dir_all(&archive_dir);
     assert!(summary.warnings.is_empty());
+}
+
+// two-lane pipeline (lane 1 rip ∥ lane 2 upload)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plain_album_job_caches_zip_without_delivering_it() {
+    // The always-zip rule: a plain (no -z) album job still builds and
+    // caches the archive to the dump for future requests, but the user
+    // only receives the individual tracks — never the ZIP parts.
+    let (orch, deps, state, _) = setup();
+    let meta = |id: &str| FakeDeps::track_meta(id, "Track", "Artist");
+    deps.albums.lock().unwrap().insert(
+        "alb.auto".into(),
+        FakeDeps::album(vec![meta("t1"), meta("t2")]),
+    );
+    deps.rip_scripts
+        .lock()
+        .unwrap()
+        .insert("t1".into(), RipScript::OkWithFile(vec![1, 2, 3]));
+    deps.rip_scripts
+        .lock()
+        .unwrap()
+        .insert("t2".into(), RipScript::OkWithFile(vec![4, 5, 6]));
+    {
+        let mut st = state.lock().unwrap();
+        for _ in 0..2 {
+            st.send_audio_results.push_back(FakeDeps::upload_ok());
+        }
+    }
+
+    let summary = run_async(&orch, &deps, &options(vec![album_item("alb.auto")], false))
+        .await
+        .expect("job succeeds");
+
+    let st = state.lock().unwrap();
+    assert_eq!(summary.ripped_count, 2);
+    assert_eq!(st.sent_audio.len(), 2, "both tracks cached to dump");
+    // Individual tracks ARE delivered to the user (message 777 is the fake
+    // per-track dump upload; only those copies appear, never 900 = ZIP part).
+    let delivered: Vec<i64> = st
+        .copies
+        .iter()
+        .filter(|(to, _, _, _)| *to == 100)
+        .map(|(_, msg, _, _)| *msg)
+        .collect();
+    assert_eq!(delivered, vec![777, 777], "individual tracks delivered");
+    // The archive was published to the dump and saved as cache rows…
+    assert_eq!(st.sent_documents.len(), 1, "archive uploaded to dump");
+    assert_eq!(st.saved_albums.len(), 1, "album ZIP row saved");
+    // …but no details photo/ZIP copy went to the user and the summary
+    // reports no ZIP delivery.
+    assert!(summary.zip_delivery.is_none());
+    assert!(
+        st.sent_photos.is_empty(),
+        "no details message on plain jobs"
+    );
+    let zip_part_copies: Vec<i64> = st
+        .copies
+        .iter()
+        .filter(|(to, _, _, _)| *to == 100)
+        .filter(|(_, msg, _, _)| *msg == 900)
+        .map(|(_, msg, _, _)| *msg)
+        .collect();
+    assert!(
+        zip_part_copies.is_empty(),
+        "ZIP parts never delivered on plain jobs"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_lanes_interleave_job_b_rips_while_job_a_uploads() {
+    // Lane 1 must free the rip slot when job A's last RIP is done, even
+    // while its uploads continue on lane 2 — so job B starts ripping
+    // before A's summary resolves.
+    let (orch, deps, state, _) = setup();
+    let meta = |id: &str| FakeDeps::track_meta(id, "Track", "Artist");
+    deps.albums.lock().unwrap().insert(
+        "alb.a".into(),
+        FakeDeps::album(vec![meta("a1"), meta("a2")]),
+    );
+    deps.albums.lock().unwrap().insert(
+        "alb.b".into(),
+        FakeDeps::album(vec![meta("b1"), meta("b2")]),
+    );
+    for id in ["a1", "a2", "b1", "b2"] {
+        deps.rip_scripts
+            .lock()
+            .unwrap()
+            .insert(id.into(), RipScript::OkWithFile(vec![1]));
+    }
+    {
+        let mut st = state.lock().unwrap();
+        for _ in 0..4 {
+            st.send_audio_results.push_back(FakeDeps::upload_ok());
+        }
+    }
+
+    let orch = Arc::new(orch);
+    let a_deps = Arc::clone(&deps);
+    let a_options = options(vec![album_item("alb.a")], false);
+    let b_deps = Arc::clone(&deps);
+    let b_options = options(vec![album_item("alb.b")], false);
+
+    let a_orch = Arc::clone(&orch);
+    let a_task = tokio::spawn(async move { run_async(&a_orch, &a_deps, &a_options).await });
+    // Ensure A is admitted and starts lane 1 first.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let b_orch = Arc::clone(&orch);
+    let b_task = tokio::spawn(async move { run_async(&b_orch, &b_deps, &b_options).await });
+    let a_summary = a_task.await.unwrap().expect("job A succeeds");
+    let b_summary = b_task.await.unwrap().expect("job B succeeds");
+    assert_eq!(a_summary.ripped_count, 2);
+    assert_eq!(b_summary.ripped_count, 2);
+
+    // Both jobs' four tracks reached the dump through lane 2.
+    let st = state.lock().unwrap();
+    assert_eq!(st.sent_audio.len(), 4);
+    assert_eq!(st.saved_albums.len(), 2, "both archives cached");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_during_lane_two_upload_still_resolves() {
+    // Cancelling after lane 1 finished its rips (uploads gated open on
+    // lane 2) must not hang start_job: the finalize marker still runs,
+    // cleans the workspaces, and resolves the summary.
+    let (orch, deps, state, events) = setup();
+    let meta = |id: &str| FakeDeps::track_meta(id, "Track", "Artist");
+    deps.albums.lock().unwrap().insert(
+        "alb.cancel".into(),
+        FakeDeps::album(vec![meta("c1"), meta("c2")]),
+    );
+    for id in ["c1", "c2"] {
+        deps.rip_scripts
+            .lock()
+            .unwrap()
+            .insert(id.into(), RipScript::OkWithFile(vec![1]));
+    }
+    {
+        let mut st = state.lock().unwrap();
+        for _ in 0..2 {
+            st.send_audio_results.push_back(FakeDeps::upload_ok());
+        }
+    }
+    // Hold every lane-2 upload open until the test releases it.
+    let gate = tokio_util::sync::CancellationToken::new();
+    state.lock().unwrap().gate_uploads = Some(gate.clone());
+
+    let orch = Arc::new(orch);
+    let run_orch = Arc::clone(&orch);
+    let run_deps = Arc::clone(&deps);
+    let run_options = options(vec![album_item("alb.cancel")], false);
+    let task = tokio::spawn(async move { run_async(&run_orch, &run_deps, &run_options).await });
+    // Wait until lane 1 is done (both rip calls recorded) — its slot frees
+    // while lane 2 is gated mid-upload.
+    let rip_done = async {
+        loop {
+            let done = {
+                let st = state.lock().unwrap();
+                st.rip_calls.len() == 2
+            };
+            if done {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    };
+    rip_done.await;
+    let job = orch
+        .get_active_jobs()
+        .into_iter()
+        .next()
+        .expect("active job");
+    assert!(orch.cancel_job(&job.id, Some("tester")));
+    // Release the gated uploads; the marker then runs and resolves.
+    gate.cancel();
+    let summary = task.await.unwrap().expect("summary still resolves");
+    // The gated uploads completed as Telegram sends but the job was
+    // already cancelled: the post-upload rollback deleted the dump rows,
+    // so nothing counts as ripped.
+    assert_eq!(summary.ripped_count, 0, "uploads rolled back post-cancel");
+    let terminal_count = events
+        .snapshot()
+        .iter()
+        .filter(|event| {
+            event.starts_with("completed")
+                || event.starts_with("cancelled")
+                || event.starts_with("failed")
+        })
+        .count();
+    assert_eq!(terminal_count, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn staging_failure_queues_rip_for_cached_track() {
+    // A cache row whose dump message cannot be downloaded is re-ripped on
+    // lane 1 instead of silently breaking the archive.
+    let (orch, deps, state, _) = setup();
+    let meta = |id: &str| FakeDeps::track_meta(id, "Track", "Artist");
+    deps.albums.lock().unwrap().insert(
+        "alb.stage".into(),
+        FakeDeps::album(vec![meta("s1"), meta("s2")]),
+    );
+    // s1 is cached with a dead dump row (staging download fails), s2 is a
+    // plain miss. Both end up ripped.
+    deps.cache_track("s1", 424242);
+    {
+        let mut st = state.lock().unwrap();
+        st.copies_fail_ids.push(424242); // instant delivery fails → re-rip
+    }
+    deps.rip_scripts
+        .lock()
+        .unwrap()
+        .insert("s1".into(), RipScript::OkWithFile(vec![9]));
+    deps.rip_scripts
+        .lock()
+        .unwrap()
+        .insert("s2".into(), RipScript::OkWithFile(vec![8]));
+    {
+        let mut st = state.lock().unwrap();
+        for _ in 0..2 {
+            st.send_audio_results.push_back(FakeDeps::upload_ok());
+        }
+    }
+
+    let summary = run_async(&orch, &deps, &options(vec![album_item("alb.stage")], false))
+        .await
+        .expect("job succeeds");
+
+    // s1 was re-ripped (stale row + dead dump) and s2 ripped fresh.
+    let st = state.lock().unwrap();
+    assert!(
+        st.rip_calls.contains(&"s1".to_string()),
+        "stale s1 re-ripped"
+    );
+    assert!(st.rip_calls.contains(&"s2".to_string()), "s2 ripped");
+    assert_eq!(summary.ripped_count, 2);
+    assert_eq!(st.saved_albums.len(), 1, "archive complete and cached");
 }

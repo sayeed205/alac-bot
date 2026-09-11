@@ -58,7 +58,10 @@ pub struct DashboardJob {
 pub struct DashboardSnapshot {
     pub ripping_mode: String,
     pub mirror_health: Option<String>,
-    pub current_activity: Option<String>,
+    /// First active lane-1 job's download text (header line, hidden when idle).
+    pub current_download: Option<String>,
+    /// First active lane-2 job's upload text (header line, hidden when idle).
+    pub current_upload: Option<String>,
     pub jobs: Vec<DashboardJob>,
 }
 
@@ -79,8 +82,11 @@ pub fn render(
         esc(&snapshot.ripping_mode),
         esc(health)
     );
-    if let Some(activity) = snapshot.current_activity.as_deref() {
-        text.push_str(&format!("<b>Activity:</b> {activity}\n"));
+    if let Some(download) = snapshot.current_download.as_deref() {
+        text.push_str(&format!("<b>⬇️ Downloading:</b> {download}\n"));
+    }
+    if let Some(upload) = snapshot.current_upload.as_deref() {
+        text.push_str(&format!("<b>⬆️ Uploading:</b> {upload}\n"));
     }
     for (offset, job) in snapshot.jobs.iter().skip(start).take(5).enumerate() {
         let number = start + offset + 1;
@@ -575,12 +581,50 @@ mod tests {
                 uploading: Some("<i>Song - Artist</i>".into()),
                 is_cancel_allowed_for_viewer: true,
             }],
-            current_activity: Some("⬇️ Downloading: <b>Song</b>".into()),
+            current_download: Some("<b>Song</b>".into()),
+            current_upload: Some("<b>Album.zip</b>".into()),
             ..DashboardSnapshot::default()
         };
 
         let (text, _) = render(&snapshot, 1, false);
-        assert!(text.contains("<b>Activity:</b> ⬇️ Downloading: <b>Song</b>"));
+        assert!(text.contains("<b>⬇️ Downloading:</b> <b>Song</b>"));
+        assert!(text.contains("<b>⬆️ Uploading:</b> <b>Album.zip</b>"));
         assert!(text.contains("/cancel_job-activity"));
+    }
+
+    #[test]
+    fn idle_lanes_hide_both_header_lines() {
+        let snapshot = DashboardSnapshot::default();
+        let (text, _) = render(&snapshot, 1, false);
+        assert!(text.contains("No active downloads."));
+        assert!(!text.contains("⬇️"));
+        assert!(!text.contains("⬆️"));
+    }
+
+    #[test]
+    fn one_active_lane_renders_only_its_header_line() {
+        let snapshot = DashboardSnapshot {
+            jobs: vec![DashboardJob {
+                id: "job-idle".into(),
+                requester_id: 7,
+                requester_name: "Alice".into(),
+                header: "Track".into(),
+                phase: JobPhase::Processing,
+                queue_position: None,
+                cached: 0,
+                ripped: 0,
+                failed: 0,
+                total: 1,
+                percent: 0,
+                downloading: None,
+                uploading: None,
+                is_cancel_allowed_for_viewer: true,
+            }],
+            current_download: Some("<b>Song</b>".into()),
+            ..DashboardSnapshot::default()
+        };
+        let (text, _) = render(&snapshot, 1, false);
+        assert!(text.contains("<b>⬇️ Downloading:</b> <b>Song</b>"));
+        assert!(!text.contains("⬆️"));
     }
 }

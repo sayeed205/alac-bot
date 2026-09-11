@@ -1,4 +1,4 @@
-//! Orchestrator domain types (port of `orchestrator/types.ts`).
+//! Orchestrator domain types.
 
 use std::sync::Arc;
 
@@ -27,9 +27,8 @@ pub enum TerminalJobState {
 /// Descriptive alias for callers that prefer the `Job*` naming convention.
 pub type JobTerminalState = TerminalJobState;
 
-/// TS `ActiveRipJob` — live job bookkeeping. TS mutates this object by
-/// reference from several tasks; here the orchestrator owns it and hands
-/// out read-only snapshots via progress events.
+/// Live job bookkeeping. The orchestrator owns it, mutates it from several
+/// tasks behind its mutex, and hands out read-only snapshots via events.
 #[derive(Debug, Clone)]
 pub struct ActiveRipJob {
     pub id: String,
@@ -53,8 +52,7 @@ pub struct ActiveRipJob {
     pub start_time_ms: u64,
     /// Last `activeActionText` written by a progress update.
     pub active_action_text: Option<String>,
-    /// TS `queuePosition?` — maintained by the /alac command handler (M5b),
-    /// not by `startJob` itself.
+    /// Queue position, maintained by the queue rather than the job flow.
     pub queue_position: Option<u64>,
     pub phase: JobPhase,
     pub terminal_state: Option<TerminalJobState>,
@@ -64,13 +62,13 @@ pub struct ActiveRipJob {
     pub reply_to_message_id: Option<i64>,
 }
 
-/// TS `RipJobOptions`.
+/// Everything one rip request carries.
 #[derive(Debug, Clone)]
 pub struct RipJobOptions {
     pub chat_id: i64,
     pub user_id: i64,
     pub user_name: Option<String>,
-    /// Chat the file copy is delivered to (TS allows number | string; the
+    /// Chat the file copy is delivered to (numbers only in practice; the
     /// bot resolves usernames/ids to i64 before enqueueing).
     pub delivery_chat_id: i64,
     pub is_group: bool,
@@ -91,7 +89,7 @@ pub struct RipJobOptions {
     pub is_admin: bool,
 }
 
-/// TS `RipJobProgress` — every field optional except the counters.
+/// A progress snapshot; every display field is optional.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RipJobProgress {
     pub job_id: String,
@@ -107,14 +105,14 @@ pub struct RipJobProgress {
     pub activity_override: Option<String>,
 }
 
-/// TS `RipJobSummary.failedTracks` entries.
+/// One failed track, as reported in the job summary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailedTrack {
     pub id: String,
     pub error: String,
 }
 
-/// TS `RipJobSummary`.
+/// The end-of-job report for the requesting chat.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RipJobSummary {
     pub job_id: String,
@@ -188,8 +186,7 @@ fn kind_name(kind: TargetKind) -> &'static str {
     }
 }
 
-/// Events emitted by the orchestrator (TS EventEmitter: job:created,
-/// job:started, job:progress, job:completed, job:cancelled, job:failed).
+/// Events emitted by the orchestrator.
 #[derive(Debug, Clone)]
 pub enum OrchestratorEvent<'a> {
     /// `job:created`

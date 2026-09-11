@@ -1,5 +1,5 @@
-//! `/dumpnew` / `/autodump` — on-demand + scheduled new-release archiver
-//! (oracle: `src/modules/alac/commands/autodump.ts`). Discovers fresh tracks
+//! `/dumpnew` / `/autodump` — on-demand + scheduled new-release archiver.
+//! Discovers fresh tracks
 //! across the configured storefronts ("New Music Daily" editorial playlist +
 //! the Apple Marketing Tools top-albums feed, each album resolved to tracks
 //! via iTunes lookup) and enqueues them through the collapsed orchestrator in
@@ -23,13 +23,13 @@ use serde_json::Value;
 
 use crate::{html::parse_dynamic_html, BotState};
 
-/// Re-entry guard (oracle `isAutoDumpRunning`).
+/// Re-entry guard .
 static AUTO_DUMP_RUNNING: AtomicBool = AtomicBool::new(false);
 
-/// Oracle "New Music Daily" editorial playlist id.
+/// The "New Music Daily" editorial playlist id.
 const NEW_MUSIC_DAILY_ID: &str = "pl.2b0e6e332fdf4b7a91164da3162127b5";
 
-/// Oracle `getCutoffDateString`: today − max(1, days), `YYYY-MM-DD`.
+/// Cutoff date: today − max(1, days), formatted `YYYY-MM-DD`.
 fn cutoff_date_string(days: i64) -> String {
     let days = days.max(1);
     (chrono::Utc::now() - chrono::Duration::days(days))
@@ -37,7 +37,7 @@ fn cutoff_date_string(days: i64) -> String {
         .to_string()
 }
 
-/// JS `Number.parseInt(raw, 10)` prefix semantics: leading ASCII digits only.
+/// parseInt-style prefix parsing: leading ASCII digits only.
 fn parse_days_prefix(raw: &str) -> Option<i64> {
     let digits: String = raw
         .chars()
@@ -49,14 +49,14 @@ fn parse_days_prefix(raw: &str) -> Option<i64> {
     digits.parse().ok()
 }
 
-/// Discovered track (oracle `DiscoveredTrackItem`).
+/// Discovered track .
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredTrackItem {
     pub id: String,
     pub storefront: String,
 }
 
-/// Discovery outcome (oracle `DiscoveredNewTracksResult`).
+/// Discovery outcome .
 #[derive(Debug, Default)]
 pub struct DiscoveredNewTracksResult {
     pub tracks: Vec<DiscoveredTrackItem>,
@@ -66,7 +66,7 @@ pub struct DiscoveredNewTracksResult {
 }
 
 /// Source 1: the New Music Daily editorial playlist via the Catalog API with
-/// the scraped developer token (errors logged and skipped per oracle).
+/// the scraped developer token (errors logged and skipped).
 async fn discover_from_playlist(
     http: &reqwest::Client,
     dev_token: &str,
@@ -125,8 +125,7 @@ async fn discover_from_playlist(
     }
 }
 
-/// Per-album iTunes lookup (oracle: wrapperType `track` with a trackId, the
-/// track's own release date OR the album's date qualifying it).
+/// Per-album iTunes lookup .
 async fn discover_album_tracks_via_itunes(
     http: &reqwest::Client,
     storefront: &str,
@@ -192,7 +191,7 @@ async fn discover_album_tracks_via_itunes(
 }
 
 /// Source 2: Marketing Tools top-albums feed, tracks resolved via iTunes
-/// lookup (errors logged and skipped per album per oracle).
+/// lookup (errors logged and skipped per album).
 async fn discover_from_rss_albums(
     http: &reqwest::Client,
     storefront: &str,
@@ -252,7 +251,7 @@ async fn discover_from_rss_albums(
     }
 }
 
-/// Oracle `discoverNewTracks`.
+/// Discover tracks newer than the cutoff across the configured storefronts.
 pub async fn discover_new_tracks(
     state: &BotState,
     storefronts: &[String],
@@ -304,7 +303,8 @@ pub async fn discover_new_tracks(
     }
 }
 
-/// Oracle `runAutoDumpPipeline`. Returns the oracle's `success` flag.
+/// Run the discovery → report → reply pipeline. Returns whether every
+/// stage succeeded.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_auto_dump_pipeline(
     state: Arc<BotState>,
@@ -326,7 +326,7 @@ pub async fn run_auto_dump_pipeline(
         );
         return false;
     }
-    // Release the re-entry guard on every exit path (oracle `finally`).
+    // Release the re-entry guard on every exit path .
     let result = run_auto_dump_pipeline_inner(
         Arc::clone(&state),
         days,
@@ -408,8 +408,8 @@ async fn run_auto_dump_pipeline_inner(
 
     match job {
         Ok(_) => {
-            // Final admin DM summary card (oracle always DMs the admin).
-            // The oracle iterates `Object.entries(storefrontCounts)`, which
+            // Final admin DM summary card .
+            // The iterates `Object.entries(storefrontCounts)`, which
             // preserves the configured storefront order (every storefront is
             // seeded with 0 before discovery).
             let sf_breakdown = storefronts
@@ -505,7 +505,7 @@ async fn autodump(state: Arc<BotState>, msg: IncomingMessage) {
     .await;
 }
 
-/// Oracle `startAutoDumpScheduler`: a 24h interval, settings-gated per tick,
+/// startAutoDumpScheduler: a 24h interval, settings-gated per tick,
 /// days = 1, triggeredBy `Daily 24h Scheduler`. Spawned once from `main`.
 pub async fn scheduler_loop(state: Arc<BotState>) {
     tracing::info!("Starting 24h auto-dump scheduler");
@@ -534,7 +534,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cutoff_dates_match_oracle_shape() {
+    fn cutoff_dates_have_expected_shape() {
         assert_eq!(cutoff_date_string(1).len(), 10);
         assert!(cutoff_date_string(1).starts_with("20"));
         assert!(cutoff_date_string(1).contains('-'));
@@ -655,8 +655,7 @@ mod tests {
     fn discovery_dedupes_and_counts_per_storefront() {
         let mut map = HashMap::new();
         let mut counts = HashMap::new();
-        // Same id from two storefronts: first insert wins (oracle map.set
-        // only when !has, so the earlier storefront keeps ownership).
+        // Same id from two storefronts: first insert wins .
         let mut first = HashMap::new();
         let mut first_counts = HashMap::new();
         discover_from_playlist_insert(&mut first, &mut first_counts, "1", "us");

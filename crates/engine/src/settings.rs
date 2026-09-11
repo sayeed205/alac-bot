@@ -1,12 +1,10 @@
-//! Bot settings: ripping mode + feature flags (port of
-//! `src/modules/settings/types.ts` + the pure logic of `service.ts`).
+//! Bot settings: ripping mode + feature flags.
 //!
 //! The DB-backed `SettingsStore` (typed singleton, write-through cache)
 //! lives in the db crate; this module carries the domain types,
-//! defaults, and permission logic with exact TS parity.
+//! defaults, and permission logic.
 
 /// Whether the bot rips live, serves cache only, or is paused.
-/// TS: `'live' | 'cache_only' | 'paused'`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RippingMode {
     #[default]
@@ -24,9 +22,8 @@ impl RippingMode {
         }
     }
 
-    /// Parse a stored `ripping_mode` row value; anything else falls back to
-    /// the default (TS keeps the default when the value is not one of the
-    /// three literals).
+    /// Parse a stored `ripping_mode` row value; anything unrecognized falls
+    /// back to the default.
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "live" => Some(RippingMode::Live),
@@ -37,7 +34,7 @@ impl RippingMode {
     }
 }
 
-/// TS `BotSettings` shape (settings/types.ts).
+/// The bot's runtime settings.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BotSettings {
     pub ripping_mode: RippingMode,
@@ -51,7 +48,7 @@ pub struct BotSettings {
     pub auto_dump_storefronts: Vec<String>,
 }
 
-/// TS `DEFAULT_SETTINGS` (settings/types.ts lines 22-32).
+/// Default settings.
 pub const DEFAULT_SETTINGS: BotSettings = BotSettings {
     ripping_mode: RippingMode::Live,
     album_rip_enabled: true,
@@ -65,7 +62,7 @@ pub const DEFAULT_SETTINGS: BotSettings = BotSettings {
 };
 
 impl BotSettings {
-    /// `canRipLive(isAdmin)`: admins always pass; users need mode `'live'`.
+    /// Admins can always rip live; users need mode `'live'`.
     pub fn can_rip_live(&self, is_admin: bool) -> bool {
         if is_admin {
             return true;
@@ -73,8 +70,7 @@ impl BotSettings {
         self.ripping_mode == RippingMode::Live
     }
 
-    /// `canServeCache(isAdmin)`: admins always pass; users need mode
-    /// `!= 'paused'`.
+    /// Admins can always serve cache; users need mode `!= 'paused'`.
     pub fn can_serve_cache(&self, is_admin: bool) -> bool {
         if is_admin {
             return true;
@@ -102,7 +98,7 @@ impl BotSettings {
         is_admin || self.multi_link_rip_enabled
     }
 
-    /// TS `cycleRippingMode`: live → cache_only → paused → live.
+    /// Cycle: live → cache_only → paused → live.
     pub fn cycled_mode(&self) -> RippingMode {
         match self.ripping_mode {
             RippingMode::Live => RippingMode::CacheOnly,

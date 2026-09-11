@@ -1,6 +1,5 @@
-//! `/random` — random album explorer (oracle:
-//! `src/modules/alac/commands/random.ts`): discovery sources, preview cards,
-//! and `random:*` callbacks. Admin-only (the oracle replies with a restricted
+//! `/random` — random album explorer : discovery sources, preview cards,
+//! and `random:*` callbacks. Admin-only (the replies with a restricted
 //! card rather than staying silent).
 
 use std::sync::Arc;
@@ -20,7 +19,7 @@ use crate::{
     BotState,
 };
 
-/// Oracle WILD_SEEDS (50 words).
+/// WILD_SEEDS (50 words).
 pub const WILD_SEEDS: &[&str] = &[
     "future",
     "midnight",
@@ -74,7 +73,7 @@ pub const WILD_SEEDS: &[&str] = &[
     "memory",
 ];
 
-/// Oracle SOURCE_LABELS.
+/// SOURCE_LABELS.
 pub fn source_label(source: &str) -> Option<&'static str> {
     Some(match source {
         "charts" => "Top charts",
@@ -89,8 +88,8 @@ pub fn source_label(source: &str) -> Option<&'static str> {
     })
 }
 
-/// Oracle fetchCandidateBySource mapping for fixed search terms; None means
-/// the source takes a different path (charts/wild) or is used as a raw query.
+/// Fixed search term per source; `None` means the source takes a
+/// different path (charts/wild) or is used as a raw query.
 fn source_search_term(source: &str) -> Option<&'static str> {
     Some(match source {
         "rock" => "rock album",
@@ -103,14 +102,14 @@ fn source_search_term(source: &str) -> Option<&'static str> {
     })
 }
 
-/// A discovered album candidate (oracle RandomAlbumCandidate).
+/// A discovered album candidate .
 #[derive(Debug, Clone, Default)]
 pub struct RandomAlbumCandidate {
     pub id: String,
     pub title: String,
     pub artist: String,
     pub url: String,
-    /// Carried for oracle-interface parity; the preview card never renders it.
+    /// Carried for interface completeness; the preview card never renders it.
     #[allow(dead_code)]
     pub artwork_url: Option<String>,
     pub release_date: Option<String>,
@@ -138,14 +137,14 @@ fn now_seed() -> u64 {
     nanos | 1
 }
 
-/// Oracle buildSourcesMenuText.
+/// buildSourcesMenuText.
 pub fn build_sources_menu_text() -> String {
     "<b>Apple Music random album explorer</b> (admin)<br/><br/>\
      <blockquote>Select a discovery source below to pick a random album to dump into your cache channel:</blockquote>"
         .to_owned()
 }
 
-/// Oracle buildPreviewText.
+/// buildPreviewText.
 pub fn build_preview_text(candidate: &RandomAlbumCandidate) -> String {
     let release = candidate
         .release_date
@@ -229,7 +228,7 @@ fn retry_keyboard(source: &str, storefront: &str) -> ferogram::tl::enums::ReplyM
         .into_markup()
 }
 
-/// Oracle fetchSearchAlbum (iTunes album-entity search, random pick).
+/// fetchSearchAlbum (iTunes album-entity search, random pick).
 async fn fetch_search_album(
     http: &reqwest::Client,
     query: &str,
@@ -311,7 +310,7 @@ async fn fetch_search_album(
     Ok(candidates.swap_remove(index))
 }
 
-/// Oracle fetchChartsAlbum via the engine's charts feed, random pick.
+/// fetchChartsAlbum via the engine's charts feed, random pick.
 async fn fetch_charts_album(
     state: &BotState,
     storefront: &str,
@@ -350,7 +349,7 @@ async fn fetch_wild_album(
     fetch_search_album(http, seed, storefront, rng).await
 }
 
-/// Oracle fetchCandidateBySource.
+/// Fetch one candidate album for a fixed source term.
 async fn fetch_candidate_by_source(
     state: &BotState,
     http: &reqwest::Client,
@@ -661,7 +660,7 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery, action: Discov
                 .await;
             delete_message(&state, &peer, message_id).await;
 
-            // Oracle delegates to executeRipPipeline in cache-only mode;
+            // delegates to executeRipPipeline in cache-only mode;
             // the collapsed orchestrator takes that path (recorded deviation).
             let user_display =
                 crate::presentation::resolve_user_display_name(&state.client, query.user_id).await;
@@ -751,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_text_fallbacks_match_oracle() {
+    fn preview_text_falls_back_when_fields_missing() {
         let mut c = candidate();
         c.track_count = None;
         c.release_date = None;
@@ -772,7 +771,7 @@ mod tests {
     }
 
     #[test]
-    fn source_terms_match_oracle() {
+    fn source_terms_render_expected_labels() {
         assert_eq!(source_search_term("rock"), Some("rock album"));
         assert_eq!(source_search_term("rap"), Some("hip hop album"));
         assert_eq!(source_search_term("hiphop"), Some("hip hop album"));
@@ -787,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn source_labels_match_oracle() {
+    fn source_labels_render_expected_text() {
         assert_eq!(source_label("charts"), Some("Top charts"));
         assert_eq!(source_label("hiphop"), Some("Hip-hop"));
         assert_eq!(source_label("unknown"), None);

@@ -1,8 +1,7 @@
-//! TTL + capacity cache replicating the TS oracle's `Map`-based cache
-//! exactly:
+//! TTL + capacity cache (insertion-ordered map with a counter):
 //! - `get`: expired → drop + miss; hit → drop + reinsert (recency refresh)
 //! - `set`: when `len >= max`, evict the FRONT entry first — even when
-//!   updating an existing key (TS quirk), so `max = 0` degenerates to
+//!   updating an existing key, so `max = 0` degenerates to
 //!   capacity 1.
 
 use std::time::{Duration, Instant};
@@ -52,7 +51,7 @@ impl<T: Clone> Cache<T> {
     }
 
     pub(crate) fn set_with_ttl(&mut self, key: &str, value: T, ttl: Duration, now: Instant) {
-        // TS quirk: eviction check runs before every insert, even when the
+        // Eviction check runs before every insert, even when the
         // key already exists (and even with max_size == 0, which degenerates
         // the cache to capacity 1).
         if self.map.len() >= self.max_size {
@@ -101,7 +100,7 @@ mod tests {
 
     #[test]
     fn update_at_capacity_still_evicts_front() {
-        // TS quirk: set on an existing key while full evicts the front entry.
+        // Setting an existing key while full evicts the front entry.
         let mut cache: Cache<u32> = Cache::new(2, Duration::from_secs(60));
         let now = Instant::now();
         cache.set("a", 1, now);
@@ -110,7 +109,7 @@ mod tests {
         assert_eq!(cache.get("a", now), Some(10));
         assert_eq!(cache.get("b", now), Some(2));
         // get("b") refreshed b to the back → front is "a" again → "a" is
-        // the eviction victim on the next full set (TS Map parity).
+        // the eviction victim on the next full set.
         cache.set("c", 3, now);
         assert_eq!(cache.get("a", now), None, "a was front after b's refresh");
         assert_eq!(cache.get("b", now), Some(2));
@@ -119,7 +118,7 @@ mod tests {
 
     #[test]
     fn zero_capacity_degenerates_to_one() {
-        // TS quirk: maxCacheSize=0 → every set evicts the only entry.
+        // maxCacheSize=0 → every set evicts the only entry.
         let mut cache: Cache<u32> = Cache::new(0, Duration::from_secs(60));
         let now = Instant::now();
         cache.set("a", 1, now);

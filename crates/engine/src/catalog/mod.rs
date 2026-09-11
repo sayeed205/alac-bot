@@ -1,9 +1,9 @@
-//! iTunes catalog client. Exact port of `src/modules/alac/catalog/catalog.service.ts`.
+//! iTunes catalog client.
 //!
-//! Parity notes (verified against the TS source):
-//! - Errors are plain messages (TS `new Error(msg)`); the message IS the
-//!   interface — it surfaces to users through the rip pipeline.
-//! - TS quirk: the track HTTP-failure message omits the context word
+//! Behavior notes:
+//! - Errors are plain user-facing messages; the message IS the interface —
+//!   it surfaces to users through the rip pipeline.
+//! - The track HTTP-failure message intentionally omits the context word
 //!   (`iTunes lookup failed (HTTP N)`) while its timeout message and the
 //!   album/artist messages include it.
 //! - Transport throws (timeout and network alike) produce the
@@ -43,16 +43,16 @@ const ARTIST_BATCH_TIMEOUT: Duration = Duration::from_secs(20);
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(15);
 const CHARTS_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Every catalog failure. `Message` carries exact TS error text.
+/// Every catalog failure. `Message` carries exact user-facing error text.
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
-    /// A TS `new Error(...)` string, verbatim.
+    /// A plain error string, surfaced verbatim to users.
     #[error("{0}")]
     Message(String),
-    /// Raw transport throw the TS oracle lets propagate (charts endpoint).
+    /// Raw transport failure (charts endpoint propagates these).
     #[error("transport error: {0}")]
     Transport(#[from] TransportError),
-    /// JSON body failed to parse; TS propagates these raw.
+    /// JSON body failed to parse.
     #[error("bad JSON: {0}")]
     Json(#[from] serde_json::Error),
 }
@@ -148,8 +148,7 @@ pub fn artwork_url_at_size(url: &str, size: u16) -> String {
 
 /// Map a raw iTunes item to [`TrackMeta`], retaining both the legacy core
 /// fields and any richer provider metadata present in the response.
-/// Note: TS `String(x || '')` maps `0` → `''` (JS falsy), so ids of `0`
-/// become empty strings here too.
+/// An id of `0` maps to an empty string (JS falsy coercion).
 fn map_itunes_item(item: &ItunesRawItem) -> TrackMeta {
     TrackMeta {
         id: item
@@ -330,7 +329,7 @@ impl CachedValue for ArtistTracks {
 pub struct Catalog<T: Transport> {
     transport: T,
     cache: Mutex<Cache<CacheValue>>,
-    #[allow(dead_code)] // parity with the TS constructor surface (capacity())
+    #[allow(dead_code)]
     max_cache: usize,
 }
 
@@ -347,7 +346,7 @@ impl<T: Transport> Catalog<T> {
         }
     }
 
-    /// Cache capacity, exposed for parity with the TS constructor params.
+    /// Cache capacity.
     pub fn capacity(&self) -> usize {
         self.max_cache
     }
@@ -375,16 +374,15 @@ impl<T: Transport> Catalog<T> {
             .set(key, value, Instant::now());
     }
 
-    /// Parse a body's `results` array; serde errors propagate (TS parity:
-    /// every `resp.json()` sits outside the try/catch).
+    /// Parse a body's `results` array; serde errors propagate.
     fn parse_results(body: &str) -> Result<Vec<ItunesRawItem>, CatalogError> {
         let data: ItunesResponse = serde_json::from_str(body)?;
         Ok(data.results)
     }
 
-    /// GET an iTunes URL and map failures to the TS oracle's exact messages.
+    /// GET an iTunes URL and map failures to the exact user-facing messages.
     /// `timeout_ctx` rides in the timeout message; `http_prefix` is the
-    /// verbatim HTTP-failure prefix (track's omits the context word — TS quirk).
+    /// verbatim HTTP-failure prefix (track's omits the context word).
     async fn fetch_itunes_body(
         &self,
         url: &str,
@@ -441,7 +439,7 @@ impl<T: Transport> Catalog<T> {
         let mut meta = map_itunes_item(track_item);
         meta.id = track_item
             .track_id
-            .filter(|id| *id != 0) // JS falsy: `String(0 || trackId)` → trackId
+            .filter(|id| *id != 0) // id 0 is treated as absent (JS falsy)
             .map_or_else(|| track_id.to_owned(), |id| id.to_string());
 
         info!(
@@ -521,7 +519,7 @@ impl<T: Transport> Catalog<T> {
             Some(c) => TrackMeta {
                 id: c
                     .collection_id
-                    .filter(|id| *id != 0) // JS falsy: `String(0 || '')` → ''
+                    .filter(|id| *id != 0) // id 0 is treated as absent (JS falsy)
                     .map_or_else(|| collection_id.to_owned(), |id| id.to_string()),
                 title: c.collection_name.clone().unwrap_or_default(),
                 artist: c.artist_name.clone().unwrap_or_default(),
@@ -649,8 +647,8 @@ impl<T: Transport> Catalog<T> {
                     "https://itunes.apple.com/lookup?id={ids}&entity=song&country={}",
                     urlencode(sf)
                 );
-                // TS parity: batch failures (transport, HTTP, JSON) are all
-                // swallowed with a debug log and the loop continues.
+                // Batch failures (transport, HTTP, JSON) are all swallowed
+                // with a debug log and the loop continues.
                 match self
                     .transport
                     .get(&url, ITUNES_USER_AGENT, ARTIST_BATCH_TIMEOUT)
@@ -757,7 +755,7 @@ impl<T: Transport> Catalog<T> {
     }
 
     /// One search attempt. Transport/HTTP failures → `[]`; JSON parse errors
-    /// propagate (TS parity — `resp.json()` sits outside the try/catch).
+    /// propagate.
     async fn do_search_catalog(
         &self,
         term: &str,
@@ -837,9 +835,9 @@ impl<T: Transport> Catalog<T> {
         Ok(results)
     }
 
-    /// Fetch Apple Music charts albums for a storefront. TS has no
-    /// try/catch here: transport throws propagate raw, `!ok` becomes the
-    /// charts HTTP message, JSON errors propagate.
+    /// Fetch Apple Music charts albums for a storefront. Transport throws
+    /// propagate raw, `!ok` becomes the charts HTTP message, JSON errors
+    /// propagate.
     pub async fn fetch_charts_albums(
         &self,
         storefront: &str,
@@ -869,7 +867,7 @@ impl<T: Transport> Catalog<T> {
                     "Failed to fetch Apple Music charts (HTTP {status})"
                 )));
             }
-            // TS: fetch() throw propagates raw (no try/catch on this path).
+            // Transport failures propagate raw on this path.
             Err(err) => return Err(err.into()),
         };
 

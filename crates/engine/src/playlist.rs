@@ -1,4 +1,4 @@
-//! Apple Music playlist resolver (port of `src/modules/alac/playlist.ts`).
+//! Apple Music playlist resolver.
 //!
 //! Two jobs:
 //!
@@ -17,7 +17,7 @@ use std::{
 
 use serde::Deserialize;
 
-/// Chrome UA used by every request here (TS parity).
+/// Chrome UA used by every request here.
 pub const APPLE_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/145.0.0.0";
 
 /// One header for an HTTP GET.
@@ -35,8 +35,8 @@ pub trait PlaylistHttp: Send + Sync {
     ) -> impl Future<Output = Result<String, PlaylistHttpError>> + Send;
 }
 
-/// Failures of a single HTTP GET. TS wraps every `fetch()` throw (timeout +
-/// network) into one "timed out after Xms" message; non-OK statuses are
+/// Failures of a single HTTP GET. Any `fetch()` throw (timeout or network)
+/// folds into one "timed out after Xms" message; non-OK statuses are
 /// checked explicitly (404 vs everything else).
 #[derive(Debug, thiserror::Error)]
 pub enum PlaylistHttpError {
@@ -103,7 +103,7 @@ pub enum PlaylistError {
     Other(String),
 }
 
-/// One track inside a playlist (TS `PlaylistTrack`).
+/// One track inside a playlist.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlaylistTrack {
     pub id: String,
@@ -112,7 +112,7 @@ pub struct PlaylistTrack {
     pub duration: Option<u64>,
 }
 
-/// Playlist metadata + full track list (TS `PlaylistData`).
+/// Playlist metadata + full track list.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlaylistData {
     pub id: String,
@@ -147,7 +147,7 @@ fn auth_headers(token: &str) -> Vec<Header> {
     ]
 }
 
-/// Playlist client with the shared token cache (TS keeps module-level
+/// Playlist client with the shared token cache (module-level
 /// `cachedToken` variables; one client hands every fetch the same cache).
 #[derive(Debug)]
 pub struct PlaylistClient<H: PlaylistHttp> {
@@ -249,7 +249,7 @@ impl<H: PlaylistHttp> PlaylistClient<H> {
         playlist_id: &str,
         storefront: &str,
     ) -> Result<PlaylistData, PlaylistError> {
-        // TS: `(storefront || 'us').toLowerCase()` — no trim, empty → 'us'.
+        // Empty storefront falls back to 'us'; no trim.
         let sf_raw = storefront.to_ascii_lowercase();
         let sf = if sf_raw.is_empty() {
             "us".to_string()
@@ -373,14 +373,14 @@ impl<H: PlaylistHttp> PlaylistClient<H> {
             .map(|d| d.as_slice())
             .unwrap_or_default();
         for t in initial_tracks {
-            // TS `if (t.id)` — falsy ids (missing or empty) are skipped.
+            // Falsy ids (missing or empty) are skipped.
             if t.id.as_deref().is_some_and(|id| !id.is_empty()) {
                 tracks.push(map_track(t));
             }
         }
 
         // Pagination: follow `next` while present, joining relative URLs to
-        // the AMP origin. Any failed page silently stops paging (TS break).
+        // the AMP origin. Any failed page silently stops paging.
         let mut next_url = playlist_item
             .relationships
             .as_ref()
@@ -400,7 +400,7 @@ impl<H: PlaylistHttp> PlaylistClient<H> {
                 Ok(body) => match serde_json::from_str::<RawTracksPageResponse>(&body) {
                     Ok(page) => {
                         for t in page.data.unwrap_or_default() {
-                            // TS `if (t.id)` — falsy ids are skipped.
+                            // Falsy ids are skipped.
                             if t.id.as_deref().is_some_and(|id| !id.is_empty()) {
                                 tracks.push(map_track(&t));
                             }
@@ -451,14 +451,14 @@ fn map_track(t: &RawTrack) -> PlaylistTrack {
             .attributes
             .as_ref()
             .and_then(|a| a.duration_in_millis)
-            // TS `durationInMillis ? Math.round(ms/1000) : undefined` — 0 or
-            // missing maps to None; Math.round is half-up on .5.
+            // A zero or missing duration maps to `None` (not 0).
+            // missing maps to None; .5 rounds half-up.
             .filter(|ms| *ms != 0)
             .map(|ms| ((ms as f64) / 1000.0).round() as u64),
     }
 }
 
-/// TS `encodeURIComponent` for path segments.
+/// URL-encode a path segment.
 fn url_encode(segment: &str) -> String {
     let mut out = String::new();
     for byte in segment.bytes() {
@@ -472,8 +472,7 @@ fn url_encode(segment: &str) -> String {
     out
 }
 
-// ── regex-free scanners for the token scrape (TS regex parity) ──────────
-
+// regex-free scanners for the token scrape
 /// `/\/assets\/index~[a-zA-Z0-9]+\.js/` — leftmost match, path + ".js".
 fn find_asset_path(html: &str) -> Option<String> {
     let pat = "/assets/index~";
@@ -558,8 +557,7 @@ fn find_direct_jwt(js: &str) -> Option<String> {
     }
 }
 
-// ── raw AMP response shapes ─────────────────────────────────────────────
-
+// raw AMP response shapes
 #[derive(Debug, Deserialize)]
 struct RawPlaylistResponse {
     #[serde(default)]

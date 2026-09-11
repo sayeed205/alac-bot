@@ -53,7 +53,7 @@ impl RipDeps {
 
         let catalog = Catalog::new(ReqwestTransport::new());
         let ripper_catalog = Catalog::new(ReqwestTransport::new());
-        // TS env schema (`src/env.ts`): the wrapper default is
+        // The wrapper default is
         // `http://127.0.0.1:12340`; the mirror key is `ALAC_API_KEY`.
         let wrapper_url = Some(
             env_option("ALAC_WRAPPER_URL").unwrap_or_else(|| "http://127.0.0.1:12340".to_owned()),
@@ -78,7 +78,7 @@ impl RipDeps {
             .ok()
             .and_then(|value| value.parse().ok())
             .filter(|value| *value <= engine::limits::MAX_RETRY_BASE_MS)
-            // TS default: 2000ms (`src/env.ts` ALAC_RETRY_BASE_MS).
+            // default: 2000ms (ALAC_RETRY_BASE_MS).
             .unwrap_or(2000);
         let max_retries = std::env::var("ALAC_MAX_RETRIES")
             .ok()
@@ -110,8 +110,7 @@ impl RipDeps {
         })
     }
 
-    /// Probe mirror health for the status dashboard (oracle
-    /// `commands/health.ts:47-61`). Uses a clone of the ripper's policy
+    /// Probe mirror health for the status dashboard . Uses a clone of the ripper's policy
     /// manager, so circuit state and the endpoint cache stay coherent
     /// between rips and probes.
     pub async fn probe_mirror_health(&self) -> crate::mirror_health::HealthReport {
@@ -120,8 +119,8 @@ impl RipDeps {
         PolicyProbe::new(self.mirror_policy.shared()).probe().await
     }
 
-    /// The mutable settings store backing the admin `/settings` panel
-    /// (oracle settingsService). Reads go through the in-memory snapshot;
+    /// The mutable settings store backing the admin `/settings` panel.
+    /// Reads go through the in-memory snapshot;
     /// writes are write-through to Postgres.
     pub fn settings(&self) -> &db::SettingsStore {
         &self.settings

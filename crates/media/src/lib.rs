@@ -620,13 +620,13 @@ fn draw_layout(pixels: &mut [u8], layout: &Layout, options: &SpectrogramOptions)
         let tick_step = 1.0;
         let mut tick = 0.0;
         while tick <= nyquist_khz + 0.01 {
-            let y =
+            let tick_y =
                 bottom.saturating_sub((tick / nyquist_khz.max(0.1) * plot_height as f32) as usize);
             draw_text(
                 pixels,
                 width,
                 38,
-                y.saturating_sub(4),
+                tick_y.saturating_sub(4),
                 &format!("{tick:.0}"),
                 axis,
             );
@@ -634,7 +634,7 @@ fn draw_layout(pixels: &mut [u8], layout: &Layout, options: &SpectrogramOptions)
                 pixels,
                 width,
                 plot_right + 6,
-                y.saturating_sub(4),
+                tick_y.saturating_sub(4),
                 &format!("{tick:.0}"),
                 axis,
             );
@@ -718,12 +718,12 @@ fn draw_layout(pixels: &mut [u8], layout: &Layout, options: &SpectrogramOptions)
         }
     }
     for index in 0..=12 {
-        let y = palette_top + index * palette_height / 12;
+        let label_y = palette_top + index * palette_height / 12;
         draw_text(
             pixels,
             width,
             palette_x + 16,
-            y.saturating_sub(4),
+            label_y.saturating_sub(4),
             &format!("-{}", index * 10),
             axis,
         );

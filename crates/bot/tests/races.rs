@@ -207,7 +207,7 @@ async fn settled_failed_job_is_no_longer_cancellable() {
     let task = tokio::spawn(async move { run_orch.start_job(run_deps, &options).await });
     let result = task.await.unwrap();
 
-    // The fake rip fails with a mirror-offline error, but the Rust deviation
+    // The fake rip fails with a mirror-offline error, but this port
     // records it as a failed track and completes the job with a summary —
     // exactly one terminal event, and it is Completed (not Failed).
     let terminals = terminals.lock().unwrap();
@@ -221,7 +221,7 @@ async fn settled_failed_job_is_no_longer_cancellable() {
 }
 
 /// The event bridge skips progress edits while total_tracks == 0 (the
-/// oracle keeps the "Resolving..." message untouched until the tracklist is
+/// keeps the "Resolving..." message untouched until the tracklist is
 /// known). This pins the guard's field shape.
 #[test]
 fn unresolved_progress_has_zero_total_tracks() {
@@ -241,9 +241,9 @@ fn unresolved_progress_has_zero_total_tracks() {
     assert_eq!(progress.total_tracks, 0);
 }
 
-/// Mirror health cache matches the oracle's last-known-only contract.
+/// Mirror health cache is last-known-only.
 #[test]
-fn mirror_health_labels_match_oracle() {
+fn mirror_health_labels_render_expected_text() {
     use bot::mirror_health::{HealthReport, LastKnownHealth, MirrorHealth};
 
     let health = LastKnownHealth::new();

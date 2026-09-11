@@ -102,16 +102,25 @@ pub fn percent_from(progress: &RipJobProgress) -> u8 {
 }
 
 /// Dashboard rows use text labels for routine activity. The pipeline's
-/// progress strings retain arrows for the legacy detailed renderer, so strip
-/// only those leading decorations at this presentation boundary.
+/// progress strings carry the lane prefix (`⬇️ Downloading: …` /
+/// `⬆️ Uploading: …`) for the legacy detailed renderer, so strip that
+/// leading decoration at this presentation boundary — the dashboard
+/// header prepends its own labels and must not duplicate them.
 fn clean_activity(text: &str) -> String {
-    text.to_owned()
+    let stripped = text
+        .strip_prefix("⬇️ ")
+        .or_else(|| text.strip_prefix("⬆️ "))
+        .unwrap_or(text);
+    let stripped = stripped
+        .strip_prefix("Downloading: ")
+        .or_else(|| stripped.strip_prefix("Uploading: "))
+        .unwrap_or(stripped);
+    stripped.to_owned()
 }
 
 /// Map an engine job snapshot into a dashboard row for a specific viewer.
 ///
-/// Cancel permission is `viewer == requester || viewer_is_admin` (oracle
-/// `commands-rip.ts:323-432` authorization).
+/// Cancel permission is `viewer == requester || viewer_is_admin` .
 pub fn job_to_dashboard(
     job: &ActiveRipJob,
     context: &JobContext,
@@ -174,21 +183,34 @@ pub fn snapshot_from(
             .cmp(&key(right))
             .then_with(|| left.id.cmp(&right.id))
     });
-    let current_activity = ordered.iter().find_map(|job| {
+    // Two-lane header: the first active job's lane-1 text and the first
+    // active job's lane-2 text, independently — downloads and uploads
+    // now run concurrently on different jobs. Queued jobs never carry
+    // lane activity. `active_action_text` (engine's legacy single field)
+    // only seeds the download line when no lane text was remembered.
+    let current_download = ordered.iter().find_map(|job| {
         if job.phase == EnginePhase::Queued {
             return None;
         }
         let ctx = contexts.get(&job.id);
-        if let Some(uploading) = ctx.and_then(|c| c.uploading.as_ref()) {
-            return Some(uploading.clone());
-        }
         if let Some(downloading) = ctx.and_then(|c| c.downloading.as_ref()) {
             return Some(downloading.clone());
         }
+        // The remembered lane texts are already cleaned; the legacy
+        // single-field fallback still carries its own decoration.
         if let Some(action) = job.active_action_text.as_ref() {
-            return Some(action.clone());
+            return Some(clean_activity(action));
         }
         None
+    });
+    let current_upload = ordered.iter().find_map(|job| {
+        if job.phase == EnginePhase::Queued {
+            return None;
+        }
+        contexts
+            .get(&job.id)
+            .and_then(|c| c.uploading.as_ref())
+            .cloned()
     });
     let jobs = ordered
         .iter()
@@ -211,7 +233,8 @@ pub fn snapshot_from(
     DashboardSnapshot {
         ripping_mode: ripping_mode.to_owned(),
         mirror_health,
-        current_activity,
+        current_download,
+        current_upload,
         jobs,
     }
 }
@@ -362,17 +385,23 @@ mod tests {
         });
 
         let snapshot = snapshot_from(&[job], &contexts, 7, false, "live", None);
+        // Per-row lane texts and header lines are all stored cleaned
+        // (decoration stripped at this boundary; the header re-adds it).
         assert_eq!(
             snapshot.jobs[0].downloading.as_deref(),
-            Some("⬇️ <b>Song - Artist:</b> <code>1 MB</code>")
+            Some("<b>Song - Artist:</b> <code>1 MB</code>")
         );
         assert_eq!(
             snapshot.jobs[0].uploading.as_deref(),
-            Some("⬆️ <b>Uploading:</b> <i>Song - Artist</i>")
+            Some("<b>Uploading:</b> <i>Song - Artist</i>")
         );
         assert_eq!(
-            snapshot.current_activity.as_deref(),
-            Some("⬆️ <b>Uploading:</b> <i>Song - Artist</i>")
+            snapshot.current_download.as_deref(),
+            Some("<b>Song - Artist:</b> <code>1 MB</code>")
+        );
+        assert_eq!(
+            snapshot.current_upload.as_deref(),
+            Some("<b>Uploading:</b> <i>Song - Artist</i>")
         );
     }
 

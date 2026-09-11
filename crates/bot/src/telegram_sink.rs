@@ -364,7 +364,7 @@ impl TelegramSink for FerogramTelegramSink {
                 .map(i32::try_from)
                 .transpose()
                 .map_err(|error| SinkError(format!("reply_to out of range: {error}")))?;
-            // TS sendDumpCopy = mtcute sendCopy with EMPTY_CAPTION: media
+            // sendDumpCopy = mtcute sendCopy with EMPTY_CAPTION: media
             // re-attached by reference, no forward attribution, empty text.
             //
             // ferogram's `copy_message` caption-override path implements

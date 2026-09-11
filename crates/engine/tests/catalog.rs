@@ -1,6 +1,5 @@
-//! Offline catalog tests via a fake transport — mapping parity, cache
-//! behavior, storefront fallback order, and error semantics against the
-//! TS oracle (`catalog.service.ts`).
+//! Offline catalog tests via a fake transport — field mapping, cache
+//! behavior, storefront fallback order, and error semantics.
 
 use std::{collections::HashMap, sync::Mutex, time::Duration};
 
@@ -95,7 +94,7 @@ fn track_json() -> String {
 }
 
 #[tokio::test]
-async fn track_mapping_parity() {
+async fn track_mapping_matches_expected_fields() {
     let mut fake = FakeTransport::new();
     fake.on("id=1440841730", &track_json());
     let catalog = Catalog::new(fake);
@@ -141,14 +140,14 @@ async fn track_missing_fields_map_to_defaults() {
     let meta = catalog.fetch_track_meta("1", "us").await.expect("track");
     assert_eq!(meta.title, "");
     assert_eq!(meta.genre, None);
-    assert_eq!(meta.release_date, ""); // absent date → '' (TS `|| ''` quirk)
+    assert_eq!(meta.release_date, ""); // absent date → ''
     assert_eq!(meta.duration_secs, 1);
-    assert_eq!(meta.artwork_url, ""); // absent artwork → '' quirk
+    assert_eq!(meta.artwork_url, ""); // absent artwork → ''
     assert!(!meta.explicit);
 }
 
 #[tokio::test]
-async fn track_not_found_returns_parity_message() {
+async fn track_not_found_returns_expected_message() {
     let mut fake = FakeTransport::new();
     fake.on("id=999", r#"{"results": []}"#);
     let catalog = Catalog::new(fake);
@@ -165,7 +164,7 @@ async fn track_not_found_returns_parity_message() {
 }
 
 #[tokio::test]
-async fn track_http_error_uses_quirk_message() {
+async fn track_http_error_uses_expected_message() {
     let mut fake = FakeTransport::new();
     fake.fail_with("id=1", 503);
     let catalog = Catalog::new(fake);
@@ -173,7 +172,7 @@ async fn track_http_error_uses_quirk_message() {
         .fetch_track_meta("1", "us")
         .await
         .expect_err("should fail");
-    // TS quirk: the track HTTP message omits the "track" context word.
+    // The track HTTP message omits the "track" context word.
     match err {
         CatalogError::Message(msg) => {
             assert_eq!(msg, "iTunes lookup failed (HTTP 503)")

@@ -147,7 +147,7 @@ impl<H: MirrorHttp> MirrorPolicyManager<H> {
         force_refresh: bool,
         signal: Option<CancellationToken>,
     ) -> Result<MirrorEndpoint, MirrorError> {
-        // TS truthiness: an empty mirror URL or key means "not configured".
+        // An empty mirror URL or key means "not configured".
         if let Some((mirror_url, api_key)) = &self.env_override {
             if !mirror_url.is_empty() && !api_key.is_empty() {
                 return Ok(MirrorEndpoint {

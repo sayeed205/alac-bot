@@ -431,7 +431,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn format_index_summary_matches_oracle() {
+    fn format_index_summary_renders_expected_text() {
         let summary = IndexSummary {
             scanned: 250,
             synced: 240,

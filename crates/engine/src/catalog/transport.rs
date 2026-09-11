@@ -2,7 +2,7 @@
 //!
 //! Two adapters justify this seam: `ReqwestTransport` for production and a
 //! fake JSON-serving transport for offline tests. User-agent and timeout are
-//! per-call decisions made by the catalog (TS parity: the TS service sets
+//! per-call decisions made by the catalog (headers/timeout are chosen
 //! them per fetch), so the transport stays a dumb GET.
 
 use std::{
@@ -13,9 +13,8 @@ use std::{
 /// Failures of a single HTTP GET.
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
-    /// The request threw — timeout OR network error. The TS oracle catches
-    /// every `fetch()` throw and lumps both into one "timed out after Xms"
-    /// message, so parity keeps them together.
+    /// The request threw — timeout OR network error. Both cases fold into
+    /// one "failed after Xms" message.
     #[error("fetch failed after {elapsed_ms}ms: {source}")]
     Fetch {
         elapsed_ms: u64,
@@ -35,9 +34,9 @@ pub trait Transport: Send + Sync {
     ) -> impl Future<Output = Result<String, TransportError>> + Send;
 }
 
-/// User-agent for every iTunes endpoint (TS parity).
+/// User-agent for every iTunes endpoint.
 pub const ITUNES_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/145.0.0.0";
-/// Different, simpler UA the charts RSS endpoint gets (TS parity).
+/// Different, simpler UA the charts RSS endpoint gets.
 pub const CHARTS_USER_AGENT: &str = "Mozilla/5.0";
 
 /// Production adapter over `reqwest`.

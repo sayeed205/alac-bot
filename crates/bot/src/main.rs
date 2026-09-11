@@ -62,7 +62,7 @@ fn load_env() -> Result<Env> {
     )
     .unwrap_or_default();
     let database_url = required("DATABASE_URL", &mut invalid);
-    // TS parity (`src/utils/logger.ts`): LOG_LEVEL || RUST_LOG || 'info'.
+    // Precedence: LOG_LEVEL || RUST_LOG || 'info'.
     let log_level = std::env::var("LOG_LEVEL")
         .or_else(|_| std::env::var("RUST_LOG"))
         .unwrap_or_else(|_| "info".to_owned());
@@ -177,7 +177,7 @@ async fn main() -> Result<()> {
     });
     // Bridge subscribes once; its consumer renders status messages + dashboard.
     bot::event_bridge::start(Arc::clone(&state));
-    // 24h auto-dump scheduler (oracle `startAutoDumpScheduler`).
+    // 24h auto-dump scheduler .
     tokio::spawn(bot::handlers::autodump::scheduler_loop(Arc::clone(&state)));
     let mut dispatcher = Dispatcher::new();
     handlers::register(&mut dispatcher, state);

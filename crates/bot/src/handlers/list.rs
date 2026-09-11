@@ -94,7 +94,7 @@ pub(crate) async fn render(
     );
     let input = InputMessage::html(parse_dynamic_html(&text)).reply_markup(keyboard(page, pages));
     if let Some(message_id) = message_id {
-        // Edit: swallow "message not modified" style errors like the oracle.
+        // Edit: swallow "message not modified" style errors.
         let _ = state.client.edit_message(peer, message_id, input).await;
     } else if let Some(msg) = reply {
         let _ = msg.reply(input).await;
@@ -140,7 +140,7 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery, action: Telegr
         TelegramAction::AuthClose => {
             let _ = query.answer().send(&state.client).await;
             if let (Some(peer), Some(id)) = (peer, query.message_id) {
-                // Channel-aware deletion parity: IncomingMessage::delete
+                // Channel-aware deletion: IncomingMessage::delete
                 // dispatches to channels.deleteMessages for supergroups,
                 // messages.deleteMessages otherwise. Fetch first, then
                 // delete through the message's own peer context.

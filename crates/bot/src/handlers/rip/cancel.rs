@@ -1,4 +1,4 @@
-//! `/cancel` and inline cancel authorization (oracle `commands-rip.ts:323-432`).
+//! `/cancel` and inline cancel authorization .
 //!
 //! M5c: the engine orchestrator owns job state. This module only performs
 //! authorization and selects which engine job to cancel.

@@ -18,7 +18,7 @@ fn settings() -> BotSettings {
 }
 
 #[test]
-fn settings_text_matches_oracle_exactly() {
+fn settings_text_renders_expected_layout() {
     let text = render_settings_text(&settings());
     assert!(text.starts_with("<b>Bot settings and operation controls</b><br/><br/>"));
     assert!(text.contains(
@@ -34,7 +34,7 @@ fn settings_text_matches_oracle_exactly() {
 }
 
 #[test]
-fn settings_text_mode_and_limit_variants_match_oracle() {
+fn settings_text_renders_mode_and_limit_variants() {
     let mut s = settings();
     s.ripping_mode = RippingMode::CacheOnly;
     assert!(render_settings_text(&s).contains(
@@ -51,7 +51,7 @@ fn settings_text_mode_and_limit_variants_match_oracle() {
 }
 
 #[test]
-fn storefronts_text_matches_oracle_exactly() {
+fn storefronts_text_renders_expected_layout() {
     let text = render_storefronts_text(&settings());
     assert!(text.starts_with("<b>Auto-dump storefront configuration</b><br/><br/>"));
     assert!(text.contains("• <b>Active Storefronts:</b> <code>US</code>"));
@@ -68,7 +68,7 @@ fn popular_storefronts_match_oracle_order() {
 }
 
 #[test]
-fn db_settings_store_auto_dump_toggle_and_sf_semantics_match_oracle() {
+fn db_settings_store_round_trips_auto_dump_and_storefronts() {
     // The db store is exercised through a tokio Postgres harness elsewhere;
     // here we pin the pure settings field semantics the UI depends on.
     let mut s = settings();

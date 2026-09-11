@@ -1,7 +1,6 @@
-//! `/settings` — admin settings UI (oracle:
-//! `src/modules/settings/commands/settings.ts`).
+//! `/settings` — admin settings UI .
 //!
-//! Two surfaces, identical to the oracle:
+//! Two surfaces:
 //! - `/settings` renders the inline keyboard panel; subcommands
 //!   (`/settings mode|album|...|storefronts|limit`) mutate a single key and
 //!   answer with the exact confirmation text.
@@ -27,13 +26,13 @@ use crate::{
     BotState,
 };
 
-/// Oracle POPULAR_STOREFRONTS (settings.ts:15-24).
+/// Storefronts offered in the auto-dump picker.
 pub const POPULAR_STOREFRONTS: [&str; 8] = ["us", "gb", "jp", "in", "ca", "au", "de", "fr"];
 
-/// Oracle limitPresets (settings.ts:39).
+/// Collection-size limit presets.
 const LIMIT_PRESETS: [u32; 4] = [25, 50, 100, 0];
 
-/// Oracle modeLabels (settings.ts:29-32).
+/// Short label per ripping mode.
 fn mode_button_label(mode: engine::settings::RippingMode) -> &'static str {
     use engine::settings::RippingMode::{CacheOnly, Live, Paused};
     match mode {
@@ -47,7 +46,7 @@ fn toggle_label(label: &str, enabled: bool) -> String {
     format!("{label}: {}", if enabled { "ON" } else { "OFF" })
 }
 
-/// Oracle buildSettingsKeyboard (settings.ts:26-78).
+/// Build the main settings inline keyboard.
 fn settings_keyboard(settings: &engine::settings::BotSettings) -> ferogram::tl::enums::ReplyMarkup {
     let limit_buttons = LIMIT_PRESETS
         .iter()
@@ -113,7 +112,7 @@ fn settings_keyboard(settings: &engine::settings::BotSettings) -> ferogram::tl::
     .into_markup()
 }
 
-/// Oracle buildStorefrontsKeyboard (settings.ts:87-105).
+/// Build the storefront picker inline keyboard.
 fn storefronts_keyboard(
     settings: &engine::settings::BotSettings,
 ) -> ferogram::tl::enums::ReplyMarkup {
@@ -146,7 +145,7 @@ fn storefronts_keyboard(
     .into_markup()
 }
 
-/// Oracle modeDescriptions (settings.ts:112-118).
+/// One-line description per ripping mode.
 fn mode_description(mode: engine::settings::RippingMode) -> &'static str {
     use engine::settings::RippingMode::{CacheOnly, Live, Paused};
     match mode {
@@ -156,7 +155,7 @@ fn mode_description(mode: engine::settings::RippingMode) -> &'static str {
     }
 }
 
-/// Oracle renderSettingsText (settings.ts:107-141).
+/// Render the settings panel text.
 pub fn render_settings_text(settings: &engine::settings::BotSettings) -> String {
     let limit_text = if settings.max_collection_tracks == 0 {
         "Unlimited".to_owned()
@@ -204,7 +203,7 @@ fn flag(enabled: bool) -> &'static str {
     }
 }
 
-/// Oracle renderStorefrontsText (settings.ts:143-156).
+/// Render the storefronts panel text.
 pub fn render_storefronts_text(settings: &engine::settings::BotSettings) -> String {
     let sf_list = settings
         .auto_dump_storefronts
@@ -220,7 +219,7 @@ Tap a country below to toggle it on or off for the daily new music auto-dump.<br
     )
 }
 
-/// Oracle renderSettingsMessage (settings.ts:157-182): edit the panel in
+/// Edit the settings panel message in place (ignore NOT_MODIFIED),
 /// place when a message id is given, else send fresh (replying when asked).
 pub(crate) async fn render_settings_message(
     state: &BotState,
@@ -232,7 +231,7 @@ pub(crate) async fn render_settings_message(
     let input = InputMessage::html(parse_dynamic_html(&render_settings_text(&settings)))
         .reply_markup(settings_keyboard(&settings));
     if let Some(message_id) = message_id {
-        // NOT_MODIFIED swallow parity.
+        // NOT_MODIFIED is swallowed.
         let _ = state
             .client
             .edit_message(peer.clone(), message_id, input)
@@ -247,20 +246,20 @@ pub(crate) async fn render_settings_message(
     }
 }
 
-/// Oracle renderStorefrontsMessage (settings.ts:184-209).
+/// Edit the storefronts panel message in place.
 pub(crate) async fn render_storefronts_message(state: &BotState, peer: &PeerRef, message_id: i32) {
     let settings = state.rip_deps.settings_snapshot();
     let input = InputMessage::html(parse_dynamic_html(&render_storefronts_text(&settings)))
         .reply_markup(storefronts_keyboard(&settings));
-    // Oracle swallows all edit errors here.
+    // swallows all edit errors here.
     let _ = state
         .client
         .edit_message(peer.clone(), message_id, input)
         .await;
 }
 
-/// `/settings [subcommand]` — oracle registerSettingsCommands
-/// (settings.ts:216-413): admin gate, subcommand mutations, else render.
+/// `/settings [subcommand]` — registerSettingsCommands
+/// admin gate, subcommand mutations, else render.
 pub async fn command(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
     let sender = msg.sender_user_id().unwrap_or_default();
     if !state.auth.is_admin(sender) {
@@ -275,7 +274,7 @@ pub async fn command(state: Arc<BotState>, msg: ferogram::update::IncomingMessag
     let text = msg.text().unwrap_or_default();
     let parts: Vec<&str> = text.split_whitespace().collect();
 
-    // Oracle: subcommands need >= 3 parts ("/settings mode live").
+    // Subcommands need >= 3 parts ("/settings mode live").
     if parts.len() >= 3 {
         let sub = parts[1].to_lowercase();
         let raw_value = parts[2].to_lowercase();
@@ -387,7 +386,7 @@ async fn subcommand_reply(
             }
         }
         "limit" => {
-            // Oracle: parse failure also answers with the usage string.
+            // Parse failure also answers with the usage string.
             let num: i64 = match raw_value.parse() {
                 Ok(num) => num,
                 Err(_) => {
@@ -425,7 +424,7 @@ fn upper_join(list: &[String]) -> String {
         .join(", ")
 }
 
-/// `settings:*` callbacks — oracle settings.ts:416-547.
+/// `settings:*` callback handler.
 pub async fn callback(state: Arc<BotState>, query: CallbackQuery, action: SettingsAction) {
     // Admin re-check on every callback (owner only).
     if !state.auth.is_admin(query.user_id) {

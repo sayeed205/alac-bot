@@ -1,10 +1,9 @@
-//! Orchestrator dependency seams (port of `OrchestratorDependencies`).
+//! Orchestrator dependency seams.
 //!
-//! TS injects `{tg, service, ripper, queue, settings?, uploadRetryBaseMs?}`.
 //! The engine keeps the typed pieces (queue) on the orchestrator itself and
 //! routes everything environment-owned through this trait: the settings
 //! snapshot, the store, catalog/playlist resolution, the rip call, and the
-//! Telegram sink. Errors reduce to strings (TS `new Error(msg)` parity).
+//! Telegram sink. Errors reduce to plain strings.
 
 use std::{collections::HashMap, future::Future, path::Path, pin::Pin};
 
@@ -20,8 +19,7 @@ use crate::{
 /// `(uploaded_bytes, total_bytes)` for upload progress callbacks.
 pub type UploadProgressCallback = std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>;
 
-/// One cache row for a track (the TS `Track` db row subset the
-/// orchestrator reads).
+/// One cache row for a track: the db row subset the orchestrator reads.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CachedTrack {
     pub track_key: TrackKey,
@@ -33,7 +31,7 @@ pub struct CachedTrack {
     pub album: String,
 }
 
-/// TS `SaveTrackInput`.
+/// A new cache row for a ripped track.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SaveTrackInput {
     pub track_key: TrackKey,
@@ -53,8 +51,7 @@ pub struct SaveTrackInput {
 }
 
 impl SaveTrackInput {
-    /// Mirrors the TS uploader: `saveTrack({...})` built from the rip
-    /// result plus the dump message ids.
+    /// Build a cache row from the rip result plus the dump message ids.
     pub fn from_rip_result(
         track_id: &str,
         rip: &TrackRipResult,
@@ -81,7 +78,7 @@ impl SaveTrackInput {
     }
 }
 
-/// TS `NewRequest` (request log row).
+/// A request-log row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RequestLog {
     pub telegram_id: i64,
@@ -138,16 +135,14 @@ pub struct SinkError(pub String);
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Telegram-side operations the orchestrator performs (implemented by the
-/// bot crate via ferogram in M5b). Boxed futures keep the trait
+/// bot crate). Boxed futures keep the trait
 /// object-safe for the `&dyn` sink accessor.
 pub trait TelegramSink: Send + Sync {
-    /// TS `tg.sendMedia(DUMP_CHANNEL_ID, {type:'audio', file, title,
-    /// performer, duration}, {caption, progressCallback})`.
+    /// Upload an audio file to the dump channel.
     ///
-    /// `Ok(None)` models the TS `dumpMsg?.media?.type !== 'audio'` case: the
-    /// send returned a message whose media is not audio (or no media) — the
-    /// caller records 'Upload failed: no audio media returned' without
-    /// retrying and without a request log.
+    /// `Ok(None)` means the send returned a message whose media is not
+    /// audio (or no media) — the caller records 'Upload failed: no audio
+    /// media returned' without retrying and without a request log.
     fn send_audio_to_dump<'a>(
         &'a self,
         file_path: &'a str,
@@ -207,8 +202,8 @@ pub trait TelegramSink: Send + Sync {
         Box::pin(async { Err(SinkError("cached file download is unavailable".into())) })
     }
 
-    /// TS `sendDumpCopy` — copy a dump message to a chat with the caption
-    /// stripped, optional replyTo, optional silent. Returns the sent message ID.
+    /// Copy a dump message to a chat with the caption stripped, optional
+    /// replyTo, optional silent. Returns the sent message ID.
     fn send_dump_copy<'a>(
         &'a self,
         to_chat_id: i64,
@@ -217,8 +212,7 @@ pub trait TelegramSink: Send + Sync {
         silent: bool,
     ) -> BoxFuture<'a, Result<i32, SinkError>>;
 
-    /// TS `tg.deleteMessagesById(env.DUMP_CHANNEL_ID, ids)` — errors
-    /// swallowed by the caller.
+    /// Delete dump messages by id; errors are swallowed by the caller.
     fn delete_dump_messages<'a>(
         &'a self,
         message_ids: &'a [i64],
@@ -228,10 +222,10 @@ pub trait TelegramSink: Send + Sync {
 /// Everything environment-owned the orchestrator calls. Generic on the
 /// ripper seam so `start_job` can move an `Arc<D>` into the queue task.
 pub trait OrchestratorDeps: Send + Sync + 'static {
-    // ── settings (ISettingsService subset — snapshot + logic in engine) ──
+    // settings (ISettingsService subset — snapshot + logic in engine)
     fn get_settings(&self) -> impl Future<Output = BotSettings> + Send;
 
-    // ── store (IAlacService subset; string errors = TS messages) ────────
+    // store
     fn find_cached_tracks(
         &self,
         keys: &[TrackKey],
@@ -274,7 +268,7 @@ pub trait OrchestratorDeps: Send + Sync + 'static {
         Box::pin(async { None })
     }
 
-    // ── catalog resolution ───────────────────────────────────────────────
+    // catalog resolution
     fn fetch_album_tracks(
         &self,
         id: &str,
@@ -286,14 +280,14 @@ pub trait OrchestratorDeps: Send + Sync + 'static {
         storefront: &str,
     ) -> impl Future<Output = Result<ArtistTracks, String>> + Send;
 
-    // ── playlist resolution ──────────────────────────────────────────────
+    // playlist resolution
     fn fetch_playlist_tracks(
         &self,
         id: &str,
         storefront: &str,
     ) -> impl Future<Output = Result<PlaylistData, crate::playlist::PlaylistError>> + Send;
 
-    // ── rip (ITrackRipper.rip) ───────────────────────────────────────────
+    // rip (ITrackRipper.rip)
     fn rip(
         &self,
         track_id: &str,
@@ -303,7 +297,7 @@ pub trait OrchestratorDeps: Send + Sync + 'static {
         output_dir: Option<&Path>,
     ) -> impl Future<Output = Result<TrackRipResult, RipError>> + Send;
 
-    // ── telegram sink ────────────────────────────────────────────────────
+    // telegram sink
     fn sink(&self) -> &dyn TelegramSink;
 
     /// Base delay for upload retries.  The live command defaults to 2000ms.

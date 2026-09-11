@@ -1,5 +1,5 @@
 //! `/alac` policy gates. Strings intentionally remain literals: they are part
-//! of the Telegram API of the bot (oracle `commands-rip.ts:216-307`).
+//! of the Telegram API of the bot .
 
 use engine::{settings::BotSettings, types::ParsedTargetItem};
 
@@ -24,7 +24,7 @@ pub fn force_gate(force: bool, is_admin: bool) -> Option<&'static str> {
     (force && !is_admin).then_some(FORCE_RESTRICTED)
 }
 
-/// Returns the first feature gate which fails, preserving the TS ordering.
+/// Returns the first feature gate which fails, preserving the ordering.
 pub fn feature_gate(
     settings: &BotSettings,
     items: &[ParsedTargetItem],

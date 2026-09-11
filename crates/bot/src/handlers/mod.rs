@@ -32,7 +32,7 @@ use ferogram::{
 use crate::{interaction::TelegramAction, BotState};
 
 /// Bot-API marked group id (-100...) -> t.me/c/ link segment, matching the
-/// TS oracle's string slice(4) semantics.
+/// string-slice semantics.
 pub(crate) fn group_link_segment(marked_id: i64) -> String {
     let s = marked_id.to_string();
     s.strip_prefix("-100")
@@ -42,7 +42,7 @@ pub(crate) fn group_link_segment(marked_id: i64) -> String {
 
 /// Bot-API "marked" peer id for storage and lookups: users stay positive,
 /// basic groups are -chat_id, channels/supergroups are -(1e12 + channel_id).
-/// Matches what the TS oracle (mtcute) reports as chat.id, which is what the
+/// Matches the id the Telegram library reports as chat.id, which is what the
 /// users table stores.
 pub(crate) fn marked_peer_id(peer: &ferogram::tl::enums::Peer) -> i64 {
     use ferogram::tl::enums::Peer;
@@ -105,7 +105,7 @@ pub(crate) fn dashboard_sink(
     status::dashboard_sink(client, peer)
 }
 
-/// Peer link parity with the TS oracle's getPeerLink: @name -> t.me link,
+/// Peer link: @name -> t.me link,
 /// user id -> tg://user, group/channel id -> t.me/c/ link.
 pub(crate) fn peer_link(name: &str, id: i64) -> String {
     if let Some(username) = name.strip_prefix('@') {

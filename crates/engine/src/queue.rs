@@ -116,6 +116,32 @@ impl SequentialRipQueue {
         task: impl FnOnce(CancellationToken) -> Pin<Box<dyn Future<Output = T> + Send>> + Send + 'static,
         options: Option<EnqueueOptions>,
     ) -> Result<T, QueueError> {
+        let completion_rx = self.submit(task, options);
+        let result = completion_rx.await.unwrap_or_else(|_| {
+            Err(QueueError::Task(
+                "queue worker stopped unexpectedly".to_owned(),
+            ))
+        })?;
+        result
+            .downcast::<T>()
+            .map(|value| *value)
+            .map_err(|_| QueueError::Task("queue result type mismatch".to_owned()))
+    }
+
+    /// Enqueue without waiting for the task to run: appends the item
+    /// synchronously (so call order == FIFO order across concurrent
+    /// submitters) and returns the completion receiver. The caller may
+    /// drop it (fire-and-forget) or spawn a waiter to observe
+    /// `Aborted`/`Cleared`.
+    ///
+    /// Returns `Err` immediately when the outer signal is already
+    /// cancelled, exactly like `enqueue`.
+    #[allow(clippy::type_complexity)]
+    pub fn submit<T: Send + 'static>(
+        &self,
+        task: impl FnOnce(CancellationToken) -> Pin<Box<dyn Future<Output = T> + Send>> + Send + 'static,
+        options: Option<EnqueueOptions>,
+    ) -> oneshot::Receiver<Result<Box<dyn Any + Send>, QueueError>> {
         let options = options.unwrap_or(EnqueueOptions {
             on_position_change: None,
             on_start: None,
@@ -126,7 +152,12 @@ impl SequentialRipQueue {
             .as_ref()
             .is_some_and(CancellationToken::is_cancelled)
         {
-            return Err(QueueError::Aborted);
+            // Mirror `enqueue`'s early rejection without a receiver to
+            // await: send the error through a fresh channel so callers
+            // handling the receiver uniformly still observe it.
+            let (completion_tx, completion_rx) = oneshot::channel();
+            let _ = completion_tx.send(Err(QueueError::Aborted));
+            return completion_rx;
         }
 
         let child = CancellationToken::new();
@@ -178,15 +209,7 @@ impl SequentialRipQueue {
             tokio::spawn(run_worker(self.inner.clone()));
         }
 
-        let result = completion_rx.await.unwrap_or_else(|_| {
-            Err(QueueError::Task(
-                "queue worker stopped unexpectedly".to_owned(),
-            ))
-        })?;
-        result
-            .downcast::<T>()
-            .map(|value| *value)
-            .map_err(|_| QueueError::Task("queue result type mismatch".to_owned()))
+        completion_rx
     }
 }
 

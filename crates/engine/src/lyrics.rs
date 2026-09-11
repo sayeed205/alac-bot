@@ -1,12 +1,12 @@
 //! Lyrics acquisition: tier detection, TTML→ELRC conversion, scoring, and
-//! four providers racing concurrently. Port of `src/modules/alac/lyrics.ts`.
+//! four providers racing concurrently.
 
 use std::{future::Future, sync::OnceLock};
 
 use regex::Regex;
 use tracing::debug;
 
-/// Quality tiers; numeric values feed the scoring math (TS parity).
+/// Quality tiers; numeric values feed the scoring math.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LyricsTier {
     WordSynced = 1000,
@@ -86,7 +86,7 @@ fn parse_time(time_str: &str) -> f64 {
     }
 }
 
-/// Format seconds as `mm:ss.mmm` (TS `formatTimestamp` parity).
+/// Format seconds as `mm:ss.mmm`.
 fn format_timestamp(time_str: &str) -> String {
     let total_sec = parse_time(time_str);
     let min = (total_sec / 60.0).floor();
@@ -165,7 +165,7 @@ pub fn detect_lyrics_tier(lyrics: &str) -> LyricsTier {
     LyricsTier::Plain
 }
 
-/// Score a lyrics text from one provider (TS `scoreLyrics` parity).
+/// Score a lyrics text from one provider.
 pub fn score_lyrics(text: &str, provider: &'static str, provider_weight: i64) -> LyricsCandidate {
     let tier = detect_lyrics_tier(text);
     let score = if tier.is_none() {
@@ -355,7 +355,7 @@ async fn fetch_lrclib_search(http: &impl LyricsHttp, meta: &LyricsMeta) -> Vec<L
         return Vec::new();
     }
 
-    // TS: sort by |duration - target| when a target exists (stable).
+    // Sort by |duration - target| when a target exists (stable).
     let mut sorted = results;
     if let Some(target) = meta.duration {
         if target > 0 {
@@ -416,7 +416,7 @@ pub async fn fetch_lyrics(
     if valid.is_empty() {
         return None;
     }
-    // Stable sort descending by score (TS Array.sort comparator parity —
+    // Stable sort descending by score (
     // sort_by_key is stable, matching TS's unspecified-stable behavior).
     valid.sort_by_key(|candidate| std::cmp::Reverse(candidate.score));
     let top = valid.into_iter().next()?;

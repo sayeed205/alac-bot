@@ -59,7 +59,7 @@ pub struct AudioStreamSource {
     pub bit_depth: u32,
     pub sample_rate: u32,
     /// Response `content-length`; `None` or `Some(0)` mean "unknown" for
-    /// progress totals (TS: `Number(header || 0)`, `> 0 ? : 0`).
+    /// progress totals.
     pub content_length: Option<u64>,
 }
 
@@ -156,8 +156,8 @@ impl<H: StreamHttp> StreamTransport<H> {
                 MAX_AUDIO_BYTES / (1024 * 1024)
             )));
         }
-        // TS parseInt produces NaN for malformed values. Rust uses the
-        // documented defaults instead, a harmless deviation for bad mirrors.
+        // Malformed values parse as documented defaults instead of
+        // failing, which only ever happens with misbehaving mirrors.
         let bit_depth = response
             .bit_depth
             .as_deref()

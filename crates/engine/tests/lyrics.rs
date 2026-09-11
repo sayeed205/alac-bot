@@ -1,4 +1,4 @@
-//! Lyrics parity tests against `src/modules/alac/lyrics.ts`.
+//! Lyrics parsing and provider-scoring tests.
 
 use std::{collections::HashMap, sync::Mutex};
 
@@ -35,7 +35,7 @@ impl LyricsHttp for FakeHttp {
 }
 
 #[test]
-fn format_timestamp_parity() {
+fn format_timestamp_renders_expected_format() {
     // m:ss with fractional → ms; garbage → 0; plain seconds.
     // (Exercised through convert_ttml_to_elrc below since format_timestamp
     //  is private; direct assertions there.)
@@ -65,24 +65,25 @@ fn scoring_math() {
 }
 
 #[test]
-fn ttml_conversion_full_parity() {
+fn ttml_conversion_maps_spans_and_decodes_entities() {
     let ttml = r#"<tt><body><div>
       <p begin="00:00:05.000" end="00:00:08.000">hello &amp; welcome</p>
       <p begin="00:00:10.500"><span begin="00:00:10.500">first </span><span begin="00:00:11.200">word</span></p>
     </div></body></tt>"#;
     let elrc = convert_ttml_to_elrc(ttml).unwrap();
     let lines: Vec<&str> = elrc.split('\n').collect();
-    // TS QUIRK 1: formatTimestamp splits on ':' and only reads [0]/[1] —
+    // Timestamp parsing splits on ':' and only reads [0]/[1] —
     // an HH:MM:SS timestamp parses as 0 → "00:00.000".
-    // TS QUIRK 2: the span-less p path does NOT entity-decode.
+    // The span-less p path does not entity-decode.
     assert_eq!(lines[0], "[00:00.000]hello &amp; welcome");
     // Spanned p: MM:SS.mmm timestamps parse correctly; word timestamps
-    // with trailing space trimmed end.
-    // Spanned p: MM:SS.msm timestamps parse correctly for the LINE start
-    // ("00:00:10.500" → minutes="00", seconds="00" → quirk 0) and words.
+    // have their trailing space trimmed.
+    // Spanned p: an HH:MM:SS.mmm line timestamp parses as 0
+    // ("00:00:10.500" → minutes="00", seconds="00" → 0) while the span
+    // timestamps parse correctly.
     // "first " carries its own trailing space, plus the appended separator
-    // → double space MID-line (trimEnd only removes the final space after
-    // "word", exactly like TS).
+    // → a double space mid-line (only the final space after "word" is
+    // trimmed).
     assert_eq!(lines[1], "[00:00.000]<00:00.000>first  <00:00.000>word");
 }
 

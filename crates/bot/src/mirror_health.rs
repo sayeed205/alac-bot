@@ -1,4 +1,4 @@
-//! Mirror health for the status dashboard (oracle: `commands/health.ts:47-61`).
+//! Mirror health for the status dashboard .
 //!
 //! The dashboard header shows the *last known* mirror state. Probing is
 //! explicit (`/status` open/refresh and terminal job refreshes); there is no
@@ -17,7 +17,7 @@ use std::{
 
 use engine::streaming::{MirrorEndpoint, MirrorError, MirrorPolicyManager};
 
-/// One health observation. `label` matches the TS `mirrorStatus` strings.
+/// One health observation. `label` matches the mirrorStatus strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MirrorHealth {
     Online,
@@ -54,7 +54,7 @@ pub trait MirrorHealthProbe: Send + Sync {
 }
 
 /// Production probe over the engine policy manager shared with the ripper.
-/// The 4s ceiling is the policy manager's health timeout (the TS oracle's
+/// The 4s ceiling is the policy manager's health timeout (the oracles
 /// HEAD probe timeout), so no separate field is needed.
 pub struct PolicyProbe<H: engine::streaming::MirrorHttp> {
     policy: MirrorPolicyManager<H>,
@@ -77,7 +77,7 @@ impl<H: engine::streaming::MirrorHttp> MirrorHealthProbe for PolicyProbe<H> {
                 Ok(_endpoint) => {
                     // The policy manager already verified manifest + /status
                     // + wrapper availability; a successful resolution IS the
-                    // health signal (equivalent to the TS HEAD probe).
+                    // health signal (equivalent to the HEAD probe).
                     self.policy.record_success();
                     HealthReport {
                         health: MirrorHealth::Online,
@@ -90,7 +90,7 @@ impl<H: engine::streaming::MirrorHttp> MirrorHealthProbe for PolicyProbe<H> {
                         MirrorError::Message(message) if message.contains("not configured") => {
                             MirrorHealth::NotConfigured
                         }
-                        // TS distinguishes fetch-failure (Unreachable) from
+                        // distinguishes fetch-failure (Unreachable) from
                         // thrown errors (Unavailable); the engine folds both
                         // into Message/Json — a resolved endpoint that fails
                         // its status check is Unavailable, transport noise is
@@ -139,7 +139,7 @@ impl LastKnownHealth {
 
     /// Last-known label for the dashboard header: `None` before the first
     /// probe (renders `unknown`), otherwise the most recent observation
-    /// regardless of age — matching the oracle's "last-known only" contract.
+    /// regardless of age (a "last-known only" contract).
     pub fn label(&self) -> Option<&'static str> {
         self.report
             .read()

@@ -1,4 +1,4 @@
-//! Progress formatting helpers. Port of `src/utils/progress.ts`.
+//! Progress formatting helpers.
 
 /// Render a Unicode block progress bar using `■`, `▤`, `□`,
 /// e.g. `[■■■■■■□□□□□□] 50%` or `[■■■▤□□□□□□□□] 35%`.

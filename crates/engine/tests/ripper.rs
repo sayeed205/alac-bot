@@ -1,4 +1,4 @@
-//! Ripper parity tests against `src/modules/alac/ripper.ts` — progress
+//! Ripper tests — progress
 //! sequences, retry semantics, stall/cancel behavior, temp cleanup, and
 //! result mapping.
 
@@ -195,7 +195,7 @@ async fn happy_path_progress_and_result_mapping() {
         .await
         .unwrap();
 
-    // Result mapping (TS || / ?? semantics).
+    // Result mapping (JS || / ?? semantics).
     assert_eq!(result.title, "Title");
     assert_eq!(result.genre, "Unknown");
     assert_eq!(result.release_date, "");
@@ -484,7 +484,7 @@ async fn progress_totals_with_content_length() {
         .filter(|(s, _, _)| s.starts_with("Downloading lossless audio"))
         .collect();
     assert!(!download_events.is_empty());
-    // Byte progress format parity (content_length None → MB only).
+    // Byte progress format (content_length None → MB only).
     assert!(download_events[0]
         .0
         .starts_with("Downloading lossless audio: 0.0 MB"));

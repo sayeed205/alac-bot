@@ -7,7 +7,7 @@ use crate::{
     BotState,
 };
 
-/// Resolve a TL peer to the Bot-API "marked" id the TS oracle stores
+/// Resolve a TL peer to the Bot-API "marked" id the stores
 /// (users positive, basic groups -chat_id, channels -1e12 - channel_id).
 fn peer_id(peer: &tl::enums::Peer) -> (i64, bool) {
     match peer {
@@ -229,7 +229,7 @@ pub(crate) async fn resolve_target(
     }
 
     // 3. Bare command inside a group (not a reply, no argument): authorize
-    // the group chat itself, using the marked id form the TS oracle stores.
+    // the group chat itself, using the marked id form the stores.
     if msg.is_any_group() {
         let marked = match msg.peer_id() {
             Some(tl::enums::Peer::Chat(c)) => -c.chat_id,

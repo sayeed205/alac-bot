@@ -1,6 +1,5 @@
-//! `/search` — local lossless cache + live Apple Music catalog search
-//! (oracle: `src/modules/alac/commands/search.ts`), plus the `dl:`/`rip:`
-//! delivery callbacks and `search_close`.
+//! `/search` — local lossless cache + live Apple Music catalog search, plus
+//! the `dl:`/`rip:` delivery callbacks and `search_close`.
 
 use std::sync::Arc;
 
@@ -21,7 +20,7 @@ use crate::{
     BotState,
 };
 
-/// Oracle truncation: `{artist} - {title}` over 28 chars → first 25 + "...".
+/// truncation: `{artist} - {title}` over 28 chars → first 25 + "...".
 fn short_title(artist: &str, title: &str) -> String {
     let raw = format!("{artist} - {title}");
     if raw.chars().count() > 28 {
@@ -32,7 +31,7 @@ fn short_title(artist: &str, title: &str) -> String {
     }
 }
 
-/// Oracle quality suffix: ` [bit/…kHz]` only when both fields are set
+/// quality suffix: ` [bit/…kHz]` only when both fields are set
 /// (zero is the DB "absent" sentinel).
 fn cached_quality(bit_depth: i32, sample_rate: i32) -> String {
     if bit_depth == 0 || sample_rate == 0 {
@@ -45,7 +44,7 @@ fn cached_quality(bit_depth: i32, sample_rate: i32) -> String {
 /// (title, artist) pairs for rendering; cached rows carry a quality suffix.
 type Row = (String, String, String);
 
-/// Builds the exact search-results text (oracle lines 77-135).
+/// Builds the exact search-results text .
 fn build_results_html(query: &str, cached: &[Row], live: &[Row]) -> String {
     let mut sections: Vec<String> = Vec::new();
     if !cached.is_empty() {
@@ -462,7 +461,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn short_title_truncates_like_oracle() {
+    fn short_title_truncates_with_ellipsis() {
         assert_eq!(short_title("A", "B"), "A - B");
         // 5 + 3 + 20 = exactly 28 chars: untouched.
         let b28 = "B".repeat(20);
@@ -481,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn quality_suffix_matches_oracle() {
+    fn quality_suffix_renders_expected_text() {
         assert_eq!(cached_quality(0, 0), "");
         assert_eq!(cached_quality(24, 48000), " [24-bit/48.0kHz]");
         assert_eq!(cached_quality(16, 44100), " [16-bit/44.1kHz]");

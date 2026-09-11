@@ -1,5 +1,4 @@
 //! Single-track ripper: metadata → stream → raw file → tagged M4A, with
-//! retries and cancellation. Port of `src/modules/alac/ripper.ts`.
 
 use std::{
     future::Future,
@@ -25,7 +24,7 @@ use crate::{
     types::{TrackMeta, TrackRipResult},
 };
 
-/// All rip failures reduce to messages (TS `new Error(msg)` parity).
+/// All rip failures reduce to plain user-facing messages.
 #[derive(Debug, thiserror::Error)]
 pub enum RipError {
     #[error("{0}")]
@@ -54,7 +53,7 @@ impl From<std::io::Error> for RipError {
 /// for the byte-progress updates.
 pub type RipProgressCallback = Arc<dyn Fn(&str, Option<u64>, Option<u64>) + Send + Sync>;
 
-/// Configuration knobs (TS constructor parity: retries 3, base delay 2s).
+/// Configuration knobs (default retries 3, base delay 2s).
 #[derive(Debug, Clone)]
 pub struct RipperConfig {
     pub default_output_dir: PathBuf,
@@ -82,7 +81,7 @@ pub trait RipperDeps: Send + Sync {
         track_id: &str,
         storefront: &str,
     ) -> impl Future<Output = Result<TrackMeta, RipError>> + Send;
-    /// `None` = mirror lookup failed (TS catches → wrapper fallback path).
+    /// `None` = mirror lookup failed → wrapper fallback path.
     fn mirror_endpoint(
         &self,
         signal: Option<&CancellationToken>,
@@ -110,7 +109,7 @@ pub trait RipperDeps: Send + Sync {
     ) -> impl Future<Output = Result<(), RipError>> + Send;
 }
 
-/// Retrying wrapper around `rip_once` (TS `rip` parity).
+/// Retrying wrapper around `rip_once`.
 pub struct AlacTrackRipper {
     config: RipperConfig,
 }
@@ -346,7 +345,7 @@ impl AlacTrackRipper {
                 )));
             }
             let mut downloaded_bytes = 0u64;
-            // TS starts at 0 → the first chunk always emits a progress event.
+            // Starting at 0 makes the first chunk always emit a progress event.
             let mut last_progress_update = std::time::Instant::now()
                 .checked_sub(Duration::from_secs(10))
                 .unwrap_or_else(std::time::Instant::now);
@@ -490,7 +489,7 @@ impl AlacTrackRipper {
         }
         .await;
 
-        // TS finally: temp raw removed in all paths; prefetch tasks reaped.
+        // Temp raw removed on every exit path; prefetch tasks reaped.
         let _ = tokio::fs::remove_file(&temp_raw_path).await;
         if result.is_err() {
             let _ = tokio::fs::remove_dir_all(&track_dir).await;
@@ -514,8 +513,8 @@ fn emit_progress(
     }
 }
 
-/// Jitter fraction in `0.0..1.0` from a cheap time-seeded xorshift (TS uses
-/// Math.random; exact values are never asserted).
+/// Jitter fraction in `0.0..1.0` from a cheap time-seeded xorshift
+/// (exact values are never asserted).
 fn jitter_fraction() -> f64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static STATE: AtomicU64 = AtomicU64::new(0);

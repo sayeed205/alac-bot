@@ -266,32 +266,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uptime_compound_matches_oracle() {
+    fn uptime_renders_compound_units() {
         assert_eq!(format_uptime(Duration::from_secs(90_061)), "1d 1h 1m 1s");
     }
 
     #[test]
-    fn uptime_seconds_matches_oracle() {
+    fn uptime_renders_seconds() {
         assert_eq!(format_uptime(Duration::from_secs(5)), "5s");
     }
 
     #[test]
-    fn duration_zero_matches_oracle() {
+    fn duration_renders_zero_as_empty() {
         assert_eq!(format_duration_ms(0), "0ms");
     }
 
     #[test]
-    fn duration_seconds_matches_oracle() {
+    fn duration_renders_seconds() {
         assert_eq!(format_duration_ms(1_250), "1.3s");
     }
 
     #[test]
-    fn duration_minutes_matches_oracle() {
+    fn duration_renders_minutes() {
         assert_eq!(format_duration_ms(61_500), "1m 2s");
     }
 
     #[test]
-    fn idle_queue_card_matches_oracle() {
+    fn idle_queue_card_renders_expected_text() {
         assert_eq!(
             queue_card(false, 0),
             "🟢 <b>Rip Queue is Idle</b><br/><br/><blockquote>• Active Workers: <code>0</code><br/>• Pending Jobs: <code>0</code><br/>• Ready to process new rip requests.</blockquote>"
@@ -299,7 +299,7 @@ mod tests {
     }
 
     #[test]
-    fn active_queue_card_matches_oracle() {
+    fn active_queue_card_renders_expected_text() {
         assert_eq!(
             queue_card(true, 2),
             "🔄 <b>Rip Queue Status</b><br/><br/><blockquote>• Worker Status: <b>Active</b><br/>• Pending in Queue: <code>2</code> tasks<br/>• Tasks are processed sequentially.</blockquote>"
@@ -307,7 +307,7 @@ mod tests {
     }
 
     #[test]
-    fn health_card_matches_oracle() {
+    fn health_card_renders_expected_text() {
         assert_eq!(
             health_card(HealthCard {
                 tg_latency: 4,
@@ -324,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn stats_card_matches_oracle() {
+    fn stats_card_renders_expected_text() {
         let stats = db::AlacStats {
             total_cached_tracks: 3,
             total_requests: 4,

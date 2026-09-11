@@ -1,7 +1,7 @@
 use db::{connect_test_isolated, migrate, Auth};
 
 #[tokio::test]
-async fn authorization_and_migration_parity() {
+async fn authorization_and_migrations_round_trip() {
     let client = connect_test_isolated()
         .await
         .expect("TEST_DATABASE_URL and PostgreSQL are required for db tests");

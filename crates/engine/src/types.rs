@@ -1,7 +1,7 @@
 //! Domain types shared across the core crate.
 //!
-//! Field-level parity with the TS oracle (`src/modules/alac/types.ts`) matters:
-//! these values flow into Telegram replies, DB rows, and media finalization.
+//! These values flow into Telegram replies, DB rows, and media finalization,
+//! so field shapes are part of the contract.
 
 use diesel::{deserialize::FromSql, pg::Pg, serialize::ToSql};
 use serde::{Deserialize, Serialize};
@@ -136,8 +136,8 @@ pub struct TrackMeta {
     pub album: String,
     pub album_artist: String,
     pub genre: Option<String>,
-    /// First 10 chars of the raw release date, or `''` when absent — the TS
-    /// oracle always produces a string here (like `artwork_url`).
+    /// First 10 chars of the raw release date, or `''` when absent
+    /// (always a string, like `artwork_url`).
     pub release_date: String,
     /// Composer when the provider exposes it; otherwise omitted.
     pub composer: Option<String>,
@@ -152,7 +152,7 @@ pub struct TrackMeta {
     /// classification), retained so the media layer can write the precise
     /// iTunes rating atom.
     pub content_advisory: Option<String>,
-    /// TS maps missing artwork to `''` (not undefined) — kept for parity.
+    /// Missing artwork maps to `''` (never absent).
     pub artwork_url: String,
     /// Provider-native album and artist identifiers, when available.
     pub album_id: Option<String>,
@@ -179,7 +179,7 @@ pub struct ArtistTracks {
     pub tracks: Vec<TrackMeta>,
 }
 
-/// Result of a completed single-track rip (parity with TS TrackRipResult).
+/// Result of a completed single-track rip.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackRipResult {
     pub file_path: String,

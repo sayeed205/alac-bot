@@ -25,8 +25,7 @@ pub struct BotState {
     pub auth: db::Auth,
     pub rip_deps: Arc<rip_deps::RipDeps>,
     pub rip_orchestrator: Arc<engine::orchestrator::RipOrchestrator>,
-    /// Env-driven ids/peers the ops commands need (oracle `env.ADMIN_ID`,
-    /// `env.DUMP_CHANNEL_ID`). `dump_peer` is the TL-level peer used for
+    /// Env-driven ids/peers the ops commands need . `dump_peer` is the TL-level peer used for
     /// sends/queries; `dump_channel_id` is the raw id for link building.
     pub admin_id: i64,
     pub bot_id: i64,
@@ -38,7 +37,7 @@ pub struct BotState {
     /// Raw DB client for the dump service (`/export`, `/import`) — cheap
     /// Arc-pool clone shared with the repositories.
     pub db_client: db::DbPool,
-    /// Process start, for `/health` uptime (oracle process.uptime()).
+    /// Process start, for `/health` uptime ).
     pub started_at: Instant,
 }
 

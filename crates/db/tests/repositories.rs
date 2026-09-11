@@ -137,7 +137,7 @@ async fn save_find_delete_search_and_prune_tracks() {
         ids.contains(&TrackKey::apple(first.clone()))
             && ids.contains(&TrackKey::apple(second.clone()))
     );
-    // The repository mirrors the TS global-prune operation. This shared test
+    // Global prune. This shared test
     // database can retain rows from interrupted earlier runs, so only assert
     // that our second row was pruned rather than an exact global count.
     assert!(

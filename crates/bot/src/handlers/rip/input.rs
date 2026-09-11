@@ -1,7 +1,7 @@
 //! Input handling for the `/alac` family of commands.
 //!
 //! The parser itself lives in `engine`; this module only deals with Telegram
-//! replies and text documents (oracle `commands-rip.ts:125-177`).
+//! replies and text documents .
 
 use std::{
     path::PathBuf,
