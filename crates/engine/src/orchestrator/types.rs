@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::types::{ParsedTargetItem, TargetKind};
+use crate::{
+    types::{ParsedTargetItem, TargetKind},
+    wrapper::CodecPreference,
+};
 
 /// The non-terminal lifecycle phase of a job.  Terminality is represented by
 /// `terminal_state` below so consumers can retain the last useful phase while
@@ -87,6 +90,9 @@ pub struct RipJobOptions {
     pub reply_to_message_id: Option<i64>,
     pub status_msg_id: i64,
     pub is_admin: bool,
+    /// Audio variant the ripper selects when several are offered
+    /// (highest quality vs Dolby Atmos).
+    pub codec_preference: CodecPreference,
 }
 
 /// A progress snapshot; every display field is optional.
@@ -160,6 +166,8 @@ pub struct ZipDeliveryInfo {
     pub record_label: Option<String>,
     pub copyright: Option<String>,
     pub photo_delivered: bool,
+    /// Highest-quality codec in the archive (`alac`, `mp4a.40.2`, `ec-3`).
+    pub codec: Option<String>,
 }
 
 /// A target which could not be resolved.  The engine deliberately keeps this

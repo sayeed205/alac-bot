@@ -296,17 +296,83 @@ pub fn transform_init_segment(init_data: &[u8]) -> Result<Vec<u8>, WrapperError>
 
 /// Parsed `trun` box information.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct TrunInfo {
-    offset_in_data: usize,
-    sample_count: usize,
-    data_offset_field_pos: Option<usize>,
-    data_offset: i32,
-    sample_sizes: Vec<usize>,
+pub(crate) struct TrunInfo {
+    #[allow(dead_code)]
+    pub(crate) offset_in_data: usize,
+    pub(crate) sample_count: usize,
+    pub(crate) data_offset_field_pos: Option<usize>,
+    pub(crate) data_offset: i32,
+    pub(crate) sample_sizes: Vec<usize>,
+}
+
+/// `tfhd` default sample values used when `trun` omits per-sample fields.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TfhdDefaults {
+    pub(crate) default_sample_duration: Option<u32>,
+    pub(crate) default_sample_size: Option<u32>,
+}
+
+/// Parse the `tfhd` box inside `traf` for its default sample fields.
+pub(crate) fn parse_tfhd_defaults(
+    data: &[u8],
+    traf_start: usize,
+    traf_len: usize,
+) -> Option<TfhdDefaults> {
+    let (tfhd_off, tfhd_len) =
+        find_child_box(data, traf_start + 8, traf_start + traf_len, b"tfhd")?;
+    // FullBox: size/type (8) + version/flags (4), then fields.
+    if tfhd_len < 16 || tfhd_off + tfhd_len > data.len() {
+        return None;
+    }
+    let flags = read_u24_be(&data[tfhd_off + 9..tfhd_off + 12]);
+    let mut cur = tfhd_off + 12;
+    if flags & 0x1 != 0 {
+        cur += 8; // base_data_offset
+    }
+    if flags & 0x2 != 0 {
+        cur += 4; // sample_description_index
+    }
+    cur += 4; // track_id
+    let mut defaults = TfhdDefaults::default();
+    if flags & 0x8 != 0 {
+        if cur + 4 > data.len() {
+            return None;
+        }
+        defaults.default_sample_duration = Some(read_u32_be(&data[cur..cur + 4]));
+        cur += 4;
+    }
+    if flags & 0x10 != 0 {
+        if cur + 4 > data.len() {
+            return None;
+        }
+        defaults.default_sample_size = Some(read_u32_be(&data[cur..cur + 4]));
+    }
+    Some(defaults)
+}
+
+/// Parse `trun` box inside `traf` (public for the CENC path).
+///
+/// Missing per-sample sizes (trun flags without 0x200) are resolved from
+/// `tfhd.default_sample_size` when present, mirroring mp4ff's
+/// `AddSampleDefaultValues` fallback chain.
+pub(crate) fn parse_trun_pub(
+    data: &[u8],
+    traf_start: usize,
+    traf_len: usize,
+    trun_start: usize,
+    trun_len: usize,
+) -> Option<TrunInfo> {
+    parse_trun(data, traf_start, traf_len, trun_start, trun_len)
 }
 
 /// Parse `trun` box inside `traf`.
-fn parse_trun(data: &[u8], trun_start: usize, trun_len: usize) -> Option<TrunInfo> {
+fn parse_trun(
+    data: &[u8],
+    traf_start: usize,
+    traf_len: usize,
+    trun_start: usize,
+    trun_len: usize,
+) -> Option<TrunInfo> {
     if trun_len < 16 || trun_start + trun_len > data.len() {
         return None;
     }
@@ -337,6 +403,13 @@ fn parse_trun(data: &[u8], trun_start: usize, trun_len: usize) -> Option<TrunInf
     let has_flags = flags & 0x000400 != 0;
     let has_ctts = flags & 0x000800 != 0;
 
+    // mp4ff fallback: missing per-sample sizes come from tfhd defaults.
+    let default_size = if has_size {
+        None
+    } else {
+        parse_tfhd_defaults(data, traf_start, traf_len).and_then(|d| d.default_sample_size)
+    };
+
     let mut sample_sizes = Vec::with_capacity(sample_count);
     for _ in 0..sample_count {
         if has_duration {
@@ -349,8 +422,7 @@ fn parse_trun(data: &[u8], trun_start: usize, trun_len: usize) -> Option<TrunInf
             sample_sizes.push(read_u32_be(&data[cur..cur + 4]) as usize);
             cur += 4;
         } else {
-            // Default sample size fallback
-            sample_sizes.push(0);
+            sample_sizes.push(default_size.unwrap_or(0) as usize);
         }
         if has_flags {
             cur += 4;
@@ -443,7 +515,7 @@ pub fn decrypt_fragment(
     }
     let mut truns = Vec::with_capacity(trun_boxes.len());
     for (t_off, t_len) in trun_boxes {
-        let trun = parse_trun(&out, t_off, t_len)
+        let trun = parse_trun(&out, traf_off, traf_len, t_off, t_len)
             .ok_or_else(|| WrapperError::Message("Failed to parse trun box".into()))?;
         truns.push(trun);
     }
@@ -455,6 +527,47 @@ pub fn decrypt_fragment(
     } else {
         None
     };
+
+    // 4b. Size fallback when trun and tfhd both omit per-sample sizes:
+    // derive each sample's size from its senc subsample entries
+    // (clear + protected bytes). Apple ec-3 packs one subsample per sample.
+    if let Some(ref encs) = enc_info {
+        for (trun_idx, trun) in truns.iter_mut().enumerate() {
+            if trun.sample_count == 0 || !trun.sample_sizes.iter().all(|&s| s == 0) {
+                continue;
+            }
+            if trun_idx > 0 {
+                // Only resolve the leading size-less trun; multi-trun
+                // size inference is ambiguous without full-sample data.
+                continue;
+            }
+            let start_idx = 0;
+            let end_idx = (start_idx + trun.sample_count).min(encs.len());
+            let mut derived = Vec::with_capacity(trun.sample_count);
+            for enc in &encs[start_idx..end_idx] {
+                let size: usize = enc
+                    .subsamples
+                    .iter()
+                    .map(|s| s.clear_bytes as usize + s.protected_bytes as usize)
+                    .sum();
+                derived.push(size);
+            }
+            if derived.iter().all(|&s| s > 0) && derived.len() == trun.sample_count {
+                trun.sample_sizes = derived;
+            }
+        }
+    }
+
+    // 4c. Guard: without usable sizes there is nothing to decrypt.
+    let any_size = truns
+        .iter()
+        .flat_map(|t| t.sample_sizes.iter())
+        .any(|&s| s > 0);
+    if !any_size && truns.iter().any(|t| t.sample_count > 0) {
+        return Err(WrapperError::Message(
+            "No sample sizes available in trun/tfhd/senc".into(),
+        ));
+    }
 
     // 5. Decrypt samples in mdat across all trun boxes
     let mut global_sample_idx = 0;
@@ -529,6 +642,27 @@ pub fn decrypt_fragment(
             boxes_to_remove.push(b);
         }
     }
+    // Drop sample-encryption group metadata (`seam`) left over in traf.
+    {
+        let mut cur = traf_off + 8;
+        let traf_end = traf_off + traf_len;
+        while cur + 8 <= traf_end {
+            let Some((b_len, b_type, _)) = read_box_header(&out, cur) else {
+                break;
+            };
+            if b_len < 8 || cur + b_len > traf_end {
+                break;
+            }
+            if (&b_type == b"sgpd" || &b_type == b"sbgp")
+                && cur + 16 <= out.len()
+                && &out[cur + 12..cur + 16] == b"seam"
+            {
+                bytes_removed_from_traf += b_len;
+                boxes_to_remove.push((cur, b_len));
+            }
+            cur += b_len;
+        }
+    }
     for b in find_all_child_boxes(&out, traf_off + 8, traf_off + traf_len, b"uuid") {
         bytes_removed_from_traf += b.1;
         boxes_to_remove.push(b);
@@ -568,5 +702,377 @@ pub fn decrypt_fragment(
         }
     }
 
+    // 8. Rebuild size-less truns so downstream remuxers see standard boxes.
+    normalize_fragment(&mut out);
+
     Ok(out)
+}
+
+/// Rebuild `trun` boxes that omit per-sample fields (sizes from tfhd
+/// defaults) into standard truns with explicit per-sample duration and
+/// size (flags 0x301). MP4Box/ffmpeg cannot resolve size-less truns,
+/// so the decrypted fragment would demux as ~9 packets without this.
+pub fn normalize_fragment(fragment: &mut Vec<u8>) {
+    let total_len = fragment.len();
+    let Some((moof_off, moof_len)) = find_child_box(fragment, 0, total_len, b"moof") else {
+        return;
+    };
+    let Some((traf_off, traf_len)) =
+        find_child_box(fragment, moof_off + 8, moof_off + moof_len, b"traf")
+    else {
+        return;
+    };
+    let Some(tfhd) = parse_tfhd_defaults(fragment, traf_off, traf_len) else {
+        return;
+    };
+
+    // The sanitized init keeps a single stsd entry, but source fragments
+    // may reference sample_description_index = 2 (Apple ships two entries:
+    // main + Atmos variant). Demuxers drop every fragment whose index
+    // exceeds the stsd entry count, so drop the tfhd flag + field.
+    let mut sdi_shrink: i64 = 0;
+    if let Some((tfhd_off, tfhd_len)) =
+        find_child_box(fragment, traf_off + 8, traf_off + traf_len, b"tfhd")
+    {
+        if tfhd_len >= 16 && tfhd_off + tfhd_len <= fragment.len() {
+            let flags = read_u24_be(&fragment[tfhd_off + 9..tfhd_off + 12]);
+            if flags & 0x2 != 0 {
+                let mut cur = tfhd_off + 12;
+                if flags & 0x1 != 0 {
+                    cur += 8; // base_data_offset
+                }
+                cur += 4; // track_id precedes sample_description_index
+                let sdi_pos = cur; // sample_description_index field
+                fragment.drain(sdi_pos..sdi_pos + 4);
+                let new_flags = flags & !0x2;
+                fragment[tfhd_off + 9..tfhd_off + 12]
+                    .copy_from_slice(&new_flags.to_be_bytes()[1..4]);
+                write_u32_be(&mut fragment[tfhd_off..tfhd_off + 4], (tfhd_len - 4) as u32);
+                let traf_size = read_u32_be(&fragment[traf_off..traf_off + 4]);
+                write_u32_be(&mut fragment[traf_off..traf_off + 4], traf_size - 4);
+                let moof_size = read_u32_be(&fragment[moof_off..moof_off + 4]);
+                write_u32_be(&mut fragment[moof_off..moof_off + 4], moof_size - 4);
+                sdi_shrink = -4;
+            }
+        }
+    }
+
+    // Collect rebuild candidates first, then splice back-to-front so
+    // earlier offsets stay valid.
+    let mut rebuilds: Vec<(usize, i32, Vec<u8>)> = Vec::new();
+    let mut cur = traf_off + 8;
+    let traf_end = (traf_off as i64 + traf_len as i64 + sdi_shrink) as usize;
+    while cur + 8 <= traf_end {
+        let Some((b_len, b_type, _)) = read_box_header(fragment, cur) else {
+            break;
+        };
+        if b_len < 8 || cur + b_len > traf_end {
+            break;
+        }
+        if &b_type == b"trun" {
+            let Some(trun) = parse_trun_pub(fragment, traf_off, traf_len, cur, b_len) else {
+                break;
+            };
+            let flags = read_u24_be(&fragment[cur + 9..cur + 12]);
+            let needs_size = flags & 0x000200 == 0;
+            // Only rebuild size-less truns: remuxers fail on missing sizes,
+            // but duration-less truns with explicit sizes (ALAC VBR) are
+            // already resolvable via tfhd defaults by MP4Box/ffmpeg.
+            if needs_size && !trun.sample_sizes.iter().all(|&s| s == 0) {
+                // Rebuild with explicit duration + size per sample.
+                let count = trun.sample_count;
+                let mut new_trun = Vec::with_capacity(8 + 4 + 4 + 4 + count * 8);
+                let body_len = 4 + 4 + 4 + count * 8;
+                new_trun.extend_from_slice(&((8 + body_len) as u32).to_be_bytes());
+                new_trun.extend_from_slice(b"trun");
+                new_trun.extend_from_slice(&[0, 0, 0x03, 0x01]); // data_offset + duration + size
+                new_trun.extend_from_slice(&(count as u32).to_be_bytes());
+                // data_offset patched after total growth is known.
+                new_trun.extend_from_slice(&trun.data_offset.to_be_bytes());
+                let duration = tfhd.default_sample_duration.unwrap_or(0);
+                for &size in &trun.sample_sizes {
+                    new_trun.extend_from_slice(&duration.to_be_bytes());
+                    new_trun.extend_from_slice(&(size as u32).to_be_bytes());
+                }
+                rebuilds.push((cur, trun.data_offset, new_trun));
+            }
+        }
+        cur += b_len;
+    }
+
+    // Rebuilt truns sit before mdat, so mdat (and every trun's data
+    // target inside it) shifts by the total delta (including the tfhd
+    // shrink). Patch each trun's data_offset when the fragment shrank
+    // but no trun is being rebuilt.
+    if rebuilds.is_empty() {
+        if sdi_shrink != 0 {
+            // No rebuild candidates: still patch data offsets of ALL
+            // trun boxes for the tfhd shrink, since mdat moved.
+            let mut cur = traf_off + 8;
+            let traf_end = (traf_off as i64 + traf_len as i64 + sdi_shrink) as usize;
+            while cur + 8 <= traf_end {
+                let Some((b_len, b_type, _)) = read_box_header(fragment, cur) else {
+                    break;
+                };
+                if b_len < 8 || cur + b_len > traf_end {
+                    break;
+                }
+                if &b_type == b"trun" {
+                    let flags = read_u24_be(&fragment[cur + 9..cur + 12]);
+                    if flags & 0x1 != 0 {
+                        let doff_pos = cur + 16;
+                        let doff = i32::from_be_bytes(
+                            fragment[doff_pos..doff_pos + 4].try_into().unwrap(),
+                        );
+                        let new_doff = doff + sdi_shrink as i32;
+                        fragment[doff_pos..doff_pos + 4].copy_from_slice(&new_doff.to_be_bytes());
+                    }
+                }
+                cur += b_len;
+            }
+        }
+        return;
+    }
+
+    // Rebuilt truns sit before mdat, so mdat (and every trun's data
+    // target inside it) shifts by the total growth (including the tfhd
+    // shrink). Patch each rebuilt trun's data_offset, then splice.
+    let total_delta: i64 = sdi_shrink
+        + rebuilds
+            .iter()
+            .map(|(_, _, new_trun)| new_trun.len() as i64)
+            .sum::<i64>()
+        - rebuilds
+            .iter()
+            .map(|(off, _, _)| read_u32_be(&fragment[*off..*off + 4]) as i64)
+            .sum::<i64>();
+
+    let mut delta: i64 = 0;
+    for (off, old_data_offset, mut new_trun) in rebuilds {
+        let old_len = read_u32_be(&fragment[off..off + 4]) as usize;
+        // data_offset field: size(4)+type(4)+verflags(4)+count(4) = offset 16.
+        new_trun[16..20]
+            .copy_from_slice(&((old_data_offset as i64 + total_delta) as i32).to_be_bytes());
+        let off_i = off as i64 + delta;
+        fragment.splice(
+            off_i as usize..off_i as usize + old_len,
+            new_trun.iter().copied(),
+        );
+        delta += new_trun.len() as i64 - old_len as i64;
+    }
+
+    // Grow parent sizes by the accumulated delta (moof, traf). The traf
+    // size already absorbed sdi_shrink above; add only the trun delta.
+    let traf_size = read_u32_be(&fragment[traf_off..traf_off + 4]);
+    write_u32_be(
+        &mut fragment[traf_off..traf_off + 4],
+        (traf_size as i64 + delta) as u32,
+    );
+    let moof_size = read_u32_be(&fragment[moof_off..moof_off + 4]);
+    write_u32_be(
+        &mut fragment[moof_off..moof_off + 4],
+        (moof_size as i64 + delta) as u32,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tfhd(flags: u32, body: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&(8 + 4 + body.len() as u32).to_be_bytes());
+        b.extend_from_slice(b"tfhd");
+        b.extend_from_slice(&flags.to_be_bytes());
+        b.extend_from_slice(body);
+        b
+    }
+
+    fn trun(flags: u32, count: u32, data_offset: i32, entries: &[u32]) -> Vec<u8> {
+        let entry_len = if flags & 0x100 != 0 { 4 } else { 0 }
+            + if flags & 0x200 != 0 { 4 } else { 0 }
+            + if flags & 0x400 != 0 { 4 } else { 0 }
+            + if flags & 0x800 != 0 { 4 } else { 0 };
+        let mut b = Vec::new();
+        b.extend_from_slice(
+            &(8 + 4
+                + 4
+                + (if flags & 0x1 != 0 { 4 } else { 0 })
+                + (if flags & 0x4 != 0 { 4 } else { 0 })
+                + (count as usize * entry_len) as u32)
+                .to_be_bytes(),
+        );
+        b.extend_from_slice(b"trun");
+        b.extend_from_slice(&flags.to_be_bytes());
+        b.extend_from_slice(&count.to_be_bytes());
+        if flags & 0x1 != 0 {
+            b.extend_from_slice(&data_offset.to_be_bytes());
+        }
+        if flags & 0x4 != 0 {
+            b.extend_from_slice(&0u32.to_be_bytes());
+        }
+        for e in entries {
+            b.extend_from_slice(&e.to_be_bytes());
+        }
+        b
+    }
+
+    fn wrap_traf(children: &[Vec<u8>]) -> (Vec<u8>, usize) {
+        let total: usize = children.iter().map(|c| c.len()).sum();
+        let mut b = Vec::new();
+        b.extend_from_slice(&((8 + total) as u32).to_be_bytes());
+        b.extend_from_slice(b"traf");
+        let traf_off = 0usize;
+        for c in children {
+            b.extend_from_slice(c);
+        }
+        (b, traf_off)
+    }
+
+    /// tfhd with default duration + size (Apple ec-3 layout: flags 0x20018).
+    #[test]
+    fn parse_trun_resolves_missing_sizes_from_tfhd() {
+        // tfhd body must include default duration + size
+        let mut tfhd_body = Vec::new();
+        tfhd_body.extend_from_slice(&1u32.to_be_bytes()); // track_id
+        tfhd_body.extend_from_slice(&1536u32.to_be_bytes()); // default duration
+        tfhd_body.extend_from_slice(&3072u32.to_be_bytes()); // default size
+        let tfhd_box = tfhd(0x020018, &tfhd_body);
+        let trun = trun(0x1, 468, 3977, &[]);
+        let (traf, traf_off) = wrap_traf(&[tfhd_box, trun.clone()]);
+        let trun_start = traf.len() - trun.len();
+        let info =
+            parse_trun_pub(&traf, traf_off, traf.len(), trun_start, trun.len()).expect("parse");
+        assert_eq!(info.sample_count, 468);
+        assert_eq!(info.sample_sizes.len(), 468);
+        assert!(info.sample_sizes.iter().all(|&s| s == 3072));
+        assert_eq!(info.data_offset, 3977);
+    }
+
+    /// trun with explicit per-sample sizes (ALAC flags 0x201) ignores tfhd.
+    #[test]
+    fn parse_trun_prefers_explicit_sizes() {
+        let mut tfhd_body = Vec::new();
+        tfhd_body.extend_from_slice(&1u32.to_be_bytes());
+        tfhd_body.extend_from_slice(&4096u32.to_be_bytes());
+        tfhd_body.extend_from_slice(&12349u32.to_be_bytes());
+        let tfhd_box = tfhd(0x020018, &tfhd_body);
+        let trun = trun(0x201, 3, 100, &[11, 22, 33]);
+        let (traf, traf_off) = wrap_traf(&[tfhd_box, trun.clone()]);
+        let trun_start = traf.len() - trun.len();
+        let info =
+            parse_trun_pub(&traf, traf_off, traf.len(), trun_start, trun.len()).expect("parse");
+        assert_eq!(info.sample_sizes, vec![11, 22, 33]);
+    }
+
+    /// normalize_fragment rebuilds a size-less trun with per-sample
+    /// duration + size and patches data_offset for the growth.
+    #[test]
+    fn normalize_fragment_rebuilds_sizeless_trun() {
+        // moof { mfhd, traf { tfhd(0x20018: dur 1536, size 3072), trun(0x1, 2, doff) } } + mdat
+        let mut tfhd_body = Vec::new();
+        tfhd_body.extend_from_slice(&1u32.to_be_bytes());
+        tfhd_body.extend_from_slice(&1536u32.to_be_bytes());
+        tfhd_body.extend_from_slice(&3072u32.to_be_bytes());
+        let tfhd_box = tfhd(0x020018, &tfhd_body);
+        let trun = trun(0x1, 2, 44, &[]);
+        let (traf, _) = wrap_traf(&[tfhd_box, trun.clone()]);
+        let mut mfhd = Vec::new();
+        mfhd.extend_from_slice(&16u32.to_be_bytes());
+        mfhd.extend_from_slice(b"mfhd");
+        mfhd.extend_from_slice(&0u32.to_be_bytes());
+        mfhd.extend_from_slice(&1u32.to_be_bytes());
+        let moof_children_len = mfhd.len() + traf.len();
+        let mut moof = Vec::new();
+        moof.extend_from_slice(&((8 + moof_children_len) as u32).to_be_bytes());
+        moof.extend_from_slice(b"moof");
+        moof.extend_from_slice(&mfhd);
+        moof.extend_from_slice(&traf);
+        let payload = vec![0xABu8; 2 * 3072];
+        let mut mdat = Vec::new();
+        mdat.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
+        mdat.extend_from_slice(b"mdat");
+        mdat.extend_from_slice(&payload);
+        let mut frag = moof;
+        frag.extend_from_slice(&mdat);
+
+        normalize_fragment(&mut frag);
+
+        // Locate the rebuilt trun by its box type; box start = type - 4.
+        let trun_type = frag.windows(4).position(|w| w == b"trun").expect("trun");
+        let trun_off = trun_type - 4; // box start
+        let size = read_u32_be(&frag[trun_off..trun_off + 4]) as usize;
+        let flags = read_u24_be(&frag[trun_off + 9..trun_off + 12]);
+        assert_eq!(flags, 0x301);
+        let count = read_u32_be(&frag[trun_off + 12..trun_off + 16]);
+        assert_eq!(count, 2);
+        assert_eq!(size, 8 + 4 + 4 + 4 + 2 * 8);
+        // doff patched by the trun growth: 44 + 16 = 60. The fixture's
+        // original 44 was arbitrary, so assert the delta, not the landing.
+        let doff = read_i32_be(&frag[trun_off + 16..trun_off + 20]);
+        assert_eq!(doff, 60);
+        // moof grew by the same 16 bytes; mdat sits right after it.
+        let moof_size = read_u32_be(&frag[0..4]) as usize;
+        assert_eq!(frag[moof_size + 4..moof_size + 8], *b"mdat");
+        // sample 0: duration then size
+        let d0 = read_u32_be(&frag[trun_off + 20..trun_off + 24]);
+        let s0 = read_u32_be(&frag[trun_off + 24..trun_off + 28]);
+        assert_eq!(d0, 1536);
+        assert_eq!(s0, 3072);
+    }
+
+    /// normalize_fragment drops tfhd sample_description_index so the
+    /// sanitized single-entry stsd stays valid.
+    #[test]
+    fn normalize_fragment_drops_tfhd_sdi() {
+        let mut tfhd_body = Vec::new();
+        tfhd_body.extend_from_slice(&1u32.to_be_bytes()); // track_id
+        tfhd_body.extend_from_slice(&2u32.to_be_bytes()); // sample_description_index = 2
+        tfhd_body.extend_from_slice(&1536u32.to_be_bytes()); // duration
+        tfhd_body.extend_from_slice(&3072u32.to_be_bytes()); // size
+        let tfhd_box = tfhd(0x02001a, &tfhd_body);
+        let trun = trun(0x201, 1, 60, &[3072]);
+        let (traf, _) = wrap_traf(&[tfhd_box, trun.clone()]);
+        let mut mfhd = Vec::new();
+        mfhd.extend_from_slice(&16u32.to_be_bytes());
+        mfhd.extend_from_slice(b"mfhd");
+        mfhd.extend_from_slice(&0u32.to_be_bytes());
+        mfhd.extend_from_slice(&1u32.to_be_bytes());
+        let mut moof = Vec::new();
+        moof.extend_from_slice(&((8 + mfhd.len() + traf.len()) as u32).to_be_bytes());
+        moof.extend_from_slice(b"moof");
+        moof.extend_from_slice(&mfhd);
+        moof.extend_from_slice(&traf);
+        let mut mdat = Vec::new();
+        mdat.extend_from_slice(&(8u32 + 3072).to_be_bytes());
+        mdat.extend_from_slice(b"mdat");
+        mdat.extend_from_slice(&vec![0u8; 3072]);
+        let mut frag = moof;
+        frag.extend_from_slice(&mdat);
+        let len_before = frag.len();
+
+        normalize_fragment(&mut frag);
+
+        // tfhd shrank by 4; trun untouched (has sizes); data_offset patched -4.
+        assert_eq!(frag.len(), len_before - 4);
+        let tfhd_type = frag.windows(4).position(|w| w == b"tfhd").expect("tfhd");
+        let tfhd_off = tfhd_type - 4;
+        let tfhd_size = read_u32_be(&frag[tfhd_off..tfhd_off + 4]);
+        assert_eq!(tfhd_size, 24);
+        let flags = read_u24_be(&frag[tfhd_off + 9..tfhd_off + 12]);
+        assert_eq!(flags, 0x20018, "sdi flag cleared");
+        // track_id preserved.
+        let track_id = read_u32_be(&frag[tfhd_off + 12..tfhd_off + 16]);
+        assert_eq!(track_id, 1);
+        let trun_type = frag.windows(4).position(|w| w == b"trun").expect("trun");
+        let trun_off = trun_type - 4;
+        let doff = read_i32_be(&frag[trun_off + 16..trun_off + 20]);
+        // The tfhd drain shifts mdat 4 bytes earlier; the patch reflects
+        // that: original 60 - 4 = 56.
+        assert_eq!(doff, 56);
+        // And the shifted target is consistent: mdat payload sits at
+        // (moof size after shrink) + 8 within the fragment.
+        let moof_size = read_u32_be(&frag[0..4]) as usize;
+        assert_eq!(frag[moof_size + 4..moof_size + 8], *b"mdat");
+    }
 }

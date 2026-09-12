@@ -75,6 +75,8 @@ pub struct AlbumDetailsCaptionMetadata<'a> {
     pub is_partial: bool,
     pub user_name: Option<&'a str>,
     pub user_id: i64,
+    /// Highest codec delivered in the archive (`alac`, `mp4a.40.2`, `ec-3`).
+    pub codec: Option<&'a str>,
 }
 
 /// Parsed metadata extracted from an album ZIP dump caption.
@@ -170,7 +172,14 @@ pub fn format_album_details_caption(meta: &AlbumDetailsCaptionMetadata<'_>) -> S
     if let Some(label) = meta.record_label.filter(|s| !s.is_empty()) {
         bullets.push(format!("• <b>Label:</b> {}", html_escape(label)));
     }
-    bullets.push("• <b>Quality:</b> Lossless · ALAC".to_string());
+    bullets.push(format!(
+        "• <b>Quality:</b> {}",
+        match meta.codec {
+            Some("ec-3") => "Dolby Atmos".to_owned(),
+            Some("mp4a.40.2") | Some("mp4a.40.5") => "AAC 256".to_owned(),
+            _ => "Lossless · ALAC".to_owned(),
+        }
+    ));
     if meta.is_partial {
         bullets.push("• ⚠️ <b>Note:</b> Partial archive".to_string());
     }
@@ -193,13 +202,24 @@ pub fn format_dump_caption(meta: &DumpCaptionMetadata<'_>) -> String {
     let seconds = format!("{:02}", meta.duration % 60);
     let track_number = meta.track_number.unwrap_or(1);
     let track_count = meta.track_count.unwrap_or(1);
+    let codec_label = codec_display(meta.codec);
+    let quality_line = match meta.codec {
+        Some("alac") | None => format!(
+            "{codec_label} · {}-bit · {:.1} kHz · {minutes}:{seconds}",
+            meta.bit_depth,
+            meta.sample_rate as f64 / 1000.0,
+        ),
+        Some("ec-3") => format!(
+            "{codec_label} · {:.1} kHz · {minutes}:{seconds}",
+            meta.sample_rate as f64 / 1000.0,
+        ),
+        Some(_) => format!("{codec_label} · 256 kbps · {minutes}:{seconds}"),
+    };
     let summary = format!(
-        "<b>{}</b> — {}<br/><i>{}</i> · <code>{track_number}/{track_count}</code><br/><code>ALAC · {}-bit · {:.1} kHz · {minutes}:{seconds}</code>",
+        "<b>{}</b> — {}<br/><i>{}</i> · <code>{track_number}/{track_count}</code><br/><code>{quality_line}</code>",
         html_escape(meta.title),
         html_escape(meta.artist),
         html_escape(meta.album),
-        meta.bit_depth,
-        meta.sample_rate as f64 / 1000.0,
     );
 
     // Machine payload: JSON with 2-space indentation, each line
@@ -428,6 +448,16 @@ fn extract_balanced_json(text: &str, required_key: &str) -> Option<String> {
     None
 }
 
+/// Compact codec label for captions: `ALAC`, `AAC`, `Dolby Atmos`.
+fn codec_display(codec: Option<&str>) -> &'static str {
+    match codec {
+        Some("alac") | None => "ALAC",
+        Some("ec-3") => "Dolby Atmos",
+        Some("mp4a.40.2") | Some("mp4a.40.5") => "AAC",
+        Some(_) => "Audio",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,6 +496,7 @@ mod tests {
             is_partial: false,
             user_name: Some("@sayeed69"),
             user_id: 123456,
+            codec: None,
         };
         let html = format_album_details_caption(&meta);
         assert!(html.contains(
@@ -503,6 +534,7 @@ mod tests {
             is_partial: true,
             user_name: Some("John Doe"),
             user_id: 78910,
+            codec: None,
         };
         let html = format_album_details_caption(&meta);
         assert!(html.contains("• <b>Tracks:</b> 15/17 tracks"));

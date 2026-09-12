@@ -81,6 +81,7 @@ impl OrchestratorDeps for RaceDeps {
         _storefront: &str,
         _signal: tokio_util::sync::CancellationToken,
         _temp_dir: Option<&std::path::Path>,
+        _codec_preference: engine::wrapper::CodecPreference,
     ) -> Result<engine::types::TrackRipResult, engine::ripper::RipError> {
         self.rip_calls.fetch_add(1, Ordering::SeqCst);
         // Hold until the test flips the gate or the safety deadline passes.
@@ -119,6 +120,7 @@ fn race_options() -> RipJobOptions {
         reply_to_message_id: Some(555),
         status_msg_id: 999,
         is_admin: true,
+        codec_preference: engine::wrapper::CodecPreference::HighestQuality,
     }
 }
 

@@ -80,13 +80,29 @@ pub fn sanitize_archive_filename(name: &str) -> String {
 
 /// Builds the base archive filename without the `.zip` extension.
 pub fn build_album_archive_base_name(artist: &str, album: &str, release_date: &str) -> String {
+    build_album_archive_base_name_with_codec(artist, album, release_date, "alac")
+}
+
+/// Same as [`build_album_archive_base_name`], labeled with the highest
+/// codec delivered in the archive (`alac`, `mp4a.40.2`, `ec-3`).
+pub fn build_album_archive_base_name_with_codec(
+    artist: &str,
+    album: &str,
+    release_date: &str,
+    codec: &str,
+) -> String {
     let year = release_date.chars().take(4).collect::<String>();
     let year_part = if year.len() == 4 && year.chars().all(|c| c.is_ascii_digit()) {
         format!(" ({year})")
     } else {
         String::new()
     };
-    sanitize_archive_filename(&format!("{artist} - {album}{year_part} [ALAC]"))
+    let label = match codec {
+        "ec-3" => "Atmos",
+        "mp4a.40.2" | "mp4a.40.5" => "AAC",
+        _ => "ALAC",
+    };
+    sanitize_archive_filename(&format!("{artist} - {album}{year_part} [{label}]"))
 }
 
 /// Deterministic identity of the resolved track set a ZIP was built from.
@@ -168,6 +184,28 @@ pub fn plan_zip_parts(
     cover_path: Option<PathBuf>,
     max_part_bytes: u64,
 ) -> Result<Vec<ZipPartPlan>, ZipError> {
+    plan_zip_parts_with_codec(
+        artist,
+        album,
+        release_date,
+        tracks,
+        cover_path,
+        max_part_bytes,
+        "alac",
+    )
+}
+
+/// Codec-aware [`plan_zip_parts`]; the label lands in the archive name.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_zip_parts_with_codec(
+    artist: &str,
+    album: &str,
+    release_date: &str,
+    tracks: &[ZipTrackEntry],
+    cover_path: Option<PathBuf>,
+    max_part_bytes: u64,
+    codec: &str,
+) -> Result<Vec<ZipPartPlan>, ZipError> {
     if tracks.is_empty() {
         return Err(ZipError::Empty);
     }
@@ -241,7 +279,7 @@ pub fn plan_zip_parts(
     }
 
     let total_parts = groups.len();
-    let base_name = build_album_archive_base_name(artist, album, release_date);
+    let base_name = build_album_archive_base_name_with_codec(artist, album, release_date, codec);
     Ok(groups
         .into_iter()
         .enumerate()

@@ -22,7 +22,7 @@ use crate::BotState;
 
 pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
     for alias in [
-        "alac", "rip", "batch", "dl", "download", "rerip", "cache", "dump", "zip",
+        "alac", "rip", "batch", "dl", "download", "rerip", "cache", "dump", "zip", "atmos",
     ] {
         let state = Arc::clone(&state);
         dp.on_message(filters::command(alias), move |msg| {
@@ -65,6 +65,7 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
 
     let command = input::command_name(msg.text().unwrap_or_default()).unwrap_or_default();
     let is_cache = command == "cache" || command == "dump";
+    let is_atmos = command == "atmos";
     let admin = state.auth.is_admin(sender);
 
     // Preflight gates .
@@ -190,6 +191,11 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
         // orchestration callers.
         status_msg_id: 0,
         is_admin: admin,
+        codec_preference: if is_atmos {
+            engine::wrapper::CodecPreference::Atmos
+        } else {
+            engine::wrapper::CodecPreference::HighestQuality
+        },
     };
 
     // Engine owns everything from here: resolution, cache-first, queue,

@@ -12,6 +12,7 @@ use engine::{
     ripper::{AlacTrackRipper, EngineRipperDeps, RipError, RipProgressCallback, RipperConfig},
     settings::BotSettings,
     types::{AlbumTracks, ArtistTracks, TrackKey, TrackRipResult},
+    wrapper::CodecPreference,
     Provider,
 };
 use tokio_util::sync::CancellationToken;
@@ -298,6 +299,7 @@ impl OrchestratorDeps for RipDeps {
         storefront: &str,
         signal: CancellationToken,
         output_dir: Option<&Path>,
+        codec_preference: CodecPreference,
     ) -> Result<TrackRipResult, RipError> {
         self.ripper
             .rip(
@@ -307,6 +309,7 @@ impl OrchestratorDeps for RipDeps {
                 storefront,
                 Some(signal),
                 output_dir,
+                codec_preference,
             )
             .await
     }

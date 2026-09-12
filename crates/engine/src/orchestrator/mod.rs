@@ -47,9 +47,10 @@ use crate::{
     ripper::RipProgressCallback,
     settings::BotSettings,
     types::{AlbumTracks, ArtistTracks, Provider, TargetKind, TrackKey, TrackRipResult},
+    wrapper::CodecPreference,
     zip::{
-        album_generation_hash, create_zip_archive, plan_zip_parts, sanitize_archive_filename,
-        ZipTrackEntry, TELEGRAM_SPLIT_THRESHOLD_BYTES,
+        album_generation_hash, create_zip_archive, plan_zip_parts_with_codec,
+        sanitize_archive_filename, ZipTrackEntry, TELEGRAM_SPLIT_THRESHOLD_BYTES,
     },
 };
 
@@ -168,9 +169,15 @@ struct JobContext {
     zip_record_label: Option<String>,
     zip_copyright: Option<String>,
     zip_generation_hash: Option<String>,
+    /// Highest-quality codec seen in this job's rips (`alac`, `mp4a.40.2`,
+    /// `ec-3`); drives the album-details quality bullet.
+    zip_codec: Arc<std::sync::Mutex<Option<String>>>,
     zip_artwork_url: Option<String>,
     zip_release_date: String,
     warnings: Vec<String>,
+    /// Set once when an Atmos-requested job delivers a non-Atmos rip; folded
+    /// into the summary warnings.
+    atmos_warning: Arc<std::sync::Mutex<Option<String>>>,
     cached_count: usize,
     is_multi_track: bool,
     max_collection_limit: u32,
@@ -1247,6 +1254,7 @@ impl RipOrchestrator {
                             is_partial: false,
                             user_name: options.user_name.as_deref(),
                             user_id: options.user_id,
+                            codec: None,
                         };
                         let details_caption = format_album_details_caption(&caption_meta);
                         let mut photo_delivered = false;
@@ -1285,6 +1293,7 @@ impl RipOrchestrator {
                             record_label: album_record_label.clone(),
                             copyright: album_copyright.clone(),
                             photo_delivered,
+                            codec: None,
                         });
                     }
                 }
@@ -1388,9 +1397,11 @@ impl RipOrchestrator {
             zip_record_label: album_record_label.clone(),
             zip_copyright: album_copyright.clone(),
             zip_generation_hash: zip_generation_hash.clone(),
+            zip_codec: Arc::new(std::sync::Mutex::new(None)),
             zip_artwork_url: album_artwork_url.clone().filter(|url| !url.is_empty()),
             zip_release_date: album_release_date.clone().unwrap_or_default(),
             warnings: warnings.clone(),
+            atmos_warning: Arc::new(std::sync::Mutex::new(None)),
             cached_count,
             is_multi_track,
             max_collection_limit,
@@ -1753,6 +1764,7 @@ async fn run_lane_one<D: OrchestratorDeps>(
                     &storefront,
                     queue_signal.clone(),
                     Some(&rip_job_dir),
+                    ctx.options.codec_preference,
                 )
                 .await
             {
@@ -1771,6 +1783,33 @@ async fn run_lane_one<D: OrchestratorDeps>(
                     // Hand the finished rip to lane 2 — FIFO behind this
                     // job's earlier items. Back-pressure (16 pending
                     // items) pauses ripping until uploads drain.
+                    if let Ok(mut codec) = ctx.zip_codec.lock() {
+                        // Keep the strongest codec seen across the album's
+                        // rips: ALAC (lossless) > Atmos ec-3 > lossy AAC.
+                        let rank = |c: &str| match c {
+                            "alac" => 3,
+                            "ec-3" => 2,
+                            _ => 1,
+                        };
+                        let better = match codec.as_deref() {
+                            None => true,
+                            Some(current) => rank(&rip_result.codec) > rank(current),
+                        };
+                        if better {
+                            *codec = Some(rip_result.codec.clone());
+                        }
+                    }
+                    if ctx.options.codec_preference == CodecPreference::Atmos
+                        && rip_result.codec != "ec-3"
+                    {
+                        let mut warnings = ctx.atmos_warning.lock().expect("atmos poisoned");
+                        if warnings.is_none() {
+                            *warnings = Some(
+                                "Dolby Atmos was not available for this track; delivered the highest available quality instead."
+                                    .to_owned(),
+                            );
+                        }
+                    }
                     let upload_item = PipelineRipResult {
                         track_id: item.track_id.clone(),
                         rip_result,
@@ -1946,7 +1985,14 @@ fn build_job_summary(
         max_collection_limit: ctx.max_collection_limit,
         is_cache_only: ctx.options.is_cache_only,
         is_group: ctx.options.is_group,
-        warnings: ctx.warnings.clone(),
+        warnings: ctx
+            .atmos_warning
+            .lock()
+            .expect("atmos poisoned")
+            .clone()
+            .into_iter()
+            .chain(ctx.warnings.clone())
+            .collect(),
         zip_delivery,
         first_delivered_msg_id: first_msg_id,
     }
@@ -2122,13 +2168,20 @@ async fn finalize_zip<D: OrchestratorDeps>(
     };
     let mut entries = entries;
     entries.sort_by(|a, b| a.archive_filename.cmp(&b.archive_filename));
-    let plan_result = plan_zip_parts(
+    let zip_codec = ctx
+        .zip_codec
+        .lock()
+        .expect("zip codec poisoned")
+        .clone()
+        .unwrap_or_else(|| "alac".to_owned());
+    let plan_result = plan_zip_parts_with_codec(
         &ctx.zip_artist,
         &ctx.zip_album,
         &ctx.zip_release_date,
         &entries,
         cover_path.clone(),
         TELEGRAM_SPLIT_THRESHOLD_BYTES,
+        &zip_codec,
     );
 
     // Before republishing complete parts, drop the previous rows so a
@@ -2413,6 +2466,7 @@ async fn finalize_zip<D: OrchestratorDeps>(
     }
     if ctx.zip_deliver && !options.is_cache_only && delivered_part_count > 0 {
         let release_year: String = ctx.zip_release_date.chars().take(4).collect();
+        let zip_codec = ctx.zip_codec.lock().expect("zip codec poisoned").clone();
         let caption_meta = AlbumDetailsCaptionMetadata {
             album: &ctx.zip_album,
             artist: &ctx.zip_artist,
@@ -2428,6 +2482,7 @@ async fn finalize_zip<D: OrchestratorDeps>(
             is_partial: !complete,
             user_name: options.user_name.as_deref(),
             user_id: options.user_id,
+            codec: zip_codec.as_deref(),
         };
         let details_caption = format_album_details_caption(&caption_meta);
         let mut photo_delivered = false;
@@ -2458,6 +2513,7 @@ async fn finalize_zip<D: OrchestratorDeps>(
             record_label: ctx.zip_record_label.clone(),
             copyright: ctx.zip_copyright.clone(),
             photo_delivered,
+            codec: ctx.zip_codec.lock().expect("zip codec poisoned").clone(),
         });
     }
     None
@@ -2893,6 +2949,7 @@ mod hardening_tests {
             reply_to_message_id: None,
             status_msg_id: 0,
             is_admin,
+            codec_preference: CodecPreference::HighestQuality,
         }
     }
 

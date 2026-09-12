@@ -15,6 +15,7 @@ use engine::{
     ripper::{AlacTrackRipper, RipError, RipProgressCallback, RipperConfig, RipperDeps},
     streaming::{AudioStreamSource, ByteStream, MirrorEndpoint, ProgressCallback},
     types::TrackMeta,
+    wrapper::CodecPreference,
 };
 use futures_util::stream;
 use tokio_util::sync::CancellationToken;
@@ -118,6 +119,7 @@ impl RipperDeps for FakeDeps {
         primary: Option<MirrorEndpoint>,
         _signal: Option<CancellationToken>,
         _on_progress: Option<ProgressCallback>,
+        _codec_preference: CodecPreference,
     ) -> Result<AudioStreamSource, RipError> {
         let n = self.connect_calls.fetch_add(1, Ordering::SeqCst);
         if n < self.connect_fails {
@@ -191,7 +193,15 @@ async fn happy_path_progress_and_result_mapping() {
     let ripper = AlacTrackRipper::new(config(dir.path(), 3, 1));
     let (cb, log) = record();
     let result = ripper
-        .rip(&deps, "42", Some(&cb), "us", None, None)
+        .rip(
+            &deps,
+            "42",
+            Some(&cb),
+            "us",
+            None,
+            None,
+            CodecPreference::HighestQuality,
+        )
         .await
         .unwrap();
 
@@ -249,7 +259,15 @@ async fn retry_succeeds_after_two_failures() {
     let ripper = AlacTrackRipper::new(config(dir.path(), 3, 1));
     let (cb, log) = record();
     let result = ripper
-        .rip(&deps, "42", Some(&cb), "us", None, None)
+        .rip(
+            &deps,
+            "42",
+            Some(&cb),
+            "us",
+            None,
+            None,
+            CodecPreference::HighestQuality,
+        )
         .await
         .unwrap();
     assert_eq!(result.title, "Title");
@@ -278,7 +296,15 @@ async fn exhaustion_rethrows_last_error() {
     deps.connect_fails = 10;
     let ripper = AlacTrackRipper::new(config(dir.path(), 2, 1));
     let error = ripper
-        .rip(&deps, "42", None, "us", None, None)
+        .rip(
+            &deps,
+            "42",
+            None,
+            "us",
+            None,
+            None,
+            CodecPreference::HighestQuality,
+        )
         .await
         .unwrap_err();
     assert_eq!(
@@ -316,8 +342,9 @@ async fn cancelled_message_bypasses_retries() {
             p: Option<MirrorEndpoint>,
             s: Option<CancellationToken>,
             o: Option<ProgressCallback>,
+            cp: engine::wrapper::CodecPreference,
         ) -> Result<AudioStreamSource, RipError> {
-            let _ = self.0.connect_stream(_t, p, s, o).await?;
+            let _ = self.0.connect_stream(_t, p, s, o, cp).await?;
             Err(RipError::Message("Download was cancelled".into()))
         }
         async fn fetch_lyrics(&self, t: &str, m: &engine::lyrics::LyricsMeta) -> Option<String> {
@@ -340,7 +367,15 @@ async fn cancelled_message_bypasses_retries() {
 
     let deps = CancelledDeps(FakeDeps::ok());
     let error = ripper
-        .rip(&deps, "42", Some(&cb), "us", None, None)
+        .rip(
+            &deps,
+            "42",
+            Some(&cb),
+            "us",
+            None,
+            None,
+            CodecPreference::HighestQuality,
+        )
         .await
         .unwrap_err();
     assert_eq!(error.to_string(), "Download was cancelled");
@@ -360,7 +395,15 @@ async fn cancellation_mid_rip_no_retry() {
     let token = CancellationToken::new();
     token.cancel();
     let error = ripper
-        .rip(&deps, "42", None, "us", Some(token), None)
+        .rip(
+            &deps,
+            "42",
+            None,
+            "us",
+            Some(token),
+            None,
+            CodecPreference::HighestQuality,
+        )
         .await
         .unwrap_err();
     assert_eq!(error.to_string(), "Download was cancelled");
@@ -374,7 +417,15 @@ async fn mirror_none_still_connects() {
     deps.mirror = None;
     let ripper = AlacTrackRipper::new(config(dir.path(), 3, 1));
     let result = ripper
-        .rip(&deps, "42", None, "us", None, None)
+        .rip(
+            &deps,
+            "42",
+            None,
+            "us",
+            None,
+            None,
+            CodecPreference::HighestQuality,
+        )
         .await
         .unwrap();
     assert_eq!(result.title, "Title");
@@ -388,7 +439,15 @@ async fn artwork_empty_vec_means_no_cover() {
     deps.artwork = Some(Vec::new());
     let ripper = AlacTrackRipper::new(config(dir.path(), 3, 1));
     ripper
-        .rip(&deps, "42", None, "us", None, None)
+        .rip(
+            &deps,
+            "42",
+            None,
+            "us",
+            None,
+            None,
+            CodecPreference::HighestQuality,
+        )
         .await
         .unwrap();
     // Tagged once — cover emptiness is handled inside tag_m4a.
@@ -414,6 +473,7 @@ async fn stalled_stream_is_retryable() {
             _p: Option<MirrorEndpoint>,
             _s: Option<CancellationToken>,
             _o: Option<ProgressCallback>,
+            _cp: engine::wrapper::CodecPreference,
         ) -> Result<AudioStreamSource, RipError> {
             self.0.connect_calls.fetch_add(1, Ordering::SeqCst);
             let pending: ByteStream = Box::pin(stream::pending());
@@ -451,7 +511,15 @@ async fn stalled_stream_is_retryable() {
     let ripper = AlacTrackRipper::new(config(dir.path(), 1, 1));
     tokio::time::pause();
     let error = ripper
-        .rip(&deps, "42", None, "us", None, None)
+        .rip(
+            &deps,
+            "42",
+            None,
+            "us",
+            None,
+            None,
+            CodecPreference::HighestQuality,
+        )
         .await
         .unwrap_err();
     assert!(error
@@ -475,7 +543,15 @@ async fn progress_totals_with_content_length() {
     let ripper = AlacTrackRipper::new(config(dir.path(), 3, 1));
     let (cb, log) = record();
     ripper
-        .rip(&deps, "42", Some(&cb), "us", None, None)
+        .rip(
+            &deps,
+            "42",
+            Some(&cb),
+            "us",
+            None,
+            None,
+            CodecPreference::HighestQuality,
+        )
         .await
         .unwrap();
     let log = log.lock().unwrap();
@@ -498,7 +574,15 @@ async fn short_body_is_rejected_before_tagging() {
     let ripper = AlacTrackRipper::new(config(dir.path(), 0, 1));
 
     let error = ripper
-        .rip(&deps, "42", None, "us", None, None)
+        .rip(
+            &deps,
+            "42",
+            None,
+            "us",
+            None,
+            None,
+            CodecPreference::HighestQuality,
+        )
         .await
         .unwrap_err();
 
@@ -514,7 +598,15 @@ async fn output_dir_override_used() {
     let deps = FakeDeps::ok();
     let ripper = AlacTrackRipper::new(config(base.path(), 3, 1));
     let result = ripper
-        .rip(&deps, "42", None, "us", None, Some(other.path()))
+        .rip(
+            &deps,
+            "42",
+            None,
+            "us",
+            None,
+            Some(other.path()),
+            CodecPreference::HighestQuality,
+        )
         .await
         .unwrap();
     assert!(result.file_path.starts_with(other.path().to_str().unwrap()));
@@ -530,7 +622,15 @@ async fn tag_failure_is_retryable_and_exhausts() {
     deps.tag_should_fail = true;
     let ripper = AlacTrackRipper::new(config(dir.path(), 2, 1));
     let error = ripper
-        .rip(&deps, "42", None, "us", None, None)
+        .rip(
+            &deps,
+            "42",
+            None,
+            "us",
+            None,
+            None,
+            CodecPreference::HighestQuality,
+        )
         .await
         .unwrap_err();
     assert_eq!(error.to_string(), "native media finalization failed: boom");
@@ -554,7 +654,15 @@ async fn progress_throttles_to_one_per_second() {
     let (cb, log) = record();
     tokio::time::pause();
     ripper
-        .rip(&deps, "42", Some(&cb), "us", None, None)
+        .rip(
+            &deps,
+            "42",
+            Some(&cb),
+            "us",
+            None,
+            None,
+            CodecPreference::HighestQuality,
+        )
         .await
         .unwrap();
     let log = log.lock().unwrap();

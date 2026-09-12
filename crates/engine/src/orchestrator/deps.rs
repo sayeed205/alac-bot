@@ -14,6 +14,7 @@ use crate::{
     ripper::{RipError, RipProgressCallback},
     settings::BotSettings,
     types::{AlbumTracks, ArtistTracks, Provider, TrackKey, TrackRipResult},
+    wrapper::CodecPreference,
 };
 
 /// `(uploaded_bytes, total_bytes)` for upload progress callbacks.
@@ -295,6 +296,7 @@ pub trait OrchestratorDeps: Send + Sync + 'static {
         storefront: &str,
         signal: CancellationToken,
         output_dir: Option<&Path>,
+        codec_preference: CodecPreference,
     ) -> impl Future<Output = Result<TrackRipResult, RipError>> + Send;
 
     // telegram sink

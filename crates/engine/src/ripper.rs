@@ -22,6 +22,7 @@ use crate::{
     },
     tagger,
     types::{TrackMeta, TrackRipResult},
+    wrapper::CodecPreference,
 };
 
 /// All rip failures reduce to plain user-facing messages.
@@ -92,6 +93,7 @@ pub trait RipperDeps: Send + Sync {
         primary: Option<MirrorEndpoint>,
         signal: Option<CancellationToken>,
         on_progress: Option<ProgressCallback>,
+        codec_preference: CodecPreference,
     ) -> impl Future<Output = Result<AudioStreamSource, RipError>> + Send;
     fn fetch_lyrics(
         &self,
@@ -123,6 +125,7 @@ impl AlacTrackRipper {
         &self.config
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn rip<D: RipperDeps>(
         &self,
         deps: &D,
@@ -131,6 +134,7 @@ impl AlacTrackRipper {
         storefront: &str,
         signal: Option<CancellationToken>,
         output_dir: Option<&Path>,
+        codec_preference: CodecPreference,
     ) -> Result<TrackRipResult, RipError> {
         let mut attempt: u32 = 0;
 
@@ -147,6 +151,7 @@ impl AlacTrackRipper {
                     storefront,
                     signal.as_ref(),
                     output_dir,
+                    codec_preference,
                 )
                 .await
             {
@@ -200,6 +205,7 @@ impl AlacTrackRipper {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn rip_once<D: RipperDeps>(
         &self,
         deps: &D,
@@ -208,6 +214,7 @@ impl AlacTrackRipper {
         storefront: &str,
         signal: Option<&CancellationToken>,
         output_dir: Option<&Path>,
+        codec_preference: CodecPreference,
     ) -> Result<TrackRipResult, RipError> {
         let rip_start = std::time::Instant::now();
 
@@ -289,7 +296,13 @@ impl AlacTrackRipper {
             .cloned()
             .map(|cb| Arc::new(move |status: &str| cb(status, None, None)) as Arc<_>);
         let mut stream = deps
-            .connect_stream(track_id, primary, signal.cloned(), stream_progress)
+            .connect_stream(
+                track_id,
+                primary,
+                signal.cloned(),
+                stream_progress,
+                codec_preference,
+            )
             .await?;
 
         debug!(
@@ -322,7 +335,10 @@ impl AlacTrackRipper {
             "stream_{safe_track_id}_{unix_ms}_{}.raw",
             unique_temp_suffix()
         ));
-        let final_path = track_dir.join(tagger::build_track_filename(&meta));
+        let final_path = track_dir.join(tagger::build_track_filename_with_codec(
+            &meta,
+            &stream.codec,
+        ));
 
         // Detached-into-the-loop prefetch: lyrics + artwork download while
         // the audio streams (polled in the same select! as the stream so
@@ -623,6 +639,7 @@ impl RipperDeps for EngineRipperDeps {
         primary: Option<MirrorEndpoint>,
         signal: Option<CancellationToken>,
         on_progress: Option<ProgressCallback>,
+        codec_preference: CodecPreference,
     ) -> Result<AudioStreamSource, RipError> {
         self.stream_transport
             .connect_audio_stream(crate::streaming::ConnectStreamOptions {
@@ -633,6 +650,7 @@ impl RipperDeps for EngineRipperDeps {
                 signal,
                 on_progress,
                 mirror_policy: Some(&self.mirror_policy),
+                codec_preference,
             })
             .await
             .map_err(RipError::from)
@@ -742,7 +760,7 @@ impl RipperDeps for EngineRipperDeps {
         };
         let cancellation = CancellationToken::new();
         self.media
-            .finalize_alac(raw_path, output_path, &tags, &cancellation)
+            .finalize_m4a(raw_path, output_path, &tags, &cancellation)
             .await
             .map(|_| ())
             .map_err(|error| RipError::Message(error.to_string()))

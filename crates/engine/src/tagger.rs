@@ -21,10 +21,21 @@ pub fn sanitize_filename(name: &str) -> String {
 
 /// Build the final output filename for a ripped track.
 pub fn build_track_filename(meta: &TrackMeta) -> String {
+    build_track_filename_with_codec(meta, "alac")
+}
+
+/// Same as [`build_track_filename`], labeled with the actually delivered
+/// codec (`alac`, `mp4a.40.2`, `ec-3`).
+pub fn build_track_filename_with_codec(meta: &TrackMeta, codec: &str) -> String {
     let number = meta.track_number.filter(|number| *number != 0).unwrap_or(1);
     let explicit = if meta.explicit { " [E]" } else { "" };
+    let label = match codec {
+        "ec-3" => "Atmos",
+        "mp4a.40.2" | "mp4a.40.5" => "AAC",
+        _ => "ALAC",
+    };
     let combined = format!(
-        "{number:02}. {} - {}{explicit} [ALAC]",
+        "{number:02}. {} - {}{explicit} [{label}]",
         meta.title, meta.artist
     );
     format!("{}.m4a", sanitize_filename(&combined))

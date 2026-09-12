@@ -399,6 +399,7 @@ async fn notify_job_completed(state: &BotState, job: &ActiveRipJob, summary: &Ri
                 is_partial: zip.is_partial,
                 user_name: job.user_name.as_deref(),
                 user_id: job.user_id,
+                codec: zip.codec.as_deref(),
             };
             let details_html =
                 engine::orchestrator::caption::format_album_details_caption(&caption_meta);

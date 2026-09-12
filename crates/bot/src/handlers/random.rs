@@ -684,6 +684,7 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery, action: Discov
                 // The shared dashboard is the only live status surface.
                 status_msg_id: 0,
                 is_admin: true,
+                codec_preference: engine::wrapper::CodecPreference::HighestQuality,
             };
             super::ensure_dashboard(&state, marked_chat, query.user_id, true, peer.clone()).await;
 

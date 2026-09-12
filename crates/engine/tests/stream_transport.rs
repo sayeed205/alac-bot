@@ -16,11 +16,16 @@ struct Route {
     sample_rate: Option<String>,
     content_length: Option<u64>,
     error: Option<StreamHttpError>,
+    /// Fail the first N calls to this route (per URL occurrence), then
+    /// succeed — used to exercise stream retry rounds.
+    fail_times: usize,
 }
 
 struct FakeHttp {
     routes: Mutex<Vec<(String, Route)>>,
     calls: Mutex<Vec<String>>,
+    /// How many times each URL has been fetched, keyed by the fetched URL.
+    url_counts: Mutex<std::collections::HashMap<String, usize>>,
 }
 
 impl FakeHttp {
@@ -28,6 +33,7 @@ impl FakeHttp {
         Self {
             routes: Mutex::new(Vec::new()),
             calls: Mutex::new(Vec::new()),
+            url_counts: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -45,12 +51,26 @@ impl StreamHttp for FakeHttp {
         _signal: Option<&CancellationToken>,
     ) -> Result<StreamHttpResponse, StreamHttpError> {
         self.calls.lock().unwrap().push(url.into());
+        let seen = self
+            .url_counts
+            .lock()
+            .unwrap()
+            .get(url)
+            .copied()
+            .unwrap_or(0);
+        self.url_counts
+            .lock()
+            .unwrap()
+            .insert(url.to_owned(), seen + 1);
         let routes = self.routes.lock().unwrap();
         let route = routes
             .iter()
             .find(|(needle, _)| url.contains(needle))
             .map(|(_, route)| route)
             .ok_or_else(|| StreamHttpError::Network("missing route".into()))?;
+        if route.fail_times > seen {
+            return Err(StreamHttpError::Network("transient".into()));
+        }
         if let Some(error) = &route.error {
             return Err(error.clone());
         }
@@ -78,6 +98,7 @@ fn ok() -> Route {
         sample_rate: None,
         content_length: None,
         error: None,
+        fail_times: 0,
     }
 }
 
@@ -118,6 +139,7 @@ async fn primary_success_uses_exact_url_and_hostname_and_records_success() {
             signal: None,
             on_progress: None,
             mirror_policy: Some(&policy),
+            codec_preference: engine::wrapper::CodecPreference::HighestQuality,
         })
         .await
         .unwrap();
@@ -147,6 +169,7 @@ async fn primary_success_carries_content_length() {
             signal: None,
             on_progress: None,
             mirror_policy: Some(&policy),
+            codec_preference: engine::wrapper::CodecPreference::HighestQuality,
         })
         .await
         .unwrap();
@@ -182,6 +205,7 @@ async fn primary_failure_falls_back_to_first_wrapper_and_reports_progress_once()
                 Arc::new(move |message| progress.lock().unwrap().push(message.into()))
             }),
             mirror_policy: Some(&policy),
+            codec_preference: engine::wrapper::CodecPreference::HighestQuality,
         })
         .await
         .unwrap();
@@ -197,6 +221,7 @@ async fn primary_failure_falls_back_to_first_wrapper_and_reports_progress_once()
 
 #[tokio::test]
 async fn both_wrapper_candidates_are_aggregated_in_order() {
+    std::env::set_var("ALAC_STREAM_RETRIES", "1");
     let http = FakeHttp::new();
     http.route(
         "wrapper/api",
@@ -222,6 +247,7 @@ async fn both_wrapper_candidates_are_aggregated_in_order() {
             signal: None,
             on_progress: None,
             mirror_policy: None,
+            codec_preference: engine::wrapper::CodecPreference::HighestQuality,
         })
         .await
         .unwrap_err();
@@ -230,6 +256,7 @@ async fn both_wrapper_candidates_are_aggregated_in_order() {
 
 #[tokio::test]
 async fn primary_failure_without_wrapper_has_exact_message() {
+    std::env::set_var("ALAC_STREAM_RETRIES", "1");
     let http = FakeHttp::new();
     http.route(
         "primary.example",
@@ -248,6 +275,7 @@ async fn primary_failure_without_wrapper_has_exact_message() {
             signal: None,
             on_progress: None,
             mirror_policy: None,
+            codec_preference: engine::wrapper::CodecPreference::HighestQuality,
         })
         .await
         .unwrap_err();
@@ -270,6 +298,7 @@ async fn cancelled_signal_is_aggregated_as_download_cancelled() {
             signal: Some(signal),
             on_progress: None,
             mirror_policy: None,
+            codec_preference: engine::wrapper::CodecPreference::HighestQuality,
         })
         .await
         .unwrap_err();
@@ -278,6 +307,7 @@ async fn cancelled_signal_is_aggregated_as_download_cancelled() {
 
 #[tokio::test]
 async fn primary_failure_records_unless_cancelled() {
+    std::env::set_var("ALAC_STREAM_RETRIES", "1");
     let http = FakeHttp::new();
     http.route(
         "primary",
@@ -297,6 +327,7 @@ async fn primary_failure_records_unless_cancelled() {
             signal: None,
             on_progress: None,
             mirror_policy: Some(&policy),
+            codec_preference: engine::wrapper::CodecPreference::HighestQuality,
         })
         .await;
     assert_eq!(&*policy.failures.lock().unwrap(), &["bad"]);
@@ -322,6 +353,7 @@ async fn primary_failure_records_unless_cancelled() {
             signal: Some(signal),
             on_progress: None,
             mirror_policy: Some(&policy),
+            codec_preference: engine::wrapper::CodecPreference::HighestQuality,
         })
         .await;
     assert!(policy.failures.lock().unwrap().is_empty());
@@ -417,3 +449,75 @@ async fn handshake_timeout_uses_integer_seconds() {
 }
 
 fn _source_is_send(_: AudioStreamSource) {}
+
+/// A mirror that recovers after one failed round is retried and succeeds
+/// on round 2; the retry backoff honors ALAC_STREAM_RETRY_BASE_MS.
+#[tokio::test(start_paused = true)]
+async fn transient_mirror_failure_is_retried_next_round() {
+    std::env::set_var("ALAC_STREAM_RETRIES", "2");
+    std::env::set_var("ALAC_STREAM_RETRY_BASE_MS", "2000");
+    let http = FakeHttp::new();
+    http.route(
+        "primary.example",
+        Route {
+            fail_times: 1,
+            ..ok()
+        },
+    );
+    let transport = StreamTransport::new(http);
+    let start = tokio::time::Instant::now();
+    let source = transport
+        .connect_audio_stream(ConnectStreamOptions {
+            track_id: "42".into(),
+            primary_mirror: Some(primary()),
+            wrapper_url: None,
+            wrapper_api_key: None,
+            signal: None,
+            on_progress: None,
+            mirror_policy: None,
+            codec_preference: engine::wrapper::CodecPreference::HighestQuality,
+        })
+        .await
+        .unwrap();
+    assert_eq!(source.source_name, "primary mirror (primary.example)");
+    // Round 2 waits one base delay before the second attempt.
+    assert_eq!(start.elapsed(), std::time::Duration::from_millis(2_000));
+}
+
+/// With retries exhausted the aggregated error lists each failing source
+/// once, regardless of how many rounds ran.
+#[tokio::test(start_paused = true)]
+async fn exhausted_retries_aggregate_each_source_once() {
+    std::env::set_var("ALAC_STREAM_RETRIES", "2");
+    std::env::set_var("ALAC_STREAM_RETRY_BASE_MS", "100");
+    let http = FakeHttp::new();
+    http.route(
+        "wrapper/api",
+        Route {
+            error: Some(StreamHttpError::Network("one".into())),
+            ..ok()
+        },
+    );
+    http.route(
+        "wrapper/stream",
+        Route {
+            error: Some(StreamHttpError::Network("two".into())),
+            ..ok()
+        },
+    );
+    let transport = StreamTransport::new(http);
+    let error = transport
+        .connect_audio_stream(ConnectStreamOptions {
+            track_id: "42".into(),
+            primary_mirror: None,
+            wrapper_url: Some("https://wrapper".into()),
+            wrapper_api_key: None,
+            signal: None,
+            on_progress: None,
+            mirror_policy: None,
+            codec_preference: engine::wrapper::CodecPreference::HighestQuality,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "Failed to stream audio from all sources. All streaming endpoints failed for track 42. Errors: Wrapper candidate (https://wrapper/api/stream/42) failed: one; Wrapper candidate (https://wrapper/stream/42) failed: two");
+}

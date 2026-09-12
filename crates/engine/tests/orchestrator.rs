@@ -496,6 +496,7 @@ impl OrchestratorDeps for FakeDeps {
         _storefront: &str,
         _signal: CancellationToken,
         output_dir: Option<&std::path::Path>,
+        _codec_preference: engine::wrapper::CodecPreference,
     ) -> impl Future<Output = Result<TrackRipResult, RipError>> + Send {
         self.state
             .lock()
@@ -598,6 +599,7 @@ fn options(items: Vec<ParsedTargetItem>, is_admin: bool) -> RipJobOptions {
         reply_to_message_id: Some(555),
         status_msg_id: 999,
         is_admin,
+        codec_preference: engine::wrapper::CodecPreference::HighestQuality,
     }
 }
 
@@ -1492,6 +1494,7 @@ fn zip_options(album: &str, cache_only: bool, explicit: bool, force: bool) -> Ri
         reply_to_message_id: Some(555),
         status_msg_id: 999,
         is_admin: true,
+        codec_preference: engine::wrapper::CodecPreference::HighestQuality,
     }
 }
 

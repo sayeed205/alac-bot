@@ -15,7 +15,7 @@ use symphonia::core::{
     audio::sample::Sample,
     codecs::audio::{
         well_known::{
-            CODEC_ID_AAC, CODEC_ID_ALAC, CODEC_ID_FLAC, CODEC_ID_MP3, CODEC_ID_OPUS,
+            CODEC_ID_AAC, CODEC_ID_ALAC, CODEC_ID_EAC3, CODEC_ID_FLAC, CODEC_ID_MP3, CODEC_ID_OPUS,
             CODEC_ID_VORBIS,
         },
         AudioCodecId, AudioDecoderOptions,
@@ -226,7 +226,12 @@ impl MediaProcessor {
         .map_err(|error| MediaError::Render(error.to_string()))?
     }
 
-    pub async fn finalize_alac(
+    /// Validate, tag, and commit an audio rip. The pipeline selects the
+    /// best available codec (ALAC, ec-3, AAC); finalize never gates on the
+    /// codec itself — it validates the file decodes when symphonia has a
+    /// decoder for it, and falls back to container-level validation for
+    /// codecs without one (e.g. Dolby Digital Plus ec-3).
+    pub async fn finalize_m4a(
         &self,
         source: &Path,
         destination: &Path,
@@ -241,7 +246,7 @@ impl MediaProcessor {
         let destination = destination.to_owned();
         let tags = tags.clone();
         let cancellation = cancellation.clone();
-        spawn_blocking(move || finalize_alac_sync(&source, &destination, &tags, &cancellation))
+        spawn_blocking(move || finalize_m4a_sync(&source, &destination, &tags, &cancellation))
             .await
             .map_err(|error| MediaError::Metadata(error.to_string()))?
     }
@@ -323,11 +328,7 @@ fn decode_sync(
     let sample_rate = params
         .sample_rate
         .ok_or_else(|| MediaError::Invalid("sample rate missing".into()))?;
-    let channels = params
-        .channels
-        .as_ref()
-        .ok_or_else(|| MediaError::Invalid("channel count missing".into()))?
-        .count() as u32;
+    let probed_channels = params.channels.as_ref().map(|layout| layout.count() as u32);
     let duration_secs = track
         .duration
         .and_then(|duration| {
@@ -343,13 +344,34 @@ fn decode_sync(
                 .unwrap_or(0.0)
         });
     let codec = codec_name(params.codec);
+    let track_id = track.id;
+    let decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(params, &AudioDecoderOptions::default());
+    // Channel layout is present for every codec with a decoder; ec-3's
+    // probe omits it. Require it only when sample data will be decoded.
+    let can_decode = decoder.is_ok();
+    let channels = if can_decode {
+        probed_channels.ok_or_else(|| MediaError::Invalid("channel count missing".into()))?
+    } else if collect_samples {
+        // The spectrogram needs decoded samples; without a decoder there
+        // is nothing to render.
+        return Err(MediaError::UnsupportedFormat);
+    } else {
+        probed_channels.unwrap_or(2)
+    };
     let bit_depth = params
         .bits_per_sample
         .or_else(|| alac_bit_depth(params.codec, params.extra_data.as_deref()));
-    let track_id = track.id;
-    let mut decoder = symphonia::default::get_codecs()
-        .make_audio_decoder(params, &AudioDecoderOptions::default())
-        .map_err(|error| MediaError::UnsupportedFormat.or_decode(error.to_string()))?;
+    // Symphonia probed the container but has no decoder for this codec
+    // (e.g. ec-3): report probe-level info and skip sample decoding. The
+    // spectrogram path (`collect_samples`) still needs a real decoder.
+    let mut decoder = match decoder {
+        Ok(decoder) => Some(decoder),
+        Err(_) if !collect_samples => None,
+        Err(error) => {
+            return Err(MediaError::UnsupportedFormat.or_decode(error.to_string()));
+        }
+    };
     let mut samples = vec![Vec::new(); channels as usize];
     while let Some(packet) = format
         .next_packet()
@@ -361,6 +383,11 @@ fn decode_sync(
         if packet.track_id != track_id {
             continue;
         }
+        let Some(decoder) = decoder.as_mut() else {
+            // No decoder: packet walking still validates the container
+            // structure end to end.
+            continue;
+        };
         let decoded = decoder.decode(&packet).map_err(|error| match error {
             SymphoniaError::DecodeError(message) => MediaError::Decode(message.to_string()),
             other => MediaError::Decode(other.to_string()),
@@ -403,6 +430,7 @@ fn codec_name(codec: AudioCodecId) -> String {
     match codec {
         CODEC_ID_ALAC => "alac",
         CODEC_ID_AAC => "aac",
+        CODEC_ID_EAC3 => "eac3",
         CODEC_ID_FLAC => "flac",
         CODEC_ID_MP3 => "mp3",
         CODEC_ID_OPUS => "opus",
@@ -800,7 +828,7 @@ fn draw_text_vertical(
     }
 }
 
-fn finalize_alac_sync(
+fn finalize_m4a_sync(
     source: &Path,
     destination: &Path,
     tags: &TrackTags,
@@ -809,10 +837,12 @@ fn finalize_alac_sync(
     if cancellation.is_cancelled() {
         return Err(MediaError::Cancelled);
     }
+    // Validate the rip before tagging. The codec gate was removed: the
+    // pipeline picks the highest quality variant the storefront offers
+    // (ALAC, ec-3, AAC) and finalize must not reject a valid rip. Codecs
+    // without a symphonia decoder (ec-3) are validated by container
+    // structure instead of sample decoding.
     let info = inspect_sync(source, cancellation)?;
-    if !info.codec.to_ascii_lowercase().contains("alac") {
-        return Err(MediaError::UnsupportedFormat);
-    }
 
     let part = destination.with_extension("m4a.part");
     if part.exists() {
@@ -888,8 +918,14 @@ fn finalize_alac_sync(
             return Err(MediaError::Cancelled);
         }
         let validated = inspect_sync(&part, cancellation)?;
-        if !validated.codec.to_ascii_lowercase().contains("alac") {
-            return Err(MediaError::Invalid("finalized file is not ALAC".into()));
+        if validated.codec != info.codec {
+            return Err(MediaError::Invalid(format!(
+                "finalized file codec changed: expected {}, found {}",
+                info.codec, validated.codec
+            )));
+        }
+        if validated.duration_secs == 0.0 {
+            return Err(MediaError::Invalid("finalized file has no duration".into()));
         }
         std::fs::rename(&part, destination)?;
         Ok(ValidatedM4a {
