@@ -1,0 +1,14 @@
+[package]
+name = "music"
+description = "Provider-neutral music domain types shared across application layers."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+diesel = ["dep:diesel"]
+
+[dependencies]
+diesel = { workspace = true, optional = true }
+serde.workspace = true

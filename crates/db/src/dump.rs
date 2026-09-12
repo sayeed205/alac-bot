@@ -11,6 +11,7 @@ use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use engine::limits::MAX_DOCUMENT_BYTES;
 use flate2::{write::GzEncoder, Compression};
+use music::Provider;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -66,7 +67,7 @@ struct UserArchive {
 #[derive(Debug, Serialize, Deserialize, Insertable)]
 #[diesel(table_name = tracks)]
 struct TrackArchive {
-    provider: engine::Provider,
+    provider: Provider,
     track_id: String,
     message_id: i32,
     file_id: String,
@@ -90,7 +91,7 @@ struct TrackArchive {
 struct RequestArchive {
     telegram_id: i64,
     chat_id: i64,
-    provider: engine::Provider,
+    provider: Provider,
     track_id: String,
     is_cache_hit: bool,
     duration_ms: Option<i32>,
@@ -102,7 +103,7 @@ struct RequestArchive {
 #[derive(Debug, Serialize, Deserialize, Insertable)]
 #[diesel(table_name = albums)]
 struct AlbumArchive {
-    provider: engine::Provider,
+    provider: Provider,
     album_id: String,
     part_index: i32,
     total_parts: i32,

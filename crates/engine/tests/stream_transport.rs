@@ -2,8 +2,8 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use engine::streaming::{
-    AudioStreamSource, ConnectStreamOptions, MirrorEndpoint, MirrorPolicy, StreamHttp,
-    StreamHttpError, StreamHttpResponse, StreamTransport,
+    ConnectStreamOptions, MirrorEndpoint, MirrorPolicy, StreamHttp, StreamHttpError,
+    StreamHttpResponse, StreamTransport,
 };
 use futures_util::stream;
 use tokio_util::sync::CancellationToken;
@@ -46,10 +46,11 @@ impl StreamHttp for FakeHttp {
     async fn fetch(
         &self,
         url: &str,
-        _api_key: Option<&str>,
-        _timeout: std::time::Duration,
-        _signal: Option<&CancellationToken>,
+        api_key: Option<&str>,
+        timeout: std::time::Duration,
+        signal: Option<&CancellationToken>,
     ) -> Result<StreamHttpResponse, StreamHttpError> {
+        let _ = (api_key, timeout, signal);
         self.calls.lock().unwrap().push(url.into());
         let seen = self
             .url_counts
@@ -221,7 +222,6 @@ async fn primary_failure_falls_back_to_first_wrapper_and_reports_progress_once()
 
 #[tokio::test]
 async fn both_wrapper_candidates_are_aggregated_in_order() {
-    std::env::set_var("ALAC_STREAM_RETRIES", "1");
     let http = FakeHttp::new();
     http.route(
         "wrapper/api",
@@ -237,7 +237,10 @@ async fn both_wrapper_candidates_are_aggregated_in_order() {
             ..ok()
         },
     );
-    let transport = StreamTransport::new(http);
+    let transport = StreamTransport::with_retry_config(
+        http,
+        engine::streaming::StreamRetryConfig::new(1, 2_000),
+    );
     let error = transport
         .connect_audio_stream(ConnectStreamOptions {
             track_id: "42".into(),
@@ -256,7 +259,6 @@ async fn both_wrapper_candidates_are_aggregated_in_order() {
 
 #[tokio::test]
 async fn primary_failure_without_wrapper_has_exact_message() {
-    std::env::set_var("ALAC_STREAM_RETRIES", "1");
     let http = FakeHttp::new();
     http.route(
         "primary.example",
@@ -265,7 +267,10 @@ async fn primary_failure_without_wrapper_has_exact_message() {
             ..ok()
         },
     );
-    let transport = StreamTransport::new(http);
+    let transport = StreamTransport::with_retry_config(
+        http,
+        engine::streaming::StreamRetryConfig::new(1, 2_000),
+    );
     let error = transport
         .connect_audio_stream(ConnectStreamOptions {
             track_id: "x".into(),
@@ -307,7 +312,6 @@ async fn cancelled_signal_is_aggregated_as_download_cancelled() {
 
 #[tokio::test]
 async fn primary_failure_records_unless_cancelled() {
-    std::env::set_var("ALAC_STREAM_RETRIES", "1");
     let http = FakeHttp::new();
     http.route(
         "primary",
@@ -317,7 +321,10 @@ async fn primary_failure_records_unless_cancelled() {
         },
     );
     let policy = FakePolicy::default();
-    let transport = StreamTransport::new(http);
+    let transport = StreamTransport::with_retry_config(
+        http,
+        engine::streaming::StreamRetryConfig::new(1, 2_000),
+    );
     let _ = transport
         .connect_audio_stream(ConnectStreamOptions {
             track_id: "x".into(),
@@ -343,7 +350,10 @@ async fn primary_failure_records_unless_cancelled() {
     let signal = CancellationToken::new();
     signal.cancel();
     let policy = FakePolicy::default();
-    let transport = StreamTransport::new(http);
+    let transport = StreamTransport::with_retry_config(
+        http,
+        engine::streaming::StreamRetryConfig::new(1, 2_000),
+    );
     let _ = transport
         .connect_audio_stream(ConnectStreamOptions {
             track_id: "x".into(),
@@ -448,14 +458,10 @@ async fn handshake_timeout_uses_integer_seconds() {
     );
 }
 
-fn _source_is_send(_: AudioStreamSource) {}
-
 /// A mirror that recovers after one failed round is retried and succeeds
-/// on round 2; the retry backoff honors ALAC_STREAM_RETRY_BASE_MS.
+/// on round 2; the retry backoff honors the configured base delay.
 #[tokio::test(start_paused = true)]
 async fn transient_mirror_failure_is_retried_next_round() {
-    std::env::set_var("ALAC_STREAM_RETRIES", "2");
-    std::env::set_var("ALAC_STREAM_RETRY_BASE_MS", "2000");
     let http = FakeHttp::new();
     http.route(
         "primary.example",
@@ -464,7 +470,10 @@ async fn transient_mirror_failure_is_retried_next_round() {
             ..ok()
         },
     );
-    let transport = StreamTransport::new(http);
+    let transport = StreamTransport::with_retry_config(
+        http,
+        engine::streaming::StreamRetryConfig::new(2, 2_000),
+    );
     let start = tokio::time::Instant::now();
     let source = transport
         .connect_audio_stream(ConnectStreamOptions {
@@ -488,8 +497,6 @@ async fn transient_mirror_failure_is_retried_next_round() {
 /// once, regardless of how many rounds ran.
 #[tokio::test(start_paused = true)]
 async fn exhausted_retries_aggregate_each_source_once() {
-    std::env::set_var("ALAC_STREAM_RETRIES", "2");
-    std::env::set_var("ALAC_STREAM_RETRY_BASE_MS", "100");
     let http = FakeHttp::new();
     http.route(
         "wrapper/api",
@@ -505,7 +512,8 @@ async fn exhausted_retries_aggregate_each_source_once() {
             ..ok()
         },
     );
-    let transport = StreamTransport::new(http);
+    let transport =
+        StreamTransport::with_retry_config(http, engine::streaming::StreamRetryConfig::new(2, 100));
     let error = transport
         .connect_audio_stream(ConnectStreamOptions {
             track_id: "42".into(),

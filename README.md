@@ -95,8 +95,8 @@ ALAC_WRAPPER_URL=http://127.0.0.1:12340
 
 ### 2. Start the Bot
 
-The canonical database migration runs automatically at startup for a fresh database. Existing databases are not upgraded
-or adopted; reset the database before starting the bot when changing schema generations.
+The canonical database migrations run automatically at startup, creating a fresh database and applying pending migrations
+to an existing supported database when applicable.
 
 ```bash
 # Development (debug build)
@@ -245,9 +245,8 @@ just test
 
 ## Database Management
 
-The canonical Diesel migration is embedded in the binary and runs automatically at startup (`db::migrate`) — no separate
-migration step is needed. This is a clean-slate schema: it intentionally provides no upgrade path from older database
-schemas.
+The canonical Diesel migrations are embedded in the binary and run automatically at startup (`db::migrate`), applying
+pending migrations when applicable — no separate migration step is needed.
 
 ---
 

@@ -502,6 +502,7 @@ dependencies = [
  "diesel_migrations",
  "engine",
  "flate2",
+ "music",
  "serde",
  "serde_json",
  "thiserror",
@@ -676,10 +677,10 @@ dependencies = [
  "cmac",
  "ctr",
  "cuid2",
- "diesel",
  "futures-util",
  "indexmap",
  "media",
+ "music",
  "rand 0.10.2",
  "regex",
  "reqwest",
@@ -1626,6 +1627,14 @@ name = "mp4ameta"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "453e991b2efe96c288cbc2d03a19e353504294559ecb6c03067fff5bd824616d"
+
+[[package]]
+name = "music"
+version = "0.1.0"
+dependencies = [
+ "diesel",
+ "serde",
+]
 
 [[package]]
 name = "nu-ansi-term"

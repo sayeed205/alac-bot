@@ -9,10 +9,8 @@ use db::{
 };
 use diesel::{sql_query, sql_types::Text};
 use diesel_async::RunQueryDsl;
-use engine::{
-    orchestrator::deps::{RequestLog, SaveTrackInput},
-    Codec, Provider, TrackKey,
-};
+use engine::orchestrator::deps::{RequestLog, SaveTrackInput};
+use music::{Codec, Provider, TrackKey};
 use serde_json::json;
 
 async fn client() -> DbPool {

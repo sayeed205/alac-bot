@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
-use engine::types::{Codec, Provider};
+use music::{Codec, Provider};
 
 use crate::schema::{albums, requests, settings, tracks, users};
 

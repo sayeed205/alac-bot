@@ -11,13 +11,13 @@ use diesel::{
 };
 use diesel_async::RunQueryDsl;
 use engine::orchestrator::deps::{CachedTrack, SaveTrackInput};
+use music::{Codec, Provider, TrackKey};
 
 use crate::{models::NewTrack, schema::tracks, DbError, DbPool, Track};
 
 fn cached_track(track: Track) -> CachedTrack {
     CachedTrack {
-        track_key: engine::TrackKey::new(track.provider, track.track_id.clone())
-            .with_codec(track.codec),
+        track_key: TrackKey::new(track.provider, track.track_id.clone()).with_codec(track.codec),
         codec: track.codec,
         message_id: i64::from(track.message_id),
         file_id: track.file_id,
@@ -41,9 +41,9 @@ impl TracksRepository {
 
     pub async fn find_cached_tracks(
         &self,
-        track_keys: &[engine::TrackKey],
-    ) -> Result<HashMap<engine::TrackKey, CachedTrack>, DbError> {
-        let unique_keys: Vec<engine::TrackKey> = track_keys
+        track_keys: &[TrackKey],
+    ) -> Result<HashMap<TrackKey, CachedTrack>, DbError> {
+        let unique_keys: Vec<TrackKey> = track_keys
             .iter()
             .filter(|key| !key.track_id.is_empty())
             .cloned()
@@ -80,7 +80,7 @@ impl TracksRepository {
             let cached = cached_track(track);
             map.insert(cached.track_key.clone(), cached.clone());
             let base_key =
-                engine::TrackKey::new(cached.track_key.provider, cached.track_key.track_id.clone());
+                TrackKey::new(cached.track_key.provider, cached.track_key.track_id.clone());
             map.entry(base_key).or_insert(cached);
         }
         Ok(map)
@@ -167,7 +167,7 @@ impl TracksRepository {
             .map_err(DbError::from)
     }
 
-    pub async fn delete_track(&self, track_key: &engine::TrackKey) -> Result<bool, DbError> {
+    pub async fn delete_track(&self, track_key: &TrackKey) -> Result<bool, DbError> {
         let mut connection = self.pool.connection().await?;
         let mut query = diesel::delete(tracks::table)
             .filter(tracks::provider.eq(track_key.provider))
@@ -199,23 +199,21 @@ impl TracksRepository {
             .await?)
     }
 
-    pub async fn get_all_track_ids(&self) -> Result<Vec<engine::TrackKey>, DbError> {
+    pub async fn get_all_track_ids(&self) -> Result<Vec<TrackKey>, DbError> {
         let mut connection = self.pool.connection().await?;
         let rows = tracks::table
             .select((tracks::provider, tracks::track_id, tracks::codec))
-            .load::<(engine::Provider, String, engine::Codec)>(&mut *connection)
+            .load::<(Provider, String, Codec)>(&mut *connection)
             .await?;
         Ok(rows
             .into_iter()
-            .map(|(provider, track_id, codec)| {
-                engine::TrackKey::new(provider, track_id).with_codec(codec)
-            })
+            .map(|(provider, track_id, codec)| TrackKey::new(provider, track_id).with_codec(codec))
             .collect())
     }
 
     pub async fn delete_tracks_not_in(
         &self,
-        valid_track_keys: &[engine::TrackKey],
+        valid_track_keys: &[TrackKey],
     ) -> Result<u64, DbError> {
         let mut connection = self.pool.connection().await?;
         let valid: HashSet<_> = valid_track_keys.iter().cloned().collect();
@@ -229,12 +227,12 @@ impl TracksRepository {
                         tracks::track_id,
                         tracks::codec,
                     ))
-                    .load::<(i32, engine::Provider, String, engine::Codec)>(&mut *transaction)
+                    .load::<(i32, Provider, String, Codec)>(&mut *transaction)
                     .await?;
                 let stale_ids: Vec<i32> = rows
                     .into_iter()
                     .filter_map(|(id, provider, track_id, codec)| {
-                        let key = engine::TrackKey::new(provider, track_id).with_codec(codec);
+                        let key = TrackKey::new(provider, track_id).with_codec(codec);
                         (!valid.contains(&key)).then_some(id)
                     })
                     .collect();

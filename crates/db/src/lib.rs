@@ -22,12 +22,10 @@ mod stats;
 pub use albums::AlbumsRepository;
 pub use auth::{Auth, AuthedPeer};
 pub use dump::{DbDumpService, DumpStats, RestoreStats};
-pub use engine::{
-    orchestrator::deps::{CachedTrack, RequestLog, SaveTrackInput},
-    Provider, TrackKey,
-};
+pub use engine::orchestrator::deps::{CachedTrack, RequestLog, SaveTrackInput};
 pub use migrations::migrate;
 pub use models::{Album, NewAlbum, Request, SettingsRow, Track, User};
+pub use music::{Provider, TrackKey};
 pub use requests::RequestLogRepository;
 pub use settings::SettingsStore;
 pub use stats::{AlacStats, StatsRepository, TopTrackStat};

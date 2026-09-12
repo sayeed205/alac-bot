@@ -81,6 +81,25 @@ impl fmt::Debug for AudioStreamSource {
 
 pub type ProgressCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
+#[derive(Clone, Copy, Debug)]
+pub struct StreamRetryConfig {
+    rounds: u32,
+    base_delay_ms: u64,
+}
+
+impl StreamRetryConfig {
+    pub const fn new(rounds: u32, base_delay_ms: u64) -> Self {
+        Self {
+            rounds,
+            base_delay_ms,
+        }
+    }
+
+    fn from_env() -> Self {
+        Self::new(stream_retry_rounds(), stream_retry_base_delay())
+    }
+}
+
 pub struct ConnectStreamOptions<'a> {
     pub track_id: String,
     pub primary_mirror: Option<MirrorEndpoint>,
@@ -96,6 +115,7 @@ pub struct ConnectStreamOptions<'a> {
 pub struct StreamTransport<H: StreamHttp> {
     http: H,
     default_timeout: Duration,
+    retry_config: Option<StreamRetryConfig>,
 }
 
 impl<H: StreamHttp> StreamTransport<H> {
@@ -104,9 +124,25 @@ impl<H: StreamHttp> StreamTransport<H> {
     }
 
     pub fn with_timeout(http: H, default_timeout: Duration) -> Self {
+        Self::with_timeout_and_retry_config(http, default_timeout, None)
+    }
+
+    /// Construct a transport with explicit retry settings, primarily for
+    /// callers that need deterministic retry behavior such as integration
+    /// tests. The default transport behavior continues to read the environment.
+    pub fn with_retry_config(http: H, retry_config: StreamRetryConfig) -> Self {
+        Self::with_timeout_and_retry_config(http, Duration::from_secs(15), Some(retry_config))
+    }
+
+    fn with_timeout_and_retry_config(
+        http: H,
+        default_timeout: Duration,
+        retry_config: Option<StreamRetryConfig>,
+    ) -> Self {
         Self {
             http,
             default_timeout,
+            retry_config,
         }
     }
 
@@ -186,8 +222,11 @@ impl<H: StreamHttp> StreamTransport<H> {
         &self,
         options: ConnectStreamOptions<'_>,
     ) -> Result<AudioStreamSource, StreamError> {
-        let rounds = stream_retry_rounds();
-        let base_delay = stream_retry_base_delay();
+        let retry_config = self
+            .retry_config
+            .unwrap_or_else(StreamRetryConfig::from_env);
+        let rounds = retry_config.rounds;
+        let base_delay = retry_config.base_delay_ms;
         let mut all_errors: Vec<String> = Vec::new();
 
         for round in 0..rounds {

@@ -3,12 +3,13 @@ use diesel::{
     sql_types::{BigInt, Double, Text},
 };
 use diesel_async::RunQueryDsl;
+use music::{Provider, TrackKey};
 
 use crate::{DbError, DbPool};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopTrackStat {
-    pub track_key: engine::TrackKey,
+    pub track_key: TrackKey,
     pub request_count: i64,
 }
 
@@ -44,7 +45,7 @@ struct AggregateRow {
 #[derive(diesel::QueryableByName)]
 struct TopTrackRow {
     #[diesel(sql_type = diesel::sql_types::VarChar)]
-    provider: engine::Provider,
+    provider: Provider,
     #[diesel(sql_type = Text)]
     track_id: String,
     #[diesel(sql_type = BigInt)]
@@ -90,7 +91,7 @@ impl StatsRepository {
             top_tracks: top_rows
                 .into_iter()
                 .map(|row| TopTrackStat {
-                    track_key: engine::TrackKey::new(row.provider, row.track_id),
+                    track_key: TrackKey::new(row.provider, row.track_id),
                     request_count: row.request_count,
                 })
                 .collect(),

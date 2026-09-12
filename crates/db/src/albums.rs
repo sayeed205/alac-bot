@@ -1,6 +1,6 @@
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
-use engine::{Codec, Provider};
+use music::{Codec, Provider};
 
 use crate::{
     models::{Album, NewAlbum},

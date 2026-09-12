@@ -13,5 +13,5 @@ pub use mirror_policy::{
 };
 pub use stream_transport::{
     is_non_retryable_error, AudioStreamSource, ConnectStreamOptions, FetchEndpointOptions,
-    ProgressCallback, StreamError, StreamTransport,
+    ProgressCallback, StreamError, StreamRetryConfig, StreamTransport,
 };
