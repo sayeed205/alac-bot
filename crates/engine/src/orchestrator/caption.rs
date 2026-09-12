@@ -171,7 +171,7 @@ pub fn format_album_details_caption(meta: &AlbumDetailsCaptionMetadata<'_>) -> S
         "• <b>Quality:</b> {}",
         match meta.codec {
             Some("ec-3") => "Dolby Atmos".to_owned(),
-            Some("mp4a.40.2") | Some("mp4a.40.5") => "AAC 256".to_owned(),
+            Some("aac") | Some("mp4a.40.2") | Some("mp4a.40.5") => "AAC 256".to_owned(),
             _ => "Lossless · ALAC".to_owned(),
         }
     ));
@@ -470,7 +470,7 @@ fn codec_display(codec: Option<&str>) -> &'static str {
     match codec {
         Some("alac") | None => "ALAC",
         Some("ec-3") => "Dolby Atmos",
-        Some("mp4a.40.2") | Some("mp4a.40.5") => "AAC",
+        Some("aac") | Some("mp4a.40.2") | Some("mp4a.40.5") => "AAC",
         Some(_) => "Audio",
     }
 }

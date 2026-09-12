@@ -1,7 +1,7 @@
 //! Rip orchestrator for the live `/alac` command contract.
 //!
-//! Owns job bookkeeping, resolves parsed items to tracks, serves the cache
-//! fast-path, and runs two concurrent lanes: lane 1 rips and tags (one job
+//! Owns job bookkeeping, resolves parsed items to tracks, feeds cache hits and
+//! misses through one ordered pipeline, and runs two concurrent lanes: lane 1 rips and tags (one job
 //! at a time, through the sequential rip queue) while lane 2 performs every
 //! Telegram upload/ZIP/delivery item from all jobs on a single global
 //! dispatcher — so downloads never wait on uploads and vice versa.
@@ -23,7 +23,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use music::CodecPreference;
+use music::Rendition;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -33,7 +33,7 @@ use crate::{
             html_escape, AlbumDetailsCaptionMetadata, DumpCaptionMetadata, DumpZipCaptionMetadata,
         },
         deps::{
-            AlbumUpload, ArtworkProvider, CachedAlbum, CollectionResolver, DumpUpload,
+            AlbumUpload, ArtworkProvider, CachedAlbum, CachedTrack, CollectionResolver, DumpUpload,
             OrchestratorDeps, ProviderComposition, ProviderPresentation, RequestLog,
             SaveTrackInput, TrackAcquisition, UploadProgressCallback,
         },
@@ -120,12 +120,15 @@ struct ResolvedTrackItem {
 }
 
 /// One item moving through the rip work feed.
+#[derive(Clone)]
 struct PipelineItem {
     track_id: String,
     storefront: Option<String>,
     meta_title: Option<String>,
     meta_artist: Option<String>,
     is_streamable: Option<bool>,
+    rendition: Rendition,
+    cached: Option<CachedTrack>,
 }
 
 /// One finished rip awaiting its upload.
@@ -133,6 +136,7 @@ struct PipelineRipResult {
     track_id: String,
     rip_result: TrackRipResult,
     start_time_ms: u64,
+    rendition: Rendition,
 }
 
 fn stream_display_label(status: &str) -> Option<&str> {
@@ -142,17 +146,15 @@ fn stream_display_label(status: &str) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
-/// A cached track queued for zip staging: lane 1 downloads it from the
-/// dump channel into the zip workspace while the rip loop runs.
-#[derive(Debug, Clone)]
-struct StageItem {
-    /// Resolved track, kept so a staging failure can re-rip it.
-    item: ResolvedTrackItem,
-    message_id: i64,
-    /// Caption label (title - artist, falling back to the resolved metadata).
-    label: String,
-    /// Precomputed `"{title} - {artist} [{id}].m4a"` archive filename.
-    archive_filename: String,
+/// Independent archive state for one requested rendition. Keeping the
+/// directories and source lists separate is important: a sparse Atmos
+/// archive must never contaminate the primary archive.
+struct ZipState {
+    rendition: Rendition,
+    dir: PathBuf,
+    sources: Arc<Mutex<Vec<ZipTrackEntry>>>,
+    codec: Arc<Mutex<Option<String>>>,
+    generation_hash: Option<String>,
 }
 
 /// Everything the two lanes need about one job, shared by `Arc` into the
@@ -161,8 +163,8 @@ struct JobContext {
     options: RipJobOptions,
     zip_build: bool,
     zip_deliver: bool,
-    zip_dir: Option<PathBuf>,
-    zip_sources: Arc<Mutex<Vec<ZipTrackEntry>>>,
+    zip_states: Vec<Arc<ZipState>>,
+    zip_reuse: HashMap<Rendition, Vec<CachedAlbum>>,
     zip_album: String,
     zip_artist: String,
     zip_album_id: String,
@@ -170,17 +172,12 @@ struct JobContext {
     zip_genre: Option<String>,
     zip_record_label: Option<String>,
     zip_copyright: Option<String>,
-    zip_generation_hash: Option<String>,
-    /// Highest-quality codec seen in this job's rips (`alac`, `mp4a.40.2`,
-    /// `ec-3`); drives the album-details quality bullet.
-    zip_codec: Arc<std::sync::Mutex<Option<String>>>,
     zip_artwork_url: Option<String>,
     zip_release_date: String,
     warnings: Vec<String>,
     /// Set once when an Atmos-requested job delivers a non-Atmos rip; folded
     /// into the summary warnings.
     atmos_warning: Arc<std::sync::Mutex<Option<String>>>,
-    cached_count: usize,
     is_multi_track: bool,
     max_collection_limit: u32,
     capped_count: usize,
@@ -189,6 +186,43 @@ struct JobContext {
     failed_tracks: Arc<Mutex<Vec<FailedTrack>>>,
     texts: Arc<PipelineTexts>,
     first_delivered_msg_id: Arc<Mutex<Option<i32>>>,
+    zip_delivery_infos: Arc<Mutex<Vec<ZipDeliveryInfo>>>,
+}
+
+impl JobContext {
+    fn zip_state(&self, rendition: Rendition) -> Option<&Arc<ZipState>> {
+        self.zip_states
+            .iter()
+            .find(|state| state.rendition == rendition)
+    }
+}
+
+/// Record the strongest codec that actually contributed a source to an
+/// archive.  In particular, an AAC cache hit must never leave the state at
+/// its historical ALAC default: the resulting filename, caption, and album
+/// row all derive from this value.
+fn seed_zip_codec(state: &ZipState, codec: Codec) {
+    let rank = |codec: Codec| match codec {
+        Codec::Alac => 3,
+        Codec::Ec3 => 2,
+        Codec::Aac => 1,
+        Codec::Flac => 0,
+    };
+    let mut current = state.codec.lock().expect("zip codec poisoned");
+    if current
+        .as_deref()
+        .and_then(|value| value.parse::<Codec>().ok())
+        .is_none_or(|existing| rank(codec) > rank(existing))
+    {
+        *current = Some(codec.as_str().to_owned());
+    }
+}
+
+fn codec_allowed_for_rendition(rendition: Rendition, codec: Codec) -> bool {
+    match rendition {
+        Rendition::Primary => matches!(codec, Codec::Alac | Codec::Aac),
+        Rendition::Atmos => codec == Codec::Ec3,
+    }
 }
 
 /// Job state shared by the orchestrator and both lanes (mutated by
@@ -913,16 +947,29 @@ impl RipOrchestrator {
             let ids: Vec<&str> = tracks_to_process.iter().map(|t| t.id.as_str()).collect();
             album_generation_hash(options.provider.as_str(), &options.parsed_items[0].id, &ids)
         });
-        let zip_dir = if zip_build {
-            let dir = std::env::temp_dir().join(format!("zip_job_{}", cuid2::create_id()));
-            tokio::fs::create_dir_all(&dir).await.map_err(|error| {
-                OrchestratorError::Message(format!("create ZIP workspace: {error}"))
-            })?;
-            Some(dir)
-        } else {
-            None
-        };
-        let zip_sources = Arc::new(Mutex::new(Vec::<ZipTrackEntry>::new()));
+        let mut zip_states = Vec::new();
+        if zip_build {
+            for rendition in options.rendition_policy.renditions() {
+                let dir = std::env::temp_dir().join(format!(
+                    "zip_job_{}_{}",
+                    cuid2::create_id(),
+                    match rendition {
+                        Rendition::Primary => "primary",
+                        Rendition::Atmos => "atmos",
+                    }
+                ));
+                tokio::fs::create_dir_all(&dir).await.map_err(|error| {
+                    OrchestratorError::Message(format!("create ZIP workspace: {error}"))
+                })?;
+                zip_states.push(Arc::new(ZipState {
+                    rendition: *rendition,
+                    dir,
+                    sources: Arc::new(Mutex::new(Vec::new())),
+                    codec: Arc::new(Mutex::new(None)),
+                    generation_hash: zip_generation_hash.clone(),
+                }));
+            }
+        }
 
         // Cache lookup; a DB failure fails the whole job.
         self.set_phase(&shared, JobPhase::CheckingCache);
@@ -937,10 +984,19 @@ impl RipOrchestrator {
             Some(&check_label),
             None,
         );
-        let target_codec = Codec::Alac;
         let requested_ids: Vec<TrackKey> = tracks_to_process
             .iter()
-            .map(|t| TrackKey::new(options.provider, t.id.clone()).with_codec(target_codec))
+            .flat_map(|track| {
+                options
+                    .rendition_policy
+                    .renditions()
+                    .iter()
+                    .flat_map(move |rendition| {
+                        rendition.accepted_cache_codecs().iter().map(move |codec| {
+                            TrackKey::new(options.provider, track.id.clone()).with_codec(*codec)
+                        })
+                    })
+            })
             .collect();
         let mut existing_tracks_map = deps
             .find_cached_tracks(&requested_ids)
@@ -953,12 +1009,22 @@ impl RipOrchestrator {
         if options.is_force && options.is_admin {
             let mut old_message_ids: Vec<i64> = Vec::new();
             for item in &tracks_to_process {
-                let lookup_key =
-                    TrackKey::new(options.provider, item.id.clone()).with_codec(target_codec);
-                if let Some(cached) = existing_tracks_map.remove(&lookup_key) {
-                    old_message_ids.push(cached.message_id);
-                    // Per-item delete; errors are swallowed.
-                    let _ = deps.delete_track(&lookup_key).await;
+                for rendition in options.rendition_policy.renditions() {
+                    for codec in rendition.accepted_cache_codecs() {
+                        let lookup_key =
+                            TrackKey::new(options.provider, item.id.clone()).with_codec(*codec);
+                        if let Some(cached) = existing_tracks_map.remove(&lookup_key) {
+                            old_message_ids.push(cached.message_id);
+                            let _ = deps.delete_track(&lookup_key).await;
+                        }
+                    }
+                }
+            }
+            if let Some(album_id) = options.parsed_items.first().map(|item| item.id.as_str()) {
+                for codec in [Codec::Alac, Codec::Aac, Codec::Ec3] {
+                    let _ = deps
+                        .delete_albums(options.provider, album_id, Some(codec))
+                        .await;
                 }
             }
             if !old_message_ids.is_empty() {
@@ -971,56 +1037,50 @@ impl RipOrchestrator {
             }
         }
 
-        // Pre-queue cache handling.
-        let mut uncached_items: Vec<ResolvedTrackItem> = Vec::new();
-        let mut cached_count = 0usize;
+        // Expand the request into track-major units. Cached units stay in the
+        // same ordered feed as fresh units; this prevents a cached Atmos copy
+        // from overtaking an uncached primary rendition.
+        let mut pipeline_items: Vec<PipelineItem> = Vec::new();
+        let cached_count = 0usize;
         let is_multi_track = tracks_to_process.len() > 1;
-        let mut first_delivered_msg_id: Option<i32> = None;
-        // Cached tracks queued for lane-1 staging (zip-build jobs whose
-        // archive isn't already cached). Downloaded concurrently with the
-        // rip loop, feeding the rebuild.
-        let mut stage_items: Vec<StageItem> = Vec::new();
+        let first_delivered_msg_id: Option<i32> = None;
 
-        // ZIP reuse precondition. Cached parts recorded under the same
-        // generation hash can serve this job directly — but only when every
-        // track is a cache hit (otherwise the rebuild path needs staged
-        // sources anyway) and the user is not forcing a re-rip. When set,
-        // the per-track ZIP staging downloads below are skipped: they exist
-        // only to feed the rebuild.
-        let mut zip_reuse: Option<Vec<CachedAlbum>> = None;
+        // A complete archive can be reused independently for each codec. The
+        // Atmos archive is allowed to be sparse, so a non-empty valid archive
+        // is sufficient to reuse it.
+        let mut zip_reuse: HashMap<Rendition, Vec<CachedAlbum>> = HashMap::new();
         if let Some(hash) = &zip_generation_hash {
-            if !options.is_force && existing_tracks_map.len() == tracks_to_process.len() {
-                match deps
-                    .find_albums(
-                        options.provider,
-                        &options.parsed_items[0].id,
-                        Some(target_codec),
-                    )
-                    .await
-                {
-                    Ok(rows) => {
-                        let complete_set = !rows.is_empty()
-                            && rows.iter().all(|row| row.generation_hash == *hash)
-                            && {
-                                let total = rows[0].total_parts.max(1) as usize;
-                                rows.len() == total
-                                    && (1..=total)
+            if !options.is_force {
+                for rendition in options.rendition_policy.renditions() {
+                    let codecs: &[Codec] = match rendition {
+                        Rendition::Primary => &[Codec::Alac, Codec::Aac],
+                        Rendition::Atmos => &[Codec::Ec3],
+                    };
+                    for codec in codecs {
+                        match deps
+                            .find_albums(
+                                options.provider,
+                                &options.parsed_items[0].id,
+                                Some(*codec),
+                            )
+                            .await
+                        {
+                            Ok(rows)
+                                if !rows.is_empty()
+                                    && rows.iter().all(|row| row.generation_hash == *hash)
+                                    && rows.len() == rows[0].total_parts.max(1) as usize
+                                    && (1..=rows.len())
                                         .zip(&rows)
-                                        .all(|(expected, row)| row.part_index as usize == expected)
-                            };
-                        if complete_set {
-                            tracing::info!(
-                                album_id = %options.parsed_items[0].id,
-                                parts = rows.len(),
-                                "Reusing cached album ZIP parts"
-                            );
-                            zip_reuse = Some(rows);
+                                        .all(|(n, row)| row.part_index as usize == n) =>
+                            {
+                                zip_reuse.insert(*rendition, rows);
+                                break;
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                tracing::warn!(%error, "album ZIP cache lookup failed; rebuilding")
+                            }
                         }
-                    }
-                    Err(error) => {
-                        // Reuse is an optimization; treat lookup failure as
-                        // a rebuild and keep going.
-                        tracing::warn!(%error, "album ZIP cache lookup failed; rebuilding");
                     }
                 }
             }
@@ -1032,166 +1092,45 @@ impl RipOrchestrator {
                     "Download was cancelled".to_string(),
                 ));
             }
-
-            let lookup_key =
-                TrackKey::new(options.provider, item.id.clone()).with_codec(target_codec);
-            let Some(cached) = existing_tracks_map.get(&lookup_key) else {
-                uncached_items.push(item.clone());
-                continue;
-            };
-
-            // Zip-build jobs (single album, >1 track) stage cached tracks
-            // into the zip workspace — in lane 1, alongside the rips. If
-            // staging later finds the dump message undownloadable the track
-            // is re-ripped so the archive still has a chance to complete.
-            if zip_build && zip_reuse.is_none() {
-                let filename = format!(
-                    "{} - {} [{}].m4a",
-                    sanitize_archive_filename(&cached.title),
-                    sanitize_archive_filename(&cached.artist),
-                    item.id
-                );
-                let label = match (&cached.title, &cached.artist) {
-                    (t, a) if !t.is_empty() && !a.is_empty() => format!("{t} - {a}"),
-                    (t, _) if !t.is_empty() => t.clone(),
-                    _ => match (&item.title, &item.artist) {
-                        (Some(t), Some(a)) if !t.is_empty() && !a.is_empty() => {
-                            format!("{t} - {a}")
-                        }
-                        (Some(t), _) if !t.is_empty() => t.clone(),
-                        _ => format!("Track {}", item.id),
-                    },
-                };
-                stage_items.push(StageItem {
-                    item: item.clone(),
-                    message_id: cached.message_id,
-                    label,
-                    archive_filename: filename,
+            for rendition in options.rendition_policy.renditions() {
+                let cached = rendition.accepted_cache_codecs().iter().find_map(|codec| {
+                    existing_tracks_map
+                        .get(&TrackKey::new(options.provider, item.id.clone()).with_codec(*codec))
+                        .cloned()
+                });
+                pipeline_items.push(PipelineItem {
+                    track_id: item.id.clone(),
+                    storefront: item.storefront.clone(),
+                    meta_title: item.title.clone(),
+                    meta_artist: item.artist.clone(),
+                    is_streamable: item.is_streamable,
+                    rendition: *rendition,
+                    cached,
                 });
             }
-
-            if options.is_cache_only {
-                cached_count += 1;
-                shared.lock().expect("job poisoned").job.cached_count = cached_count;
-                tracing::info!(track_id = %item.id, "Track already cached in dump channel");
-                self.bus
-                    .emit_progress(&shared, Some("Recognized cached tracks..."), None, None);
-            } else if zip_deliver {
-                // ZIP-delivery jobs deliver the archive, not the individual
-                // track files. The cache row is still validated by the lane-1
-                // staging download; only the request log remains.
-                let outcome = deps
-                    .log_request(RequestLog {
-                        telegram_id: options.user_id,
-                        chat_id: options.chat_id,
-                        track_key: TrackKey::new(options.provider, item.id.clone()),
-                        is_cache_hit: true,
-                        duration_ms: Some(0),
-                        status: "completed".to_string(),
-                        error_reason: None,
-                    })
-                    .await
-                    .map_err(|e| e.to_string());
-                match outcome {
-                    Ok(()) => {
-                        tracing::info!(track_id = %item.id, time = "0ms", "Cache hit: staged for ZIP");
-                    }
-                    Err(err) => {
-                        // Logging alone cannot prove the dump row stale (the
-                        // staging download already re-validates it), so only
-                        // warn and keep the cache hit.
-                        tracing::warn!(
-                            track_id = %item.id,
-                            error = %err,
-                            "Failed to log cached track request for ZIP job"
-                        );
-                    }
-                }
-                cached_count += 1;
-                shared.lock().expect("job poisoned").job.cached_count = cached_count;
-                self.bus
-                    .emit_progress(&shared, Some("Staged cached tracks..."), None, None);
-            } else {
-                let reply_to = (options.delivery_chat_id == options.chat_id)
-                    .then_some(options.reply_to_message_id)
-                    .flatten();
-                let outcome: Result<i32, String> = async {
-                    let sent_id = deps
-                        .sink()
-                        .send_dump_copy(
-                            options.delivery_chat_id,
-                            cached.message_id,
-                            reply_to,
-                            is_multi_track,
-                        )
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    deps.log_request(RequestLog {
-                        telegram_id: options.user_id,
-                        chat_id: options.chat_id,
-                        track_key: TrackKey::new(options.provider, item.id.clone()),
-                        is_cache_hit: true,
-                        duration_ms: Some(0),
-                        status: "completed".to_string(),
-                        error_reason: None,
-                    })
-                    .await
-                    .map_err(|e| e.to_string())?;
-                    Ok(sent_id)
-                }
-                .await;
-                match outcome {
-                    Ok(sent_id) => {
-                        if first_delivered_msg_id.is_none() {
-                            first_delivered_msg_id = Some(sent_id);
-                        }
-                        tracing::info!(track_id = %item.id, time = "0ms", "Cache hit: delivered");
-                        cached_count += 1;
-                        shared.lock().expect("job poisoned").job.cached_count = cached_count;
-                        self.bus.emit_progress(
-                            &shared,
-                            Some("Delivered cached tracks..."),
-                            None,
-                            None,
-                        );
-                    }
-                    Err(err) => {
-                        tracing::error!(
-                            track_id = %item.id,
-                            error = %err,
-                            "Failed to deliver cached track copy, marking for re-rip"
-                        );
-                        // The database row points at a dump message that no
-                        // longer exists (for example after channel cleanup).
-                        // Remove it immediately so a failed re-rip cannot
-                        // leave a ghost cache entry behind.
-                        let stale_key = TrackKey::new(options.provider, item.id.clone())
-                            .with_codec(cached.codec);
-                        if let Err(delete_error) = deps.delete_track(&stale_key).await {
-                            tracing::warn!(
-                                track_id = %item.id,
-                                error = %delete_error,
-                                "Failed to remove stale cache row after dump copy failure"
-                            );
-                        }
-                        uncached_items.push(item.clone());
-                        // Any queued staging for this track is now moot: the
-                        // cache row was deleted, so the re-rip supplies the
-                        // zip source instead.
-                        if let Some(pos) = stage_items
-                            .iter()
-                            .position(|stage| stage.item.id == item.id)
-                        {
-                            stage_items.remove(pos);
-                        }
-                    }
-                }
+        }
+        for rendition in options.rendition_policy.renditions() {
+            // Atmos archives are intentionally sparse: unavailable Atmos
+            // tracks have no individual cache row, but a complete cached
+            // sparse archive is still independently reusable.
+            let reuse_valid = zip_reuse.contains_key(rendition)
+                && (*rendition == Rendition::Atmos
+                    || pipeline_items
+                        .iter()
+                        .filter(|item| item.rendition == *rendition)
+                        .all(|item| item.cached.is_some()));
+            if !reuse_valid {
+                zip_reuse.remove(rendition);
             }
         }
-
+        if zip_reuse.contains_key(&Rendition::Atmos) {
+            pipeline_items.retain(|item| item.rendition != Rendition::Atmos);
+        }
+        let mut uncached_items = pipeline_items;
+        let has_fresh = uncached_items.iter().any(|item| item.cached.is_none());
         // Delivery metadata for the ZIP details message. Populated by
-        // the reuse fast path and the rebuild block; None on cache-only.
-        let mut zip_delivery: Option<ZipDeliveryInfo> = None;
+        // the reuse and rebuild finalization paths; None on cache-only.
+        let zip_delivery: Option<ZipDeliveryInfo> = None;
 
         let summary = |cached_count: usize,
                        ripped_count: usize,
@@ -1216,182 +1155,28 @@ impl RipOrchestrator {
                 is_cache_only: options.is_cache_only,
                 is_group: options.is_group,
                 warnings: warnings.clone(),
-                zip_delivery,
+                zip_delivery: zip_delivery.clone(),
+                zip_deliveries: zip_delivery.clone().into_iter().collect(),
                 first_delivered_msg_id: first_msg_id,
             }
         };
 
-        // All-cached fast path.
-        if uncached_items.is_empty() && !zip_build {
-            let elapsed = format!(
-                "{:.1}",
-                (now_ms().saturating_sub(shared.lock().expect("job poisoned").job.start_time_ms)
-                    as f64)
-                    / 1000.0
-            );
-            return Ok(summary(
-                cached_count,
-                0,
-                Vec::new(),
-                Vec::new(),
-                &elapsed,
-                zip_delivery,
-                first_delivered_msg_id,
-            ));
-        }
-
-        // Fully-cached album with a reusable ZIP set. The parts are
-        // already in the dump channel; nothing needs staging, building, or
-        // re-uploading. Cache-only jobs are done; `-z` user jobs get the
-        // cached parts delivered (with a cover preview when artwork is
-        // available). Plain jobs already received every cached track
-        // instantly in the pre-queue loop — the archive stays cached
-        // without a second delivery.
-        if let Some(rows) = &zip_reuse {
-            if uncached_items.is_empty() {
-                if !options.is_cache_only && zip_deliver {
-                    let reply_to = (options.delivery_chat_id == options.chat_id)
-                        .then_some(options.reply_to_message_id)
-                        .flatten();
-                    let total_parts = rows.len();
-                    let mut delivered_all = true;
-                    for row in rows {
-                        match deps
-                            .sink()
-                            .send_dump_copy(
-                                options.delivery_chat_id,
-                                row.message_id,
-                                reply_to,
-                                total_parts > 1,
-                            )
-                            .await
-                        {
-                            Ok(sent_id) => {
-                                if first_delivered_msg_id.is_none() {
-                                    first_delivered_msg_id = Some(sent_id);
-                                }
-                            }
-                            Err(error) => {
-                                tracing::warn!(%error, "cached ZIP part delivery failed");
-                                delivered_all = false;
-                                break;
-                            }
-                        }
-                    }
-                    if !delivered_all {
-                        // The dump message behind a cached part is gone. Purge
-                        // the album's ZIP rows so the next request rebuilds
-                        // instead of skipping staging and failing forever.
-                        if let Err(error) = deps
-                            .delete_albums(
-                                options.provider,
-                                &options.parsed_items[0].id,
-                                Some(target_codec),
-                            )
-                            .await
-                        {
-                            tracing::warn!(%error, "failed to purge undeliverable album ZIP rows");
-                        }
-                    }
-                    if delivered_all {
-                        let release_year: String = album_release_date
-                            .as_deref()
-                            .map(|date| date.chars().take(4).collect())
-                            .unwrap_or_default();
-                        let total_size: i64 = rows.iter().map(|row| row.file_size).sum();
-                        let album_url = match (&album_id, &album_sf) {
-                            (Some(id), Some(storefront)) => {
-                                deps.providers().presentation().album_url(id, storefront)
-                            }
-                            _ => None,
-                        };
-                        let caption_meta = AlbumDetailsCaptionMetadata {
-                            album: album_name.as_deref().unwrap_or_default(),
-                            artist: album_artist.as_deref().unwrap_or_default(),
-                            album_url: album_url.as_deref(),
-                            total_tracks: tracks_to_process.len(),
-                            delivered_tracks: tracks_to_process.len(),
-                            size_bytes: total_size,
-                            total_parts: rows.len(),
-                            release_year: &release_year,
-                            genre: album_genre.as_deref(),
-                            record_label: album_record_label.as_deref(),
-                            is_partial: false,
-                            user_name: options.user_name.as_deref(),
-                            user_id: options.user_id,
-                            codec: None,
-                        };
-                        let details_caption = format_album_details_caption(&caption_meta);
-                        let mut photo_delivered = false;
-                        if let Some(artwork_url) =
-                            album_artwork_url.as_deref().filter(|url| !url.is_empty())
-                        {
-                            if let Some(bytes) =
-                                deps.providers().artwork().fetch_artwork(artwork_url).await
-                            {
-                                if let Err(error) = deps
-                                    .sink()
-                                    .send_photo_to_chat(
-                                        options.delivery_chat_id,
-                                        &bytes,
-                                        &details_caption,
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!(%error, "cover preview send failed");
-                                } else {
-                                    photo_delivered = true;
-                                }
-                            }
-                        }
-                        zip_delivery = Some(ZipDeliveryInfo {
-                            album: album_name.clone().unwrap_or_default(),
-                            artist: album_artist.clone().unwrap_or_default(),
-                            release_year,
-                            total_tracks: tracks_to_process.len(),
-                            delivered_tracks: tracks_to_process.len(),
-                            total_parts: rows.len(),
-                            size_bytes: total_size,
-                            is_partial: false,
-                            album_id: album_id.clone().unwrap_or_default(),
-                            album_url,
-                            artwork_url: album_artwork_url.clone(),
-                            genre: album_genre.clone(),
-                            record_label: album_record_label.clone(),
-                            copyright: album_copyright.clone(),
-                            photo_delivered,
-                            codec: None,
-                        });
-                    }
-                }
-                let elapsed = format!(
-                    "{:.1}",
-                    (now_ms().saturating_sub(shared.lock().expect("job poisoned").job.start_time_ms)
-                        as f64)
-                        / 1000.0
-                );
-                // The zip workspace was created for this album job but the
-                // reusable parts made it unnecessary — remove the empty dir.
-                if let Some(dir) = &zip_dir {
-                    let _ = tokio::fs::remove_dir_all(dir).await;
-                }
-                return Ok(summary(
-                    cached_count,
-                    0,
-                    Vec::new(),
-                    Vec::new(),
-                    &elapsed,
-                    zip_delivery,
-                    first_delivered_msg_id,
-                ));
-            }
-        }
-
+        // Reusable archive rows are consumed by the same finalization path as
+        // newly-built rows. Keeping the decision in the per-rendition state
+        // avoids mixing primary and Atmos archive identities.
         // Maintenance mode skips misses. Cache-only jobs still rip
         // uncached tracks, but keep the resulting audio in the dump channel
         // instead of delivering a copy to the requester.
-        if !settings.can_rip_live(options.is_admin) && (!zip_build || !uncached_items.is_empty()) {
-            let skipped: Vec<String> = uncached_items.iter().map(|i| i.id.clone()).collect();
+        let cache_hits_present = uncached_items.iter().any(|item| item.cached.is_some());
+        if !settings.can_rip_live(options.is_admin)
+            && (!zip_build || has_fresh)
+            && !cache_hits_present
+        {
+            let skipped: Vec<String> = uncached_items
+                .iter()
+                .filter(|item| item.cached.is_none() && item.rendition == Rendition::Primary)
+                .map(|i| i.track_id.clone())
+                .collect();
             {
                 let mut guard = shared.lock().expect("job poisoned");
                 guard.job.skipped_count = skipped.len();
@@ -1406,8 +1191,8 @@ impl RipOrchestrator {
             );
             // No staging or packaging will happen for the skipped tracks;
             // drop the zip workspace too.
-            if let Some(dir) = &zip_dir {
-                let _ = tokio::fs::remove_dir_all(dir).await;
+            for state in &zip_states {
+                let _ = tokio::fs::remove_dir_all(&state.dir).await;
             }
             return Ok(summary(
                 cached_count,
@@ -1418,6 +1203,15 @@ impl RipOrchestrator {
                 zip_delivery,
                 first_delivered_msg_id,
             ));
+        }
+        if !settings.can_rip_live(options.is_admin) && has_fresh && cache_hits_present {
+            let skipped: Vec<String> = uncached_items
+                .iter()
+                .filter(|item| item.cached.is_none() && item.rendition == Rendition::Primary)
+                .map(|item| item.track_id.clone())
+                .collect();
+            shared.lock().expect("job poisoned").job.skipped_count = skipped.len();
+            uncached_items.retain(|item| item.cached.is_some());
         }
 
         // Live rip through the queue.
@@ -1436,7 +1230,10 @@ impl RipOrchestrator {
             "Rip job queued"
         );
 
-        let queue_start_time = now_ms();
+        // Include resolution/cache time in the elapsed value, as the former
+        // cache-only path did; this also avoids reporting a completed cached
+        // job as `0.0s` after a slow cache lookup.
+        let queue_start_time = shared.lock().expect("job poisoned").job.start_time_ms;
 
         // Lane 2 must exist before lane 1 can push items into it. The
         // dispatcher is global and lazily spawned once per orchestrator.
@@ -1448,8 +1245,8 @@ impl RipOrchestrator {
             options: options.clone(),
             zip_build,
             zip_deliver,
-            zip_dir: zip_dir.clone(),
-            zip_sources: Arc::clone(&zip_sources),
+            zip_states: zip_states.clone(),
+            zip_reuse: zip_reuse.clone(),
             zip_album: album_name.clone().unwrap_or_else(|| "Album".to_owned()),
             zip_artist: album_artist
                 .clone()
@@ -1468,13 +1265,10 @@ impl RipOrchestrator {
             zip_genre: album_genre.clone(),
             zip_record_label: album_record_label.clone(),
             zip_copyright: album_copyright.clone(),
-            zip_generation_hash: zip_generation_hash.clone(),
-            zip_codec: Arc::new(std::sync::Mutex::new(None)),
             zip_artwork_url: album_artwork_url.clone().filter(|url| !url.is_empty()),
             zip_release_date: album_release_date.clone().unwrap_or_default(),
             warnings: warnings.clone(),
             atmos_warning: Arc::new(std::sync::Mutex::new(None)),
-            cached_count,
             is_multi_track,
             max_collection_limit,
             capped_count,
@@ -1483,6 +1277,7 @@ impl RipOrchestrator {
             failed_tracks: Arc::new(Mutex::new(Vec::new())),
             texts: Arc::new(PipelineTexts::default()),
             first_delivered_msg_id: Arc::new(Mutex::new(first_delivered_msg_id)),
+            zip_delivery_infos: Arc::new(Mutex::new(Vec::new())),
         });
 
         // The finalize marker (last lane-2 item for this job) resolves the
@@ -1496,7 +1291,6 @@ impl RipOrchestrator {
         let task_items = uncached_items;
         let task_controller = job_controller.clone();
         let task_bus = self.bus.clone();
-        let task_stage_items = stage_items;
         let task_job_ctx = Arc::clone(&job_ctx);
         let task_upload_lane = self.upload_lane.clone();
         let task_summary_tx = Arc::clone(&summary_tx);
@@ -1538,7 +1332,6 @@ impl RipOrchestrator {
                     job_controller: task_controller,
                     queue_signal,
                     ctx: task_job_ctx,
-                    stage_items: &task_stage_items,
                     upload_lane: task_upload_lane,
                     summary_tx: task_summary_tx,
                 })
@@ -1568,8 +1361,8 @@ impl RipOrchestrator {
                 // the zip workspace exists since the pre-queue phase and no
                 // marker will ever clean it — remove it here. Any staged
                 // downloads for the archive never happened either.
-                if let Some(dir) = &zip_dir {
-                    let _ = tokio::fs::remove_dir_all(dir).await;
+                for state in &zip_states {
+                    let _ = tokio::fs::remove_dir_all(&state.dir).await;
                 }
                 return Err(error.into());
             }
@@ -1602,11 +1395,10 @@ struct LaneOneContext<'a, D: OrchestratorDeps> {
     deps: Arc<D>,
     bus: EventBus,
     shared: Arc<Mutex<JobShared>>,
-    uncached_items: &'a [ResolvedTrackItem],
+    uncached_items: &'a [PipelineItem],
     job_controller: CancellationToken,
     queue_signal: CancellationToken,
     ctx: Arc<JobContext>,
-    stage_items: &'a [StageItem],
     upload_lane: Arc<Mutex<Option<tokio::sync::mpsc::Sender<LaneTask>>>>,
     summary_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<RipJobSummary>>>>,
 }
@@ -1622,7 +1414,6 @@ async fn run_lane_one<D: OrchestratorDeps>(input: LaneOneContext<'_, D>) -> RipJ
         job_controller,
         queue_signal,
         ctx,
-        stage_items,
         upload_lane,
         summary_tx,
     } = input;
@@ -1655,138 +1446,145 @@ async fn run_lane_one<D: OrchestratorDeps>(input: LaneOneContext<'_, D>) -> RipJ
             if is_cancelled() {
                 break;
             }
-            let pipeline_item = PipelineItem {
-                track_id: item.id.clone(),
-                storefront: item.storefront.clone(),
-                meta_title: item.title.clone(),
-                meta_artist: item.artist.clone(),
-                is_streamable: item.is_streamable,
-            };
-            if producer_tx.send(pipeline_item).await.is_err() {
+            if producer_tx.send(item.clone()).await.is_err() {
                 break;
             }
         }
     };
-
-    // Staging task
-    // Cached tracks queued for the archive are downloaded from the dump
-    // channel into the zip workspace concurrently with the rips. A cache
-    // row that cannot be materialized is re-ripped instead.
-    let staging = async {
-        let staging_tx = work_tx; // last clone: its drop closes the feed
-        let Some(zip_dir) = ctx.zip_dir.clone() else {
-            return;
-        };
-        for stage in stage_items {
-            if is_cancelled() {
-                break;
-            }
-            let destination = zip_dir.join(&stage.archive_filename);
-            let on_download_progress: UploadProgressCallback = {
-                let texts = Arc::clone(&ctx.texts);
-                let shared = Arc::clone(&shared);
-                let bus = bus.clone();
-                let label = stage.label.clone();
-                Arc::new(move |done: u64, total: u64| {
-                    let text = if total > 0 {
-                        format!(
-                            "⬇️ Downloading from TG: <b>{}</b> <code>{}</code>",
-                            html_escape(&label),
-                            format_byte_progress(done, total, 12)
-                        )
-                    } else {
-                        format!("⬇️ Downloading from TG: <b>{}</b>", html_escape(&label))
-                    };
-                    *texts.download.lock().expect("texts poisoned") = Some(text.clone());
-                    shared.lock().expect("job poisoned").job.active_action_text =
-                        Some(text.clone());
-                    let (download_text, upload_text) = texts.snapshot();
-                    bus.emit_progress(
-                        &shared,
-                        None,
-                        download_text.as_deref(),
-                        upload_text.as_deref(),
-                    );
-                })
-            };
-            let initial_text = format!(
-                "⬇️ Downloading from TG: <b>{}</b>",
-                html_escape(&stage.label)
-            );
-            *ctx.texts.download.lock().expect("texts poisoned") = Some(initial_text.clone());
-            shared.lock().expect("job poisoned").job.active_action_text = Some(initial_text);
-            let (download_text, upload_text) = ctx.texts.snapshot();
-            bus.emit_progress(
-                &shared,
-                None,
-                download_text.as_deref(),
-                upload_text.as_deref(),
-            );
-
-            let download_res = deps
-                .sink()
-                .download_dump_file(stage.message_id, &destination, Some(&on_download_progress))
-                .await;
-
-            // Lane 1 owns the download slot only; the upload slot (lane 2)
-            // is preserved by snapshotting both into the emit.
-            *ctx.texts.download.lock().expect("texts poisoned") = None;
-            shared.lock().expect("job poisoned").job.active_action_text = None;
-            let (download_text, upload_text) = ctx.texts.snapshot();
-            bus.emit_progress(
-                &shared,
-                None,
-                download_text.as_deref(),
-                upload_text.as_deref(),
-            );
-
-            match download_res {
-                Ok(()) => {
-                    let size = tokio::fs::metadata(&destination)
-                        .await
-                        .map(|m| m.len())
-                        .unwrap_or(0);
-                    ctx.zip_sources
-                        .lock()
-                        .expect("zip sources poisoned")
-                        .push(ZipTrackEntry {
-                            file_path: destination,
-                            archive_filename: stage.archive_filename.clone(),
-                            file_size: size,
-                        });
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        track_id = %stage.item.id,
-                        %error,
-                        "failed to materialize cached track for ZIP; queueing re-rip"
-                    );
-                    // Feed the resolved track back for a re-rip: the cache
-                    // row cannot participate in the archive (the re-rip's
-                    // save overwrites the stale row).
-                    let pipeline_item = PipelineItem {
-                        track_id: stage.item.id.clone(),
-                        storefront: stage.item.storefront.clone(),
-                        meta_title: stage.item.title.clone(),
-                        meta_artist: stage.item.artist.clone(),
-                        is_streamable: stage.item.is_streamable,
-                    };
-                    if staging_tx.send(pipeline_item).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    };
+    drop(work_tx);
 
     // Rip loop (lane 1)
     let rip_loop = async {
-        while let Some(item) = work_rx.recv().await {
+        let mut pending_uploads: Vec<tokio::sync::oneshot::Receiver<()>> = Vec::new();
+        while let Some(mut item) = work_rx.recv().await {
             if is_cancelled() {
                 break;
             }
 
+            // Cache hits deliberately pass through the same ordered loop as
+            // fresh rips. This is the ordering barrier between a cached
+            // Atmos rendition and a later uncached primary rendition.
+            if let Some(cached) = item.cached.take() {
+                for pending in pending_uploads.drain(..) {
+                    let _ = pending.await;
+                }
+                if is_cancelled() {
+                    break;
+                }
+                let cache_key = cached.track_key.clone();
+                let mut cache_ok = true;
+                if !codec_allowed_for_rendition(item.rendition, cached.codec) {
+                    tracing::warn!(
+                        track_id = %item.track_id,
+                        codec = %cached.codec.as_str(),
+                        "cached track codec does not match rendition; reripping"
+                    );
+                    cache_ok = false;
+                }
+                if cache_ok && !ctx.options.is_cache_only && !ctx.zip_deliver {
+                    if is_cancelled() {
+                        break;
+                    }
+                    let reply_to = (ctx.options.delivery_chat_id == ctx.options.chat_id)
+                        .then_some(ctx.options.reply_to_message_id)
+                        .flatten();
+                    if let Ok(sent_id) = deps
+                        .sink()
+                        .send_dump_copy(
+                            ctx.options.delivery_chat_id,
+                            cached.message_id,
+                            reply_to,
+                            ctx.is_multi_track,
+                        )
+                        .await
+                    {
+                        if is_cancelled() {
+                            break;
+                        }
+                        let _ = deps
+                            .log_request(RequestLog {
+                                telegram_id: ctx.options.user_id,
+                                chat_id: ctx.options.chat_id,
+                                track_key: cache_key.clone(),
+                                is_cache_hit: true,
+                                duration_ms: Some(0),
+                                status: "completed".to_owned(),
+                                error_reason: None,
+                            })
+                            .await;
+                        if ctx.first_delivered_msg_id.lock().unwrap().is_none() {
+                            *ctx.first_delivered_msg_id.lock().unwrap() = Some(sent_id);
+                        }
+                    } else {
+                        tracing::warn!(track_id = %item.track_id, "cached track delivery failed; reripping");
+                        cache_ok = false;
+                    }
+                }
+                if cache_ok && !ctx.options.is_cache_only && ctx.zip_deliver {
+                    if is_cancelled() {
+                        break;
+                    }
+                    let _ = deps
+                        .log_request(RequestLog {
+                            telegram_id: ctx.options.user_id,
+                            chat_id: ctx.options.chat_id,
+                            track_key: cache_key.clone(),
+                            is_cache_hit: true,
+                            duration_ms: Some(0),
+                            status: "completed".to_owned(),
+                            error_reason: None,
+                        })
+                        .await;
+                }
+                if cache_ok && ctx.zip_build && !ctx.zip_reuse.contains_key(&item.rendition) {
+                    if let Some(state) = ctx.zip_state(item.rendition) {
+                        seed_zip_codec(state, cached.codec);
+                        let filename = format!(
+                            "{} - {} [{}].m4a",
+                            sanitize_archive_filename(&cached.title),
+                            sanitize_archive_filename(&cached.artist),
+                            item.track_id
+                        );
+                        let destination = state.dir.join(&filename);
+                        if let Err(error) = deps
+                            .sink()
+                            .download_dump_file(cached.message_id, &destination, None)
+                            .await
+                        {
+                            tracing::warn!(track_id = %item.track_id, %error, "cached ZIP source unavailable; reripping");
+                            cache_ok = false;
+                        } else if is_cancelled() {
+                            let _ = tokio::fs::remove_file(&destination).await;
+                            break;
+                        } else if let Ok(size) =
+                            tokio::fs::metadata(&destination).await.map(|m| m.len())
+                        {
+                            state.sources.lock().expect("zip sources poisoned").push(
+                                ZipTrackEntry {
+                                    file_path: destination,
+                                    archive_filename: filename,
+                                    file_size: size,
+                                },
+                            );
+                        }
+                    }
+                }
+                if cache_ok {
+                    if item.rendition == Rendition::Primary {
+                        let mut guard = shared.lock().expect("job poisoned");
+                        guard.job.cached_count += 1;
+                    }
+                    bus.emit_progress(&shared, Some("Delivered cached tracks..."), None, None);
+                    continue;
+                }
+                let _ = deps.delete_track(&cache_key).await;
+                item.cached = None;
+            }
+
             if item.is_streamable == Some(false) {
+                if item.rendition == Rendition::Atmos {
+                    continue;
+                }
                 let presentation = deps.providers().presentation();
                 let err_msg = presentation.unavailable_track_message().to_owned();
                 let log_message = presentation.unavailable_track_log_message();
@@ -1900,7 +1698,7 @@ async fn run_lane_one<D: OrchestratorDeps>(input: LaneOneContext<'_, D>) -> RipJ
                 on_progress: Some(&on_progress),
                 signal: Some(queue_signal.clone()),
                 output_dir: Some(&rip_job_dir),
-                codec_preference: CodecPreference::HighestQuality,
+                codec_preference: item.rendition.codec_preference(),
             };
             match deps
                 .providers()
@@ -1923,26 +1721,18 @@ async fn run_lane_one<D: OrchestratorDeps>(input: LaneOneContext<'_, D>) -> RipJ
                     // Hand the finished rip to lane 2 — FIFO behind this
                     // job's earlier items. Back-pressure (16 pending
                     // items) pauses ripping until uploads drain.
-                    if let Ok(mut codec) = ctx.zip_codec.lock() {
-                        // Keep the strongest codec seen across the album's
-                        // rips: ALAC (lossless) > Atmos ec-3 > lossy AAC.
-                        let rank = |c: &str| match c {
-                            "alac" => 3,
-                            "ec-3" => 2,
-                            _ => 1,
-                        };
-                        let better = match codec.as_deref() {
-                            None => true,
-                            Some(current) => rank(&rip_result.codec) > rank(current),
-                        };
-                        if better {
-                            *codec = Some(rip_result.codec.clone());
+                    if let Some(state) = ctx.zip_state(item.rendition) {
+                        if let Ok(codec) = rip_result.codec.parse::<Codec>() {
+                            if codec_allowed_for_rendition(item.rendition, codec) {
+                                seed_zip_codec(state, codec);
+                            }
                         }
                     }
                     let upload_item = PipelineRipResult {
                         track_id: item.track_id.clone(),
                         rip_result,
                         start_time_ms: track_start_time,
+                        rendition: item.rendition,
                     };
                     let item_deps = Arc::clone(&deps);
                     let item_bus = bus.clone();
@@ -1950,6 +1740,7 @@ async fn run_lane_one<D: OrchestratorDeps>(input: LaneOneContext<'_, D>) -> RipJ
                     let item_ctx = Arc::clone(&ctx);
                     let item_controller = job_controller.clone();
                     let lane = Arc::clone(&upload_lane);
+                    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
                     let pushed = push_lane_task(&lane, "upload_track", move || {
                         Box::pin(async move {
                             run_upload_item(
@@ -1961,6 +1752,7 @@ async fn run_lane_one<D: OrchestratorDeps>(input: LaneOneContext<'_, D>) -> RipJ
                                 upload_item,
                             )
                             .await;
+                            let _ = done_tx.send(());
                         })
                     })
                     .await;
@@ -1969,6 +1761,7 @@ async fn run_lane_one<D: OrchestratorDeps>(input: LaneOneContext<'_, D>) -> RipJ
                         // upload can never run, so stop ripping.
                         break;
                     }
+                    pending_uploads.push(done_rx);
                 }
                 Err(err) => {
                     *ctx.texts.download.lock().expect("texts poisoned") = None;
@@ -1976,18 +1769,29 @@ async fn run_lane_one<D: OrchestratorDeps>(input: LaneOneContext<'_, D>) -> RipJ
                         break;
                     }
 
+                    // A provider-confirmed absence of an optional Atmos
+                    // variant is not a failure and never creates cache state.
+                    if item.rendition == Rendition::Atmos
+                        && matches!(&err, crate::ripper::RipError::Unavailable(_))
+                    {
+                        tracing::debug!(track_id = %item.track_id, "Atmos rendition unavailable");
+                        continue;
+                    }
+
                     let err_msg = err.to_string();
                     let duration_ms = (now_ms() - track_start_time) as i64;
                     {
-                        let mut failures = ctx.failed_tracks.lock().expect("failures poisoned");
-                        failures.push(FailedTrack {
-                            id: item.track_id.clone(),
-                            error: err_msg.clone(),
-                            title: item.meta_title.clone(),
-                            artist: item.meta_artist.clone(),
-                            storefront: item.storefront.clone(),
-                        });
-                        shared.lock().expect("job poisoned").job.failed_count = failures.len();
+                        if item.rendition == Rendition::Primary {
+                            let mut failures = ctx.failed_tracks.lock().expect("failures poisoned");
+                            failures.push(FailedTrack {
+                                id: item.track_id.clone(),
+                                error: err_msg.clone(),
+                                title: item.meta_title.clone(),
+                                artist: item.meta_artist.clone(),
+                                storefront: item.storefront.clone(),
+                            });
+                            shared.lock().expect("job poisoned").job.failed_count = failures.len();
+                        }
                     }
 
                     tracing::error!(
@@ -2001,7 +1805,12 @@ async fn run_lane_one<D: OrchestratorDeps>(input: LaneOneContext<'_, D>) -> RipJ
                         .log_request(RequestLog {
                             telegram_id: ctx.options.user_id,
                             chat_id: ctx.options.chat_id,
-                            track_key: TrackKey::new(ctx.options.provider, item.track_id.clone()),
+                            track_key: if item.rendition == Rendition::Primary {
+                                TrackKey::new(ctx.options.provider, item.track_id.clone())
+                            } else {
+                                TrackKey::new(ctx.options.provider, item.track_id.clone())
+                                    .with_codec(item.rendition.accepted_cache_codecs()[0])
+                            },
                             is_cache_hit: false,
                             duration_ms: Some(duration_ms),
                             status: "failed".to_string(),
@@ -2029,7 +1838,7 @@ async fn run_lane_one<D: OrchestratorDeps>(input: LaneOneContext<'_, D>) -> RipJ
                     ]
                     .iter()
                     .any(|phrase| err_msg.contains(phrase));
-                    if is_mirror_down {
+                    if is_mirror_down && item.rendition == Rendition::Primary {
                         {
                             let mut failures = ctx.failed_tracks.lock().expect("failures poisoned");
                             failures.push(FailedTrack {
@@ -2053,10 +1862,13 @@ async fn run_lane_one<D: OrchestratorDeps>(input: LaneOneContext<'_, D>) -> RipJ
                 }
             }
         }
+        for pending in pending_uploads {
+            let _ = pending.await;
+        }
     };
 
     // All three stages settle (channel drops propagate end-to-end).
-    let _: ((), (), ()) = tokio::join!(producer, staging, rip_loop);
+    let _: ((), ()) = tokio::join!(producer, rip_loop);
 
     // Finalize marker: the last lane-2 item for this job (FIFO after all
     // of its track uploads). Builds the archive, publishes it, cleans both
@@ -2105,12 +1917,13 @@ fn build_job_summary(
     );
     let failed = ctx.failed_tracks.lock().expect("failures poisoned").clone();
     let first_msg_id = *ctx.first_delivered_msg_id.lock().unwrap();
+    let zip_deliveries = ctx.zip_delivery_infos.lock().unwrap().clone();
     let guard = shared.lock().expect("job poisoned");
     RipJobSummary {
         job_id: guard.job.id.clone(),
         job_header: guard.job.job_header.clone(),
         total_tracks: guard.job.total_tracks,
-        cached_count: ctx.cached_count,
+        cached_count: guard.job.cached_count,
         ripped_count: ctx.ripped_count.load(std::sync::atomic::Ordering::SeqCst),
         failed_count: failed.len(),
         failed_tracks: failed,
@@ -2128,7 +1941,8 @@ fn build_job_summary(
             .into_iter()
             .chain(ctx.warnings.clone())
             .collect(),
-        zip_delivery,
+        zip_delivery: zip_deliveries.first().cloned().or(zip_delivery),
+        zip_deliveries,
         first_delivered_msg_id: first_msg_id,
     }
 }
@@ -2147,8 +1961,10 @@ async fn run_upload_item<D: OrchestratorDeps>(
 ) {
     let uploaded_ok = upload_one(&deps, &bus, &shared, &ctx, &job_controller, &upload_item).await;
 
-    if uploaded_ok && ctx.zip_build {
-        if let Some(dir) = &ctx.zip_dir {
+    let cancelled =
+        shared.lock().expect("job poisoned").job.is_cancelled || job_controller.is_cancelled();
+    if uploaded_ok && ctx.zip_build && !cancelled {
+        if let Some(state) = ctx.zip_state(upload_item.rendition) {
             let filename = format!(
                 "{:02} - {} - {} [{}].m4a",
                 upload_item.rip_result.track_number,
@@ -2156,17 +1972,22 @@ async fn run_upload_item<D: OrchestratorDeps>(
                 sanitize_archive_filename(&upload_item.rip_result.artist),
                 upload_item.track_id
             );
-            let destination = dir.join(&filename);
+            let destination = state.dir.join(&filename);
             if let Err(error) =
                 tokio::fs::copy(&upload_item.rip_result.file_path, &destination).await
             {
                 tracing::warn!(%error, track_id = %upload_item.track_id, "failed to stage track for ZIP");
+            } else if shared.lock().expect("job poisoned").job.is_cancelled
+                || job_controller.is_cancelled()
+            {
+                let _ = tokio::fs::remove_file(&destination).await;
             } else {
                 let size = tokio::fs::metadata(&destination)
                     .await
                     .map(|m| m.len())
                     .unwrap_or(0);
-                ctx.zip_sources
+                state
+                    .sources
                     .lock()
                     .expect("zip sources poisoned")
                     .push(ZipTrackEntry {
@@ -2206,8 +2027,8 @@ async fn finalize_job<D: OrchestratorDeps>(
 
     // Cleanup both workspaces. Runs on every path, including cancellation.
     let _ = tokio::fs::remove_dir_all(&rip_job_dir).await;
-    if let Some(dir) = &ctx.zip_dir {
-        let _ = tokio::fs::remove_dir_all(dir).await;
+    for state in &ctx.zip_states {
+        let _ = tokio::fs::remove_dir_all(&state.dir).await;
     }
 
     let summary = build_job_summary(&shared, &ctx, zip_delivery);
@@ -2229,438 +2050,444 @@ async fn finalize_zip<D: OrchestratorDeps>(
     if !ctx.zip_build {
         return None;
     }
-    let Some(dir) = &ctx.zip_dir else {
+    let is_cancelled =
+        || shared.lock().expect("job poisoned").job.is_cancelled || job_controller.is_cancelled();
+    if is_cancelled() {
         return None;
-    };
-
-    let entries = ctx
-        .zip_sources
-        .lock()
-        .expect("zip sources poisoned")
-        .clone();
-    let failures = ctx.failed_tracks.lock().expect("failures poisoned").clone();
+    }
     let expected_tracks = shared.lock().expect("job poisoned").job.total_tracks;
-    let complete = failures.is_empty() && entries.len() == expected_tracks;
-    // A cache job publishes only complete ZIPs; a user ZIP request may
-    // receive a partial archive directly, but it is never persisted in
-    // the dump. Plain jobs (no `-z`) never receive the archive itself —
-    // the complete one is still cached for later `-z` requests.
-    let should_publish =
-        complete || (ctx.zip_deliver && !options.is_cache_only && !entries.is_empty());
-    if !should_publish || entries.is_empty() {
-        return None;
-    }
+    let failures = ctx.failed_tracks.lock().expect("failures poisoned").clone();
+    let mut first_delivery = None;
 
-    // Metadata for the ZIP details message (user deliveries).
-    let delivered_track_count = entries.len();
-    let mut delivered_part_count = 0usize;
-    let mut delivered_size_bytes = 0i64;
-    // Fetch the cover once; it feeds both the archive entry and (for
-    // user jobs) the chat preview. Any failure degrades to a coverless
-    // archive.
-    let cover_bytes = match &ctx.zip_artwork_url {
-        Some(url) => deps.providers().artwork().fetch_artwork(url).await,
-        None => None,
-    };
-    // Telegram document thumbnail (320x320 artwork, best-effort: failures
-    // degrade to a thumbless document).
-    let thumb_path = match &ctx.zip_artwork_url {
-        Some(url) if !url.is_empty() => {
-            let thumb_url = deps.providers().artwork().artwork_url_at_size(url, 320);
-            match deps.providers().artwork().fetch_artwork(&thumb_url).await {
-                Some(bytes) if !bytes.is_empty() => {
-                    let path = dir.join("cover_thumb.jpg");
-                    match tokio::fs::write(&path, bytes).await {
-                        Ok(()) => Some(path),
-                        Err(error) => {
-                            tracing::warn!(%error, "failed to stage ZIP thumbnail");
-                            None
-                        }
+    for state in &ctx.zip_states {
+        if is_cancelled() {
+            return first_delivery;
+        }
+        if let Some(rows) = ctx.zip_reuse.get(&state.rendition) {
+            if ctx.zip_deliver && !options.is_cache_only {
+                let reply_to = (options.delivery_chat_id == options.chat_id)
+                    .then_some(options.reply_to_message_id)
+                    .flatten();
+                let mut delivered = 0usize;
+                let mut size = 0i64;
+                for row in rows {
+                    if is_cancelled() {
+                        return first_delivery;
                     }
-                }
-                _ => None,
-            }
-        }
-        _ => None,
-    };
-    let thumb_path_str = thumb_path
-        .as_deref()
-        .map(|path| path.to_string_lossy().into_owned());
-    let cover_path = match &cover_bytes {
-        Some(bytes) => {
-            let path = dir.join("cover.jpg");
-            match tokio::fs::write(&path, bytes).await {
-                Ok(()) => Some(path),
-                Err(error) => {
-                    tracing::warn!(%error, "failed to stage cover for ZIP");
-                    None
-                }
-            }
-        }
-        None => None,
-    };
-    let mut entries = entries;
-    entries.sort_by(|a, b| a.archive_filename.cmp(&b.archive_filename));
-    let zip_codec = ctx
-        .zip_codec
-        .lock()
-        .expect("zip codec poisoned")
-        .clone()
-        .unwrap_or_else(|| "alac".to_owned());
-    let plan_result = plan_zip_parts_with_codec(
-        &ctx.zip_artist,
-        &ctx.zip_album,
-        &ctx.zip_release_date,
-        &entries,
-        cover_path.clone(),
-        TELEGRAM_SPLIT_THRESHOLD_BYTES,
-        &zip_codec,
-    );
-
-    // Before republishing complete parts, drop the previous rows so a
-    // shrinking part count cannot leave stale parts behind. The upsert
-    // below re-saves each fresh part.
-    let album_codec = zip_codec.parse::<Codec>().unwrap_or(Codec::Alac);
-    if complete {
-        if let Err(error) = deps
-            .delete_albums(ctx.options.provider, &ctx.zip_album_id, Some(album_codec))
-            .await
-        {
-            tracing::warn!(%error, "failed to purge stale album ZIP rows");
-        }
-    }
-    match plan_result {
-        Ok(plans) => {
-            for original_plan in plans {
-                let mut plan = original_plan;
-                if !complete {
-                    plan.archive_filename = plan
-                        .archive_filename
-                        .strip_suffix(".zip")
-                        .map(|name| format!("{name} [Partial].zip"))
-                        .unwrap_or_else(|| format!("{} [Partial]", plan.archive_filename));
-                }
-                let output = dir.join(&plan.archive_filename);
-                let zip_title = if plan.total_parts > 1 {
-                    format!(
-                        "{} (Part {}/{})",
-                        ctx.zip_album, plan.part_index, plan.total_parts
-                    )
-                } else {
-                    ctx.zip_album.clone()
-                };
-
-                let build = tokio::task::spawn_blocking({
-                    let output = output.clone();
-                    let plan = plan.clone();
-                    let cancel = job_controller.clone();
-                    let bus = bus.clone();
-                    let shared = Arc::clone(shared);
-                    let texts = Arc::clone(&ctx.texts);
-                    let zip_title = zip_title.clone();
-                    move || {
-                        let last_emit = std::sync::Mutex::new(
-                            std::time::Instant::now()
-                                .checked_sub(std::time::Duration::from_secs(1))
-                                .unwrap_or_else(std::time::Instant::now),
-                        );
-                        let cb = |written: u64, total: u64| {
-                            let mut last = last_emit.lock().expect("last_emit poisoned");
-                            if last.elapsed() >= std::time::Duration::from_millis(500)
-                                || (total > 0 && written >= total)
-                            {
-                                *last = std::time::Instant::now();
-                                let progress_bar = format_byte_progress(written, total, 12);
-                                let text = format!(
-                                    "📦 Zipping: <b>{}</b> <code>{}</code>",
-                                    html_escape(&zip_title),
-                                    progress_bar
-                                );
-                                *texts.upload.lock().expect("texts poisoned") = Some(text.clone());
-                                shared.lock().expect("job poisoned").job.active_action_text =
-                                    Some(text.clone());
-                                let (download_text, upload_text) = texts.snapshot();
-                                bus.emit_progress(
-                                    &shared,
-                                    None,
-                                    download_text.as_deref(),
-                                    upload_text.as_deref(),
-                                );
-                            }
-                        };
-                        let initial_text =
-                            format!("📦 Zipping: <b>{}</b>", html_escape(&zip_title));
-                        *texts.upload.lock().expect("texts poisoned") = Some(initial_text.clone());
-                        shared.lock().expect("job poisoned").job.active_action_text =
-                            Some(initial_text);
-                        let (download_text, upload_text) = texts.snapshot();
-                        bus.emit_progress(
-                            &shared,
-                            None,
-                            download_text.as_deref(),
-                            upload_text.as_deref(),
-                        );
-
-                        let progress_ref: &dyn Fn(u64, u64) = &cb;
-                        let res =
-                            create_zip_archive(&output, &plan, Some(progress_ref), Some(&cancel));
-
-                        *texts.upload.lock().expect("texts poisoned") = None;
-                        shared.lock().expect("job poisoned").job.active_action_text = None;
-                        let (download_text, upload_text) = texts.snapshot();
-                        bus.emit_progress(
-                            &shared,
-                            None,
-                            download_text.as_deref(),
-                            upload_text.as_deref(),
-                        );
-
-                        res
-                    }
-                })
-                .await;
-                let Ok(Ok(size)) = build else {
-                    tracing::warn!(album_id = %ctx.zip_album_id, "ZIP creation failed");
-                    continue;
-                };
-                if size > TELEGRAM_SPLIT_THRESHOLD_BYTES {
-                    tracing::warn!(size, "ZIP exceeds Telegram upload ceiling");
-                    let _ = tokio::fs::remove_file(&output).await;
-                    continue;
-                }
-                let album_codec = ctx
-                    .zip_codec
-                    .lock()
-                    .ok()
-                    .and_then(|c| c.as_deref().and_then(|s| s.parse().ok()))
-                    .unwrap_or(Codec::Alac);
-                let caption = format_zip_dump_caption(
-                    &DumpZipCaptionMetadata {
-                        provider: ctx.options.provider,
-                        album_id: &ctx.zip_album_id,
-                        codec: Some(album_codec.as_str()),
-                        album: &ctx.zip_album,
-                        artist: &ctx.zip_artist,
-                        filename: &plan.archive_filename,
-                        part_index: plan.part_index as i32,
-                        total_parts: plan.total_parts as i32,
-                        generation_hash: ctx.zip_generation_hash.as_deref().unwrap_or(""),
-                    },
-                    complete,
-                    failures.len(),
-                );
-
-                let on_zip_upload: UploadProgressCallback = {
-                    let last_emit = Arc::new(Mutex::new(
-                        std::time::Instant::now()
-                            .checked_sub(std::time::Duration::from_secs(1))
-                            .unwrap_or_else(std::time::Instant::now),
-                    ));
-                    let bus = bus.clone();
-                    let shared = Arc::clone(shared);
-                    let texts = Arc::clone(&ctx.texts);
-                    let zip_title = zip_title.clone();
-                    Arc::new(move |uploaded: u64, total: u64| {
-                        let mut last = last_emit.lock().expect("last_emit poisoned");
-                        if last.elapsed() >= std::time::Duration::from_millis(500)
-                            || (total > 0 && uploaded >= total)
-                        {
-                            *last = std::time::Instant::now();
-                            let progress_bar = format_byte_progress(uploaded, total, 12);
-                            let text = format!(
-                                "⬆️ Uploading: <b>{}</b> <code>{}</code>",
-                                html_escape(&zip_title),
-                                progress_bar
-                            );
-                            *texts.upload.lock().expect("texts poisoned") = Some(text.clone());
-                            shared.lock().expect("job poisoned").job.active_action_text =
-                                Some(text.clone());
-                            let (download_text, upload_text) = texts.snapshot();
-                            bus.emit_progress(
-                                &shared,
-                                None,
-                                download_text.as_deref(),
-                                upload_text.as_deref(),
-                            );
-                        }
-                    })
-                };
-                let initial_upload_text =
-                    format!("⬆️ Uploading: <b>{}</b>", html_escape(&zip_title));
-                *ctx.texts.upload.lock().expect("texts poisoned") =
-                    Some(initial_upload_text.clone());
-                shared.lock().expect("job poisoned").job.active_action_text =
-                    Some(initial_upload_text);
-                let (download_text, upload_text) = ctx.texts.snapshot();
-                bus.emit_progress(
-                    shared,
-                    None,
-                    download_text.as_deref(),
-                    upload_text.as_deref(),
-                );
-
-                let output_path = output.to_string_lossy().into_owned();
-                // Complete archives go to the dump (the cache); partial
-                // ones are only ever sent directly to the delivery chat.
-                let upload = if complete {
-                    deps.sink()
-                        .send_document_to_dump(
-                            &output_path,
-                            thumb_path_str.as_deref(),
-                            &caption,
-                            Some(&on_zip_upload),
+                    if let Ok(sent_id) = deps
+                        .sink()
+                        .send_dump_copy(
+                            options.delivery_chat_id,
+                            row.message_id,
+                            reply_to,
+                            rows.len() > 1,
                         )
                         .await
-                } else {
-                    let res = deps
-                        .sink()
-                        .send_document_to_chat(
-                            options.delivery_chat_id,
-                            &output_path,
-                            thumb_path_str.as_deref(),
-                            &caption,
-                            Some(&on_zip_upload),
-                        )
-                        .await;
-                    match res {
-                        Ok(sent_id) => {
-                            let mut guard = ctx.first_delivered_msg_id.lock().unwrap();
-                            if guard.is_none() {
-                                *guard = Some(sent_id);
-                            }
-                            Ok(None)
+                    {
+                        if is_cancelled() {
+                            return first_delivery;
                         }
-                        Err(err) => Err(err),
+                        let mut first = ctx.first_delivered_msg_id.lock().unwrap();
+                        if first.is_none() {
+                            *first = Some(sent_id);
+                        }
+                        delivered += 1;
+                        size += row.file_size;
                     }
-                };
+                }
+                if delivered > 0 {
+                    let codec = rows[0].codec.as_str().to_owned();
+                    let info = ZipDeliveryInfo {
+                        album: ctx.zip_album.clone(),
+                        artist: ctx.zip_artist.clone(),
+                        release_year: ctx.zip_release_date.chars().take(4).collect(),
+                        total_tracks: expected_tracks,
+                        delivered_tracks: if state.rendition == Rendition::Primary {
+                            expected_tracks
+                        } else {
+                            rows.len()
+                        },
+                        total_parts: delivered,
+                        size_bytes: size,
+                        is_partial: false,
+                        album_id: ctx.zip_album_id.clone(),
+                        album_url: ctx.zip_album_url.clone(),
+                        artwork_url: ctx.zip_artwork_url.clone(),
+                        genre: ctx.zip_genre.clone(),
+                        record_label: ctx.zip_record_label.clone(),
+                        copyright: ctx.zip_copyright.clone(),
+                        photo_delivered: false,
+                        codec: Some(codec),
+                    };
+                    if first_delivery.is_none() {
+                        first_delivery = Some(info.clone());
+                    }
+                    ctx.zip_delivery_infos.lock().unwrap().push(info);
+                }
+            }
+            continue;
+        }
+        let mut entries = state.sources.lock().expect("zip sources poisoned").clone();
+        if entries.is_empty() {
+            // In particular, never publish an empty Atmos archive.
+            continue;
+        }
+        entries.sort_by(|a, b| a.archive_filename.cmp(&b.archive_filename));
+        let complete = match state.rendition {
+            Rendition::Primary => failures.is_empty() && entries.len() == expected_tracks,
+            Rendition::Atmos => true, // Atmos is intentionally sparse/optional.
+        };
+        let should_publish =
+            complete || (ctx.zip_deliver && !options.is_cache_only && !entries.is_empty());
+        if !should_publish {
+            continue;
+        }
 
-                *ctx.texts.upload.lock().expect("texts poisoned") = None;
-                shared.lock().expect("job poisoned").job.active_action_text = None;
-                let (download_text, upload_text) = ctx.texts.snapshot();
-                bus.emit_progress(
-                    shared,
+        let cover_bytes = match &ctx.zip_artwork_url {
+            Some(url) => deps.providers().artwork().fetch_artwork(url).await,
+            None => None,
+        };
+        if is_cancelled() {
+            return first_delivery;
+        }
+        let cover_path = match &cover_bytes {
+            Some(bytes) => {
+                let path = state.dir.join("cover.jpg");
+                tokio::fs::write(&path, bytes).await.ok().map(|_| path)
+            }
+            None => None,
+        };
+        let thumb_path = match &ctx.zip_artwork_url {
+            Some(url) if !url.is_empty() => {
+                let thumb_url = deps.providers().artwork().artwork_url_at_size(url, 320);
+                match deps.providers().artwork().fetch_artwork(&thumb_url).await {
+                    Some(bytes) if !bytes.is_empty() => {
+                        let path = state.dir.join("cover_thumb.jpg");
+                        tokio::fs::write(&path, bytes).await.ok().map(|_| path)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if is_cancelled() {
+            return first_delivery;
+        }
+        let thumb_path_str = thumb_path
+            .as_deref()
+            .map(|path| path.to_string_lossy().into_owned());
+        let codec = state
+            .codec
+            .lock()
+            .expect("zip codec poisoned")
+            .clone()
+            .or_else(|| (state.rendition == Rendition::Atmos).then(|| "ec-3".to_owned()))
+            .unwrap_or_else(|| "alac".to_owned());
+        let album_codec = codec.parse::<Codec>().unwrap_or(Codec::Alac);
+        let _ = deps
+            .delete_albums(options.provider, &ctx.zip_album_id, Some(album_codec))
+            .await;
+        let plans = match plan_zip_parts_with_codec(
+            &ctx.zip_artist,
+            &ctx.zip_album,
+            &ctx.zip_release_date,
+            &entries,
+            cover_path,
+            TELEGRAM_SPLIT_THRESHOLD_BYTES,
+            &codec,
+        ) {
+            Ok(plans) => plans,
+            Err(error) => {
+                tracing::warn!(%error, "ZIP planning failed");
+                continue;
+            }
+        };
+        let mut delivered_parts = 0usize;
+        let mut delivered_size = 0i64;
+        for original in plans {
+            let mut plan = original;
+            if !complete {
+                plan.archive_filename = plan
+                    .archive_filename
+                    .strip_suffix(".zip")
+                    .map(|name| format!("{name} [Partial].zip"))
+                    .unwrap_or_else(|| format!("{} [Partial]", plan.archive_filename));
+            }
+            let output = state.dir.join(&plan.archive_filename);
+            let zip_title = if plan.total_parts > 1 {
+                format!(
+                    "{} (Part {}/{})",
+                    ctx.zip_album, plan.part_index, plan.total_parts
+                )
+            } else {
+                ctx.zip_album.clone()
+            };
+            let bus_clone = bus.clone();
+            let shared_clone = Arc::clone(shared);
+            let texts = Arc::clone(&ctx.texts);
+            let cancel = job_controller.clone();
+            let output_clone = output.clone();
+            let plan_clone = plan.clone();
+            let title_clone = zip_title.clone();
+            if is_cancelled() {
+                return first_delivery;
+            }
+            let build = tokio::task::spawn_blocking(move || {
+                let text = format!("📦 Zipping: <b>{}</b>", html_escape(&title_clone));
+                *texts.upload.lock().expect("texts poisoned") = Some(text);
+                let (download_text, upload_text) = texts.snapshot();
+                bus_clone.emit_progress(
+                    &shared_clone,
                     None,
                     download_text.as_deref(),
                     upload_text.as_deref(),
                 );
-                match upload {
-                    Ok(Some(upload)) if complete => {
-                        // Archive copies go to the user only for `-z`
-                        // user jobs; plain jobs got the individual tracks.
-                        if ctx.zip_deliver && !options.is_cache_only {
-                            delivered_part_count += 1;
-                            delivered_size_bytes += size as i64;
-                            let reply_to = if options.delivery_chat_id == options.chat_id {
-                                options.reply_to_message_id
-                            } else {
-                                None
-                            };
-                            match deps
-                                .sink()
-                                .send_dump_copy(
-                                    options.delivery_chat_id,
-                                    upload.message_id,
-                                    reply_to,
-                                    plan.total_parts > 1,
-                                )
-                                .await
-                            {
-                                Ok(sent_id) => {
-                                    let mut guard = ctx.first_delivered_msg_id.lock().unwrap();
-                                    if guard.is_none() {
-                                        *guard = Some(sent_id);
-                                    }
-                                }
-                                Err(error) => {
-                                    tracing::warn!(%error, "ZIP DM delivery failed");
-                                }
-                            }
-                        }
-                        let _ = deps
-                            .save_album(AlbumUpload {
-                                provider: ctx.options.provider,
-                                album_id: ctx.zip_album_id.clone(),
-                                codec: album_codec,
-                                part_index: plan.part_index as i32,
-                                total_parts: plan.total_parts as i32,
-                                message_id: upload.message_id,
-                                file_id: upload.file_id,
-                                file_unique_id: upload.file_unique_id,
-                                file_size: size as i64,
-                                file_name: plan.archive_filename.clone(),
-                                generation_hash: ctx
-                                    .zip_generation_hash
-                                    .clone()
-                                    .unwrap_or_default(),
-                            })
-                            .await;
-                    }
-                    Ok(_) => {
-                        // Partial user deliveries land here (sent straight
-                        // to the delivery chat).
-                        if !complete && !options.is_cache_only {
-                            delivered_part_count += 1;
-                            delivered_size_bytes += size as i64;
-                        }
-                    }
-                    Err(error) => tracing::warn!(%error, "ZIP upload failed"),
-                }
+                let progress_texts = Arc::clone(&texts);
+                let progress_shared = Arc::clone(&shared_clone);
+                let progress_bus = bus_clone.clone();
+                let on_progress = move |uploaded: u64, total: u64| {
+                    let progress = format_byte_progress(uploaded, total, 12);
+                    let text = format!("📦 Zipping: <code>{progress}</code>");
+                    *progress_texts.upload.lock().expect("texts poisoned") = Some(text);
+                    let (download_text, upload_text) = progress_texts.snapshot();
+                    progress_bus.emit_progress(
+                        &progress_shared,
+                        None,
+                        download_text.as_deref(),
+                        upload_text.as_deref(),
+                    );
+                };
+                let result = create_zip_archive(
+                    &output_clone,
+                    &plan_clone,
+                    Some(&on_progress),
+                    Some(&cancel),
+                );
+                *texts.upload.lock().expect("texts poisoned") = None;
+                result
+            })
+            .await;
+            if is_cancelled() {
+                let _ = tokio::fs::remove_file(&output).await;
+                return first_delivery;
             }
-        }
-        Err(error) => tracing::warn!(%error, "ZIP planning failed"),
-    }
-    if ctx.zip_deliver && !options.is_cache_only && delivered_part_count > 0 {
-        let release_year: String = ctx.zip_release_date.chars().take(4).collect();
-        let zip_codec = ctx.zip_codec.lock().expect("zip codec poisoned").clone();
-        let caption_meta = AlbumDetailsCaptionMetadata {
-            album: &ctx.zip_album,
-            artist: &ctx.zip_artist,
-            album_url: ctx.zip_album_url.as_deref(),
-            total_tracks: expected_tracks,
-            delivered_tracks: delivered_track_count,
-            size_bytes: delivered_size_bytes,
-            total_parts: delivered_part_count,
-            release_year: &release_year,
-            genre: ctx.zip_genre.as_deref(),
-            record_label: ctx.zip_record_label.as_deref(),
-            is_partial: !complete,
-            user_name: options.user_name.as_deref(),
-            user_id: options.user_id,
-            codec: zip_codec.as_deref(),
-        };
-        let details_caption = format_album_details_caption(&caption_meta);
-        let mut photo_delivered = false;
-        if let Some(bytes) = &cover_bytes {
-            if let Err(error) = deps
-                .sink()
-                .send_photo_to_chat(options.delivery_chat_id, bytes, &details_caption)
-                .await
-            {
-                tracing::warn!(%error, "cover preview send failed");
+            let Ok(Ok(size)) = build else { continue };
+            if size > TELEGRAM_SPLIT_THRESHOLD_BYTES {
+                let _ = tokio::fs::remove_file(&output).await;
+                continue;
+            }
+            let caption = format_zip_dump_caption(
+                &DumpZipCaptionMetadata {
+                    provider: options.provider,
+                    album_id: &ctx.zip_album_id,
+                    codec: Some(album_codec.as_str()),
+                    album: &ctx.zip_album,
+                    artist: &ctx.zip_artist,
+                    filename: &plan.archive_filename,
+                    part_index: plan.part_index as i32,
+                    total_parts: plan.total_parts as i32,
+                    generation_hash: state.generation_hash.as_deref().unwrap_or(""),
+                },
+                complete,
+                failures.len(),
+            );
+            let path = output.to_string_lossy().into_owned();
+            if is_cancelled() {
+                let _ = tokio::fs::remove_file(&output).await;
+                return first_delivery;
+            }
+            let on_upload: UploadProgressCallback = {
+                let texts = Arc::clone(&ctx.texts);
+                let shared = Arc::clone(shared);
+                let bus = bus.clone();
+                let title = zip_title.clone();
+                Arc::new(move |uploaded, total| {
+                    let progress = format_byte_progress(uploaded, total, 12);
+                    let text = format!(
+                        "⬆️ Uploading ZIP: <b>{}</b> <code>{progress}</code>",
+                        html_escape(&title)
+                    );
+                    *texts.upload.lock().expect("texts poisoned") = Some(text);
+                    let (download_text, upload_text) = texts.snapshot();
+                    bus.emit_progress(
+                        &shared,
+                        None,
+                        download_text.as_deref(),
+                        upload_text.as_deref(),
+                    );
+                })
+            };
+            *ctx.texts.upload.lock().expect("texts poisoned") = Some(format!(
+                "⬆️ Uploading ZIP: <b>{}</b>",
+                html_escape(&zip_title)
+            ));
+            let (download_text, upload_text) = ctx.texts.snapshot();
+            bus.emit_progress(
+                shared,
+                None,
+                download_text.as_deref(),
+                upload_text.as_deref(),
+            );
+            let upload = if complete {
+                deps.sink()
+                    .send_document_to_dump(
+                        &path,
+                        thumb_path_str.as_deref(),
+                        &caption,
+                        Some(&on_upload),
+                    )
+                    .await
             } else {
-                photo_delivered = true;
+                match deps
+                    .sink()
+                    .send_document_to_chat(
+                        options.delivery_chat_id,
+                        &path,
+                        thumb_path_str.as_deref(),
+                        &caption,
+                        Some(&on_upload),
+                    )
+                    .await
+                {
+                    Ok(sent_id) => {
+                        let mut first = ctx.first_delivered_msg_id.lock().unwrap();
+                        if first.is_none() {
+                            *first = Some(sent_id);
+                        }
+                        Ok(None)
+                    }
+                    Err(error) => Err(error),
+                }
+            };
+            *ctx.texts.upload.lock().expect("texts poisoned") = None;
+            if is_cancelled() {
+                if let Some(message_id) = upload
+                    .as_ref()
+                    .ok()
+                    .and_then(|result| result.as_ref().map(|sent| sent.message_id))
+                {
+                    let _ = deps.sink().delete_dump_messages(&[message_id]).await;
+                }
+                return first_delivery;
+            }
+            match upload {
+                Ok(Some(upload)) if complete => {
+                    if is_cancelled() {
+                        let _ = deps.sink().delete_dump_messages(&[upload.message_id]).await;
+                        return first_delivery;
+                    }
+                    if ctx.zip_deliver && !options.is_cache_only {
+                        if is_cancelled() {
+                            return first_delivery;
+                        }
+                        let reply_to = (options.delivery_chat_id == options.chat_id)
+                            .then_some(options.reply_to_message_id)
+                            .flatten();
+                        if let Ok(sent_id) = deps
+                            .sink()
+                            .send_dump_copy(
+                                options.delivery_chat_id,
+                                upload.message_id,
+                                reply_to,
+                                plan.total_parts > 1,
+                            )
+                            .await
+                        {
+                            if is_cancelled() {
+                                return first_delivery;
+                            }
+                            let mut first = ctx.first_delivered_msg_id.lock().unwrap();
+                            if first.is_none() {
+                                *first = Some(sent_id);
+                            }
+                            delivered_parts += 1;
+                            delivered_size += size as i64;
+                        }
+                    }
+                    let _ = deps
+                        .save_album(AlbumUpload {
+                            provider: options.provider,
+                            album_id: ctx.zip_album_id.clone(),
+                            codec: album_codec,
+                            part_index: plan.part_index as i32,
+                            total_parts: plan.total_parts as i32,
+                            message_id: upload.message_id,
+                            file_id: upload.file_id,
+                            file_unique_id: upload.file_unique_id,
+                            file_size: size as i64,
+                            file_name: plan.archive_filename.clone(),
+                            generation_hash: state.generation_hash.clone().unwrap_or_default(),
+                        })
+                        .await;
+                }
+                Ok(_) if !complete && !options.is_cache_only => {
+                    delivered_parts += 1;
+                    delivered_size += size as i64;
+                }
+                Err(error) => tracing::warn!(%error, "ZIP upload failed"),
+                _ => {}
             }
         }
-        return Some(ZipDeliveryInfo {
-            album: ctx.zip_album.clone(),
-            artist: ctx.zip_artist.clone(),
-            release_year,
-            total_tracks: expected_tracks,
-            delivered_tracks: delivered_track_count,
-            total_parts: delivered_part_count,
-            size_bytes: delivered_size_bytes,
-            is_partial: !complete,
-            album_id: ctx.zip_album_id.clone(),
-            album_url: ctx.zip_album_url.clone(),
-            artwork_url: ctx.zip_artwork_url.clone(),
-            genre: ctx.zip_genre.clone(),
-            record_label: ctx.zip_record_label.clone(),
-            copyright: ctx.zip_copyright.clone(),
-            photo_delivered,
-            codec: ctx.zip_codec.lock().expect("zip codec poisoned").clone(),
-        });
+        if ctx.zip_deliver && !options.is_cache_only && delivered_parts > 0 {
+            let release_year = ctx.zip_release_date.chars().take(4).collect::<String>();
+            let caption_meta = AlbumDetailsCaptionMetadata {
+                album: &ctx.zip_album,
+                artist: &ctx.zip_artist,
+                album_url: ctx.zip_album_url.as_deref(),
+                total_tracks: expected_tracks,
+                delivered_tracks: entries.len(),
+                size_bytes: delivered_size,
+                total_parts: delivered_parts,
+                release_year: &release_year,
+                genre: ctx.zip_genre.as_deref(),
+                record_label: ctx.zip_record_label.as_deref(),
+                is_partial: !complete,
+                user_name: options.user_name.as_deref(),
+                user_id: options.user_id,
+                codec: Some(codec.as_str()),
+            };
+            let details = format_album_details_caption(&caption_meta);
+            let photo_delivered = if let Some(bytes) = &cover_bytes {
+                if is_cancelled() {
+                    return first_delivery;
+                }
+                let delivered = deps
+                    .sink()
+                    .send_photo_to_chat(options.delivery_chat_id, bytes, &details)
+                    .await
+                    .is_ok();
+                if is_cancelled() {
+                    return first_delivery;
+                }
+                delivered
+            } else {
+                false
+            };
+            let info = ZipDeliveryInfo {
+                album: ctx.zip_album.clone(),
+                artist: ctx.zip_artist.clone(),
+                release_year,
+                total_tracks: expected_tracks,
+                delivered_tracks: entries.len(),
+                total_parts: delivered_parts,
+                size_bytes: delivered_size,
+                is_partial: !complete,
+                album_id: ctx.zip_album_id.clone(),
+                album_url: ctx.zip_album_url.clone(),
+                artwork_url: ctx.zip_artwork_url.clone(),
+                genre: ctx.zip_genre.clone(),
+                record_label: ctx.zip_record_label.clone(),
+                copyright: ctx.zip_copyright.clone(),
+                photo_delivered,
+                codec: Some(codec),
+            };
+            if first_delivery.is_none() {
+                first_delivery = Some(info.clone());
+            }
+            ctx.zip_delivery_infos.lock().unwrap().push(info);
+        }
     }
-    None
+    first_delivery
 }
 
 /// Best-effort cleanup for a cancellation after an upload has completed.
@@ -2751,6 +2578,9 @@ async fn upload_one<D: OrchestratorDeps>(
     }
     let mut outcome: Option<SendOutcome> = None;
     'upload: for attempt in 0..=max_retries {
+        if is_cancelled() {
+            break 'upload;
+        }
         let on_upload: UploadProgressCallback = {
             let texts = Arc::clone(texts);
             let shared = Arc::clone(shared);
@@ -2795,6 +2625,9 @@ async fn upload_one<D: OrchestratorDeps>(
                     // `media?.type === 'audio'` check below fails.
                     None => SendOutcome::NotAudio,
                 });
+                // The post-upload transaction performs cancellation cleanup
+                // before saving or delivering anything derived from this
+                // message.  Do not start another awaited operation here.
                 break 'upload;
             }
             Err(upload_err) => {
@@ -2833,7 +2666,7 @@ async fn upload_one<D: OrchestratorDeps>(
                     );
                     // Record the track failure and keep the job alive so
                     // later tracks still upload.
-                    {
+                    if upload_item.rendition == Rendition::Primary {
                         let mut failures = ctx.failed_tracks.lock().expect("failures poisoned");
                         failures.push(FailedTrack {
                             id: track_id.clone(),
@@ -2880,7 +2713,7 @@ async fn upload_one<D: OrchestratorDeps>(
         SendOutcome::NotAudio => {
             if !is_cancelled() {
                 let err_msg = "Upload failed: no audio media returned";
-                {
+                if upload_item.rendition == Rendition::Primary {
                     let mut failures = ctx.failed_tracks.lock().expect("failures poisoned");
                     failures.push(FailedTrack {
                         id: track_id.clone(),
@@ -2997,11 +2830,13 @@ async fn upload_one<D: OrchestratorDeps>(
         Ok(total_duration_ms) => {
             *texts.upload.lock().expect("texts poisoned") = None;
             shared.lock().expect("job poisoned").job.active_action_text = None;
-            let new_count = ctx
-                .ripped_count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                + 1;
-            shared.lock().expect("job poisoned").job.ripped_count = new_count;
+            if upload_item.rendition == Rendition::Primary {
+                let new_count = ctx
+                    .ripped_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                shared.lock().expect("job poisoned").job.ripped_count = new_count;
+            }
 
             // Publish the completed upload immediately. Without this event a
             // single-track job could leave the dashboard showing
@@ -3032,19 +2867,21 @@ async fn upload_one<D: OrchestratorDeps>(
             if is_cancelled() {
                 return false;
             }
-            record_failure(
-                shared,
-                ctx,
-                deps,
-                TrackFailureDetails {
-                    track_id: &track_id,
-                    err_msg,
-                    start_time_ms: upload_item.start_time_ms,
-                    title: Some(upload_item.rip_result.title.clone()),
-                    artist: Some(upload_item.rip_result.artist.clone()),
-                },
-            )
-            .await;
+            if upload_item.rendition == Rendition::Primary {
+                record_failure(
+                    shared,
+                    ctx,
+                    deps,
+                    TrackFailureDetails {
+                        track_id: &track_id,
+                        err_msg,
+                        start_time_ms: upload_item.start_time_ms,
+                        title: Some(upload_item.rip_result.title.clone()),
+                        artist: Some(upload_item.rip_result.artist.clone()),
+                    },
+                )
+                .await;
+            }
             let (download_text, upload_text) = texts.snapshot();
             bus.emit_progress(
                 shared,

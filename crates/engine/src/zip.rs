@@ -99,7 +99,7 @@ pub fn build_album_archive_base_name_with_codec(
     };
     let label = match codec {
         "ec-3" => "Atmos",
-        "mp4a.40.2" | "mp4a.40.5" => "AAC",
+        "aac" | "mp4a.40.2" | "mp4a.40.5" => "AAC",
         _ => "ALAC",
     };
     sanitize_archive_filename(&format!("{artist} - {album}{year_part} [{label}]"))

@@ -78,6 +78,7 @@ struct DepsState {
     deleted_album_zip_ids: Vec<String>,
     found_albums: HashMap<String, Vec<CachedAlbum>>,
     sent_documents: Vec<String>, // dump + direct document upload paths
+    sent_document_captions: Vec<String>,
     uploaded_document_bytes: Vec<u8>, // captured at upload time (workspace is deleted after)
     /// Thumbnail paths passed to document sends (may repeat per part).
     sent_thumbs: Vec<String>,
@@ -133,11 +134,11 @@ impl FakeDeps {
         (deps, state)
     }
 
-    fn cache_track(&self, id: &str, message_id: i64) {
-        let key = TrackKey::apple(id).with_codec(engine::Codec::Alac);
+    fn cache_track_with_codec(&self, id: &str, message_id: i64, codec: engine::Codec) {
+        let key = TrackKey::apple(id).with_codec(codec);
         let track = CachedTrack {
             track_key: key.clone(),
-            codec: engine::Codec::Alac,
+            codec,
             message_id,
             file_id: format!("file_{id}"),
             file_unique_id: format!("uniq_{id}"),
@@ -146,10 +147,16 @@ impl FakeDeps {
             album: "Cached Album".into(),
         };
         self.cache.lock().unwrap().insert(key, track.clone());
-        self.cache
-            .lock()
-            .unwrap()
-            .insert(TrackKey::apple(id), track);
+        if codec == engine::Codec::Alac {
+            self.cache
+                .lock()
+                .unwrap()
+                .insert(TrackKey::apple(id), track);
+        }
+    }
+
+    fn cache_track(&self, id: &str, message_id: i64) {
+        self.cache_track_with_codec(id, message_id, engine::Codec::Alac);
     }
 
     fn set_settings(&self, f: impl FnOnce(&mut BotSettings)) {
@@ -299,7 +306,7 @@ impl TelegramSink for FakeSink {
         caption_html: &'a str,
         on_upload_progress: Option<&'a UploadProgressCallback>,
     ) -> Pin<Box<dyn Future<Output = Result<Option<DumpUpload>, SinkError>> + Send + 'a>> {
-        let _ = (caption_html, on_upload_progress);
+        let _ = caption_html;
         let state = Arc::clone(&self.state);
         let path = file_path.to_owned();
         let thumb = thumb_path.map(str::to_owned);
@@ -307,8 +314,13 @@ impl TelegramSink for FakeSink {
             // Read the bytes now: the orchestrator deletes the workspace
             // right after the upload returns.
             let bytes = std::fs::read(&path).unwrap_or_default();
+            if let Some(callback) = on_upload_progress {
+                callback(0, bytes.len() as u64);
+                callback(bytes.len() as u64, bytes.len() as u64);
+            }
             let mut st = state.lock().unwrap();
             st.sent_documents.push(path);
+            st.sent_document_captions.push(caption_html.to_string());
             st.uploaded_document_bytes = bytes;
             st.sent_thumbs.extend(thumb);
             Ok(Some(DumpUpload {
@@ -327,14 +339,19 @@ impl TelegramSink for FakeSink {
         caption_html: &'a str,
         on_upload_progress: Option<&'a UploadProgressCallback>,
     ) -> Pin<Box<dyn Future<Output = Result<i32, SinkError>> + Send + 'a>> {
-        let _ = (chat_id, caption_html, on_upload_progress);
+        let _ = (chat_id, caption_html);
         let state = Arc::clone(&self.state);
         let path = file_path.to_owned();
         let thumb = thumb_path.map(str::to_owned);
         Box::pin(async move {
             let bytes = std::fs::read(&path).unwrap_or_default();
+            if let Some(callback) = on_upload_progress {
+                callback(0, bytes.len() as u64);
+                callback(bytes.len() as u64, bytes.len() as u64);
+            }
             let mut st = state.lock().unwrap();
             st.sent_documents.push(path);
+            st.sent_document_captions.push(caption_html.to_string());
             st.uploaded_document_bytes = bytes;
             st.sent_thumbs.extend(thumb);
             Ok(200)
@@ -444,12 +461,21 @@ impl TrackAcquisition for FakeDeps {
                 let dir = output_dir
                     .map(std::path::Path::to_path_buf)
                     .unwrap_or_else(|| std::env::temp_dir().join(format!("fake_rip_{id}")));
-                let path = dir.join(format!("{id}.m4a"));
+                let rendition = if options.codec_preference == music::CodecPreference::Atmos {
+                    "atmos"
+                } else {
+                    "primary"
+                };
+                let path = dir.join(format!("{id}-{rendition}.m4a"));
                 std::fs::write(&path, &bytes).map_err(|e| RipError::Message(e.to_string()))?;
-                Ok(TrackRipResult {
+                let mut result = TrackRipResult {
                     file_path: path.to_string_lossy().into_owned(),
                     ..Self::rip_result(&id)
-                })
+                };
+                if options.codec_preference == music::CodecPreference::Atmos {
+                    result.codec = "ec-3".into();
+                }
+                Ok(result)
             }
             _ => Ok(Self::rip_result(&id)),
         }
@@ -621,14 +647,17 @@ impl OrchestratorDeps for FakeDeps {
 #[derive(Clone)]
 struct EventLog {
     records: Arc<Mutex<Vec<String>>>,
+    upload_progress: Arc<Mutex<Vec<String>>>,
 }
 
 impl EventLog {
     fn attach(orch: &RipOrchestrator) -> Self {
         let log = Self {
             records: Arc::new(Mutex::new(Vec::new())),
+            upload_progress: Arc::new(Mutex::new(Vec::new())),
         };
         let records = Arc::clone(&log.records);
+        let upload_progress = Arc::clone(&log.upload_progress);
         orch.subscribe(Arc::new(move |event: &OrchestratorEvent<'_>| {
             let mut v = records.lock().unwrap();
             match event {
@@ -640,6 +669,9 @@ impl EventLog {
                 }
                 OrchestratorEvent::Failed(_, msg) => v.push(format!("failed:{msg}")),
                 OrchestratorEvent::Progress(_, p) => {
+                    if let Some(text) = &p.active_upload_text {
+                        upload_progress.lock().unwrap().push(text.clone());
+                    }
                     v.push(format!(
                         "progress:{}:{}:{}",
                         p.percent,
@@ -654,6 +686,10 @@ impl EventLog {
 
     fn snapshot(&self) -> Vec<String> {
         self.records.lock().unwrap().clone()
+    }
+
+    fn upload_progress_snapshot(&self) -> Vec<String> {
+        self.upload_progress.lock().unwrap().clone()
     }
 }
 
@@ -824,7 +860,7 @@ async fn album_resolution_refines_header_and_lists_tracks() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn all_cached_fast_path() {
+async fn all_cached_uses_ordered_pipeline_once() {
     let (orch, deps, state, events) = setup();
     deps.cache_track("1440828878", 4242);
     *deps.cache_delay_ms.lock().unwrap() = 120;
@@ -854,7 +890,10 @@ async fn all_cached_fast_path() {
     let ev = events.snapshot();
     assert!(ev.contains(&"progress:100:Delivered cached tracks...:1".to_string()));
     assert_eq!(*ev.last().unwrap(), "completed");
-    assert!(!ev.contains(&"started".to_string()), "queue never starts");
+    assert!(
+        ev.contains(&"started".to_string()),
+        "cache hits use the ordered pipeline"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1651,6 +1690,80 @@ async fn zip_only_delivery_skips_individual_track_copies() {
     assert!(!delivery.is_partial);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zip_primary_and_atmos_progress_reaches_event_consumers() {
+    let (orch, deps, state, events) = setup();
+    let meta = |id: &str| FakeDeps::track_meta(id, "Track", "Artist");
+    deps.albums.lock().unwrap().insert(
+        "alb.progress".into(),
+        FakeDeps::album(vec![meta("t1"), meta("t2")]),
+    );
+    for id in ["t1", "t2"] {
+        deps.rip_scripts
+            .lock()
+            .unwrap()
+            .insert(id.into(), RipScript::OkWithFile(vec![1, 2, 3]));
+    }
+    {
+        let mut st = state.lock().unwrap();
+        for _ in 0..4 {
+            st.send_audio_results.push_back(FakeDeps::upload_ok());
+        }
+    }
+
+    let mut opts = zip_options("alb.progress", false, true, false);
+    opts.rendition_policy = music::RenditionPolicy::PrimaryWithOptionalAtmos;
+    run_async(&orch, &deps, &opts)
+        .await
+        .expect("dual-rendition ZIP job succeeds");
+
+    let st = state.lock().unwrap();
+    assert_eq!(
+        st.sent_documents.len(),
+        2,
+        "primary and Atmos archives upload"
+    );
+    assert_eq!(
+        st.saved_albums.len(),
+        2,
+        "primary and Atmos archive rows persist"
+    );
+    assert!(st
+        .saved_albums
+        .iter()
+        .any(|album| album.codec == engine::Codec::Alac));
+    assert!(st
+        .saved_albums
+        .iter()
+        .any(|album| album.codec == engine::Codec::Ec3));
+    drop(st);
+
+    let progress = events.upload_progress_snapshot();
+    let build_progress = progress
+        .iter()
+        .filter(|text| text.starts_with("📦 Zipping:"))
+        .collect::<Vec<_>>();
+    let upload_progress = progress
+        .iter()
+        .filter(|text| text.starts_with("⬆️ Uploading ZIP:"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        build_progress.len(),
+        6,
+        "both archives emit build status and bytes"
+    );
+    assert_eq!(
+        upload_progress.len(),
+        6,
+        "both archives emit upload status and bytes"
+    );
+    assert!(
+        build_progress.iter().any(|text| text.contains("<code>"))
+            && upload_progress.iter().any(|text| text.contains("<code>")),
+        "byte progress remains visible to EventBus consumers: {progress:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zip_cached_without_reuse_rows_stages_and_rebuilds() {
     // Fully cached album, no reusable ZIP rows: staging downloads run, the
@@ -1704,6 +1817,34 @@ async fn zip_cached_without_reuse_rows_stages_and_rebuilds() {
             .as_ref()
             .is_some_and(|d| !d.is_partial && d.delivered_tracks == 2),
         "delivery metadata present"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cached_aac_zip_uses_aac_identity_everywhere() {
+    let (orch, deps, state, _) = setup();
+    let meta = |id: &str| FakeDeps::track_meta(id, "Track", "Artist");
+    deps.albums.lock().unwrap().insert(
+        "alb.aac".into(),
+        FakeDeps::album(vec![meta("a1"), meta("a2")]),
+    );
+    deps.cache_track_with_codec("a1", 201, engine::Codec::Aac);
+    deps.cache_track_with_codec("a2", 202, engine::Codec::Aac);
+
+    let summary = run_async(&orch, &deps, &zip_options("alb.aac", false, true, false))
+        .await
+        .expect("job succeeds");
+
+    let st = state.lock().unwrap();
+    assert_eq!(st.saved_albums.len(), 1);
+    assert_eq!(st.saved_albums[0].codec, engine::Codec::Aac);
+    assert!(st.sent_document_captions[0].contains("[AAC]"));
+    assert_eq!(
+        summary
+            .zip_delivery
+            .as_ref()
+            .and_then(|info| info.codec.as_deref()),
+        Some("aac")
     );
 }
 

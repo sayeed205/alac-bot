@@ -95,7 +95,7 @@ pub enum RenditionPolicy {
     PrimaryWithOptionalAtmos,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Rendition {
     Primary,
     Atmos,
