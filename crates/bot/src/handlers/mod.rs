@@ -1,8 +1,9 @@
 mod auth;
-pub mod autodump;
 mod backup;
 mod clean;
 mod delete;
+pub mod dump;
+pub(crate) mod get;
 mod help;
 mod index;
 mod info;
@@ -11,7 +12,6 @@ mod ops;
 mod random;
 mod report;
 mod revoke;
-pub(crate) mod rip;
 mod search;
 pub mod settings;
 mod spec;
@@ -71,7 +71,7 @@ pub(crate) fn chat_peer_ref(msg: &ferogram::update::IncomingMessage) -> ferogram
         .unwrap_or(ferogram::PeerRef::from(msg.chat_id()))
 }
 
-/// Open or refresh the single status dashboard owned by a chat. Rip commands
+/// Open or refresh the single status dashboard owned by a chat. Get commands
 /// and callback-driven deliveries share this helper so neither path can
 /// accidentally create a per-job progress message or deliver into a group.
 pub(crate) async fn ensure_dashboard(
@@ -122,7 +122,7 @@ pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
     auth::register(dp, Arc::clone(&state));
     revoke::register(dp, Arc::clone(&state));
     list::register(dp, Arc::clone(&state));
-    rip::register(dp, Arc::clone(&state));
+    get::register(dp, Arc::clone(&state));
     status::register(dp, Arc::clone(&state));
     settings::register(dp, Arc::clone(&state));
     ops::register(dp, Arc::clone(&state));
@@ -135,7 +135,7 @@ pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
     report::register(dp, Arc::clone(&state));
     search::register(dp, Arc::clone(&state));
     random::register(dp, Arc::clone(&state));
-    autodump::register(dp, Arc::clone(&state));
+    dump::register(dp, Arc::clone(&state));
 
     let callback_state = Arc::clone(&state);
     dp.on_callback_query(filters::all::<CallbackQuery>(), move |query| {
@@ -170,7 +170,7 @@ pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
                     backup::callback(state, query, action).await
                 }
                 Some(action @ TelegramAction::DeliverCached { .. })
-                | Some(action @ TelegramAction::Rip { .. })
+                | Some(action @ TelegramAction::Get { .. })
                 | Some(action @ TelegramAction::SearchClose) => {
                     search::callback(state, query, action).await
                 }

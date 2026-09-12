@@ -321,7 +321,11 @@ fn failed_track_reason(error: &str) -> Option<&'static str> {
 fn format_failed_track(failed: &FailedTrack) -> String {
     let label = match (&failed.title, &failed.artist) {
         (Some(title), Some(artist)) if !title.trim().is_empty() && !artist.trim().is_empty() => {
-            format!("{} - {}", crate::html::escape(title), crate::html::escape(artist))
+            format!(
+                "{} - {}",
+                crate::html::escape(title),
+                crate::html::escape(artist)
+            )
         }
         (Some(title), _) if !title.trim().is_empty() => crate::html::escape(title).to_string(),
         _ if !failed.id.is_empty() && failed.id.chars().all(|c| c.is_ascii_digit()) => {
@@ -331,7 +335,11 @@ fn format_failed_track(failed: &FailedTrack) -> String {
     };
 
     let link = if !failed.id.is_empty() && failed.id.chars().all(|c| c.is_ascii_digit()) {
-        let url = if let Some(sf) = failed.storefront.as_deref().filter(|s| !s.trim().is_empty()) {
+        let url = if let Some(sf) = failed
+            .storefront
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
             format!("https://music.apple.com/{sf}/song/{}", failed.id)
         } else {
             format!("https://music.apple.com/song/{}", failed.id)

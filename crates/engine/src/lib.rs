@@ -19,6 +19,6 @@ pub mod zip;
 
 pub use parser::{extract_batch_items, parse_alac_input, parse_single_item};
 pub use types::{
-    AlbumTracks, ArtistTracks, ChartAlbum, ParsedAlacInput, ParsedTargetItem, Provider, TargetKind,
-    Codec, TrackKey, TrackMeta,
+    AlbumTracks, ArtistTracks, ChartAlbum, Codec, ParsedAlacInput, ParsedTargetItem, Provider,
+    TargetKind, TrackKey, TrackMeta,
 };

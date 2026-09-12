@@ -15,7 +15,7 @@ struct TelegramSink {
     peer: PeerRef,
 }
 
-/// Construct the dashboard adapter used by both `/status` and rip commands.
+/// Construct the dashboard adapter used by both `/status` and get commands.
 /// Keeping the adapter here ensures every chat has one consistent message
 /// lifecycle regardless of which command first opens the dashboard.
 pub(crate) fn dashboard_sink(client: ferogram::Client, peer: PeerRef) -> Arc<dyn DashboardSink> {

@@ -347,7 +347,9 @@ async fn index_dump_channel(
     if let Ok(zip_rows) = zip_repo.list_albums().await {
         for row in zip_rows {
             if !valid_zip_msg_ids.contains(&row.message_id) {
-                let _ = zip_repo.delete_albums(row.provider, &row.album_id, Some(row.codec)).await;
+                let _ = zip_repo
+                    .delete_albums(row.provider, &row.album_id, Some(row.codec))
+                    .await;
                 pruned += 1;
             }
         }

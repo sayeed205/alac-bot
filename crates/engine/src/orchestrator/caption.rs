@@ -614,7 +614,10 @@ mod tests {
             .replace("&#39;", "'")
             .replace("<br/>", "\n");
         let parsed = parse_dump_caption(Some(&unescaped)).expect("payload found");
-        assert_eq!(parsed.track_key, TrackKey::apple("1440828878").with_codec(Codec::Alac));
+        assert_eq!(
+            parsed.track_key,
+            TrackKey::apple("1440828878").with_codec(Codec::Alac)
+        );
         assert_eq!(parsed.codec, Codec::Alac);
         assert_eq!(parsed.title, "Night Song");
         assert_eq!(parsed.artist, "A&R <duo>");
@@ -641,7 +644,10 @@ mod tests {
     fn parse_defaults_missing_fields() {
         let parsed = parse_dump_caption(Some("{\"provider\": \"apple\", \"track_id\": \"abc\"}"))
             .expect("minimal payload parses");
-        assert_eq!(parsed.track_key, TrackKey::apple("abc").with_codec(Codec::Alac));
+        assert_eq!(
+            parsed.track_key,
+            TrackKey::apple("abc").with_codec(Codec::Alac)
+        );
         assert_eq!(parsed.codec, Codec::Alac);
         assert_eq!(parsed.title, "");
         assert_eq!(parsed.bit_depth, 16);

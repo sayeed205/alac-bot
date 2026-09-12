@@ -17,8 +17,8 @@ use crate::{
     limits::MAX_AUDIO_BYTES,
     lyrics::{self, LyricsHttp, LyricsMeta},
     streaming::{
-        AudioStreamSource, MirrorEndpoint, MirrorPolicyManager, ProgressCallback, StreamError,
-        StreamTransport, is_non_retryable_error,
+        is_non_retryable_error, AudioStreamSource, MirrorEndpoint, MirrorPolicyManager,
+        ProgressCallback, StreamError, StreamTransport,
     },
     tagger,
     types::{TrackMeta, TrackRipResult},
@@ -283,120 +283,149 @@ impl AlacTrackRipper {
         let target_dir: &Path = output_dir.unwrap_or(&self.config.default_output_dir);
         tokio::fs::create_dir_all(target_dir).await?;
         let track_dir = target_dir.join(format!(".track_{}", unique_temp_suffix()));
-        tokio::fs::create_dir_all(&track_dir).await?;
-
-        emit_progress(on_progress, "Fetching track metadata...", None, None);
-        let meta = deps.track_meta(track_id, storefront).await?;
-
-        if signal.is_some_and(|t| t.is_cancelled()) {
-            return Err(cancelled());
+        if let Err(error) = tokio::fs::create_dir_all(&track_dir).await {
+            // `create_dir_all` can leave a partially-created directory behind
+            // before reporting an error.  Do not leave that staging lane for
+            // a later `/clean` invocation to discover.
+            let _ = tokio::fs::remove_dir_all(&track_dir).await;
+            return Err(error.into());
         }
 
-        emit_progress(
-            on_progress,
-            &format!("Connecting stream for {} - {}...", meta.title, meta.artist),
-            None,
-            None,
-        );
+        // Keep every operation after staging-directory creation inside one
+        // result so metadata/connect/cancellation errors get the same cleanup
+        // as stream and tagging errors.
+        let result: Result<TrackRipResult, RipError> = async {
+            emit_progress(on_progress, "Fetching track metadata...", None, None);
+            let meta = deps.track_meta(track_id, storefront).await?;
+
+            if signal.is_some_and(|t| t.is_cancelled()) {
+                return Err(cancelled());
+            }
+
+            emit_progress(
+                on_progress,
+                &format!("Connecting stream for {} - {}...", meta.title, meta.artist),
+                None,
+                None,
+            );
 
         // Concurrent prefetch: lyrics + artwork run while the audio streams.
-        let lyrics_meta = LyricsMeta {
-            title: meta.title.clone(),
-            artist: meta.artist.clone(),
-            album: Some(meta.album.clone()).filter(|a| !a.is_empty()),
-            duration: Some(meta.duration_secs).filter(|d| *d != 0),
-        };
-        let lyrics_task = {
-            let meta = lyrics_meta.clone();
-            let track_id = track_id.to_owned();
-            async move {
-                match deps.fetch_lyrics(&track_id, &meta).await {
-                    Some(l) => {
-                        debug!(track_id, found = true, "Lyrics prefetch completed");
-                        Some(l)
-                    }
-                    None => {
-                        debug!(track_id, found = false, "Lyrics prefetch completed");
-                        None
+            let lyrics_meta = LyricsMeta {
+                title: meta.title.clone(),
+                artist: meta.artist.clone(),
+                album: Some(meta.album.clone()).filter(|a| !a.is_empty()),
+                duration: Some(meta.duration_secs).filter(|d| *d != 0),
+            };
+            let lyrics_task = {
+                let meta = lyrics_meta.clone();
+                let track_id = track_id.to_owned();
+                async move {
+                    match deps.fetch_lyrics(&track_id, &meta).await {
+                        Some(l) => {
+                            debug!(track_id, found = true, "Lyrics prefetch completed");
+                            Some(l)
+                        }
+                        None => {
+                            debug!(track_id, found = false, "Lyrics prefetch completed");
+                            None
+                        }
                     }
                 }
-            }
-        };
-        let artwork_task = {
-            let track_id = track_id.to_owned();
-            let artwork_url = meta.artwork_url.clone();
-            async move {
-                if artwork_url.is_empty() {
-                    return None;
+            };
+            let artwork_task = {
+                let track_id = track_id.to_owned();
+                let artwork_url = meta.artwork_url.clone();
+                async move {
+                    if artwork_url.is_empty() {
+                        return None;
+                    }
+                    let artwork = deps.fetch_artwork(&artwork_url).await;
+                    debug!(
+                        track_id,
+                        size_bytes = artwork.as_ref().map_or(0, Vec::len),
+                        "Artwork prefetch completed"
+                    );
+                    artwork
                 }
-                let artwork = deps.fetch_artwork(&artwork_url).await;
-                debug!(
-                    track_id,
-                    size_bytes = artwork.as_ref().map_or(0, Vec::len),
-                    "Artwork prefetch completed"
-                );
-                artwork
-            }
-        };
+            };
 
         // Primary mirror (failure is not fatal — wrapper fallback).
-        let primary = deps.mirror_endpoint(signal).await;
-        if primary.is_none() {
-            debug!(
-                track_id,
-                "Primary mirror manifest/status lookup failed, will attempt fallback"
-            );
-        }
+            let primary = deps.mirror_endpoint(signal).await;
+            if primary.is_none() {
+                debug!(
+                    track_id,
+                    "Primary mirror manifest/status lookup failed, will attempt fallback"
+                );
+            }
 
         // Connect the audio stream.
-        let stream_start = std::time::Instant::now();
-        let stream_progress: Option<ProgressCallback> = on_progress
-            .cloned()
-            .map(|cb| Arc::new(move |status: &str| cb(status, None, None)) as Arc<_>);
-        let mut stream = deps
-            .connect_stream(
+            let stream_start = std::time::Instant::now();
+            let stream_progress: Option<ProgressCallback> = on_progress
+                .cloned()
+                .map(|cb| Arc::new(move |status: &str| cb(status, None, None)) as Arc<_>);
+            let mut stream = deps
+                .connect_stream(
+                    track_id,
+                    primary,
+                    signal.cloned(),
+                    stream_progress,
+                    codec_preference,
+                )
+                .await?;
+
+            debug!(
                 track_id,
-                primary,
-                signal.cloned(),
-                stream_progress,
-                codec_preference,
-            )
-            .await?;
+                source = %stream.source_name,
+                codec = %stream.codec,
+                bit_depth = stream.bit_depth,
+                sample_rate = stream.sample_rate,
+                "Stream audio specs received"
+            );
 
-        debug!(
-            track_id,
-            source = %stream.source_name,
-            codec = %stream.codec,
-            bit_depth = stream.bit_depth,
-            sample_rate = stream.sample_rate,
-            "Stream audio specs received"
-        );
-
-        let unix_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let safe_track_id: String = track_id
-            .chars()
-            .map(|character| {
-                if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
-                    character
-                } else {
-                    '_'
+            let unix_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let safe_track_id: String = track_id
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                        character
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            // Keep the human-readable track id for diagnostics, but always add a
+            // monotonic/time component. Track ids are external input and must not
+            // be allowed to select a path or collide within one job.
+            let temp_raw_path = track_dir.join(format!(
+                "stream_{safe_track_id}_{unix_ms}_{}.raw",
+                unique_temp_suffix()
+            ));
+            // The raw stream is staged in the private lane, but the completed
+            // file must live outside it: callers consume this path after `rip`
+            // returns, while the lane is removed on every outcome. Reserve the
+            // normal human-readable name first, falling back to a unique name
+            // rather than clobbering a concurrent rip's output.
+            let final_name = tagger::build_track_filename_with_codec(&meta, &stream.codec);
+            let stem = final_name.strip_suffix(".m4a").unwrap_or(&final_name);
+            let mut final_path = target_dir.join(&final_name);
+            loop {
+                match tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&final_path)
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        final_path = target_dir
+                            .join(format!("{stem}_{}.m4a", unique_temp_suffix()));
+                    }
+                    Err(error) => return Err(error.into()),
                 }
-            })
-            .collect();
-        // Keep the human-readable track id for diagnostics, but always add a
-        // monotonic/time component. Track ids are external input and must not
-        // be allowed to select a path or collide within one job.
-        let temp_raw_path = track_dir.join(format!(
-            "stream_{safe_track_id}_{unix_ms}_{}.raw",
-            unique_temp_suffix()
-        ));
-        let final_path = track_dir.join(tagger::build_track_filename_with_codec(
-            &meta,
-            &stream.codec,
-        ));
+            }
 
         // Detached-into-the-loop prefetch: lyrics + artwork download while
         // the audio streams (polled in the same select! as the stream so
@@ -410,7 +439,7 @@ impl AlacTrackRipper {
 
         const CHUNK_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(45);
 
-        let result: Result<TrackRipResult, RipError> = async {
+            let result: Result<TrackRipResult, RipError> = async {
             let total = stream.content_length.filter(|len| *len > 0);
             if total.is_some_and(|length| length > MAX_AUDIO_BYTES) {
                 return Err(RipError::Message(format!(
@@ -560,14 +589,23 @@ impl AlacTrackRipper {
                 track_number: meta.track_number.unwrap_or(1),
                 track_count: meta.track_count.unwrap_or(1),
             })
+            }
+            .await;
+
+            // Temp raw removed on every exit path; prefetch tasks reaped.  A
+            // failed finalizer may also have left a partial public output.
+            let _ = tokio::fs::remove_file(&temp_raw_path).await;
+            if result.is_err() {
+                let _ = tokio::fs::remove_file(&final_path).await;
+            }
+            result
         }
         .await;
 
-        // Temp raw removed on every exit path; prefetch tasks reaped.
-        let _ = tokio::fs::remove_file(&temp_raw_path).await;
-        if result.is_err() {
-            let _ = tokio::fs::remove_dir_all(&track_dir).await;
-        }
+        // The staging lane is private implementation detail, not persistent
+        // storage. Remove it after both success and failure (including errors
+        // before the inner stream result is constructed).
+        let _ = tokio::fs::remove_dir_all(&track_dir).await;
         result
     }
 }

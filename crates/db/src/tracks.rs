@@ -16,7 +16,8 @@ use crate::{models::NewTrack, schema::tracks, DbError, DbPool, Track};
 
 fn cached_track(track: Track) -> CachedTrack {
     CachedTrack {
-        track_key: engine::TrackKey::new(track.provider, track.track_id.clone()).with_codec(track.codec),
+        track_key: engine::TrackKey::new(track.provider, track.track_id.clone())
+            .with_codec(track.codec),
         codec: track.codec,
         message_id: i64::from(track.message_id),
         file_id: track.file_id,
@@ -78,7 +79,8 @@ impl TracksRepository {
         for track in rows {
             let cached = cached_track(track);
             map.insert(cached.track_key.clone(), cached.clone());
-            let base_key = engine::TrackKey::new(cached.track_key.provider, cached.track_key.track_id.clone());
+            let base_key =
+                engine::TrackKey::new(cached.track_key.provider, cached.track_key.track_id.clone());
             map.entry(base_key).or_insert(cached);
         }
         Ok(map)
@@ -205,7 +207,9 @@ impl TracksRepository {
             .await?;
         Ok(rows
             .into_iter()
-            .map(|(provider, track_id, codec)| engine::TrackKey::new(provider, track_id).with_codec(codec))
+            .map(|(provider, track_id, codec)| {
+                engine::TrackKey::new(provider, track_id).with_codec(codec)
+            })
             .collect())
     }
 
@@ -219,7 +223,12 @@ impl TracksRepository {
             .build_transaction()
             .run(async |transaction| -> Result<u64, diesel::result::Error> {
                 let rows = tracks::table
-                    .select((tracks::id, tracks::provider, tracks::track_id, tracks::codec))
+                    .select((
+                        tracks::id,
+                        tracks::provider,
+                        tracks::track_id,
+                        tracks::codec,
+                    ))
                     .load::<(i32, engine::Provider, String, engine::Codec)>(&mut *transaction)
                     .await?;
                 let stale_ids: Vec<i32> = rows

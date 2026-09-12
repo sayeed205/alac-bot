@@ -804,12 +804,9 @@ async fn admin_callback(state: Arc<BotState>, query: CallbackQuery, action: Repo
 }
 
 pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
-    for command in ["report", "issue"] {
-        let state = Arc::clone(&state);
-        dp.on_message(filters::command(command), move |msg| {
-            handle_command(Arc::clone(&state), msg)
-        });
-    }
+    dp.on_message(filters::command("report"), move |msg| {
+        handle_command(Arc::clone(&state), msg)
+    });
 }
 
 pub async fn callback(state: Arc<BotState>, query: CallbackQuery, action: ReportAction) {

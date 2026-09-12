@@ -128,7 +128,7 @@ async fn info(msg: ferogram::update::IncomingMessage, state: Arc<BotState>) {
             ),
             None => (
                 "! <b>Not cached</b>".to_owned(),
-                format!("Use <code>/alac {track_id}</code> to rip in lossless ALAC."),
+                format!("Use <code>/get {track_id}</code> to download lossless ALAC."),
             ),
         };
 

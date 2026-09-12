@@ -64,17 +64,6 @@ fn health_card(card: HealthCard<'_>) -> String {
     )
 }
 
-fn queue_card(processing: bool, pending: usize) -> String {
-    if !processing && pending == 0 {
-        return "🟢 <b>Rip Queue is Idle</b><br/><br/><blockquote>• Active Workers: <code>0</code><br/>• Pending Jobs: <code>0</code><br/>• Ready to process new rip requests.</blockquote>".to_owned();
-    }
-    format!(
-        "🔄 <b>Rip Queue Status</b><br/><br/><blockquote>• Worker Status: <b>{}</b><br/>• Pending in Queue: <code>{pending}</code> task{}<br/>• Tasks are processed sequentially.</blockquote>",
-        if processing { "Active" } else { "Idle" },
-        if pending == 1 { "" } else { "s" }
-    )
-}
-
 fn format_duration_ms(ms: i64) -> String {
     if ms <= 0 {
         return "0ms".to_owned();
@@ -126,7 +115,7 @@ fn format_stats_html(stats: &db::AlacStats) -> String {
     )
 }
 
-async fn health(msg: ferogram::update::IncomingMessage, state: Arc<BotState>) {
+async fn ping(msg: ferogram::update::IncomingMessage, state: Arc<BotState>) {
     let sender = msg.sender_user_id().unwrap_or_default();
     if !state
         .auth
@@ -199,28 +188,6 @@ async fn health(msg: ferogram::update::IncomingMessage, state: Arc<BotState>) {
         .await;
 }
 
-async fn queue(msg: ferogram::update::IncomingMessage, state: Arc<BotState>) {
-    let sender = msg.sender_user_id().unwrap_or_default();
-    if !state
-        .auth
-        .is_authorized(sender, Some(super::marked_chat_id(&msg)))
-        .await
-        .unwrap_or(false)
-    {
-        return;
-    }
-    let jobs = state.rip_orchestrator.get_active_jobs();
-    let processing = jobs.iter().any(|job| job.phase == JobPhase::Processing);
-    let pending = jobs
-        .iter()
-        .filter(|job| job.phase == JobPhase::Queued)
-        .count();
-    let text = queue_card(processing, pending);
-    let _ = msg
-        .reply(InputMessage::html(parse_dynamic_html(&text)))
-        .await;
-}
-
 async fn stats(msg: ferogram::update::IncomingMessage, state: Arc<BotState>) {
     let sender = msg.sender_user_id().unwrap_or_default();
     if !state.auth.is_admin(sender) {
@@ -244,17 +211,9 @@ async fn stats(msg: ferogram::update::IncomingMessage, state: Arc<BotState>) {
 }
 
 pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
-    let health_state = Arc::clone(&state);
+    let ping_state = Arc::clone(&state);
     dp.on_message(filters::command("ping"), move |msg| {
-        health(msg, Arc::clone(&health_state))
-    });
-    let health_state = Arc::clone(&state);
-    dp.on_message(filters::command("health"), move |msg| {
-        health(msg, Arc::clone(&health_state))
-    });
-    let queue_state = Arc::clone(&state);
-    dp.on_message(filters::command("queue"), move |msg| {
-        queue(msg, Arc::clone(&queue_state))
+        ping(msg, Arc::clone(&ping_state))
     });
     dp.on_message(filters::command("stats"), move |msg| {
         stats(msg, Arc::clone(&state))
@@ -288,22 +247,6 @@ mod tests {
     #[test]
     fn duration_renders_minutes() {
         assert_eq!(format_duration_ms(61_500), "1m 2s");
-    }
-
-    #[test]
-    fn idle_queue_card_renders_expected_text() {
-        assert_eq!(
-            queue_card(false, 0),
-            "🟢 <b>Rip Queue is Idle</b><br/><br/><blockquote>• Active Workers: <code>0</code><br/>• Pending Jobs: <code>0</code><br/>• Ready to process new rip requests.</blockquote>"
-        );
-    }
-
-    #[test]
-    fn active_queue_card_renders_expected_text() {
-        assert_eq!(
-            queue_card(true, 2),
-            "🔄 <b>Rip Queue Status</b><br/><br/><blockquote>• Worker Status: <b>Active</b><br/>• Pending in Queue: <code>2</code> tasks<br/>• Tasks are processed sequentially.</blockquote>"
-        );
     }
 
     #[test]

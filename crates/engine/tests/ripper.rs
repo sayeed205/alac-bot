@@ -12,7 +12,9 @@ use std::{
 
 use bytes::Bytes;
 use engine::{
-    ripper::{AlacTrackRipper, RipError, RipOptions, RipProgressCallback, RipperConfig, RipperDeps},
+    ripper::{
+        AlacTrackRipper, RipError, RipOptions, RipProgressCallback, RipperConfig, RipperDeps,
+    },
     streaming::{AudioStreamSource, ByteStream, MirrorEndpoint, ProgressCallback},
     types::TrackMeta,
     wrapper::CodecPreference,
@@ -247,6 +249,30 @@ async fn happy_path_progress_and_result_mapping() {
         .filter(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(".raw")))
         .collect();
     assert!(leftovers.is_empty(), "temp raw removed");
+    assert!(
+        std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(".track_"))),
+        "successful rips remove their staging directory"
+    );
+}
+
+#[tokio::test]
+async fn metadata_error_cleans_staging_lane() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut deps = FakeDeps::ok();
+    deps.meta_failures = 1;
+    let ripper = AlacTrackRipper::new(config(dir.path(), 0, 1));
+
+    let error = ripper
+        .rip(&deps, "42", RipOptions::new("us"))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.to_string(), "catalog down");
+    assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
 }
 
 #[tokio::test]
@@ -524,7 +550,11 @@ async fn output_dir_override_used() {
     let deps = FakeDeps::ok();
     let ripper = AlacTrackRipper::new(config(base.path(), 3, 1));
     let result = ripper
-        .rip(&deps, "42", RipOptions::new("us").with_output_dir(other.path()))
+        .rip(
+            &deps,
+            "42",
+            RipOptions::new("us").with_output_dir(other.path()),
+        )
         .await
         .unwrap();
     assert!(result.file_path.starts_with(other.path().to_str().unwrap()));

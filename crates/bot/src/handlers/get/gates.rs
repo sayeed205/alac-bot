@@ -1,4 +1,4 @@
-//! `/alac` policy gates. Strings intentionally remain literals: they are part
+//! `/get` policy gates. Strings intentionally remain literals: they are part
 //! of the Telegram API of the bot .
 
 use engine::{settings::BotSettings, types::ParsedTargetItem};
@@ -69,9 +69,9 @@ pub fn feature_gate(
 
 pub fn usage(is_cache_only: bool) -> &'static str {
     if is_cache_only {
-        "<b>Apple Music lossless cacher (admin)</b><br/><br/><blockquote><b>Usage:</b><br/>• <code>/cache &lt;link | id&gt;</code><br/>• Send multiple links or attach a <code>.txt</code> file<br/>• Alias: <code>/dump</code><br/>• Option: <code>-f</code> (force re-rip)<br/><i>Seeds lossless audio into the dump channel and database.</i></blockquote>"
+        "<b>Apple Music lossless dumper (admin)</b><br/><br/><blockquote><b>Usage:</b><br/>• <code>/get &lt;link | id&gt;</code><br/>• <code>/zip &lt;album link | id&gt;</code><br/>• Send multiple links or attach a <code>.txt</code> file<br/>• Option: <code>-f</code> (force re-rip)<br/><i>Seeds lossless audio into the dump channel and database.</i></blockquote>"
     } else {
-        "<b>Apple Music lossless downloader</b><br/><br/><blockquote><b>Supported inputs:</b><br/>• <code>/alac &lt;link | id&gt;</code><br/>• Send multiple links or attach a <code>.txt</code> file<br/>• Aliases: <code>/rip</code>, <code>/batch</code>, <code>/dl</code>, <code>/download</code><br/>• Dolby Atmos: <code>/atmos &lt;link | id&gt;</code> (falls back to the best available quality)<br/>• Album ZIP: <code>-z</code> or <code>--zip</code><br/>• Cancel with <code>/cancel</code> or the Cancel download button<br/>• Option: <code>-f</code> (force re-rip)</blockquote>"
+        "<b>Apple Music lossless downloader</b><br/><br/><blockquote><b>Supported inputs:</b><br/>• <code>/get &lt;link | id&gt;</code><br/>• Send multiple links or attach a <code>.txt</code> file<br/>• Album ZIP: <code>-z</code> or <code>--zip</code><br/>• Cancel with the Cancel download button<br/>• Option: <code>-f</code> (force re-rip)</blockquote>"
     }
 }
 
@@ -81,6 +81,8 @@ mod tests {
     #[test]
     fn usage_and_restrictions_are_actionable() {
         assert!(usage(false).contains("Cancel download button"));
+        assert!(usage(false).contains("/get"));
+        assert!(!usage(false).contains("/alac"));
         assert!(!usage(false).contains('🎵'));
         assert_eq!(cache_gate(true, false), Some(CACHE_RESTRICTED));
         assert_eq!(force_gate(true, false), Some(FORCE_RESTRICTED));

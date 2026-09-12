@@ -1,29 +1,9 @@
-//! `/cancel` and inline cancel authorization .
+//! Dynamic `/cancel_<cuid>` and inline cancel authorization.
 //!
 //! M5c: the engine orchestrator owns job state. This module only performs
 //! authorization and selects which engine job to cancel.
 
 use crate::BotState;
-
-pub async fn cancel_command(
-    state: &BotState,
-    chat_id: i64,
-    caller_id: i64,
-    is_admin: bool,
-    caller_name: &str,
-) -> bool {
-    let target = state
-        .rip_orchestrator
-        .get_active_jobs()
-        .into_iter()
-        .find(|job| job.chat_id == chat_id && (is_admin || job.user_id == caller_id));
-    let Some(target) = target else {
-        return false;
-    };
-    state
-        .rip_orchestrator
-        .cancel_job(&target.id, Some(caller_name))
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelResult {
@@ -56,7 +36,6 @@ pub fn cancel_inline(
     }
 }
 
-pub const NO_ACTIVE: &str = "<b>No active download to cancel in this chat.</b>";
 pub const COMMAND_ACK: &str = "✓ <b>Download cancelled.</b>";
 pub const CALLBACK_ACK: &str = "Download cancelled.";
 pub const CALLBACK_UNAUTHORIZED: &str =

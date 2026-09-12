@@ -9,11 +9,9 @@ use crate::{
 };
 
 pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
-    for command in ["revoke", "unauth"] {
+    dp.on_message(filters::command("revoke"), move |msg| {
         let state = Arc::clone(&state);
-        dp.on_message(filters::command(command), move |msg| {
-            let state = Arc::clone(&state);
-            async move {
+        async move {
                 let sender = match msg.sender_user_id() { Some(id) => id, None => return };
                 if !state.auth.is_admin(sender) { return; }
                 let (id, name, _is_user) = match resolve_target(&msg, &state).await {
@@ -43,7 +41,6 @@ pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
                     Ok(false) => { let _ = msg.reply(InputMessage::html(parse_dynamic_html(&format!("! <b>Not found:</b> ID <code>{id}</code> was not in the authorized list.")))).await; }
                     Err(error) => tracing::error!(%error, "revocation failed"),
                 }
-            }
-        });
-    }
+        }
+    });
 }

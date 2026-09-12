@@ -12,6 +12,6 @@ pub use mirror_policy::{
     MirrorEndpoint, MirrorError, MirrorPolicy, MirrorPolicyManager, MANIFEST_URL,
 };
 pub use stream_transport::{
-    AudioStreamSource, ConnectStreamOptions, FetchEndpointOptions, ProgressCallback, StreamError,
-    StreamTransport, is_non_retryable_error,
+    is_non_retryable_error, AudioStreamSource, ConnectStreamOptions, FetchEndpointOptions,
+    ProgressCallback, StreamError, StreamTransport,
 };

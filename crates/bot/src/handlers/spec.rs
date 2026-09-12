@@ -16,7 +16,7 @@ use crate::{
     BotState,
 };
 
-const USAGE: &str = "<b>Audio spectrogram analyzer</b><br/><br/>Reply to any audio file, voice note, or audio document with <code>/spec</code> or <code>/spectogram</code> to generate its frequency spectrogram.<br/><br/><blockquote><i>Spectrograms expose frequency cut-offs and help verify lossless masters.</i></blockquote>";
+const USAGE: &str = "<b>Audio spectrogram analyzer</b><br/><br/>Reply to any audio file, voice note, or audio document with <code>/spec</code> to generate its frequency spectrogram.<br/><br/><blockquote><i>Spectrograms expose frequency cut-offs and help verify lossless masters.</i></blockquote>";
 const UNSUPPORTED: &str =
     "! <b>Unsupported media</b><br/>Reply to an audio track, voice message, or audio document.";
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -264,11 +264,8 @@ async fn handle(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
 }
 
 pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
-    for command in ["spec", "spectogram", "spectrogram", "spek"] {
+    dp.on_message(filters::command("spec"), move |msg| {
         let state = Arc::clone(&state);
-        dp.on_message(filters::command(command), move |msg| {
-            let state = Arc::clone(&state);
-            async move { handle(state, msg).await }
-        });
-    }
+        async move { handle(state, msg).await }
+    });
 }

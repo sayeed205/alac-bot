@@ -178,7 +178,7 @@ async fn main() -> Result<()> {
     // Bridge subscribes once; its consumer renders status messages + dashboard.
     bot::event_bridge::start(Arc::clone(&state));
     // 24h auto-dump scheduler .
-    tokio::spawn(bot::handlers::autodump::scheduler_loop(Arc::clone(&state)));
+    tokio::spawn(bot::handlers::dump::scheduler_loop(Arc::clone(&state)));
     let mut dispatcher = Dispatcher::new();
     handlers::register(&mut dispatcher, state);
 

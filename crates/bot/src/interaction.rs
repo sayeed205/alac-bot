@@ -18,7 +18,7 @@ pub enum TelegramAction {
     DeliverCached {
         track_id: String,
     },
-    Rip {
+    Get {
         track_id: String,
     },
     SearchClose,
@@ -168,8 +168,8 @@ impl TelegramAction {
         let rest = parts.collect::<Vec<_>>();
         match prefix {
             "cancel" => one(rest).map(|job_id| Self::Cancel { job_id }),
-            "dl" => one(rest).map(|track_id| Self::DeliverCached { track_id }),
-            "rip" => one(rest).map(|track_id| Self::Rip { track_id }),
+            "cached" => one(rest).map(|track_id| Self::DeliverCached { track_id }),
+            "get" => one(rest).map(|track_id| Self::Get { track_id }),
             "authpage" => one(rest)
                 .and_then(|value| parse_page(&value))
                 .map(|page| Self::AuthPage { page }),
@@ -234,8 +234,8 @@ impl TelegramAction {
             Self::Settings(action) => encode_settings(action),
             Self::Report(action) => encode_report(action),
             Self::Discovery(action) => encode_discovery(action),
-            Self::DeliverCached { track_id } => format!("dl:{track_id}"),
-            Self::Rip { track_id } => format!("rip:{track_id}"),
+            Self::DeliverCached { track_id } => format!("cached:{track_id}"),
+            Self::Get { track_id } => format!("get:{track_id}"),
             Self::SearchClose => "search_close".to_owned(),
             Self::AuthPage { page } => format!("authpage:{page}"),
             Self::AuthClose => "authclose".to_owned(),
@@ -487,7 +487,7 @@ mod tests {
             TelegramAction::DeliverCached {
                 track_id: "1".into(),
             },
-            TelegramAction::Rip {
+            TelegramAction::Get {
                 track_id: "2".into(),
             },
             TelegramAction::SearchClose,

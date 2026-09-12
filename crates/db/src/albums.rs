@@ -61,7 +61,12 @@ impl AlbumsRepository {
         let mut connection = self.pool.connection().await?;
         diesel::insert_into(albums::table)
             .values(input)
-            .on_conflict((albums::provider, albums::album_id, albums::codec, albums::part_index))
+            .on_conflict((
+                albums::provider,
+                albums::album_id,
+                albums::codec,
+                albums::part_index,
+            ))
             .do_update()
             .set((
                 albums::total_parts.eq(input.total_parts),

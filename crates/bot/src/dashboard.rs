@@ -192,7 +192,11 @@ pub fn format_lane_header(activity: &str, default_verb: &str, default_emoji: &st
     }
 
     let stages: [(&str, &str, &[&str]); 8] = [
-        ("🏷️", "Tagging", &["🏷️ Tagging:", "🏷️ Tagging", "Tagging:", "🏷️"]),
+        (
+            "🏷️",
+            "Tagging",
+            &["🏷️ Tagging:", "🏷️ Tagging", "Tagging:", "🏷️"],
+        ),
         (
             "🔓",
             "Decrypting",
@@ -205,7 +209,11 @@ pub fn format_lane_header(activity: &str, default_verb: &str, default_emoji: &st
                 "🔑",
             ],
         ),
-        ("📦", "Zipping", &["📦 Zipping:", "📦 Zipping", "Zipping:", "📦"]),
+        (
+            "📦",
+            "Zipping",
+            &["📦 Zipping:", "📦 Zipping", "Zipping:", "📦"],
+        ),
         (
             "🔍",
             "Checking cache",
@@ -225,7 +233,12 @@ pub fn format_lane_header(activity: &str, default_verb: &str, default_emoji: &st
         (
             "🔍",
             "Resolving",
-            &["🔍 Resolving:", "🔍 Resolving", "Resolving:", "🌐 Resolving:"],
+            &[
+                "🔍 Resolving:",
+                "🔍 Resolving",
+                "Resolving:",
+                "🌐 Resolving:",
+            ],
         ),
         (
             "🌐",

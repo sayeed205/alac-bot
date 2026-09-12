@@ -37,7 +37,7 @@ pub struct BotState {
     /// Raw DB client for the dump service (`/export`, `/import`) — cheap
     /// Arc-pool clone shared with the repositories.
     pub db_client: db::DbPool,
-    /// Process start, for `/health` uptime ).
+    /// Process start, for `/ping` uptime ).
     pub started_at: Instant,
 }
 

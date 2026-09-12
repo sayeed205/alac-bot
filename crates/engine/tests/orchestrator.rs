@@ -125,7 +125,10 @@ impl FakeDeps {
             album: "Cached Album".into(),
         };
         self.cache.lock().unwrap().insert(key, track.clone());
-        self.cache.lock().unwrap().insert(TrackKey::apple(id), track);
+        self.cache
+            .lock()
+            .unwrap()
+            .insert(TrackKey::apple(id), track);
     }
 
     fn set_settings(&self, f: impl FnOnce(&mut BotSettings)) {
@@ -682,7 +685,10 @@ async fn happy_path_single_track() {
         "a live miss must upload to the dump before delivering the DM copy"
     );
     let saved = &st.saved_tracks[0];
-    assert_eq!(saved.track_key, TrackKey::apple("1440828878").with_codec(engine::Codec::Alac));
+    assert_eq!(
+        saved.track_key,
+        TrackKey::apple("1440828878").with_codec(engine::Codec::Alac)
+    );
     assert_eq!(saved.codec, engine::Codec::Alac);
     assert_eq!(saved.message_id, 777);
     assert_eq!(saved.title, "Night Song");

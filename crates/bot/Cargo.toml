@@ -26,3 +26,6 @@ dotenvy.workspace = true
 reqwest.workspace = true
 chrono.workspace = true
 cuid2.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

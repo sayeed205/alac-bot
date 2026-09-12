@@ -1,4 +1,4 @@
-//! `/dumpnew` / `/autodump` — on-demand + scheduled new-release archiver.
+//! `/dump` — on-demand + scheduled new-release archiver.
 //! Discovers fresh tracks
 //! across the configured storefronts ("New Music Daily" editorial playlist +
 //! the Apple Marketing Tools top-albums feed, each album resolved to tracks
@@ -358,7 +358,7 @@ async fn run_auto_dump_pipeline_inner(
             .send_message(
                 PeerRef::from(state.admin_id),
                 InputMessage::html(parse_dynamic_html(&format!(
-                    "<b>Auto-dump complete</b><br/>No new tracks found in the last <code>{days}</code> day(s)."
+                    "<b>Dump complete</b><br/>No new tracks found in the last <code>{days}</code> day(s)."
                 ))),
             )
             .await;
@@ -424,7 +424,7 @@ async fn run_auto_dump_pipeline_inner(
                 .collect::<Vec<_>>()
                 .join("<br/>");
             let summary_html = format!(
-                "📦 <b>Auto-Dump Run Completed</b><br/><br/>\
+                "📦 <b>Dump Run Completed</b><br/><br/>\
 <blockquote>• <b>Total Discovered:</b> <code>{} tracks</code><br/>\
 • <b>Time Window:</b> Last <code>{days}</code> day(s)<br/>\
 • <b>Trigger:</b> {triggered_by}<br/><br/>\
@@ -448,7 +448,7 @@ async fn run_auto_dump_pipeline_inner(
                 .send_message(
                     PeerRef::from(state.admin_id),
                     InputMessage::html(parse_dynamic_html(
-                        "<b>Auto-dump failed.</b><br/>The dashboard contains the job outcome.",
+                        "<b>Dump failed.</b><br/>The dashboard contains the job outcome.",
                     )),
                 )
                 .await;
@@ -458,20 +458,16 @@ async fn run_auto_dump_pipeline_inner(
 }
 
 pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
-    let state_dumpnew = Arc::clone(&state);
-    dp.on_message(filters::command("dumpnew"), move |msg| {
-        autodump(Arc::clone(&state_dumpnew), msg)
-    });
-    let state_autodump = Arc::clone(&state);
-    dp.on_message(filters::command("autodump"), move |msg| {
-        autodump(Arc::clone(&state_autodump), msg)
+    let state_dump = Arc::clone(&state);
+    dp.on_message(filters::command("dump"), move |msg| {
+        handle_dump_command(Arc::clone(&state_dump), msg)
     });
 }
 
-async fn autodump(state: Arc<BotState>, msg: IncomingMessage) {
+async fn handle_dump_command(state: Arc<BotState>, msg: IncomingMessage) {
     let sender = msg.sender_user_id().unwrap_or_default();
     if !state.auth.is_admin(sender) {
-        tracing::debug!(user_id = sender, "Non-admin attempted autodump command");
+        tracing::debug!(user_id = sender, "Non-admin attempted dump command");
         return;
     }
 
@@ -488,7 +484,7 @@ async fn autodump(state: Arc<BotState>, msg: IncomingMessage) {
     if AUTO_DUMP_RUNNING.load(Ordering::SeqCst) {
         let _ = msg
             .reply(InputMessage::html(parse_dynamic_html(
-                "… <b>Auto-dump is already in progress.</b> Please wait for the current sweep to finish.",
+                "… <b>Dump is already in progress.</b> Please wait for the current sweep to finish.",
             )))
             .await;
         return;
@@ -498,7 +494,7 @@ async fn autodump(state: Arc<BotState>, msg: IncomingMessage) {
     run_auto_dump_pipeline(
         state,
         days,
-        &format!("Admin Command (/dumpnew {days})"),
+        &format!("Admin Command (/dump {days})"),
         Some(marked_chat),
         Some(sender),
     )
@@ -577,19 +573,19 @@ mod tests {
 • <b>Mode:</b> Dump Channel Archiver (Cache-Only)</blockquote>",
             days = 3,
             sf_formatted = "US, GB",
-            triggered_by = "Admin Command (/dumpnew 3)",
+            triggered_by = "Admin Command (/dump 3)",
         );
         assert_eq!(
             initial,
             "… <b>Scanning Apple Music for new releases</b><br/><br/>\
 <blockquote>• <b>Time Window:</b> Last <code>3</code> day(s)<br/>\
 • <b>Storefronts:</b> <code>US, GB</code><br/>\
-• <b>Triggered By:</b> Admin Command (/dumpnew 3)<br/>\
+• <b>Triggered By:</b> Admin Command (/dump 3)<br/>\
 • <b>Mode:</b> Dump Channel Archiver (Cache-Only)</blockquote>"
         );
 
         let empty = format!(
-            "✨ <b>Auto-Dump Finished: No New Tracks Found</b><br/><br/>\
+            "✨ <b>Dump Finished: No New Tracks Found</b><br/><br/>\
 <blockquote>• <b>Time Window:</b> Last <code>{days}</code> day(s)<br/>\
 • <b>Cutoff Date:</b> <code>{cutoff}</code><br/>\
 • <b>Storefronts Scanned:</b> <code>{sf}</code><br/>\
@@ -600,7 +596,7 @@ mod tests {
         );
         assert_eq!(
             empty,
-            "✨ <b>Auto-Dump Finished: No New Tracks Found</b><br/><br/>\
+            "✨ <b>Dump Finished: No New Tracks Found</b><br/><br/>\
 <blockquote>• <b>Time Window:</b> Last <code>1</code> day(s)<br/>\
 • <b>Cutoff Date:</b> <code>2026-09-08</code><br/>\
 • <b>Storefronts Scanned:</b> <code>US</code><br/>\
@@ -626,7 +622,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("<br/>");
         let summary = format!(
-            "📦 <b>Auto-Dump Run Completed</b><br/><br/>\
+            "📦 <b>Dump Run Completed</b><br/><br/>\
 <blockquote>• <b>Total Discovered:</b> <code>{} tracks</code><br/>\
 • <b>Time Window:</b> Last <code>{days}</code> day(s)<br/>\
 • <b>Trigger:</b> {triggered_by}<br/><br/>\
@@ -637,7 +633,7 @@ mod tests {
             triggered_by = "Daily 24h Scheduler",
         );
         assert!(summary.starts_with(
-            "📦 <b>Auto-Dump Run Completed</b><br/><br/>\
+            "📦 <b>Dump Run Completed</b><br/><br/>\
 <blockquote>• <b>Total Discovered:</b> <code>6 tracks</code><br/>\
 • <b>Time Window:</b> Last <code>1</code> day(s)<br/>\
 • <b>Trigger:</b> Daily 24h Scheduler<br/><br/>\

@@ -1,4 +1,4 @@
-//! Input handling for the `/alac` family of commands.
+//! Input handling for the `/get` and `/zip` commands.
 //!
 //! The parser itself lives in `engine`; this module only deals with Telegram
 //! replies and text documents .
@@ -42,11 +42,11 @@ pub fn has_zip_token(text: &str) -> bool {
     text.split_whitespace().any(|t| t == "-z" || t == "--zip")
 }
 
-pub fn parse_text(text: &str, reply: Option<&str>, rerip: bool) -> Option<ParsedCommand> {
+pub fn parse_text(text: &str, reply: Option<&str>, force_override: bool) -> Option<ParsedCommand> {
     let parsed = parse_alac_input(text, reply)?;
     Some(ParsedCommand {
         items: parsed.items,
-        force: rerip || parsed.force,
+        force: force_override || parsed.force,
         zip: parsed.zip,
         storefront: parsed.storefront,
         document: false,
@@ -72,14 +72,14 @@ pub async fn parse_message(
     client: &ferogram::Client,
     message: &IncomingMessage,
     chat_id: i64,
-    rerip: bool,
+    force_override: bool,
 ) -> ParsedCommand {
     // Prime the peer cache for this chat so channels.getMessages has a valid
     // access_hash. On a cache hit this is a no-op (just a local map read);
     // on a cache miss (fresh start) it does one cheap RPC to fetch the chat.
     if message.reply_to_message_id().is_some() {
         if let Err(e) = client.resolve(ferogram::PeerRef::Id(chat_id)).await {
-            tracing::warn!(chat_id, error = %e, "rip: could not prime peer cache for chat");
+            tracing::warn!(chat_id, error = %e, "get: could not prime peer cache for chat");
         }
     }
 
@@ -122,7 +122,7 @@ pub async fn parse_message(
             if let Ok(content) = result {
                 return ParsedCommand {
                     items: extract_batch_items(&content),
-                    force: rerip || message.text().is_some_and(has_force_token),
+                    force: force_override || message.text().is_some_and(has_force_token),
                     zip: message.text().is_some_and(has_zip_token),
                     storefront: None,
                     document: true,
@@ -133,11 +133,11 @@ pub async fn parse_message(
     parse_text(
         message.text().unwrap_or_default(),
         reply.as_ref().and_then(IncomingMessage::text),
-        rerip,
+        force_override,
     )
     .unwrap_or(ParsedCommand {
         items: Vec::new(),
-        force: rerip,
+        force: force_override,
         storefront: None,
         document: false,
         zip: false,
@@ -148,9 +148,9 @@ pub async fn parse_message(
 mod tests {
     use super::*;
     #[test]
-    fn aliases_and_flags_are_case_insensitive() {
-        assert_eq!(command_name("/ALAC@bot 1"), Some("alac".into()));
-        assert!(has_force_token("/alac --force 1"));
-        assert!(has_zip_token("/alac --zip 1"));
+    fn command_and_flags_are_case_insensitive() {
+        assert_eq!(command_name("/GET@bot 1"), Some("get".into()));
+        assert!(has_force_token("/get --force 1"));
+        assert!(has_zip_token("/get --zip 1"));
     }
 }

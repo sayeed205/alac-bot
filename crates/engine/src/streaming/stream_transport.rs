@@ -192,7 +192,11 @@ impl<H: StreamHttp> StreamTransport<H> {
 
         for round in 0..rounds {
             if round > 0 {
-                if options.signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                if options
+                    .signal
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled)
+                {
                     break;
                 }
                 let delay = base_delay * 2u64.pow(round - 1);
@@ -220,7 +224,11 @@ impl<H: StreamHttp> StreamTransport<H> {
                     all_errors.push(message);
                 }
             }
-            if options.signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
+            if options
+                .signal
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+            {
                 break;
             }
 
@@ -230,9 +238,9 @@ impl<H: StreamHttp> StreamTransport<H> {
                 .map(|url| !url.trim().trim_end_matches('/').is_empty())
                 .unwrap_or(false);
             let permanent_failure = if wrapper_configured {
-                all_errors
-                    .iter()
-                    .any(|e| (e.contains("wrapper") || e.contains("Wrapper")) && is_non_retryable_error(e))
+                all_errors.iter().any(|e| {
+                    (e.contains("wrapper") || e.contains("Wrapper")) && is_non_retryable_error(e)
+                })
             } else {
                 !all_errors.is_empty() && all_errors.iter().all(|e| is_non_retryable_error(e))
             };
@@ -291,7 +299,11 @@ impl<H: StreamHttp> StreamTransport<H> {
                     Err(error) => {
                         let message = error.into_message();
                         errors.push(format!("Primary mirror failed: {message}"));
-                        if !options.signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                        if !options
+                            .signal
+                            .as_ref()
+                            .is_some_and(CancellationToken::is_cancelled)
+                        {
                             if let Some(policy) = options.mirror_policy {
                                 policy.record_failure(&message);
                             }
@@ -315,8 +327,10 @@ impl<H: StreamHttp> StreamTransport<H> {
             || clean_wrapper.ends_with("/lite")
             || clean_wrapper.contains("wrapper-lite");
         if is_wrapper_lite {
-            let wrapper_engine =
-                crate::wrapper::WrapperEngine::new(clean_wrapper, options.wrapper_api_key.as_deref());
+            let wrapper_engine = crate::wrapper::WrapperEngine::new(
+                clean_wrapper,
+                options.wrapper_api_key.as_deref(),
+            );
             match wrapper_engine
                 .rip_track(
                     &options.track_id,
@@ -337,7 +351,11 @@ impl<H: StreamHttp> StreamTransport<H> {
                 format!("{clean_wrapper}/api/stream/{}", options.track_id),
                 format!("{clean_wrapper}/stream/{}", options.track_id),
             ] {
-                if options.signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                if options
+                    .signal
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled)
+                {
                     errors.push(format!(
                         "Wrapper candidate ({endpoint}) failed: Download was cancelled"
                     ));

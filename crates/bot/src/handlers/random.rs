@@ -652,8 +652,7 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery, action: Discov
                 .await;
             delete_message(&state, &peer, message_id).await;
 
-            // delegates to executeRipPipeline in cache-only mode;
-            // the collapsed orchestrator takes that path (recorded deviation).
+            // The collapsed orchestrator handles this as a cache-only job.
             let user_display =
                 crate::presentation::resolve_user_display_name(&state.client, query.user_id).await;
             let options = engine::orchestrator::types::RipJobOptions {

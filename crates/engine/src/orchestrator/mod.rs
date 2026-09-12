@@ -898,8 +898,12 @@ impl RipOrchestrator {
             format!("🔍 Checking cache: {header}")
         };
         shared.lock().expect("job poisoned").job.active_action_text = Some(check_label.clone());
-        self.bus
-            .emit_progress(&shared, Some("Checking local cache..."), Some(&check_label), None);
+        self.bus.emit_progress(
+            &shared,
+            Some("Checking local cache..."),
+            Some(&check_label),
+            None,
+        );
         let target_codec = match options.codec_preference {
             CodecPreference::Atmos => Codec::Ec3,
             CodecPreference::HighestQuality => Codec::Alac,
@@ -919,15 +923,12 @@ impl RipOrchestrator {
         if options.is_force && options.is_admin {
             let mut old_message_ids: Vec<i64> = Vec::new();
             for item in &tracks_to_process {
-                let lookup_key = TrackKey::new(Provider::Apple, item.id.clone()).with_codec(target_codec);
-                if let Some(cached) =
-                    existing_tracks_map.remove(&lookup_key)
-                {
+                let lookup_key =
+                    TrackKey::new(Provider::Apple, item.id.clone()).with_codec(target_codec);
+                if let Some(cached) = existing_tracks_map.remove(&lookup_key) {
                     old_message_ids.push(cached.message_id);
                     // Per-item delete; errors are swallowed.
-                    let _ = deps
-                        .delete_track(&lookup_key)
-                        .await;
+                    let _ = deps.delete_track(&lookup_key).await;
                 }
             }
             if !old_message_ids.is_empty() {
@@ -960,7 +961,11 @@ impl RipOrchestrator {
         if let Some(hash) = &zip_generation_hash {
             if !options.is_force && existing_tracks_map.len() == tracks_to_process.len() {
                 match deps
-                    .find_albums(Provider::Apple, &options.parsed_items[0].id, Some(target_codec))
+                    .find_albums(
+                        Provider::Apple,
+                        &options.parsed_items[0].id,
+                        Some(target_codec),
+                    )
                     .await
                 {
                     Ok(rows) => {
@@ -998,10 +1003,9 @@ impl RipOrchestrator {
                 ));
             }
 
-            let lookup_key = TrackKey::new(Provider::Apple, item.id.clone()).with_codec(target_codec);
-            let Some(cached) =
-                existing_tracks_map.get(&lookup_key)
-            else {
+            let lookup_key =
+                TrackKey::new(Provider::Apple, item.id.clone()).with_codec(target_codec);
+            let Some(cached) = existing_tracks_map.get(&lookup_key) else {
                 uncached_items.push(item.clone());
                 continue;
             };
@@ -1131,7 +1135,8 @@ impl RipOrchestrator {
                         // longer exists (for example after channel cleanup).
                         // Remove it immediately so a failed re-rip cannot
                         // leave a ghost cache entry behind.
-                        let stale_key = TrackKey::new(Provider::Apple, item.id.clone()).with_codec(cached.codec);
+                        let stale_key = TrackKey::new(Provider::Apple, item.id.clone())
+                            .with_codec(cached.codec);
                         if let Err(delete_error) = deps.delete_track(&stale_key).await {
                             tracing::warn!(
                                 track_id = %item.id,
@@ -1248,7 +1253,11 @@ impl RipOrchestrator {
                         // the album's ZIP rows so the next request rebuilds
                         // instead of skipping staging and failing forever.
                         if let Err(error) = deps
-                            .delete_albums(Provider::Apple, &options.parsed_items[0].id, Some(target_codec))
+                            .delete_albums(
+                                Provider::Apple,
+                                &options.parsed_items[0].id,
+                                Some(target_codec),
+                            )
                             .await
                         {
                             tracing::warn!(%error, "failed to purge undeliverable album ZIP rows");
@@ -2275,9 +2284,16 @@ async fn finalize_zip<D: OrchestratorDeps>(
     // Before republishing complete parts, drop the previous rows so a
     // shrinking part count cannot leave stale parts behind. The upsert
     // below re-saves each fresh part.
-    let album_codec = if ctx.options.codec_preference == CodecPreference::Atmos { Codec::Ec3 } else { zip_codec.parse::<Codec>().unwrap_or(Codec::Alac) };
+    let album_codec = if ctx.options.codec_preference == CodecPreference::Atmos {
+        Codec::Ec3
+    } else {
+        zip_codec.parse::<Codec>().unwrap_or(Codec::Alac)
+    };
     if complete {
-        if let Err(error) = deps.delete_albums(Provider::Apple, &ctx.zip_album_id, Some(album_codec)).await {
+        if let Err(error) = deps
+            .delete_albums(Provider::Apple, &ctx.zip_album_id, Some(album_codec))
+            .await
+        {
             tracing::warn!(%error, "failed to purge stale album ZIP rows");
         }
     }
@@ -2637,9 +2653,7 @@ async fn rollback_cancelled<D: OrchestratorDeps>(
         if let Some(c) = codec {
             key = key.with_codec(c);
         }
-        let _ = deps
-            .delete_track(&key)
-            .await;
+        let _ = deps.delete_track(&key).await;
     }
 }
 
@@ -2912,7 +2926,14 @@ async fn upload_one<D: OrchestratorDeps>(
         }
 
         if is_cancelled() {
-            rollback_cancelled(deps, &track_id, dump_upload.message_id, true, rip_result.codec.parse::<Codec>().ok()).await;
+            rollback_cancelled(
+                deps,
+                &track_id,
+                dump_upload.message_id,
+                true,
+                rip_result.codec.parse::<Codec>().ok(),
+            )
+            .await;
             return Err("cancelled".to_owned());
         }
 

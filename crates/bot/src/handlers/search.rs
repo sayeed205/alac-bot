@@ -1,5 +1,5 @@
 //! `/search` — local lossless cache + live Apple Music catalog search, plus
-//! the `dl:`/`rip:` delivery callbacks and `search_close`.
+//! the `cached:`/`get:` delivery callbacks and `search_close`.
 
 use std::sync::Arc;
 
@@ -86,13 +86,13 @@ fn build_results_html(query: &str, cached: &[Row], live: &[Row]) -> String {
         ));
     }
     format!(
-        "<b>Search results for \"<i>{}</i>\":</b><br/><br/>{}<br/><br/><i>Choose Cached for instant delivery or Rip for lossless audio.</i>",
+        "<b>Search results for \"<i>{}</i>\":</b><br/><br/>{}<br/><br/><i>Choose Cached for instant delivery or Get for lossless audio.</i>",
         escape(query),
         sections.join("<br/><br/>")
     )
 }
 
-/// Keyboard rows: cached `dl:{id}` rows then live `rip:{id}` rows, Close last.
+/// Keyboard rows: cached `cached:{id}` rows then live `get:{id}` rows, Close last.
 fn build_results_keyboard(
     cached: &[(String, String, String)],
     live: &[(String, String, String)],
@@ -111,8 +111,8 @@ fn build_results_keyboard(
     let start = cached.len() + 1;
     for (index, (id, title, artist)) in live.iter().enumerate() {
         kb = kb.row(vec![Button::callback(
-            format!("Rip · {}. {}", start + index, short_title(artist, title)),
-            crate::interaction::TelegramAction::Rip {
+            format!("Get · {}. {}", start + index, short_title(artist, title)),
+            crate::interaction::TelegramAction::Get {
                 track_id: id.clone(),
             }
             .encode()
@@ -233,8 +233,8 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery, action: Telegr
         TelegramAction::DeliverCached { track_id } => {
             deliver_cached(state, query, track_id).await;
         }
-        TelegramAction::Rip { track_id } => {
-            rip(state, query, track_id).await;
+        TelegramAction::Get { track_id } => {
+            get(state, query, track_id).await;
         }
         _ => {
             let _ = query
@@ -330,7 +330,7 @@ async fn deliver_cached(state: Arc<BotState>, query: CallbackQuery, track_id: St
         .await;
 }
 
-async fn rip(state: Arc<BotState>, query: CallbackQuery, track_id: String) {
+async fn get(state: Arc<BotState>, query: CallbackQuery, track_id: String) {
     let track_key = TrackKey::new(Provider::Apple, track_id.clone());
     let marked_chat = query
         .chat_peer
@@ -394,7 +394,7 @@ async fn rip(state: Arc<BotState>, query: CallbackQuery, track_id: String) {
 
     let _ = query
         .answer()
-        .text("Queuing lossless rip")
+        .text("Queuing lossless download")
         .send(&state.client)
         .await;
 
@@ -437,7 +437,7 @@ async fn rip(state: Arc<BotState>, query: CallbackQuery, track_id: String) {
             delete_query_message(&state, &query).await;
         }
         Err(error) => {
-            tracing::warn!(track_id, %error, "search rip job failed");
+            tracing::warn!(track_id, %error, "search get job failed");
         }
     }
 }
@@ -509,7 +509,7 @@ mod tests {
         let text = build_results_html("query", &cached, &live);
         assert_eq!(
             text,
-            "<b>Search results for \"<i>query</i>\":</b><br/><br/><b>Cached tracks:</b><br/><blockquote>1. <b>Cached One</b> — <i>Artist A</i><code> [24-bit/48.0kHz]</code><br/>2. <b>Cached Two</b> — <i>Artist B</i><code></code></blockquote><br/><br/><b>Apple Music catalog:</b><br/><blockquote>3. <b>Live One</b> — <i>Artist C</i></blockquote><br/><br/><i>Choose Cached for instant delivery or Rip for lossless audio.</i>"
+            "<b>Search results for \"<i>query</i>\":</b><br/><br/><b>Cached tracks:</b><br/><blockquote>1. <b>Cached One</b> — <i>Artist A</i><code> [24-bit/48.0kHz]</code><br/>2. <b>Cached Two</b> — <i>Artist B</i><code></code></blockquote><br/><br/><b>Apple Music catalog:</b><br/><blockquote>3. <b>Live One</b> — <i>Artist C</i></blockquote><br/><br/><i>Choose Cached for instant delivery or Get for lossless audio.</i>"
         );
     }
 
@@ -518,12 +518,12 @@ mod tests {
         let cached = vec![("C".to_owned(), "A".to_owned(), String::new())];
         assert_eq!(
             build_results_html("q", &cached, &[]),
-            "<b>Search results for \"<i>q</i>\":</b><br/><br/><b>Cached tracks:</b><br/><blockquote>1. <b>C</b> — <i>A</i><code></code></blockquote><br/><br/><i>Choose Cached for instant delivery or Rip for lossless audio.</i>"
+            "<b>Search results for \"<i>q</i>\":</b><br/><br/><b>Cached tracks:</b><br/><blockquote>1. <b>C</b> — <i>A</i><code></code></blockquote><br/><br/><i>Choose Cached for instant delivery or Get for lossless audio.</i>"
         );
         let live = vec![("L".to_owned(), "B".to_owned(), String::new())];
         assert_eq!(
             build_results_html("q", &[], &live),
-            "<b>Search results for \"<i>q</i>\":</b><br/><br/><b>Apple Music catalog:</b><br/><blockquote>1. <b>L</b> — <i>B</i></blockquote><br/><br/><i>Choose Cached for instant delivery or Rip for lossless audio.</i>"
+            "<b>Search results for \"<i>q</i>\":</b><br/><br/><b>Apple Music catalog:</b><br/><blockquote>1. <b>L</b> — <i>B</i></blockquote><br/><br/><i>Choose Cached for instant delivery or Get for lossless audio.</i>"
         );
     }
 }

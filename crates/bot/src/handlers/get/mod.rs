@@ -1,7 +1,7 @@
-//! Live `/alac` command policy and pipeline entry point.
+//! `/get` and `/zip` command policy and pipeline entry point.
 //!
 //! M5c: the bot owns only preflight policy and input parsing. Status is
-//! rendered by one shared dashboard message per chat. All rip semantics —
+//! rendered by one shared dashboard message per chat. All download semantics —
 //! cache-first maintenance, queue position, retries, circuit breaker — live
 //! in the engine orchestrator.
 
@@ -20,21 +20,14 @@ use ferogram::{
 use crate::BotState;
 
 pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
-    for alias in [
-        "alac", "rip", "batch", "dl", "download", "rerip", "cache", "dump", "zip", "atmos",
-    ] {
+    for command in ["get", "zip"] {
         let state = Arc::clone(&state);
-        dp.on_message(filters::command(alias), move |msg| {
+        dp.on_message(filters::command(command), move |msg| {
             let state = Arc::clone(&state);
             async move { handle_command(state, msg).await }
         });
     }
-    let state_cancel = Arc::clone(&state);
-    dp.on_message(filters::command("cancel"), move |msg| {
-        let state = Arc::clone(&state_cancel);
-        async move { handle_cancel_command(state, msg).await }
-    });
-    let state_cancel_id = Arc::clone(&state);
+    let cancel_state = Arc::clone(&state);
     dp.on_message(
         filters::custom(|msg| {
             msg.text().is_some_and(|t| {
@@ -44,7 +37,7 @@ pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
             })
         }),
         move |msg| {
-            let state = Arc::clone(&state_cancel_id);
+            let state = Arc::clone(&cancel_state);
             async move { handle_cancel_id_command(state, msg).await }
         },
     );
@@ -63,24 +56,23 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
     }
 
     let command = input::command_name(msg.text().unwrap_or_default()).unwrap_or_default();
-    let is_cache = command == "cache" || command == "dump";
-    let is_atmos = command == "atmos";
     let admin = state.auth.is_admin(sender);
+    // Administrative get/zip requests seed the dump channel only. The engine
+    // suppresses all user-facing media for cache-only jobs.
+    let is_cache_only = admin;
 
     // Preflight gates .
-    if let Some(text) = gates::cache_gate(is_cache, admin) {
+    if let Some(text) = gates::cache_gate(is_cache_only, admin) {
         reply(&msg, text).await;
         return;
     }
-    let parsed = input::parse_message(&state.client, &msg, chat, command == "rerip").await;
+    let parsed = input::parse_message(&state.client, &msg, chat, false).await;
     let zip_command = command == "zip";
     let explicit_zip_valid =
         parsed.items.len() == 1 && parsed.items[0].kind == engine::types::TargetKind::Album;
-    let zip_requested = command == "dump"
-        || (zip_command && explicit_zip_valid)
-        || (parsed.zip && explicit_zip_valid);
+    let zip_requested = (zip_command || parsed.zip) && explicit_zip_valid;
     if parsed.items.is_empty() {
-        reply(&msg, gates::usage(is_cache)).await;
+        reply(&msg, gates::usage(is_cache_only)).await;
         return;
     }
     if (parsed.zip || zip_command)
@@ -132,7 +124,7 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
     // anything. A failure prompts them to start the bot in DM and stops the
     // job; on success delivery is retargeted to the DM.
     let mut delivery_chat_id = chat;
-    if is_group && !is_cache {
+    if is_group && !is_cache_only {
         let note = InputMessage::html(format!(
             "<b>Download queued</b><br/>Tracks requested in <b>{}</b> will be delivered to your private chat.",
             crate::html::escape(&display_name)
@@ -179,7 +171,7 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
         delivery_chat_id,
         is_group,
         is_force: parsed.force,
-        is_cache_only: is_cache,
+        is_cache_only,
         zip: zip_requested,
         zip_explicit: zip_command || parsed.zip,
         single_storefront: parsed.storefront,
@@ -190,11 +182,7 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
         // orchestration callers.
         status_msg_id: 0,
         is_admin: admin,
-        codec_preference: if is_atmos {
-            engine::wrapper::CodecPreference::Atmos
-        } else {
-            engine::wrapper::CodecPreference::HighestQuality
-        },
+        codec_preference: engine::wrapper::CodecPreference::HighestQuality,
     };
 
     // Engine owns everything from here: resolution, cache-first, queue,
@@ -205,18 +193,7 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
         .start_job(Arc::clone(&state.rip_deps), &options)
         .await
     {
-        tracing::error!(error = %error, "rip job failed");
-    }
-}
-
-async fn handle_cancel_command(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
-    let caller = msg.sender_user_id().unwrap_or_default();
-    let admin = state.auth.is_admin(caller);
-    let name = if admin { "Admin" } else { "User" };
-    if cancel::cancel_command(&state, super::marked_chat_id(&msg), caller, admin, name).await {
-        reply(&msg, cancel::COMMAND_ACK).await;
-    } else {
-        reply(&msg, cancel::NO_ACTIVE).await;
+        tracing::error!(error = %error, "get job failed");
     }
 }
 

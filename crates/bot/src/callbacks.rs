@@ -1,11 +1,11 @@
-//! Callback dispatcher for list pagination, dashboard paging, and rip
+//! Callback dispatcher for list pagination, dashboard paging, and get
 //! cancellation.
 
 use std::sync::Arc;
 
 use ferogram::update::CallbackQuery;
 
-use crate::{handlers::rip::cancel, interaction::DashboardAction, BotState};
+use crate::{handlers::get::cancel, interaction::DashboardAction, BotState};
 
 pub async fn dispatch_dashboard(
     state: Arc<BotState>,

@@ -5,7 +5,7 @@ use ferogram::{filters, filters::Dispatcher, InputMessage};
 use crate::{html::parse_dynamic_html, BotState};
 
 const WELCOME: &str = "<b>Welcome to ALAC Bot</b><br/><br/>\
-Send <code>/alac &lt;link&gt;</code> to download lossless audio.<br/><br/>\
+Send <code>/get &lt;link&gt;</code> to download lossless audio.<br/><br/>\
 Use <code>/help</code> for commands. Audio requested in a group is delivered to your private chat.";
 
 const UNAUTHORIZED: &str =
