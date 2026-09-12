@@ -30,7 +30,9 @@ pub enum QueueError {
     Task(String),
 }
 
-type ErasedValue = Box<dyn Any + Send>;
+pub type ErasedValue = Box<dyn Any + Send>;
+pub type TaskResult = Result<ErasedValue, QueueError>;
+pub type TaskReceiver = oneshot::Receiver<TaskResult>;
 type ErasedTask =
     Box<dyn FnOnce(CancellationToken) -> Pin<Box<dyn Future<Output = ErasedValue> + Send>> + Send>;
 
@@ -136,12 +138,11 @@ impl SequentialRipQueue {
     ///
     /// Returns `Err` immediately when the outer signal is already
     /// cancelled, exactly like `enqueue`.
-    #[allow(clippy::type_complexity)]
     pub fn submit<T: Send + 'static>(
         &self,
         task: impl FnOnce(CancellationToken) -> Pin<Box<dyn Future<Output = T> + Send>> + Send + 'static,
         options: Option<EnqueueOptions>,
-    ) -> oneshot::Receiver<Result<Box<dyn Any + Send>, QueueError>> {
+    ) -> TaskReceiver {
         let options = options.unwrap_or(EnqueueOptions {
             on_position_change: None,
             on_start: None,

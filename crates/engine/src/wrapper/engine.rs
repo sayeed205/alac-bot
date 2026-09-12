@@ -62,7 +62,6 @@ impl WrapperEngine {
             cb("Connecting to wrapper-lite engine...");
         }
 
-        // 1. Fetch master playlist URL from wrapper-lite
         let master_url = self
             .client
             .fetch_m3u8_url(track_id)
@@ -71,7 +70,6 @@ impl WrapperEngine {
 
         debug!(track_id = %track_id, master_url = %master_url, "Fetched master m3u8 URL");
 
-        // 2. Download master playlist
         let master_resp = self
             .http_client
             .get(&master_url)
@@ -113,7 +111,6 @@ impl WrapperEngine {
             cb("Fetching media playlist and FairPlay keys...");
         }
 
-        // 4. Download media playlist
         let media_resp = self
             .http_client
             .get(&alac_info.stream_url)
@@ -125,7 +122,6 @@ impl WrapperEngine {
             .await
             .map_err(|e| StreamError::Message(format!("Read media playlist: {e}")))?;
 
-        // 5. Parse media playlist
         let media_info = parse_media_playlist(&media_text, &alac_info.stream_url)
             .map_err(|e| StreamError::Message(format!("Parse media playlist: {e}")))?;
 
@@ -147,7 +143,6 @@ impl WrapperEngine {
                 .await;
         }
 
-        // 6. Pre-fetch FairPlay templates for all keys used in the playlist
         let mut key_templates: HashMap<String, Arc<temari::rounds::Template>> = HashMap::new();
         for seg in &media_info.segments {
             if let Some(key_uri) = &seg.key_uri {
@@ -174,7 +169,6 @@ impl WrapperEngine {
             cb("Downloading encrypted audio stream from Apple CDN...");
         }
 
-        // 7. Download audio stream and decrypt
         // In Apple Music, media_info.single_file_url is almost always present
         let decrypted_bytes = if let Some(single_url) = &media_info.single_file_url {
             let resp = self
@@ -453,9 +447,8 @@ impl WrapperEngine {
         media_info: &crate::wrapper::playlist::MediaPlaylistInfo,
         key_templates: &HashMap<String, Arc<temari::rounds::Template>>,
         track_id: &str,
-        _on_progress: Option<&ProgressCallback>,
+        _: Option<&ProgressCallback>,
     ) -> Result<Vec<u8>, StreamError> {
-        // 1. Fetch init segment
         let init_resp = self
             .http_client
             .get(&media_info.init_uri)

@@ -205,7 +205,6 @@ impl<H: PlaylistHttp> PlaylistClient<H> {
     /// The live scrape: browse page → index asset → token assignment (or a
     /// direct JWT anywhere in the asset).
     async fn scrape_token(&self) -> Result<String, String> {
-        // 1. Browse page.
         let browse = self
             .http
             .get(
@@ -216,7 +215,7 @@ impl<H: PlaylistHttp> PlaylistClient<H> {
             .await
             .map_err(|e| e.to_string())?;
 
-        // 2. Match /assets/index~[a-zA-Z0-9]+.js (leftmost occurrence).
+        // Match /assets/index~[a-zA-Z0-9]+.js asset.
         let asset = find_asset_path(&browse).ok_or("no index asset in browse page")?;
         let js = self
             .http
@@ -228,14 +227,14 @@ impl<H: PlaylistHttp> PlaylistClient<H> {
             .await
             .map_err(|e| e.to_string())?;
 
-        // 3. developerToken:($varName) → varName = "value".
+        // developerToken:($varName) -> varName = "value".
         if let Some(var_name) = find_developer_token_var(&js) {
             if let Some(value) = find_var_assignment(&js, &var_name) {
                 return Ok(value);
             }
         }
 
-        // 4. Direct JWT fallback: /eyJh[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*/
+        // Direct JWT fallback.
         if let Some(jwt) = find_direct_jwt(&js) {
             return Ok(jwt);
         }

@@ -305,7 +305,6 @@ pub async fn discover_new_tracks(
 
 /// Run the discovery → report → reply pipeline. Returns whether every
 /// stage succeeded.
-#[allow(clippy::too_many_arguments)]
 pub async fn run_auto_dump_pipeline(
     state: Arc<BotState>,
     days: i64,

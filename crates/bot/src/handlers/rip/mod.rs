@@ -8,7 +8,6 @@
 pub mod cancel;
 pub mod gates;
 pub mod input;
-pub mod status;
 
 use std::sync::Arc;
 

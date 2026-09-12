@@ -109,9 +109,6 @@ pub struct RandomAlbumCandidate {
     pub title: String,
     pub artist: String,
     pub url: String,
-    /// Carried for interface completeness; the preview card never renders it.
-    #[allow(dead_code)]
-    pub artwork_url: Option<String>,
     pub release_date: Option<String>,
     pub genre: Option<String>,
     pub track_count: Option<usize>,
@@ -281,10 +278,6 @@ async fn fetch_search_album(
                     .unwrap_or("Unknown Artist")
                     .to_owned(),
                 url,
-                artwork_url: item
-                    .get("artworkUrl100")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
                 release_date: item
                     .get("releaseDate")
                     .and_then(Value::as_str)
@@ -332,7 +325,6 @@ async fn fetch_charts_album(
         title: chart.title.clone(),
         artist: chart.artist.clone(),
         url: chart.url.clone(),
-        artwork_url: chart.artwork_url.clone(),
         release_date: chart.release_date.clone(),
         genre: chart.genre.clone(),
         track_count: None,
@@ -727,7 +719,6 @@ mod tests {
             title: "Moon Dreams".to_owned(),
             artist: "Luna".to_owned(),
             url: "https://music.apple.com/us/album/x/1".to_owned(),
-            artwork_url: None,
             release_date: Some("2024-05-01T00:00:00Z".to_owned()),
             genre: Some("Pop".to_owned()),
             track_count: Some(12),

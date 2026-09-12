@@ -297,8 +297,6 @@ pub fn transform_init_segment(init_data: &[u8]) -> Result<Vec<u8>, WrapperError>
 /// Parsed `trun` box information.
 #[derive(Debug, Clone)]
 pub(crate) struct TrunInfo {
-    #[allow(dead_code)]
-    pub(crate) offset_in_data: usize,
     pub(crate) sample_count: usize,
     pub(crate) data_offset_field_pos: Option<usize>,
     pub(crate) data_offset: i32,
@@ -433,7 +431,6 @@ fn parse_trun(
     }
 
     Some(TrunInfo {
-        offset_in_data: trun_start,
         sample_count,
         data_offset_field_pos,
         data_offset,
@@ -498,17 +495,14 @@ pub fn decrypt_fragment(
     let mut out = fragment_data.to_vec();
     let total_len = out.len();
 
-    // 1. Locate moof and mdat
     let (moof_off, moof_len) = find_child_box(&out, 0, total_len, b"moof")
         .ok_or_else(|| WrapperError::Message("Missing moof box in fragment".into()))?;
-    let (mdat_off, _mdat_len) = find_child_box(&out, 0, total_len, b"mdat")
+    let (mdat_off, _) = find_child_box(&out, 0, total_len, b"mdat")
         .ok_or_else(|| WrapperError::Message("Missing mdat box in fragment".into()))?;
 
-    // 2. Locate traf inside moof
     let (traf_off, traf_len) = find_child_box(&out, moof_off + 8, moof_off + moof_len, b"traf")
         .ok_or_else(|| WrapperError::Message("Missing traf box in moof".into()))?;
 
-    // 3. Parse ALL trun boxes in traf
     let trun_boxes = find_all_child_boxes(&out, traf_off + 8, traf_off + traf_len, b"trun");
     if trun_boxes.is_empty() {
         return Err(WrapperError::Message("No trun boxes in traf".into()));
@@ -520,7 +514,6 @@ pub fn decrypt_fragment(
         truns.push(trun);
     }
 
-    // 4. Parse senc (or UUID senc)
     let senc_box = find_child_box(&out, traf_off + 8, traf_off + traf_len, b"senc");
     let enc_info = if let Some((s_off, s_len)) = senc_box {
         parse_senc(&out, s_off, s_len)
@@ -569,7 +562,6 @@ pub fn decrypt_fragment(
         ));
     }
 
-    // 5. Decrypt samples in mdat across all trun boxes
     let mut global_sample_idx = 0;
     let mut prev_sample_end = mdat_off + 8;
 
@@ -632,7 +624,6 @@ pub fn decrypt_fragment(
         prev_sample_end = sample_offset;
     }
 
-    // 6. Collect encryption boxes to remove: senc, saiz, saio, uuid (in traf), pssh (in moof)
     let mut boxes_to_remove: Vec<(usize, usize)> = Vec::new();
     let mut bytes_removed_from_traf = 0;
 
@@ -674,7 +665,6 @@ pub fn decrypt_fragment(
         boxes_to_remove.push(b);
     }
 
-    // 7. Adjust trun.data_offset for ALL trun boxes and update parent box sizes BEFORE draining
     if bytes_removed_from_moof > 0 {
         for trun in &truns {
             if let Some(pos) = trun.data_offset_field_pos {
@@ -702,7 +692,6 @@ pub fn decrypt_fragment(
         }
     }
 
-    // 8. Rebuild size-less truns so downstream remuxers see standard boxes.
     normalize_fragment(&mut out);
 
     Ok(out)

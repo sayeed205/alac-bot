@@ -11,7 +11,6 @@ mod ops;
 mod random;
 mod report;
 mod revoke;
-#[allow(dead_code)]
 pub(crate) mod rip;
 mod search;
 pub mod settings;

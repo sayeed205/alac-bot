@@ -124,6 +124,58 @@ pub struct AlacTrackRipper {
     config: RipperConfig,
 }
 
+/// Options controlling a track rip operation.
+#[derive(Clone)]
+pub struct RipOptions<'a> {
+    pub storefront: &'a str,
+    pub on_progress: Option<&'a RipProgressCallback>,
+    pub signal: Option<CancellationToken>,
+    pub output_dir: Option<&'a Path>,
+    pub codec_preference: CodecPreference,
+}
+
+impl std::fmt::Debug for RipOptions<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RipOptions")
+            .field("storefront", &self.storefront)
+            .field("signal", &self.signal)
+            .field("output_dir", &self.output_dir)
+            .field("codec_preference", &self.codec_preference)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> RipOptions<'a> {
+    pub fn new(storefront: &'a str) -> Self {
+        Self {
+            storefront,
+            on_progress: None,
+            signal: None,
+            output_dir: None,
+            codec_preference: CodecPreference::HighestQuality,
+        }
+    }
+
+    pub fn with_progress(mut self, on_progress: &'a RipProgressCallback) -> Self {
+        self.on_progress = Some(on_progress);
+        self
+    }
+
+    pub fn with_signal(mut self, signal: CancellationToken) -> Self {
+        self.signal = Some(signal);
+        self
+    }
+
+    pub fn with_output_dir(mut self, output_dir: &'a Path) -> Self {
+        self.output_dir = Some(output_dir);
+        self
+    }
+
+    pub fn with_codec_preference(mut self, preference: CodecPreference) -> Self {
+        self.codec_preference = preference;
+        self
+    }
+}
 impl AlacTrackRipper {
     pub fn new(config: RipperConfig) -> Self {
         Self { config }
@@ -133,40 +185,24 @@ impl AlacTrackRipper {
         &self.config
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn rip<D: RipperDeps>(
         &self,
         deps: &D,
         track_id: &str,
-        on_progress: Option<&RipProgressCallback>,
-        storefront: &str,
-        signal: Option<CancellationToken>,
-        output_dir: Option<&Path>,
-        codec_preference: CodecPreference,
+        options: RipOptions<'_>,
     ) -> Result<TrackRipResult, RipError> {
         let mut attempt: u32 = 0;
 
         loop {
-            if signal.as_ref().is_some_and(|t| t.is_cancelled()) {
+            if options.signal.as_ref().is_some_and(|t| t.is_cancelled()) {
                 return Err(cancelled());
             }
 
-            match self
-                .rip_once(
-                    deps,
-                    track_id,
-                    on_progress,
-                    storefront,
-                    signal.as_ref(),
-                    output_dir,
-                    codec_preference,
-                )
-                .await
-            {
+            match self.rip_once(deps, track_id, &options).await {
                 Ok(result) => return Ok(result),
                 Err(err) => {
                     let message = err.to_string();
-                    if signal.as_ref().is_some_and(|t| t.is_cancelled())
+                    if options.signal.as_ref().is_some_and(|t| t.is_cancelled())
                         || message == "Download was cancelled"
                     {
                         return Err(err);
@@ -190,7 +226,7 @@ impl AlacTrackRipper {
 
                     let wait_sec = delay_ms as f64 / 1000.0;
                     emit_progress(
-                        on_progress,
+                        options.on_progress,
                         &format!(
                             "⚠️ Rip failed, retrying (attempt {attempt}/{}) in {wait_sec:.1}s: {message}",
                             self.config.max_retries
@@ -208,7 +244,7 @@ impl AlacTrackRipper {
                     );
 
                     // Abortable sleep: cancellation rejects immediately.
-                    if let Some(token) = &signal {
+                    if let Some(token) = &options.signal {
                         tokio::select! {
                             _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
                             _ = token.cancelled() => return Err(cancelled()),
@@ -221,17 +257,23 @@ impl AlacTrackRipper {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn rip_once<D: RipperDeps>(
         &self,
         deps: &D,
         track_id: &str,
-        on_progress: Option<&RipProgressCallback>,
-        storefront: &str,
-        signal: Option<&CancellationToken>,
-        output_dir: Option<&Path>,
-        codec_preference: CodecPreference,
+        options: &RipOptions<'_>,
     ) -> Result<TrackRipResult, RipError> {
+        let RipOptions {
+            on_progress,
+            storefront,
+            signal,
+            output_dir,
+            codec_preference,
+        } = options;
+        let on_progress = *on_progress;
+        let signal = signal.as_ref();
+        let output_dir = *output_dir;
+        let codec_preference = *codec_preference;
         let rip_start = std::time::Instant::now();
 
         if signal.is_some_and(|t| t.is_cancelled()) {
@@ -297,7 +339,7 @@ impl AlacTrackRipper {
             }
         };
 
-        // 1. Primary mirror (failure is not fatal — wrapper fallback).
+        // Primary mirror (failure is not fatal — wrapper fallback).
         let primary = deps.mirror_endpoint(signal).await;
         if primary.is_none() {
             debug!(
@@ -306,7 +348,7 @@ impl AlacTrackRipper {
             );
         }
 
-        // 2. Connect the audio stream.
+        // Connect the audio stream.
         let stream_start = std::time::Instant::now();
         let stream_progress: Option<ProgressCallback> = on_progress
             .cloned()
@@ -585,7 +627,6 @@ pub struct EngineRipperDeps {
 }
 
 impl EngineRipperDeps {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         catalog: Catalog<ReqwestTransport>,
         mirror_policy: MirrorPolicyManager<crate::streaming::ReqwestHttp>,

@@ -331,7 +331,6 @@ impl CachedValue for ArtistTracks {
 pub struct Catalog<T: Transport> {
     transport: T,
     cache: Mutex<Cache<CacheValue>>,
-    #[allow(dead_code)]
     max_cache: usize,
 }
 

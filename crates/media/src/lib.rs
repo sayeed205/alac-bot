@@ -252,11 +252,11 @@ impl MediaProcessor {
     }
 }
 
-fn inspect_sync(_source: &Path, cancellation: &CancellationToken) -> Result<AudioInfo, MediaError> {
+fn inspect_sync(source: &Path, cancellation: &CancellationToken) -> Result<AudioInfo, MediaError> {
     if cancellation.is_cancelled() {
         return Err(MediaError::Cancelled);
     }
-    let decoded = decode_sync(_source, cancellation, false)?;
+    let decoded = decode_sync(source, cancellation, false)?;
     Ok(decoded.info)
 }
 

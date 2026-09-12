@@ -1470,18 +1470,18 @@ impl RipOrchestrator {
 
         let task = move |queue_signal: CancellationToken| {
             Box::pin(async move {
-                run_lane_one(
-                    task_deps,
-                    task_bus,
-                    task_shared,
-                    &task_items,
-                    task_controller,
+                run_lane_one(LaneOneContext {
+                    deps: task_deps,
+                    bus: task_bus,
+                    shared: task_shared,
+                    uncached_items: &task_items,
+                    job_controller: task_controller,
                     queue_signal,
-                    task_job_ctx,
-                    &task_stage_items,
-                    task_upload_lane,
-                    task_summary_tx,
-                )
+                    ctx: task_job_ctx,
+                    stage_items: &task_stage_items,
+                    upload_lane: task_upload_lane,
+                    summary_tx: task_summary_tx,
+                })
                 .await
             })
                 as std::pin::Pin<Box<dyn std::future::Future<Output = RipJobSummary> + Send>>
@@ -1538,21 +1538,34 @@ impl RipOrchestrator {
 /// Staging failures are fed back into the work feed as re-rip items, so an
 /// undownloadable cache row still leaves the archive a chance to complete.
 ///
-/// Upload retry exhaustion is recorded as a track failure and the job
-/// drains the remaining results.
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-async fn run_lane_one<D: OrchestratorDeps>(
+struct LaneOneContext<'a, D: OrchestratorDeps> {
     deps: Arc<D>,
     bus: EventBus,
     shared: Arc<Mutex<JobShared>>,
-    uncached_items: &[ResolvedTrackItem],
+    uncached_items: &'a [ResolvedTrackItem],
     job_controller: CancellationToken,
     queue_signal: CancellationToken,
     ctx: Arc<JobContext>,
-    stage_items: &[StageItem],
+    stage_items: &'a [StageItem],
     upload_lane: Arc<Mutex<Option<tokio::sync::mpsc::Sender<LaneTask>>>>,
     summary_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<RipJobSummary>>>>,
-) -> RipJobSummary {
+}
+
+/// Upload retry exhaustion is recorded as a track failure and the job
+/// drains the remaining results.
+async fn run_lane_one<D: OrchestratorDeps>(input: LaneOneContext<'_, D>) -> RipJobSummary {
+    let LaneOneContext {
+        deps,
+        bus,
+        shared,
+        uncached_items,
+        job_controller,
+        queue_signal,
+        ctx,
+        stage_items,
+        upload_lane,
+        summary_tx,
+    } = input;
     tracing::debug!("Rip job started from queue");
 
     let is_cancelled = || {
@@ -2117,7 +2130,6 @@ async fn run_upload_item<D: OrchestratorDeps>(
 /// - Incomplete archive → never cached; delivered as `[Partial].zip`
 ///   straight to the delivery chat only for `zip_deliver` user jobs;
 ///   otherwise skipped entirely.
-#[allow(clippy::too_many_lines)]
 async fn finalize_job<D: OrchestratorDeps>(
     deps: Arc<D>,
     bus: EventBus,
@@ -2143,7 +2155,6 @@ async fn finalize_job<D: OrchestratorDeps>(
 
 /// The archive half of the finalize marker. Returns the delivery info for
 /// the summary when parts reached the user, `None` otherwise.
-#[allow(clippy::too_many_lines)]
 async fn finalize_zip<D: OrchestratorDeps>(
     deps: &Arc<D>,
     bus: &EventBus,
@@ -2945,14 +2956,15 @@ async fn upload_one<D: OrchestratorDeps>(
             }
             record_failure(
                 shared,
-                &ctx.failed_tracks,
+                ctx,
                 deps,
-                options,
-                &track_id,
-                err_msg,
-                upload_item.start_time_ms,
-                Some(upload_item.rip_result.title.clone()),
-                Some(upload_item.rip_result.artist.clone()),
+                TrackFailureDetails {
+                    track_id: &track_id,
+                    err_msg,
+                    start_time_ms: upload_item.start_time_ms,
+                    title: Some(upload_item.rip_result.title.clone()),
+                    artist: Some(upload_item.rip_result.artist.clone()),
+                },
             )
             .await;
             let (download_text, upload_text) = texts.snapshot();
@@ -2967,40 +2979,43 @@ async fn upload_one<D: OrchestratorDeps>(
     }
 }
 
-/// Record a track failure: push the row, update the counter, and log the
-/// request.
-async fn record_failure<D: OrchestratorDeps>(
-    shared: &Arc<Mutex<JobShared>>,
-    failed_tracks: &Arc<Mutex<Vec<FailedTrack>>>,
-    deps: &Arc<D>,
-    options: &RipJobOptions,
-    track_id: &str,
+struct TrackFailureDetails<'a> {
+    track_id: &'a str,
     err_msg: String,
     start_time_ms: u64,
     title: Option<String>,
     artist: Option<String>,
+}
+
+/// Record a track failure: push the row, update the counter, and log the
+/// request.
+async fn record_failure<D: OrchestratorDeps>(
+    shared: &Arc<Mutex<JobShared>>,
+    ctx: &JobContext,
+    deps: &Arc<D>,
+    details: TrackFailureDetails<'_>,
 ) {
     {
-        let mut failures = failed_tracks.lock().expect("failures poisoned");
+        let mut failures = ctx.failed_tracks.lock().expect("failures poisoned");
         failures.push(FailedTrack {
-            id: track_id.to_string(),
-            error: err_msg.clone(),
-            title,
-            artist,
+            id: details.track_id.to_string(),
+            error: details.err_msg.clone(),
+            title: details.title,
+            artist: details.artist,
             storefront: None,
         });
         shared.lock().expect("job poisoned").job.failed_count = failures.len();
     }
-    tracing::error!(track_id = %track_id, error = %err_msg, "Track upload failed");
+    tracing::error!(track_id = %details.track_id, error = %details.err_msg, "Track upload failed");
     let _ = deps
         .log_request(RequestLog {
-            telegram_id: options.user_id,
-            chat_id: options.chat_id,
-            track_key: TrackKey::new(Provider::Apple, track_id),
+            telegram_id: ctx.options.user_id,
+            chat_id: ctx.options.chat_id,
+            track_key: TrackKey::new(Provider::Apple, details.track_id),
             is_cache_hit: false,
-            duration_ms: Some((now_ms() - start_time_ms) as i64),
+            duration_ms: Some((now_ms() - details.start_time_ms) as i64),
             status: "failed".to_string(),
-            error_reason: Some(err_msg),
+            error_reason: Some(details.err_msg),
         })
         .await;
 }

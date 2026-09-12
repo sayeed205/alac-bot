@@ -196,7 +196,6 @@ pub fn plan_zip_parts(
 }
 
 /// Codec-aware [`plan_zip_parts`]; the label lands in the archive name.
-#[allow(clippy::too_many_arguments)]
 pub fn plan_zip_parts_with_codec(
     artist: &str,
     album: &str,

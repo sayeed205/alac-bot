@@ -186,37 +186,23 @@ impl<H: StreamHttp> StreamTransport<H> {
         &self,
         options: ConnectStreamOptions<'_>,
     ) -> Result<AudioStreamSource, StreamError> {
-        let ConnectStreamOptions {
-            track_id,
-            primary_mirror,
-            wrapper_url,
-            wrapper_api_key,
-            signal,
-            on_progress,
-            mirror_policy,
-            codec_preference,
-        } = options;
-        let policy = mirror_policy;
-
         let rounds = stream_retry_rounds();
         let base_delay = stream_retry_base_delay();
-        // Unique failure messages in first-seen order: retry rounds revisit
-        // the same sources and must not spam the aggregated error.
         let mut all_errors: Vec<String> = Vec::new();
 
         for round in 0..rounds {
             if round > 0 {
-                if signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                if options.signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
                     break;
                 }
                 let delay = base_delay * 2u64.pow(round - 1);
-                if let Some(on_progress) = on_progress.as_ref() {
+                if let Some(on_progress) = options.on_progress.as_ref() {
                     on_progress(&format!(
                         "All sources failed; retrying (round {round}/{rounds}) in {:.1}s...",
                         delay as f32 / 1000.0
                     ));
                 }
-                if let Some(token) = signal.as_ref() {
+                if let Some(token) = options.signal.as_ref() {
                     tokio::select! {
                         _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
                         _ = token.cancelled() => break,
@@ -226,20 +212,7 @@ impl<H: StreamHttp> StreamTransport<H> {
                 }
             }
             let round_errors = &mut Vec::new();
-            if let Some(stream) = self
-                .connect_once(
-                    &track_id,
-                    primary_mirror.clone(),
-                    wrapper_url.as_deref(),
-                    wrapper_api_key.clone(),
-                    signal.clone(),
-                    on_progress.clone(),
-                    policy,
-                    codec_preference,
-                    round_errors,
-                )
-                .await
-            {
+            if let Some(stream) = self.connect_once(&options, round_errors).await {
                 return Ok(stream);
             }
             for message in round_errors.drain(..) {
@@ -247,17 +220,12 @@ impl<H: StreamHttp> StreamTransport<H> {
                     all_errors.push(message);
                 }
             }
-            // A cancellation surfaced as an error string, not a token
-            // state; stop retrying silently.
-            if signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
+            if options.signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
                 break;
             }
 
-            // Fast exit on non-retryable errors:
-            // If the wrapper is configured and reported a 404/unavailable error,
-            // or if no wrapper is configured and all mirror sources reported 404,
-            // subsequent retry rounds will never succeed.
-            let wrapper_configured = wrapper_url
+            let wrapper_configured = options
+                .wrapper_url
                 .as_deref()
                 .map(|url| !url.trim().trim_end_matches('/').is_empty())
                 .unwrap_or(false);
@@ -273,7 +241,8 @@ impl<H: StreamHttp> StreamTransport<H> {
             }
         }
 
-        let wrapper_missing = wrapper_url
+        let wrapper_missing = options
+            .wrapper_url
             .as_deref()
             .map(|url| url.trim().trim_end_matches('/').is_empty())
             .unwrap_or(true);
@@ -284,46 +253,37 @@ impl<H: StreamHttp> StreamTransport<H> {
             )));
         }
         Err(StreamError::message(format!(
-            "Failed to stream audio from all sources. All streaming endpoints failed for track {track_id}. Errors: {}",
+            "Failed to stream audio from all sources. All streaming endpoints failed for track {}. Errors: {}",
+            options.track_id,
             all_errors.join("; ")
         )))
     }
 
     /// One attempt through mirror then wrapper; pushes one message per
     /// failed source into `errors`.
-    #[allow(clippy::too_many_arguments)]
     async fn connect_once(
         &self,
-        track_id: &str,
-        primary_mirror: Option<MirrorEndpoint>,
-        wrapper_url: Option<&str>,
-        wrapper_api_key: Option<String>,
-        signal: Option<CancellationToken>,
-        on_progress: Option<ProgressCallback>,
-        policy: Option<&dyn MirrorPolicy>,
-        codec_preference: CodecPreference,
+        options: &ConnectStreamOptions<'_>,
         errors: &mut Vec<String>,
     ) -> Option<AudioStreamSource> {
-        if let Some(primary) = primary_mirror {
-            // The mirror only serves ALAC rips; an Atmos request would be a
-            // guaranteed dead end there.
-            if codec_preference == CodecPreference::Atmos {
+        if let Some(primary) = &options.primary_mirror {
+            if options.codec_preference == CodecPreference::Atmos {
                 errors.push("Skipping primary mirror: Atmos requested".to_owned());
             } else {
                 let mirror_url = primary.mirror_url.trim_end_matches('/').to_owned();
                 let source_name = format!("primary mirror ({})", hostname(&primary.mirror_url));
                 let result = self
                     .fetch_endpoint(FetchEndpointOptions {
-                        stream_url: format!("{mirror_url}/api/stream/{track_id}"),
-                        api_key: Some(primary.api_key),
+                        stream_url: format!("{mirror_url}/api/stream/{}", options.track_id),
+                        api_key: Some(primary.api_key.clone()),
                         source_name,
-                        signal: signal.clone(),
+                        signal: options.signal.clone(),
                         timeout: self.default_timeout,
                     })
                     .await;
                 match result {
                     Ok(stream) => {
-                        if let Some(policy) = policy {
+                        if let Some(policy) = options.mirror_policy {
                             policy.record_success();
                         }
                         return Some(stream);
@@ -331,8 +291,8 @@ impl<H: StreamHttp> StreamTransport<H> {
                     Err(error) => {
                         let message = error.into_message();
                         errors.push(format!("Primary mirror failed: {message}"));
-                        if !signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
-                            if let Some(policy) = policy {
+                        if !options.signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                            if let Some(policy) = options.mirror_policy {
                                 policy.record_failure(&message);
                             }
                         }
@@ -341,34 +301,28 @@ impl<H: StreamHttp> StreamTransport<H> {
             }
         }
 
-        let clean_wrapper = wrapper_url
+        let clean_wrapper = options
+            .wrapper_url
+            .as_deref()
             .map(str::trim)
             .map(|url| url.trim_end_matches('/'))
-            .filter(|url| !url.is_empty());
-        let Some(clean_wrapper) = clean_wrapper else {
-            // The caller owns the no-wrapper message; there is nothing left
-            // to try this round.
-            return None;
-        };
-        if let Some(on_progress) = on_progress.as_ref() {
+            .filter(|url| !url.is_empty())?;
+        if let Some(on_progress) = options.on_progress.as_ref() {
             on_progress("Primary mirror unavailable. Connecting to fallback wrapper...");
         }
 
-        // A wrapper-lite instance (default port 12340 or "lite" in the URL)
-        // is served by the native Rust engine with Temari FairPlay
-        // decryption.
         let is_wrapper_lite = clean_wrapper.contains("12340")
             || clean_wrapper.ends_with("/lite")
             || clean_wrapper.contains("wrapper-lite");
         if is_wrapper_lite {
             let wrapper_engine =
-                crate::wrapper::WrapperEngine::new(clean_wrapper, wrapper_api_key.as_deref());
+                crate::wrapper::WrapperEngine::new(clean_wrapper, options.wrapper_api_key.as_deref());
             match wrapper_engine
                 .rip_track(
-                    track_id,
-                    signal.clone(),
-                    on_progress.clone(),
-                    codec_preference,
+                    &options.track_id,
+                    options.signal.clone(),
+                    options.on_progress.clone(),
+                    options.codec_preference,
                 )
                 .await
             {
@@ -379,12 +333,11 @@ impl<H: StreamHttp> StreamTransport<H> {
                 }
             }
         } else {
-            // Standard HTTP stream proxies: try the known candidate paths.
             for endpoint in [
-                format!("{clean_wrapper}/api/stream/{track_id}"),
-                format!("{clean_wrapper}/stream/{track_id}"),
+                format!("{clean_wrapper}/api/stream/{}", options.track_id),
+                format!("{clean_wrapper}/stream/{}", options.track_id),
             ] {
-                if signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                if options.signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
                     errors.push(format!(
                         "Wrapper candidate ({endpoint}) failed: Download was cancelled"
                     ));
@@ -393,9 +346,9 @@ impl<H: StreamHttp> StreamTransport<H> {
                 match self
                     .fetch_endpoint(FetchEndpointOptions {
                         stream_url: endpoint.clone(),
-                        api_key: wrapper_api_key.clone(),
+                        api_key: options.wrapper_api_key.clone(),
                         source_name: format!("wrapper ({clean_wrapper})"),
-                        signal: signal.clone(),
+                        signal: options.signal.clone(),
                         timeout: self.default_timeout,
                     })
                     .await

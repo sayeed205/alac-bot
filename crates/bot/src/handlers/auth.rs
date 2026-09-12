@@ -76,9 +76,8 @@ pub(crate) async fn resolve_target(
     let reply_header = extract_reply_header(&msg.raw);
     let is_reply = reply_header.is_some() || msg.reply_to_message_id().is_some();
 
-    // 1. Reply target: if the message is a reply, resolve the replied-to sender.
     if is_reply {
-        // 1a. Fast path: check reply_from on the MessageReplyHeader (zero-RPC, privacy-resilient).
+        // Fast path: check reply_from on the MessageReplyHeader.
         if let Some(tl::enums::MessageReplyHeader::MessageReplyHeader(h)) = reply_header {
             if let Some(tl::enums::MessageFwdHeader::MessageFwdHeader(fwd)) = &h.reply_from {
                 if let Some(peer) = &fwd.from_id {
@@ -118,7 +117,7 @@ pub(crate) async fn resolve_target(
             };
         }
 
-        // 1b. Fetch the replied-to message if reply_from was absent or omitted from_id.
+        // Fetch the replied-to message if reply_from was absent or omitted from_id.
         // Prime the peer cache first so channels.getMessages has a valid access_hash.
         // PeerRef::Id resolves from cache if available, or does one cheap RPC on miss.
         if let Some(chat_peer) = msg.peer_id() {

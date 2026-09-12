@@ -40,8 +40,6 @@ pub struct TrackReport {
     pub track_artist: String,
     pub track_album: String,
     pub dump_message_id: Option<i32>,
-    #[allow(dead_code)]
-    pub timestamp_ms: u128,
 }
 
 #[derive(Default)]
@@ -257,7 +255,6 @@ async fn dispatch_report(
         dump_message_id: (track.message_id != 0)
             .then(|| i32::try_from(track.message_id).ok())
             .flatten(),
-        timestamp_ms: now_ms(),
     };
     let report_id = report.id.clone();
     let admin_card = {

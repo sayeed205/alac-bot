@@ -76,9 +76,7 @@ pub async fn connect(database_url: &str) -> Result<DbPool, DbError> {
     };
     // Fail during application bootstrap, not on the first repository call.
     // The pool still performs normal health checks for subsequent requests.
-    {
-        let _connection = database.connection().await?;
-    }
+    let _ = database.connection().await?;
     Ok(database)
 }
 

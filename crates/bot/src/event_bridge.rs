@@ -235,15 +235,12 @@ async fn handle_event(state: Arc<BotState>, event: BridgeEvent) -> Result<(), St
             notify_job_completed(state_ref, &job, &summary).await;
             refresh_dashboard(state_ref, true).await;
         }
-        BridgeEvent::Cancelled {
-            job,
-            cancelled_by: _,
-        } => {
+        BridgeEvent::Cancelled { job, .. } => {
             registry().remember(&job);
             registry().forget(&job.id);
             refresh_dashboard(state_ref, true).await;
         }
-        BridgeEvent::Failed { job, error: _ } => {
+        BridgeEvent::Failed { job, .. } => {
             registry().remember(&job);
             registry().forget(&job.id);
             refresh_dashboard(state_ref, true).await;
@@ -299,10 +296,6 @@ async fn refresh_dashboard_for_job(state: &BotState, job: &ActiveRipJob) {
     }
 }
 
-/// Send one terminal completion notice to the originating chat. Reply to the
-/// command when it still exists; otherwise mention the requester explicitly
-/// so completion remains visible even after message cleanup.
-
 fn failed_track_reason(error: &str) -> Option<&'static str> {
     let lower = error.to_ascii_lowercase();
     if lower.contains("404")
@@ -355,6 +348,9 @@ fn format_failed_track(failed: &FailedTrack) -> String {
     }
 }
 
+/// Send one terminal completion notice to the originating chat. Reply to the
+/// command when it still exists; otherwise mention the requester explicitly
+/// so completion remains visible even after message cleanup.
 async fn notify_job_completed(state: &BotState, job: &ActiveRipJob, summary: &RipJobSummary) {
     let peer = ferogram::PeerRef::from(job.chat_id);
     let reply_id = job

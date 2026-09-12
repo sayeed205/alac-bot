@@ -309,11 +309,13 @@ impl OrchestratorDeps for RipDeps {
             .rip(
                 &self.ripper_deps,
                 track_id,
-                on_progress,
-                storefront,
-                Some(signal),
-                output_dir,
-                codec_preference,
+                engine::ripper::RipOptions {
+                    storefront,
+                    on_progress,
+                    signal: Some(signal),
+                    output_dir,
+                    codec_preference,
+                },
             )
             .await
     }
