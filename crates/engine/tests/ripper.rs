@@ -44,6 +44,7 @@ fn meta() -> TrackMeta {
         record_label: None,
         copyright: None,
         upc: None,
+        is_streamable: None,
     }
 }
 
@@ -71,6 +72,7 @@ struct FakeDeps {
     stream_chunks: Vec<Bytes>,
     stream_content_length: Option<u64>,
     connect_fails: u32, // first N connect calls fail with a stall message
+    connect_error: Option<String>,
     connect_calls: AtomicU32,
     lyrics: Option<String>,
     artwork: Option<Vec<u8>>,
@@ -91,6 +93,7 @@ impl FakeDeps {
             stream_chunks: vec![Bytes::from(vec![1u8; 10]), Bytes::from(vec![2u8; 5])],
             stream_content_length: None,
             connect_fails: 0,
+            connect_error: None,
             connect_calls: AtomicU32::new(0),
             lyrics: Some("la\nla".into()),
             artwork: Some(vec![1, 2, 3]),
@@ -122,6 +125,9 @@ impl RipperDeps for FakeDeps {
         _codec_preference: CodecPreference,
     ) -> Result<AudioStreamSource, RipError> {
         let n = self.connect_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(ref err) = self.connect_error {
+            return Err(RipError::Message(err.clone()));
+        }
         if n < self.connect_fails {
             return Err(RipError::Message(
                 "Audio stream stalled on test: no data received for 45s".into(),
@@ -678,5 +684,31 @@ async fn progress_throttles_to_one_per_second() {
         download_events.len() <= 3,
         "throttled: got {}",
         download_events.len()
+    );
+}
+
+#[tokio::test]
+async fn not_found_404_skips_retries_completely() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut deps = FakeDeps::ok();
+    deps.connect_error = Some("Failed to stream audio from all sources. All streaming endpoints failed for track 6804576275. Errors: Native wrapper engine failed: Fetch m3u8 URL: Wrapper API error (code 404): failed to get m3u8".into());
+    let ripper = AlacTrackRipper::new(config(dir.path(), 4, 1000));
+    let error = ripper
+        .rip(
+            &deps,
+            "6804576275",
+            None,
+            "in",
+            None,
+            None,
+            CodecPreference::HighestQuality,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("code 404"));
+    assert_eq!(
+        deps.connect_calls.load(Ordering::SeqCst),
+        1,
+        "should have stopped on attempt 0 without retrying"
     );
 }

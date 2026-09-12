@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
-use engine::types::Provider;
+use engine::types::{Codec, Provider};
 
 use crate::schema::{albums, requests, settings, tracks, users};
 
@@ -21,6 +21,8 @@ pub struct Track {
     pub provider: Provider,
     #[diesel(sql_type = diesel::sql_types::Text)]
     pub track_id: String,
+    #[diesel(sql_type = diesel::sql_types::VarChar)]
+    pub codec: Codec,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     pub message_id: i32,
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -90,6 +92,7 @@ pub struct Album {
     pub id: i32,
     pub provider: Provider,
     pub album_id: String,
+    pub codec: Codec,
     pub part_index: i32,
     pub total_parts: i32,
     pub message_id: i32,
@@ -113,6 +116,7 @@ pub struct NewUser<'a> {
 pub struct NewTrack<'a> {
     pub provider: Provider,
     pub track_id: &'a str,
+    pub codec: Codec,
     pub message_id: i32,
     pub file_id: &'a str,
     pub file_unique_id: &'a str,
@@ -146,6 +150,7 @@ pub struct NewRequest<'a> {
 pub struct NewAlbum<'a> {
     pub provider: Provider,
     pub album_id: &'a str,
+    pub codec: Codec,
     pub part_index: i32,
     pub total_parts: i32,
     pub message_id: i32,

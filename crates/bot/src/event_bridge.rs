@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use engine::orchestrator::{
     deps::OrchestratorDeps,
-    types::{ActiveRipJob, OrchestratorEvent, RipJobProgress, RipJobSummary},
+    types::{ActiveRipJob, FailedTrack, OrchestratorEvent, RipJobProgress, RipJobSummary},
 };
 use tokio::sync::mpsc;
 
@@ -302,6 +302,59 @@ async fn refresh_dashboard_for_job(state: &BotState, job: &ActiveRipJob) {
 /// Send one terminal completion notice to the originating chat. Reply to the
 /// command when it still exists; otherwise mention the requester explicitly
 /// so completion remains visible even after message cleanup.
+
+fn failed_track_reason(error: &str) -> Option<&'static str> {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("404")
+        || lower.contains("failed to get m3u8")
+        || lower.contains("unavailable")
+        || lower.contains("unstreamable")
+        || lower.contains("not streamable")
+        || lower.contains("not available")
+        || lower.contains("not found")
+    {
+        Some("Unavailable on Apple Music")
+    } else if lower.contains("cancelled") {
+        Some("Cancelled")
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        Some("Timed out")
+    } else if lower.contains("401") || lower.contains("403") || lower.contains("unauthorized") {
+        Some("Authentication error")
+    } else {
+        None
+    }
+}
+
+fn format_failed_track(failed: &FailedTrack) -> String {
+    let label = match (&failed.title, &failed.artist) {
+        (Some(title), Some(artist)) if !title.trim().is_empty() && !artist.trim().is_empty() => {
+            format!("{} - {}", crate::html::escape(title), crate::html::escape(artist))
+        }
+        (Some(title), _) if !title.trim().is_empty() => crate::html::escape(title).to_string(),
+        _ if !failed.id.is_empty() && failed.id.chars().all(|c| c.is_ascii_digit()) => {
+            format!("Track {}", failed.id)
+        }
+        _ => crate::html::escape(&failed.id).to_string(),
+    };
+
+    let link = if !failed.id.is_empty() && failed.id.chars().all(|c| c.is_ascii_digit()) {
+        let url = if let Some(sf) = failed.storefront.as_deref().filter(|s| !s.trim().is_empty()) {
+            format!("https://music.apple.com/{sf}/song/{}", failed.id)
+        } else {
+            format!("https://music.apple.com/song/{}", failed.id)
+        };
+        format!(r#"<a href="{url}">{label}</a>"#)
+    } else {
+        label
+    };
+
+    if let Some(reason) = failed_track_reason(&failed.error) {
+        format!("{link} <i>({reason})</i>")
+    } else {
+        link
+    }
+}
+
 async fn notify_job_completed(state: &BotState, job: &ActiveRipJob, summary: &RipJobSummary) {
     let peer = ferogram::PeerRef::from(job.chat_id);
     let reply_id = job
@@ -350,6 +403,22 @@ async fn notify_job_completed(state: &BotState, job: &ActiveRipJob, summary: &Ri
         ),
         format!("┣ Elapsed: {elapsed}"),
     ];
+    if !summary.failed_tracks.is_empty() {
+        if summary.failed_tracks.len() == 1 {
+            let item = format_failed_track(&summary.failed_tracks[0]);
+            lines.push(format!("┣ ❌ Failed: {item}"));
+        } else {
+            lines.push("┣ ❌ Failed tracks:".to_owned());
+            for track in summary.failed_tracks.iter().take(15) {
+                let item = format_failed_track(track);
+                lines.push(format!("┣ • {item}"));
+            }
+            if summary.failed_tracks.len() > 15 {
+                let rem = summary.failed_tracks.len() - 15;
+                lines.push(format!("┣ • ...and {rem} more"));
+            }
+        }
+    }
     // Engine-authored plain-text notes (e.g. single-track ZIP skip). Escaped
     // because they can embed album names.
     for warning in &summary.warnings {
@@ -507,5 +576,69 @@ mod tests {
             BridgeEvent::from_engine(&OrchestratorEvent::Failed(&job, "err")),
             Some(BridgeEvent::Failed { .. })
         ));
+    }
+    #[test]
+    fn format_failed_track_rendering() {
+        // 1. With title, artist, storefront
+        let ft1 = FailedTrack {
+            id: "6804576275".into(),
+            error: "failed to get m3u8".into(),
+            title: Some("Bhaber deshe thako konya".into()),
+            artist: Some("Fakira".into()),
+            storefront: Some("in".into()),
+        };
+        assert_eq!(
+            format_failed_track(&ft1),
+            r#"<a href="https://music.apple.com/in/song/6804576275">Bhaber deshe thako konya - Fakira</a> <i>(Unavailable on Apple Music)</i>"#
+        );
+
+        // 2. Without storefront
+        let ft2 = FailedTrack {
+            id: "6804576275".into(),
+            error: "failed to get m3u8".into(),
+            title: Some("Bhaber deshe thako konya".into()),
+            artist: Some("Fakira".into()),
+            storefront: None,
+        };
+        assert_eq!(
+            format_failed_track(&ft2),
+            r#"<a href="https://music.apple.com/song/6804576275">Bhaber deshe thako konya - Fakira</a> <i>(Unavailable on Apple Music)</i>"#
+        );
+
+        // 3. Only numeric ID
+        let ft3 = FailedTrack {
+            id: "12345".into(),
+            error: "404".into(),
+            title: None,
+            artist: None,
+            storefront: None,
+        };
+        assert_eq!(
+            format_failed_track(&ft3),
+            r#"<a href="https://music.apple.com/song/12345">Track 12345</a> <i>(Unavailable on Apple Music)</i>"#
+        );
+
+        // 4. Non-numeric ID (circuit breaker)
+        let ft4 = FailedTrack {
+            id: "Remaining tracks".into(),
+            error: "offline".into(),
+            title: None,
+            artist: None,
+            storefront: None,
+        };
+        assert_eq!(format_failed_track(&ft4), "Remaining tracks");
+
+        // 5. Special chars escaped
+        let ft5 = FailedTrack {
+            id: "999".into(),
+            error: "err".into(),
+            title: Some("Tom & Jerry <Special>".into()),
+            artist: Some("AC/DC & Friends".into()),
+            storefront: None,
+        };
+        assert_eq!(
+            format_failed_track(&ft5),
+            r#"<a href="https://music.apple.com/song/999">Tom &amp; Jerry &lt;Special&gt; - AC/DC &amp; Friends</a>"#
+        );
     }
 }

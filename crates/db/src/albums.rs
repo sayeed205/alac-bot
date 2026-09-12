@@ -1,6 +1,6 @@
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
-use engine::Provider;
+use engine::{Codec, Provider};
 
 use crate::{
     models::{Album, NewAlbum},
@@ -24,12 +24,18 @@ impl AlbumsRepository {
         &self,
         provider: Provider,
         album_id: &str,
+        codec: Option<Codec>,
     ) -> Result<Vec<Album>, DbError> {
         let mut connection = self.pool.connection().await?;
-        let rows = albums::table
+        let mut query = albums::table
             .filter(albums::provider.eq(provider))
             .filter(albums::album_id.eq(album_id))
             .order(albums::part_index.asc())
+            .into_boxed();
+        if let Some(c) = codec {
+            query = query.filter(albums::codec.eq(c));
+        }
+        let rows = query
             .select(Album::as_select())
             .load::<Album>(&mut *connection)
             .await?;
@@ -55,7 +61,7 @@ impl AlbumsRepository {
         let mut connection = self.pool.connection().await?;
         diesel::insert_into(albums::table)
             .values(input)
-            .on_conflict((albums::provider, albums::album_id, albums::part_index))
+            .on_conflict((albums::provider, albums::album_id, albums::codec, albums::part_index))
             .do_update()
             .set((
                 albums::total_parts.eq(input.total_parts),
@@ -72,6 +78,7 @@ impl AlbumsRepository {
         albums::table
             .filter(albums::provider.eq(input.provider))
             .filter(albums::album_id.eq(input.album_id))
+            .filter(albums::codec.eq(input.codec))
             .filter(albums::part_index.eq(input.part_index))
             .select(Album::as_select())
             .first::<Album>(&mut *connection)
@@ -84,19 +91,21 @@ impl AlbumsRepository {
         &self,
         provider: Provider,
         album_id: &str,
+        codec: Option<Codec>,
     ) -> Result<Vec<Album>, DbError> {
-        let existing = self.find_albums(provider, album_id).await?;
+        let existing = self.find_albums(provider, album_id, codec).await?;
         if existing.is_empty() {
             return Ok(Vec::new());
         }
         let mut connection = self.pool.connection().await?;
-        diesel::delete(
-            albums::table
-                .filter(albums::provider.eq(provider))
-                .filter(albums::album_id.eq(album_id)),
-        )
-        .execute(&mut *connection)
-        .await?;
+        let mut query = diesel::delete(albums::table)
+            .filter(albums::provider.eq(provider))
+            .filter(albums::album_id.eq(album_id))
+            .into_boxed();
+        if let Some(c) = codec {
+            query = query.filter(albums::codec.eq(c));
+        }
+        query.execute(&mut *connection).await?;
         Ok(existing)
     }
 

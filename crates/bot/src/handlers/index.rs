@@ -235,6 +235,7 @@ async fn index_dump_channel(
                     .tracks()
                     .save_track(&SaveTrackInput {
                         track_key: meta.track_key.clone(),
+                        codec: meta.codec,
                         message_id: i64::from(message.id()),
                         file_id,
                         file_unique_id,
@@ -298,6 +299,7 @@ async fn index_dump_channel(
                     .save_album(&db::NewAlbum {
                         provider: zip_meta.provider,
                         album_id: &zip_meta.album_id,
+                        codec: zip_meta.codec,
                         part_index: zip_meta.part_index,
                         total_parts: zip_meta.total_parts,
                         message_id: message.id(),
@@ -345,7 +347,7 @@ async fn index_dump_channel(
     if let Ok(zip_rows) = zip_repo.list_albums().await {
         for row in zip_rows {
             if !valid_zip_msg_ids.contains(&row.message_id) {
-                let _ = zip_repo.delete_albums(row.provider, &row.album_id).await;
+                let _ = zip_repo.delete_albums(row.provider, &row.album_id, Some(row.codec)).await;
                 pruned += 1;
             }
         }

@@ -11,7 +11,7 @@ use diesel::{sql_query, sql_types::Text};
 use diesel_async::RunQueryDsl;
 use engine::{
     orchestrator::deps::{RequestLog, SaveTrackInput},
-    Provider, TrackKey,
+    Codec, Provider, TrackKey,
 };
 use serde_json::json;
 
@@ -25,7 +25,8 @@ async fn client() -> DbPool {
 
 fn track(id: &str, title: &str) -> SaveTrackInput {
     SaveTrackInput {
-        track_key: TrackKey::new(Provider::Apple, id),
+        track_key: TrackKey::new(Provider::Apple, id).with_codec(Codec::Alac),
+        codec: Codec::Alac,
         message_id: 123,
         file_id: format!("file-{id}"),
         file_unique_id: format!("unique-{id}"),
@@ -286,7 +287,7 @@ async fn albums_repository_save_find_delete() {
     let repo = AlbumsRepository::new(client.clone());
     let album_id = format!("test-alb-{}", std::process::id());
 
-    let _ = repo.delete_albums(Provider::Apple, &album_id).await;
+    let _ = repo.delete_albums(Provider::Apple, &album_id, None).await;
 
     let uid1 = format!("uniq1-{}", std::process::id());
     let uid2 = format!("uniq2-{}", std::process::id());
@@ -294,6 +295,7 @@ async fn albums_repository_save_find_delete() {
     let new_part1 = NewAlbum {
         provider: Provider::Apple,
         album_id: &album_id,
+        codec: Codec::Alac,
         part_index: 1,
         total_parts: 2,
         message_id: 100,
@@ -306,6 +308,7 @@ async fn albums_repository_save_find_delete() {
     let new_part2 = NewAlbum {
         provider: Provider::Apple,
         album_id: &album_id,
+        codec: Codec::Alac,
         part_index: 2,
         total_parts: 2,
         message_id: 101,
@@ -320,7 +323,7 @@ async fn albums_repository_save_find_delete() {
     repo.save_album(&new_part2).await.expect("save part 2");
 
     let parts = repo
-        .find_albums(Provider::Apple, &album_id)
+        .find_albums(Provider::Apple, &album_id, None)
         .await
         .expect("find albums");
     assert_eq!(parts.len(), 2);
@@ -328,13 +331,13 @@ async fn albums_repository_save_find_delete() {
     assert_eq!(parts[1].part_index, 2);
 
     let deleted = repo
-        .delete_albums(Provider::Apple, &album_id)
+        .delete_albums(Provider::Apple, &album_id, None)
         .await
         .expect("delete");
     assert_eq!(deleted.len(), 2);
 
     let parts_after = repo
-        .find_albums(Provider::Apple, &album_id)
+        .find_albums(Provider::Apple, &album_id, None)
         .await
         .expect("find after delete");
     assert_eq!(parts_after.len(), 0);

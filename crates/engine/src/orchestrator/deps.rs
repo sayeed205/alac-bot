@@ -13,7 +13,7 @@ use crate::{
     playlist::PlaylistData,
     ripper::{RipError, RipProgressCallback},
     settings::BotSettings,
-    types::{AlbumTracks, ArtistTracks, Provider, TrackKey, TrackRipResult},
+    types::{AlbumTracks, ArtistTracks, Codec, Provider, TrackKey, TrackRipResult},
     wrapper::CodecPreference,
 };
 
@@ -24,6 +24,7 @@ pub type UploadProgressCallback = std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>
 #[derive(Debug, Clone, PartialEq)]
 pub struct CachedTrack {
     pub track_key: TrackKey,
+    pub codec: Codec,
     pub message_id: i64,
     pub file_id: String,
     pub file_unique_id: String,
@@ -36,6 +37,7 @@ pub struct CachedTrack {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SaveTrackInput {
     pub track_key: TrackKey,
+    pub codec: Codec,
     pub message_id: i64,
     pub file_id: String,
     pub file_unique_id: String,
@@ -60,8 +62,10 @@ impl SaveTrackInput {
         file_id: &str,
         file_unique_id: &str,
     ) -> Self {
+        let codec = rip.codec.parse::<Codec>().unwrap_or(Codec::Alac);
         Self {
-            track_key: TrackKey::new(Provider::Apple, track_id),
+            track_key: TrackKey::new(Provider::Apple, track_id).with_codec(codec),
+            codec,
             message_id,
             file_id: file_id.to_string(),
             file_unique_id: file_unique_id.to_string(),
@@ -104,6 +108,7 @@ pub struct DumpUpload {
 pub struct AlbumUpload {
     pub provider: Provider,
     pub album_id: String,
+    pub codec: Codec,
     pub part_index: i32,
     pub total_parts: i32,
     pub message_id: i64,
@@ -126,6 +131,7 @@ pub struct CachedAlbum {
     pub generation_hash: String,
     /// Bytes of the stored archive part; powers the ZIP details message.
     pub file_size: i64,
+    pub codec: Codec,
 }
 
 /// Telegram-side failures (surface as messages like TS).
@@ -249,6 +255,7 @@ pub trait OrchestratorDeps: Send + Sync + 'static {
         &'a self,
         _provider: Provider,
         _album_id: &'a str,
+        _codec: Option<Codec>,
     ) -> BoxFuture<'a, Result<Vec<CachedAlbum>, String>> {
         Box::pin(async { Ok(Vec::new()) })
     }
@@ -259,6 +266,7 @@ pub trait OrchestratorDeps: Send + Sync + 'static {
         &'a self,
         _provider: Provider,
         _album_id: &'a str,
+        _codec: Option<Codec>,
     ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async { Ok(()) })
     }

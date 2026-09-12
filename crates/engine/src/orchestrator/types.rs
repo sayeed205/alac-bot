@@ -116,6 +116,33 @@ pub struct RipJobProgress {
 pub struct FailedTrack {
     pub id: String,
     pub error: String,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub storefront: Option<String>,
+}
+
+impl FailedTrack {
+    pub fn new(id: impl Into<String>, error: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            error: error.into(),
+            title: None,
+            artist: None,
+            storefront: None,
+        }
+    }
+
+    pub fn with_meta(
+        mut self,
+        title: Option<String>,
+        artist: Option<String>,
+        storefront: Option<String>,
+    ) -> Self {
+        self.title = title;
+        self.artist = artist;
+        self.storefront = storefront;
+        self
+    }
 }
 
 /// The end-of-job report for the requesting chat.

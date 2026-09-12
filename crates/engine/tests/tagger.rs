@@ -29,6 +29,7 @@ fn meta() -> TrackMeta {
         record_label: None,
         copyright: None,
         upc: None,
+        is_streamable: None,
     }
 }
 

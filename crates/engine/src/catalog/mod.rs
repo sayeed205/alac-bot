@@ -88,6 +88,7 @@ struct ItunesRawItem {
     record_label: Option<String>,
     copyright: Option<String>,
     upc: Option<String>,
+    is_streamable: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -202,6 +203,7 @@ fn map_itunes_item(item: &ItunesRawItem) -> TrackMeta {
         record_label: item.record_label.clone().filter(|value| !value.is_empty()),
         copyright: item.copyright.clone().filter(|value| !value.is_empty()),
         upc: item.upc.clone().filter(|value| !value.is_empty()),
+        is_streamable: item.is_streamable,
     }
 }
 
@@ -559,6 +561,7 @@ impl<T: Transport> Catalog<T> {
                 record_label: c.record_label.clone().filter(|value| !value.is_empty()),
                 copyright: c.copyright.clone().filter(|value| !value.is_empty()),
                 upc: c.upc.clone().filter(|value| !value.is_empty()),
+                is_streamable: None,
             },
             None => first_track,
         };

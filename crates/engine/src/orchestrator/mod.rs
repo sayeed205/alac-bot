@@ -46,7 +46,7 @@ use crate::{
     queue::{EnqueueOptions, SequentialRipQueue},
     ripper::RipProgressCallback,
     settings::BotSettings,
-    types::{AlbumTracks, ArtistTracks, Provider, TargetKind, TrackKey, TrackRipResult},
+    types::{AlbumTracks, ArtistTracks, Codec, Provider, TargetKind, TrackKey, TrackRipResult},
     wrapper::CodecPreference,
     zip::{
         album_generation_hash, create_zip_archive, plan_zip_parts_with_codec,
@@ -116,6 +116,7 @@ struct ResolvedTrackItem {
     title: Option<String>,
     artist: Option<String>,
     storefront: Option<String>,
+    is_streamable: Option<bool>,
 }
 
 /// One item moving through the rip work feed.
@@ -124,6 +125,7 @@ struct PipelineItem {
     storefront: Option<String>,
     meta_title: Option<String>,
     meta_artist: Option<String>,
+    is_streamable: Option<bool>,
 }
 
 /// One finished rip awaiting its upload.
@@ -671,6 +673,7 @@ impl RipOrchestrator {
                         title: None,
                         artist: None,
                         storefront: Some(effective_sf.clone()),
+                        is_streamable: None,
                     });
                     Ok(())
                 }
@@ -691,6 +694,7 @@ impl RipOrchestrator {
                                 title: Some(t.title.clone()),
                                 artist: Some(t.artist.clone()),
                                 storefront: Some(effective_sf.clone()),
+                                is_streamable: t.is_streamable,
                             });
                         }
                         Ok(())
@@ -711,6 +715,7 @@ impl RipOrchestrator {
                                     title: Some(t.title.clone()),
                                     artist: Some(t.artist.clone()),
                                     storefront: Some(effective_sf.clone()),
+                                    is_streamable: None,
                                 });
                             }
                             Ok(())
@@ -727,6 +732,7 @@ impl RipOrchestrator {
                                     title: Some(t.title.clone()),
                                     artist: Some(t.artist.clone()),
                                     storefront: Some(effective_sf.clone()),
+                                    is_streamable: None,
                                 });
                             }
                             Ok(())
@@ -887,9 +893,13 @@ impl RipOrchestrator {
         self.set_phase(&shared, JobPhase::CheckingCache);
         self.bus
             .emit_progress(&shared, Some("Checking local cache..."), None, None);
+        let target_codec = match options.codec_preference {
+            CodecPreference::Atmos => Codec::Ec3,
+            CodecPreference::HighestQuality => Codec::Alac,
+        };
         let requested_ids: Vec<TrackKey> = tracks_to_process
             .iter()
-            .map(|t| TrackKey::new(Provider::Apple, t.id.clone()))
+            .map(|t| TrackKey::new(Provider::Apple, t.id.clone()).with_codec(target_codec))
             .collect();
         let mut existing_tracks_map = deps
             .find_cached_tracks(&requested_ids)
@@ -900,13 +910,14 @@ impl RipOrchestrator {
         if options.is_force && options.is_admin {
             let mut old_message_ids: Vec<i64> = Vec::new();
             for item in &tracks_to_process {
+                let lookup_key = TrackKey::new(Provider::Apple, item.id.clone()).with_codec(target_codec);
                 if let Some(cached) =
-                    existing_tracks_map.remove(&TrackKey::new(Provider::Apple, item.id.clone()))
+                    existing_tracks_map.remove(&lookup_key)
                 {
                     old_message_ids.push(cached.message_id);
                     // Per-item delete; errors are swallowed.
                     let _ = deps
-                        .delete_track(&TrackKey::new(Provider::Apple, item.id.clone()))
+                        .delete_track(&lookup_key)
                         .await;
                 }
             }
@@ -940,7 +951,7 @@ impl RipOrchestrator {
         if let Some(hash) = &zip_generation_hash {
             if !options.is_force && existing_tracks_map.len() == tracks_to_process.len() {
                 match deps
-                    .find_albums(Provider::Apple, &options.parsed_items[0].id)
+                    .find_albums(Provider::Apple, &options.parsed_items[0].id, Some(target_codec))
                     .await
                 {
                     Ok(rows) => {
@@ -978,8 +989,9 @@ impl RipOrchestrator {
                 ));
             }
 
+            let lookup_key = TrackKey::new(Provider::Apple, item.id.clone()).with_codec(target_codec);
             let Some(cached) =
-                existing_tracks_map.get(&TrackKey::new(Provider::Apple, item.id.clone()))
+                existing_tracks_map.get(&lookup_key)
             else {
                 uncached_items.push(item.clone());
                 continue;
@@ -1110,7 +1122,7 @@ impl RipOrchestrator {
                         // longer exists (for example after channel cleanup).
                         // Remove it immediately so a failed re-rip cannot
                         // leave a ghost cache entry behind.
-                        let stale_key = TrackKey::new(Provider::Apple, item.id.clone());
+                        let stale_key = TrackKey::new(Provider::Apple, item.id.clone()).with_codec(cached.codec);
                         if let Err(delete_error) = deps.delete_track(&stale_key).await {
                             tracing::warn!(
                                 track_id = %item.id,
@@ -1227,7 +1239,7 @@ impl RipOrchestrator {
                         // the album's ZIP rows so the next request rebuilds
                         // instead of skipping staging and failing forever.
                         if let Err(error) = deps
-                            .delete_albums(Provider::Apple, &options.parsed_items[0].id)
+                            .delete_albums(Provider::Apple, &options.parsed_items[0].id, Some(target_codec))
                             .await
                         {
                             tracing::warn!(%error, "failed to purge undeliverable album ZIP rows");
@@ -1575,6 +1587,7 @@ async fn run_lane_one<D: OrchestratorDeps>(
                 storefront: item.storefront.clone(),
                 meta_title: item.title.clone(),
                 meta_artist: item.artist.clone(),
+                is_streamable: item.is_streamable,
             };
             if producer_tx.send(pipeline_item).await.is_err() {
                 break;
@@ -1683,6 +1696,7 @@ async fn run_lane_one<D: OrchestratorDeps>(
                         storefront: stage.item.storefront.clone(),
                         meta_title: stage.item.title.clone(),
                         meta_artist: stage.item.artist.clone(),
+                        is_streamable: stage.item.is_streamable,
                     };
                     if staging_tx.send(pipeline_item).await.is_err() {
                         break;
@@ -1697,6 +1711,45 @@ async fn run_lane_one<D: OrchestratorDeps>(
         while let Some(item) = work_rx.recv().await {
             if is_cancelled() {
                 break;
+            }
+
+            if item.is_streamable == Some(false) {
+                let err_msg = "Unavailable on Apple Music (not streamable)".to_string();
+                let duration_ms = 0;
+                {
+                    let mut failures = ctx.failed_tracks.lock().expect("failures poisoned");
+                    failures.push(FailedTrack {
+                        id: item.track_id.clone(),
+                        error: err_msg.clone(),
+                        title: item.meta_title.clone(),
+                        artist: item.meta_artist.clone(),
+                        storefront: item.storefront.clone(),
+                    });
+                    shared.lock().expect("job poisoned").job.failed_count = failures.len();
+                }
+                tracing::warn!(
+                    track_id = %item.track_id,
+                    "Track is not streamable in Apple Music catalog, skipping rip"
+                );
+                let _ = deps
+                    .log_request(RequestLog {
+                        telegram_id: ctx.options.user_id,
+                        chat_id: ctx.options.chat_id,
+                        track_key: TrackKey::new(Provider::Apple, item.track_id.clone()),
+                        is_cache_hit: false,
+                        duration_ms: Some(duration_ms),
+                        status: "failed".to_string(),
+                        error_reason: Some(err_msg.clone()),
+                    })
+                    .await;
+                let (download_text, upload_text) = ctx.texts.snapshot();
+                bus.emit_progress(
+                    &shared,
+                    None,
+                    download_text.as_deref(),
+                    upload_text.as_deref(),
+                );
+                continue;
             }
 
             let track_start_time = now_ms();
@@ -1854,6 +1907,9 @@ async fn run_lane_one<D: OrchestratorDeps>(
                         failures.push(FailedTrack {
                             id: item.track_id.clone(),
                             error: err_msg.clone(),
+                            title: item.meta_title.clone(),
+                            artist: item.meta_artist.clone(),
+                            storefront: item.storefront.clone(),
                         });
                         shared.lock().expect("job poisoned").job.failed_count = failures.len();
                     }
@@ -1905,6 +1961,9 @@ async fn run_lane_one<D: OrchestratorDeps>(
                                 error:
                                     "Mirror service offline / unreachable (stopped remaining batch)"
                                         .to_string(),
+                                title: None,
+                                artist: None,
+                                storefront: None,
                             });
                             shared.lock().expect("job poisoned").job.failed_count = failures.len();
                         }
@@ -2187,8 +2246,9 @@ async fn finalize_zip<D: OrchestratorDeps>(
     // Before republishing complete parts, drop the previous rows so a
     // shrinking part count cannot leave stale parts behind. The upsert
     // below re-saves each fresh part.
+    let album_codec = if ctx.options.codec_preference == CodecPreference::Atmos { Codec::Ec3 } else { zip_codec.parse::<Codec>().unwrap_or(Codec::Alac) };
     if complete {
-        if let Err(error) = deps.delete_albums(Provider::Apple, &ctx.zip_album_id).await {
+        if let Err(error) = deps.delete_albums(Provider::Apple, &ctx.zip_album_id, Some(album_codec)).await {
             tracing::warn!(%error, "failed to purge stale album ZIP rows");
         }
     }
@@ -2291,10 +2351,20 @@ async fn finalize_zip<D: OrchestratorDeps>(
                     let _ = tokio::fs::remove_file(&output).await;
                     continue;
                 }
+                let album_codec = if ctx.options.codec_preference == CodecPreference::Atmos {
+                    Codec::Ec3
+                } else {
+                    ctx.zip_codec
+                        .lock()
+                        .ok()
+                        .and_then(|c| c.as_deref().and_then(|s| s.parse().ok()))
+                        .unwrap_or(Codec::Alac)
+                };
                 let caption = format_zip_dump_caption(
                     &DumpZipCaptionMetadata {
                         provider: Provider::Apple,
                         album_id: &ctx.zip_album_id,
+                        codec: Some(album_codec.as_str()),
                         album: &ctx.zip_album,
                         artist: &ctx.zip_artist,
                         filename: &plan.archive_filename,
@@ -2436,6 +2506,7 @@ async fn finalize_zip<D: OrchestratorDeps>(
                             .save_album(AlbumUpload {
                                 provider: Provider::Apple,
                                 album_id: ctx.zip_album_id.clone(),
+                                codec: album_codec,
                                 part_index: plan.part_index as i32,
                                 total_parts: plan.total_parts as i32,
                                 message_id: upload.message_id,
@@ -2525,6 +2596,7 @@ async fn rollback_cancelled<D: OrchestratorDeps>(
     track_id: &str,
     dump_message_id: i64,
     delete_record: bool,
+    codec: Option<Codec>,
 ) {
     let dump_removed = deps
         .sink()
@@ -2532,8 +2604,12 @@ async fn rollback_cancelled<D: OrchestratorDeps>(
         .await
         .is_ok();
     if dump_removed && delete_record {
+        let mut key = TrackKey::new(Provider::Apple, track_id);
+        if let Some(c) = codec {
+            key = key.with_codec(c);
+        }
         let _ = deps
-            .delete_track(&TrackKey::new(Provider::Apple, track_id))
+            .delete_track(&key)
             .await;
     }
 }
@@ -2690,6 +2766,9 @@ async fn upload_one<D: OrchestratorDeps>(
                         failures.push(FailedTrack {
                             id: track_id.clone(),
                             error: upload_err.to_string(),
+                            title: Some(rip_result.title.clone()),
+                            artist: Some(rip_result.artist.clone()),
+                            storefront: None,
                         });
                         shared.lock().expect("job poisoned").job.failed_count = failures.len();
                     }
@@ -2734,6 +2813,9 @@ async fn upload_one<D: OrchestratorDeps>(
                     failures.push(FailedTrack {
                         id: track_id.clone(),
                         error: err_msg.to_string(),
+                        title: Some(rip_result.title.clone()),
+                        artist: Some(rip_result.artist.clone()),
+                        storefront: None,
                     });
                     shared.lock().expect("job poisoned").job.failed_count = failures.len();
                 }
@@ -2773,7 +2855,8 @@ async fn upload_one<D: OrchestratorDeps>(
         .map_err(|e| e.to_string())?;
 
         if is_cancelled() {
-            rollback_cancelled(deps, &track_id, dump_upload.message_id, true).await;
+            let rip_codec = rip_result.codec.parse::<Codec>().ok();
+            rollback_cancelled(deps, &track_id, dump_upload.message_id, true, rip_codec).await;
             return Err("cancelled".to_owned());
         }
 
@@ -2800,7 +2883,7 @@ async fn upload_one<D: OrchestratorDeps>(
         }
 
         if is_cancelled() {
-            rollback_cancelled(deps, &track_id, dump_upload.message_id, true).await;
+            rollback_cancelled(deps, &track_id, dump_upload.message_id, true, rip_result.codec.parse::<Codec>().ok()).await;
             return Err("cancelled".to_owned());
         }
 
@@ -2868,6 +2951,8 @@ async fn upload_one<D: OrchestratorDeps>(
                 &track_id,
                 err_msg,
                 upload_item.start_time_ms,
+                Some(upload_item.rip_result.title.clone()),
+                Some(upload_item.rip_result.artist.clone()),
             )
             .await;
             let (download_text, upload_text) = texts.snapshot();
@@ -2892,12 +2977,17 @@ async fn record_failure<D: OrchestratorDeps>(
     track_id: &str,
     err_msg: String,
     start_time_ms: u64,
+    title: Option<String>,
+    artist: Option<String>,
 ) {
     {
         let mut failures = failed_tracks.lock().expect("failures poisoned");
         failures.push(FailedTrack {
             id: track_id.to_string(),
             error: err_msg.clone(),
+            title,
+            artist,
+            storefront: None,
         });
         shared.lock().expect("job poisoned").job.failed_count = failures.len();
     }

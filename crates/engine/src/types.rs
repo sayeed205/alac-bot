@@ -75,11 +75,97 @@ impl FromSql<diesel::sql_types::VarChar, Pg> for Provider {
     }
 }
 
-/// A globally unique track identity. The provider is part of the identity.
+/// An audio codec / encoding format supported by the bot.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    diesel::AsExpression,
+    diesel::FromSqlRow,
+    Default,
+)]
+#[diesel(sql_type = diesel::sql_types::VarChar)]
+#[serde(rename_all = "lowercase")]
+pub enum Codec {
+    #[default]
+    Alac,
+    #[serde(rename = "ec-3")]
+    Ec3,
+    Aac,
+    Flac,
+}
+
+impl Codec {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Alac => "alac",
+            Self::Ec3 => "ec-3",
+            Self::Aac => "aac",
+            Self::Flac => "flac",
+        }
+    }
+
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Alac => "ALAC",
+            Self::Ec3 => "Dolby Atmos",
+            Self::Aac => "AAC",
+            Self::Flac => "FLAC",
+        }
+    }
+}
+
+impl std::fmt::Display for Codec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Codec {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "alac" => Ok(Self::Alac),
+            "ec-3" | "ec3" | "atmos" | "dolby" | "dolby atmos" | "eac3" => Ok(Self::Ec3),
+            "aac" | "mp4a.40.2" | "mp4a.40.5" | "heaac" => Ok(Self::Aac),
+            "flac" => Ok(Self::Flac),
+            other => Err(format!("unknown codec: {other}")),
+        }
+    }
+}
+
+impl ToSql<diesel::sql_types::VarChar, Pg> for Codec {
+    fn to_sql<'b>(
+        &'b self,
+        out: &mut diesel::serialize::Output<'b, '_, Pg>,
+    ) -> diesel::serialize::Result {
+        <str as ToSql<diesel::sql_types::Text, Pg>>::to_sql(self.as_str(), out)
+    }
+}
+
+impl FromSql<diesel::sql_types::VarChar, Pg> for Codec {
+    fn from_sql(
+        bytes: <Pg as diesel::backend::Backend>::RawValue<'_>,
+    ) -> diesel::deserialize::Result<Self> {
+        <String as FromSql<diesel::sql_types::Text, Pg>>::from_sql(bytes)?
+            .parse()
+            .map_err(Into::into)
+    }
+}
+
+/// A globally unique track identity. The provider and optional codec are part of the identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TrackKey {
     pub provider: Provider,
     pub track_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec: Option<Codec>,
 }
 
 impl TrackKey {
@@ -87,11 +173,21 @@ impl TrackKey {
         Self {
             provider,
             track_id: track_id.into(),
+            codec: None,
         }
+    }
+
+    pub fn with_codec(mut self, codec: Codec) -> Self {
+        self.codec = Some(codec);
+        self
     }
 
     pub fn apple(track_id: impl Into<String>) -> Self {
         Self::new(Provider::Apple, track_id)
+    }
+
+    pub fn apple_codec(track_id: impl Into<String>, codec: Codec) -> Self {
+        Self::new(Provider::Apple, track_id).with_codec(codec)
     }
 }
 
@@ -162,6 +258,7 @@ pub struct TrackMeta {
     pub record_label: Option<String>,
     pub copyright: Option<String>,
     pub upc: Option<String>,
+    pub is_streamable: Option<bool>,
 }
 
 /// An album plus its ordered track list.

@@ -113,18 +113,19 @@ impl FakeDeps {
     }
 
     fn cache_track(&self, id: &str, message_id: i64) {
-        self.cache.lock().unwrap().insert(
-            TrackKey::apple(id),
-            CachedTrack {
-                track_key: TrackKey::apple(id),
-                message_id,
-                file_id: format!("file_{id}"),
-                file_unique_id: format!("uniq_{id}"),
-                title: format!("T{id}"),
-                artist: "Cached Artist".into(),
-                album: "Cached Album".into(),
-            },
-        );
+        let key = TrackKey::apple(id).with_codec(engine::Codec::Alac);
+        let track = CachedTrack {
+            track_key: key.clone(),
+            codec: engine::Codec::Alac,
+            message_id,
+            file_id: format!("file_{id}"),
+            file_unique_id: format!("uniq_{id}"),
+            title: format!("T{id}"),
+            artist: "Cached Artist".into(),
+            album: "Cached Album".into(),
+        };
+        self.cache.lock().unwrap().insert(key, track.clone());
+        self.cache.lock().unwrap().insert(TrackKey::apple(id), track);
     }
 
     fn set_settings(&self, f: impl FnOnce(&mut BotSettings)) {
@@ -155,6 +156,7 @@ impl FakeDeps {
             record_label: None,
             copyright: None,
             upc: None,
+            is_streamable: None,
         }
     }
 
@@ -419,6 +421,7 @@ impl OrchestratorDeps for FakeDeps {
         &'a self,
         _provider: engine::types::Provider,
         album_id: &'a str,
+        _codec: Option<engine::Codec>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<CachedAlbum>, String>> + Send + 'a>> {
         let rows = self
             .state
@@ -435,6 +438,7 @@ impl OrchestratorDeps for FakeDeps {
         &'a self,
         _provider: engine::types::Provider,
         album_id: &'a str,
+        _codec: Option<engine::Codec>,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         self.state
             .lock()
@@ -678,7 +682,8 @@ async fn happy_path_single_track() {
         "a live miss must upload to the dump before delivering the DM copy"
     );
     let saved = &st.saved_tracks[0];
-    assert_eq!(saved.track_key, TrackKey::apple("1440828878"));
+    assert_eq!(saved.track_key, TrackKey::apple("1440828878").with_codec(engine::Codec::Alac));
+    assert_eq!(saved.codec, engine::Codec::Alac);
     assert_eq!(saved.message_id, 777);
     assert_eq!(saved.title, "Night Song");
     assert_eq!(saved.bit_depth, 24);
@@ -1512,6 +1517,7 @@ fn cached_zip_row(album: &str, part: i32, total: i32, hash: &str) -> CachedAlbum
         file_unique_id: format!("zip_uniq_{album}_{part}"),
         generation_hash: hash.to_owned(),
         file_size: 512,
+        codec: engine::Codec::Alac,
     }
 }
 

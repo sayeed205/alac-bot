@@ -18,7 +18,7 @@ use crate::{
     lyrics::{self, LyricsHttp, LyricsMeta},
     streaming::{
         AudioStreamSource, MirrorEndpoint, MirrorPolicyManager, ProgressCallback, StreamError,
-        StreamTransport,
+        StreamTransport, is_non_retryable_error,
     },
     tagger,
     types::{TrackMeta, TrackRipResult},
@@ -47,6 +47,14 @@ impl From<CatalogError> for RipError {
 impl From<std::io::Error> for RipError {
     fn from(error: std::io::Error) -> Self {
         RipError::Message(error.to_string())
+    }
+}
+
+impl RipError {
+    pub fn is_non_retryable(&self) -> bool {
+        match self {
+            RipError::Message(msg) => is_non_retryable_error(msg),
+        }
     }
 }
 
@@ -161,6 +169,14 @@ impl AlacTrackRipper {
                     if signal.as_ref().is_some_and(|t| t.is_cancelled())
                         || message == "Download was cancelled"
                     {
+                        return Err(err);
+                    }
+                    if err.is_non_retryable() {
+                        warn!(
+                            track_id,
+                            error = %message,
+                            "Track rip failed permanently (404/unavailable), skipping retries"
+                        );
                         return Err(err);
                     }
                     if attempt >= self.config.max_retries {

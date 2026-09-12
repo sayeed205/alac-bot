@@ -252,6 +252,25 @@ impl<H: StreamHttp> StreamTransport<H> {
             if signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
                 break;
             }
+
+            // Fast exit on non-retryable errors:
+            // If the wrapper is configured and reported a 404/unavailable error,
+            // or if no wrapper is configured and all mirror sources reported 404,
+            // subsequent retry rounds will never succeed.
+            let wrapper_configured = wrapper_url
+                .as_deref()
+                .map(|url| !url.trim().trim_end_matches('/').is_empty())
+                .unwrap_or(false);
+            let permanent_failure = if wrapper_configured {
+                all_errors
+                    .iter()
+                    .any(|e| (e.contains("wrapper") || e.contains("Wrapper")) && is_non_retryable_error(e))
+            } else {
+                !all_errors.is_empty() && all_errors.iter().all(|e| is_non_retryable_error(e))
+            };
+            if permanent_failure {
+                break;
+            }
         }
 
         let wrapper_missing = wrapper_url
@@ -452,4 +471,23 @@ fn stream_retry_base_delay() -> u64 {
         .filter(|delay| *delay > 0)
         .unwrap_or(2000)
         .min(30_000)
+}
+
+/// Returns true if an error message indicates the track is permanently
+/// unavailable / 404 and should not be retried.
+pub fn is_non_retryable_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("code 404")
+        || lower.contains("code: 404")
+        || lower.contains("http 404")
+        || lower.contains("status 404")
+        || lower.contains("status: 404")
+        || lower.contains("404 not found")
+        || lower.contains("failed to get m3u8")
+        || lower.contains("song is currently unavailable")
+        || lower.contains("track is currently unavailable")
+        || lower.contains("track not found in itunes")
+        || lower.contains("not available in your region")
+        || lower.contains("not available in this country")
+        || lower.contains("not available in the current storefront")
 }

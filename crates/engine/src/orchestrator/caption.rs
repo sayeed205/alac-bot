@@ -6,7 +6,7 @@
 //! string to ferogram's HTML support. Captions are clean-slate: the indexer
 //! accepts only the current payload shape and does not support older formats.
 
-use crate::types::{Provider, TrackKey, TrackRipResult};
+use crate::types::{Codec, Provider, TrackKey, TrackRipResult};
 
 /// Everything the dump caption builder takes; `None` fields are simply
 /// everything else required.
@@ -50,6 +50,7 @@ impl<'a> From<(&'a TrackRipResult, &'a str)> for DumpCaptionMetadata<'a> {
 pub struct DumpZipCaptionMetadata<'a> {
     pub provider: Provider,
     pub album_id: &'a str,
+    pub codec: Option<&'a str>,
     pub album: &'a str,
     pub artist: &'a str,
     pub filename: &'a str,
@@ -84,6 +85,7 @@ pub struct AlbumDetailsCaptionMetadata<'a> {
 pub struct ParsedZipDumpMetadata {
     pub provider: Provider,
     pub album_id: String,
+    pub codec: Codec,
     pub album: String,
     pub artist: String,
     pub part_index: i32,
@@ -221,12 +223,18 @@ pub fn format_dump_caption(meta: &DumpCaptionMetadata<'_>) -> String {
         html_escape(meta.artist),
         html_escape(meta.album),
     );
+    let canonical_codec = meta
+        .codec
+        .and_then(|c| c.parse::<crate::types::Codec>().ok())
+        .map(|c| c.as_str())
+        .unwrap_or("alac");
 
     // Machine payload: JSON with 2-space indentation, each line
     // escaped, joined with <br/>.
     let payload_json = serde_json::json!({
         "provider": meta.track_key.provider,
         "track_id": meta.track_key.track_id,
+        "codec": canonical_codec,
         "title": meta.title,
         "artist": meta.artist,
         "album": meta.album,
@@ -282,6 +290,7 @@ pub fn format_zip_dump_caption(
         "type": "album_zip",
         "provider": meta.provider,
         "album_id": meta.album_id,
+        "codec": meta.codec.unwrap_or("alac"),
         "album": meta.album,
         "artist": meta.artist,
         "part": meta.part_index,
@@ -302,6 +311,7 @@ pub fn format_zip_dump_caption(
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedDumpMetadata {
     pub track_key: TrackKey,
+    pub codec: Codec,
     pub title: String,
     pub artist: String,
     pub album: String,
@@ -326,8 +336,15 @@ pub fn parse_dump_caption(text: Option<&str>) -> Option<ParsedDumpMetadata> {
         return None;
     }
 
+    let codec = parsed
+        .get("codec")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<Codec>().ok())
+        .unwrap_or(Codec::Alac);
+
     Some(ParsedDumpMetadata {
-        track_key: TrackKey::new(provider, track_id),
+        track_key: TrackKey::new(provider, track_id).with_codec(codec),
+        codec,
         title: string_field(&parsed, "title"),
         artist: string_field(&parsed, "artist"),
         album: string_field(&parsed, "album"),
@@ -352,9 +369,16 @@ pub fn parse_zip_dump_caption(text: Option<&str>) -> Option<ParsedZipDumpMetadat
         return None;
     }
 
+    let codec = parsed
+        .get("codec")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<Codec>().ok())
+        .unwrap_or(Codec::Alac);
+
     Some(ParsedZipDumpMetadata {
         provider,
         album_id: album_id.to_owned(),
+        codec,
         album: string_field(&parsed, "album"),
         artist: string_field(&parsed, "artist"),
         part_index: number_field(&parsed, "part", 1).max(1) as i32,
@@ -590,7 +614,8 @@ mod tests {
             .replace("&#39;", "'")
             .replace("<br/>", "\n");
         let parsed = parse_dump_caption(Some(&unescaped)).expect("payload found");
-        assert_eq!(parsed.track_key, TrackKey::apple("1440828878"));
+        assert_eq!(parsed.track_key, TrackKey::apple("1440828878").with_codec(Codec::Alac));
+        assert_eq!(parsed.codec, Codec::Alac);
         assert_eq!(parsed.title, "Night Song");
         assert_eq!(parsed.artist, "A&R <duo>");
         assert_eq!(parsed.album, "Escapes");
@@ -616,7 +641,8 @@ mod tests {
     fn parse_defaults_missing_fields() {
         let parsed = parse_dump_caption(Some("{\"provider\": \"apple\", \"track_id\": \"abc\"}"))
             .expect("minimal payload parses");
-        assert_eq!(parsed.track_key, TrackKey::apple("abc"));
+        assert_eq!(parsed.track_key, TrackKey::apple("abc").with_codec(Codec::Alac));
+        assert_eq!(parsed.codec, Codec::Alac);
         assert_eq!(parsed.title, "");
         assert_eq!(parsed.bit_depth, 16);
         assert_eq!(parsed.sample_rate, 44100);
@@ -631,5 +657,28 @@ mod tests {
             parse_dump_caption(Some("{\"provider\": \"apple\", \"title\": \"Missing id\"}"))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn parse_dump_caption_with_mp4a_codec() {
+        let text = r#"{
+  "album": "Bare Bare Aar Asha Hobena - Single",
+  "artist": "Fakira",
+  "bit": 16,
+  "cnt": 1,
+  "codec": "mp4a.40.2",
+  "date": "2021-04-13",
+  "dur": 367,
+  "genre": "Bengali",
+  "hz": 44100,
+  "provider": "apple",
+  "title": "Bare Bare Aar Asha Hobena",
+  "track_id": "1561413895",
+  "trk": 1
+}"#;
+        let parsed = parse_dump_caption(Some(text)).expect("payload parsed");
+        assert_eq!(parsed.codec, Codec::Aac);
+        assert_eq!(parsed.track_key.codec, Some(Codec::Aac));
+        assert_eq!(parsed.track_key.track_id, "1561413895");
     }
 }

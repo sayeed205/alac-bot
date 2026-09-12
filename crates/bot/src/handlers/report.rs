@@ -131,7 +131,8 @@ fn document_file_unique_id(document: &ferogram::media::Document) -> String {
 
 fn cached_from_track(track: db::Track) -> CachedTrack {
     CachedTrack {
-        track_key: TrackKey::new(track.provider, track.track_id),
+        track_key: TrackKey::new(track.provider, track.track_id.clone()).with_codec(track.codec),
+        codec: track.codec,
         message_id: i64::from(track.message_id),
         file_id: track.file_id,
         file_unique_id: track.file_unique_id,

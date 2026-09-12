@@ -13,7 +13,7 @@ use engine::{
     settings::BotSettings,
     types::{AlbumTracks, ArtistTracks, TrackKey, TrackRipResult},
     wrapper::CodecPreference,
-    Provider,
+    Codec, Provider,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -210,6 +210,7 @@ impl OrchestratorDeps for RipDeps {
             let new_album = db::NewAlbum {
                 provider: upload.provider,
                 album_id: &upload.album_id,
+                codec: upload.codec,
                 part_index: upload.part_index,
                 total_parts: upload.total_parts,
                 message_id: i32::try_from(upload.message_id).map_err(|e| e.to_string())?,
@@ -231,11 +232,12 @@ impl OrchestratorDeps for RipDeps {
         &'a self,
         provider: Provider,
         album_id: &'a str,
+        codec: Option<Codec>,
     ) -> BoxFuture<'a, Result<Vec<CachedAlbum>, String>> {
         Box::pin(async move {
             let rows = self
                 .albums
-                .find_albums(provider, album_id)
+                .find_albums(provider, album_id, codec)
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(rows
@@ -247,6 +249,7 @@ impl OrchestratorDeps for RipDeps {
                     file_unique_id: r.file_unique_id,
                     generation_hash: r.generation_hash,
                     file_size: r.file_size,
+                    codec: r.codec,
                 })
                 .collect())
         })
@@ -256,10 +259,11 @@ impl OrchestratorDeps for RipDeps {
         &'a self,
         provider: Provider,
         album_id: &'a str,
+        codec: Option<Codec>,
     ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
             self.albums
-                .delete_albums(provider, album_id)
+                .delete_albums(provider, album_id, codec)
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string())
