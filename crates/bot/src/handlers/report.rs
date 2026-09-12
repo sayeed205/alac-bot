@@ -70,8 +70,7 @@ pub fn check_user_rate_limit(state: &mut ReportState, user_id: i64, now_ms: u128
     true
 }
 
-/// Parses an Apple Music track id using the same URL/direct-id precedence as
-/// the TypeScript handler.
+/// Parses an Apple Music track id from a provider URL.
 pub fn extract_track_id_from_text(text: &str) -> Option<String> {
     if text.is_empty() {
         return None;
@@ -86,10 +85,7 @@ pub fn extract_track_id_from_text(text: &str) -> Option<String> {
             .or_else(|| captures.get(1))
             .map(|capture| capture.as_str().to_owned());
     }
-    let direct_id = Regex::new(r"\b(\d{8,11})\b").expect("report id regex is valid");
-    direct_id
-        .captures(text)
-        .and_then(|captures| captures.get(1).map(|capture| capture.as_str().to_owned()))
+    None
 }
 
 pub fn clean_dump_id(id: i64) -> String {
@@ -360,7 +356,7 @@ async fn handle_command(state: Arc<BotState>, msg: IncomingMessage) {
     }
 
     let Some(track) = target else {
-        let text = "⚠️ <b>Report a Track Issue</b><br/><br/><blockquote><b>How to report an issue:</b><br/>• <b>Reply to any song</b> sent by the bot with <code>/report</code><br/>• Or reply with your note: <code>/report &lt;description&gt;</code><br/>• Or send: <code>/report &lt;apple_music_link_or_id&gt; [description]</code><br/><br/><i>Example: Reply to a song and type <code>/report cuts off at 2:15</code></i></blockquote>";
+        let text = "⚠️ <b>Report a Track Issue</b><br/><br/><blockquote><b>How to report an issue:</b><br/>• <b>Reply to any song</b> sent by the bot with <code>/report</code><br/>• Or reply with your note: <code>/report &lt;description&gt;</code><br/>• Or send: <code>/report &lt;apple_music_link&gt; [description]</code><br/><br/><i>Example: Reply to a song and type <code>/report cuts off at 2:15</code></i></blockquote>";
         let _ = msg
             .reply(InputMessage::html(parse_dynamic_html(text)))
             .await;
@@ -725,6 +721,7 @@ async fn admin_callback(state: Arc<BotState>, query: CallbackQuery, action: Repo
             )
             .await;
             let options = engine::orchestrator::types::RipJobOptions {
+                provider: engine::Provider::Apple,
                 chat_id: marked_chat,
                 user_id: query.user_id,
                 user_name: Some(format!("User {}", query.user_id)),
@@ -867,10 +864,7 @@ mod tests {
             extract_track_id_from_text("music.apple.com/album/x/id789"),
             Some("789".into())
         );
-        assert_eq!(
-            extract_track_id_from_text("1441226844"),
-            Some("1441226844".into())
-        );
+        assert_eq!(extract_track_id_from_text("1441226844"), None);
         assert_eq!(extract_track_id_from_text("123"), None);
         assert_eq!(extract_track_id_from_text("text without ids"), None);
         assert_eq!(

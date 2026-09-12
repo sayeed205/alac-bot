@@ -9,6 +9,7 @@ pub mod html;
 pub mod interaction;
 pub mod mirror_health;
 pub mod presentation;
+pub mod providers;
 pub mod rip_deps;
 pub mod spectrogram;
 pub mod telegram_retry;

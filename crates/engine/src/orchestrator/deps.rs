@@ -7,11 +7,10 @@
 
 use std::{collections::HashMap, future::Future, path::Path, pin::Pin};
 
-use music::{CodecPreference, PlaylistData};
-use tokio_util::sync::CancellationToken;
+use music::PlaylistData;
 
 use crate::{
-    ripper::{RipError, RipProgressCallback},
+    ripper::{RipError, RipOptions},
     settings::BotSettings,
     types::{AlbumTracks, ArtistTracks, Codec, Provider, TrackKey, TrackRipResult},
 };
@@ -55,6 +54,7 @@ pub struct SaveTrackInput {
 impl SaveTrackInput {
     /// Build a cache row from the rip result plus the dump message ids.
     pub fn from_rip_result(
+        provider: Provider,
         track_id: &str,
         rip: &TrackRipResult,
         message_id: i64,
@@ -63,7 +63,7 @@ impl SaveTrackInput {
     ) -> Self {
         let codec = rip.codec.parse::<Codec>().unwrap_or(Codec::Alac);
         Self {
-            track_key: TrackKey::new(Provider::Apple, track_id).with_codec(codec),
+            track_key: TrackKey::new(provider, track_id).with_codec(codec),
             codec,
             message_id,
             file_id: file_id.to_string(),
@@ -225,9 +225,76 @@ pub trait TelegramSink: Send + Sync {
     ) -> BoxFuture<'a, Result<(), SinkError>>;
 }
 
+/// Collection resolution is a cohesive provider capability owned by the
+/// caller's provider composition.
+pub trait CollectionResolver: Send + Sync {
+    fn fetch_album_tracks(
+        &self,
+        id: &str,
+        storefront: &str,
+    ) -> impl Future<Output = Result<AlbumTracks, String>> + Send;
+
+    fn fetch_artist_tracks(
+        &self,
+        id: &str,
+        storefront: &str,
+    ) -> impl Future<Output = Result<ArtistTracks, String>> + Send;
+
+    fn fetch_playlist_tracks(
+        &self,
+        id: &str,
+        storefront: &str,
+    ) -> impl Future<Output = Result<PlaylistData, String>> + Send;
+}
+
+/// Whole-track acquisition is separate from collection resolution. The
+/// provider implementation may use the engine's internal [`RipperDeps`]
+/// seam, but the orchestrator only sees this cohesive operation.
+pub trait TrackAcquisition: Send + Sync {
+    fn rip(
+        &self,
+        track_id: &str,
+        options: RipOptions<'_>,
+    ) -> impl Future<Output = Result<TrackRipResult, RipError>> + Send;
+}
+
+/// Artwork operations used by album ZIP delivery.
+pub trait ArtworkProvider: Send + Sync {
+    fn fetch_artwork(&self, url: &str) -> impl Future<Output = Option<Vec<u8>>> + Send;
+    fn artwork_url_at_size(&self, url: &str, size: u16) -> String;
+}
+
+/// Provider-owned user-visible labels and links used by the generic
+/// orchestrator.  Providers keep their branding and URL formats behind this
+/// narrow presentation seam.
+pub trait ProviderPresentation: Send + Sync {
+    fn default_job_header(&self) -> &str;
+    fn album_url(&self, album_id: &str, storefront: &str) -> Option<String>;
+    fn unavailable_track_message(&self) -> &str;
+    fn unavailable_track_log_message(&self) -> &str;
+}
+
+/// A statically composed provider. This is intentionally not a registry of
+/// dynamic providers: the bot supplies one compiled composition per job.
+pub trait ProviderComposition: Send + Sync + 'static {
+    type Collections: CollectionResolver;
+    type Acquisition: TrackAcquisition;
+    type Artwork: ArtworkProvider;
+    type Presentation: ProviderPresentation;
+
+    fn provider(&self) -> Provider;
+    fn collections(&self) -> &Self::Collections;
+    fn acquisition(&self) -> &Self::Acquisition;
+    fn artwork(&self) -> &Self::Artwork;
+    fn presentation(&self) -> &Self::Presentation;
+}
+
 /// Everything environment-owned the orchestrator calls. Generic on the
-/// ripper seam so `start_job` can move an `Arc<D>` into the queue task.
+/// provider composition so `start_job` can move an `Arc<D>` into the queue
+/// task without introducing a dynamic provider map.
 pub trait OrchestratorDeps: Send + Sync + 'static {
+    type Providers: ProviderComposition;
+
     // settings (ISettingsService subset — snapshot + logic in engine)
     fn get_settings(&self) -> impl Future<Output = BotSettings> + Send;
 
@@ -270,48 +337,8 @@ pub trait OrchestratorDeps: Send + Sync + 'static {
         Box::pin(async { Ok(()) })
     }
 
-    /// Fetches album artwork bytes for the ZIP cover (3000x3000 URL form).
-    /// `None` = no artwork; failures degrade to a coverless archive.
-    fn fetch_artwork<'a>(&'a self, _url: &'a str) -> BoxFuture<'a, Option<Vec<u8>>> {
-        Box::pin(async { None })
-    }
-
-    /// Rewrites an artwork URL for a requested image size. Provider adapters
-    /// own the URL format; the default keeps URLs unchanged.
-    fn artwork_url_at_size(&self, url: &str, size: u16) -> String {
-        let _ = size;
-        url.to_owned()
-    }
-
-    // catalog resolution
-    fn fetch_album_tracks(
-        &self,
-        id: &str,
-        storefront: &str,
-    ) -> impl Future<Output = Result<AlbumTracks, String>> + Send;
-    fn fetch_artist_tracks(
-        &self,
-        id: &str,
-        storefront: &str,
-    ) -> impl Future<Output = Result<ArtistTracks, String>> + Send;
-
-    // playlist resolution
-    fn fetch_playlist_tracks(
-        &self,
-        id: &str,
-        storefront: &str,
-    ) -> impl Future<Output = Result<PlaylistData, String>> + Send;
-
-    // rip (ITrackRipper.rip)
-    fn rip(
-        &self,
-        track_id: &str,
-        on_progress: Option<&RipProgressCallback>,
-        storefront: &str,
-        signal: CancellationToken,
-        output_dir: Option<&Path>,
-        codec_preference: CodecPreference,
-    ) -> impl Future<Output = Result<TrackRipResult, RipError>> + Send;
+    /// The caller-owned, statically compiled provider composition.
+    fn providers(&self) -> &Self::Providers;
 
     // telegram sink
     fn sink(&self) -> &dyn TelegramSink;

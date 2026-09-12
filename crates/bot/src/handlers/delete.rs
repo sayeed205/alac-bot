@@ -25,7 +25,7 @@ use crate::{
 
 const RESTRICTED: &str =
     "! <b>Access restricted</b><br/>This command is restricted to the bot owner.";
-const USAGE: &str = "<b>Delete track usage</b><br/><br/><blockquote>• <code>/delete &lt;apple_music_link | track_id&gt;</code><br/>• Reply to an Apple Music link with <code>/delete</code></blockquote>";
+const USAGE: &str = "<b>Delete track usage</b><br/><br/><blockquote>• <code>/delete &lt;Apple Music link&gt;</code><br/>• Reply to an Apple Music link with <code>/delete</code></blockquote>";
 const CONFIRMATION_TTL: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]

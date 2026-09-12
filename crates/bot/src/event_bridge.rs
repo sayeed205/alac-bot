@@ -460,8 +460,7 @@ async fn notify_job_completed(state: &BotState, job: &ActiveRipJob, summary: &Ri
             let caption_meta = engine::orchestrator::caption::AlbumDetailsCaptionMetadata {
                 album: &zip.album,
                 artist: &zip.artist,
-                album_id: &zip.album_id,
-                storefront: &zip.storefront,
+                album_url: zip.album_url.as_deref(),
                 total_tracks: zip.total_tracks,
                 delivered_tracks: zip.delivered_tracks,
                 size_bytes: zip.size_bytes,

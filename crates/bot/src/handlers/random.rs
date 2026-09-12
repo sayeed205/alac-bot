@@ -590,6 +590,7 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery, action: Discov
             let user_display =
                 crate::presentation::resolve_user_display_name(&state.client, query.user_id).await;
             let options = engine::orchestrator::types::RipJobOptions {
+                provider: engine::Provider::Apple,
                 chat_id: marked_chat,
                 user_id: query.user_id,
                 user_name: Some(user_display),

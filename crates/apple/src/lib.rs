@@ -13,8 +13,8 @@ pub mod playlist;
 pub mod wrapper;
 
 pub use acquisition::{
-    AppleAcquisitionConfig, AppleProduction, AppleProductionConfig, AppleRipperDeps,
-    AppleStreamAcquisition,
+    AppleAcquisitionConfig, ApplePresentation, AppleProduction, AppleProductionConfig,
+    AppleRipperDeps, AppleStreamAcquisition,
 };
 pub use catalog::{
     AlbumSearchResult, Catalog, CatalogError, ChartAlbum, ReqwestTransport, SharedCatalog,

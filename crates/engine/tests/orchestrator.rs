@@ -11,23 +11,44 @@ use std::{
 use engine::{
     orchestrator::{
         deps::{
-            AlbumUpload, CachedAlbum, CachedTrack, DumpUpload, OrchestratorDeps, RequestLog,
-            SaveTrackInput, SinkError, TelegramSink, UploadProgressCallback,
+            AlbumUpload, ArtworkProvider, CachedAlbum, CachedTrack, CollectionResolver, DumpUpload,
+            OrchestratorDeps, ProviderComposition, ProviderPresentation, RequestLog,
+            SaveTrackInput, SinkError, TelegramSink, TrackAcquisition, UploadProgressCallback,
         },
         types::{JobPhase, OrchestratorEvent, RipJobOptions, RipJobSummary},
         OrchestratorError, RipOrchestrator,
     },
-    ripper::{RipError, RipProgressCallback},
+    ripper::RipError,
     settings::{default_settings, BotSettings, RippingMode},
     types::{
-        AlbumTracks, ArtistTracks, ParsedTargetItem, TargetKind, TrackKey, TrackMeta,
+        AlbumTracks, ArtistTracks, ParsedTargetItem, Provider, TargetKind, TrackKey, TrackMeta,
         TrackRipResult,
     },
 };
 use music::{PlaylistData, PlaylistTrack};
-use tokio_util::sync::CancellationToken;
 
 // fakes
+struct FakePresentation;
+
+impl ProviderPresentation for FakePresentation {
+    fn default_job_header(&self) -> &str {
+        "Apple Music Lossless Rip"
+    }
+
+    fn album_url(&self, album_id: &str, storefront: &str) -> Option<String> {
+        (!album_id.is_empty())
+            .then(|| format!("https://music.apple.com/{storefront}/album/{album_id}"))
+    }
+
+    fn unavailable_track_message(&self) -> &str {
+        "Unavailable on Apple Music (not streamable)"
+    }
+
+    fn unavailable_track_log_message(&self) -> &str {
+        "Track is not streamable in Apple Music catalog, skipping rip"
+    }
+}
+
 /// What the fake ripper should do for a given track id.
 #[derive(Clone)]
 enum RipScript {
@@ -359,7 +380,133 @@ impl FakeSink {
     }
 }
 
+impl CollectionResolver for FakeDeps {
+    async fn fetch_album_tracks(&self, id: &str, storefront: &str) -> Result<AlbumTracks, String> {
+        let _ = storefront;
+        self.albums
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("Album {id} not found"))
+    }
+
+    async fn fetch_artist_tracks(
+        &self,
+        id: &str,
+        storefront: &str,
+    ) -> Result<ArtistTracks, String> {
+        let _ = storefront;
+        self.artists
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("Artist {id} not found"))
+    }
+
+    async fn fetch_playlist_tracks(
+        &self,
+        id: &str,
+        storefront: &str,
+    ) -> Result<PlaylistData, String> {
+        let _ = storefront;
+        self.playlists
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("Playlist {id} not found on storefront 'us'"))
+    }
+}
+
+impl TrackAcquisition for FakeDeps {
+    async fn rip(
+        &self,
+        track_id: &str,
+        options: engine::ripper::RipOptions<'_>,
+    ) -> Result<TrackRipResult, RipError> {
+        let output_dir = options.output_dir;
+        self.state
+            .lock()
+            .unwrap()
+            .rip_calls
+            .push(track_id.to_string());
+        let script = self.rip_scripts.lock().unwrap().get(track_id).cloned();
+        let id = track_id.to_string();
+        let delay_ms = *self.rip_delay_ms.lock().unwrap();
+        if delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+        match script {
+            Some(RipScript::Fail(msg)) => Err(RipError::Message(msg.to_string())),
+            Some(RipScript::OkWithFile(bytes)) => {
+                let dir = output_dir
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_else(|| std::env::temp_dir().join(format!("fake_rip_{id}")));
+                let path = dir.join(format!("{id}.m4a"));
+                std::fs::write(&path, &bytes).map_err(|e| RipError::Message(e.to_string()))?;
+                Ok(TrackRipResult {
+                    file_path: path.to_string_lossy().into_owned(),
+                    ..Self::rip_result(&id)
+                })
+            }
+            _ => Ok(Self::rip_result(&id)),
+        }
+    }
+}
+
+impl ArtworkProvider for FakeDeps {
+    async fn fetch_artwork(&self, url: &str) -> Option<Vec<u8>> {
+        self.state
+            .lock()
+            .unwrap()
+            .fetch_artwork_urls
+            .push(url.to_owned());
+        self.state.lock().unwrap().artwork_bytes.clone()
+    }
+
+    fn artwork_url_at_size(&self, url: &str, size: u16) -> String {
+        let _ = size;
+        url.to_owned()
+    }
+}
+
+impl ProviderComposition for FakeDeps {
+    type Collections = Self;
+    type Acquisition = Self;
+    type Artwork = Self;
+    type Presentation = FakePresentation;
+
+    fn provider(&self) -> Provider {
+        Provider::Apple
+    }
+
+    fn collections(&self) -> &Self::Collections {
+        self
+    }
+
+    fn acquisition(&self) -> &Self::Acquisition {
+        self
+    }
+
+    fn artwork(&self) -> &Self::Artwork {
+        self
+    }
+
+    fn presentation(&self) -> &Self::Presentation {
+        static PRESENTATION: FakePresentation = FakePresentation;
+        &PRESENTATION
+    }
+}
+
 impl OrchestratorDeps for FakeDeps {
+    type Providers = Self;
+
+    fn providers(&self) -> &Self::Providers {
+        self
+    }
+
     fn get_settings(&self) -> impl Future<Output = BotSettings> + Send {
         let settings = self.settings.lock().unwrap().clone();
         async move { settings }
@@ -457,91 +604,6 @@ impl OrchestratorDeps for FakeDeps {
         Box::pin(async { Ok(()) })
     }
 
-    fn fetch_artwork<'a>(
-        &'a self,
-        url: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send + 'a>> {
-        self.state
-            .lock()
-            .unwrap()
-            .fetch_artwork_urls
-            .push(url.into());
-        let bytes = self.state.lock().unwrap().artwork_bytes.clone();
-        Box::pin(async move { bytes })
-    }
-
-    fn fetch_album_tracks(
-        &self,
-        id: &str,
-        storefront: &str,
-    ) -> impl Future<Output = Result<AlbumTracks, String>> + Send {
-        let _ = storefront;
-        let result = self.albums.lock().unwrap().get(id).cloned();
-        async move { result.ok_or_else(|| format!("Album {id} not found")) }
-    }
-
-    fn fetch_artist_tracks(
-        &self,
-        id: &str,
-        storefront: &str,
-    ) -> impl Future<Output = Result<ArtistTracks, String>> + Send {
-        let _ = storefront;
-        let result = self.artists.lock().unwrap().get(id).cloned();
-        async move { result.ok_or_else(|| format!("Artist {id} not found")) }
-    }
-
-    fn fetch_playlist_tracks(
-        &self,
-        id: &str,
-        storefront: &str,
-    ) -> impl Future<Output = Result<PlaylistData, String>> + Send {
-        let _ = storefront;
-        let result = self.playlists.lock().unwrap().get(id).cloned();
-        async move { result.ok_or_else(|| format!("Playlist {id} not found on storefront 'us'")) }
-    }
-
-    fn rip(
-        &self,
-        track_id: &str,
-        on_progress: Option<&RipProgressCallback>,
-        storefront: &str,
-        signal: CancellationToken,
-        output_dir: Option<&std::path::Path>,
-        codec_preference: music::CodecPreference,
-    ) -> impl Future<Output = Result<TrackRipResult, RipError>> + Send {
-        let _ = (on_progress, storefront, signal, codec_preference);
-        self.state
-            .lock()
-            .unwrap()
-            .rip_calls
-            .push(track_id.to_string());
-        let script = self.rip_scripts.lock().unwrap().get(track_id).cloned();
-        let id = track_id.to_string();
-        let delay_ms = *self.rip_delay_ms.lock().unwrap();
-        async move {
-            if delay_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-            }
-            match script {
-                Some(RipScript::Fail(msg)) => Err(RipError::Message(msg.to_string())),
-                Some(RipScript::OkWithFile(bytes)) => {
-                    // Write a real file so the ZIP staging path has actual
-                    // bytes to copy into the archive workspace.
-                    let dir = output_dir
-                        .map(std::path::Path::to_path_buf)
-                        .unwrap_or_else(|| std::env::temp_dir().join(format!("fake_rip_{id}")));
-                    let path = dir.join(format!("{id}.m4a"));
-                    std::fs::write(&path, &bytes).map_err(|e| RipError::Message(e.to_string()))?;
-                    Ok(TrackRipResult {
-                        file_path: path.to_string_lossy().into_owned(),
-                        ..Self::rip_result(&id)
-                    })
-                }
-                _ => Ok(Self::rip_result(&id)),
-            }
-        }
-    }
-
     fn sink(&self) -> &dyn TelegramSink {
         &self.sink
     }
@@ -597,6 +659,7 @@ impl EventLog {
 
 fn options(items: Vec<ParsedTargetItem>, is_admin: bool) -> RipJobOptions {
     RipJobOptions {
+        provider: engine::types::Provider::Apple,
         chat_id: 100,
         user_id: 42,
         user_name: Some("tester".into()),
@@ -1496,6 +1559,7 @@ async fn empty_tracks_after_cap_edge() {
 /// Builds a zip-enabled RipJobOptions for a single album item.
 fn zip_options(album: &str, cache_only: bool, explicit: bool, force: bool) -> RipJobOptions {
     RipJobOptions {
+        provider: engine::types::Provider::Apple,
         chat_id: 100,
         user_id: 42,
         user_name: Some("tester".into()),

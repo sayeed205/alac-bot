@@ -25,13 +25,13 @@ pub const COMMANDS: &[CommandDescriptor] = &[
         name: "get",
         role: CommandRole::User,
         summary: "Download a track, album, playlist, or artist",
-        usage: "/get <link | id> [--zip]",
+        usage: "/get <Apple Music link> [--zip]",
     },
     CommandDescriptor {
         name: "zip",
         role: CommandRole::User,
         summary: "Package a multi-track album as a ZIP",
-        usage: "/zip <album link | id>",
+        usage: "/zip <Apple Music album link>",
     },
     CommandDescriptor {
         name: "search",
@@ -49,7 +49,7 @@ pub const COMMANDS: &[CommandDescriptor] = &[
         name: "info",
         role: CommandRole::User,
         summary: "Inspect metadata and cache status",
-        usage: "/info <link | id>",
+        usage: "/info <Apple Music link>",
     },
     CommandDescriptor {
         name: "spec",
@@ -91,7 +91,7 @@ pub const COMMANDS: &[CommandDescriptor] = &[
         name: "delete",
         role: CommandRole::Admin,
         summary: "Delete a cached track",
-        usage: "/delete <track_id>",
+        usage: "/delete <Apple Music link>",
     },
     CommandDescriptor {
         name: "auth",
@@ -197,7 +197,7 @@ mod tests {
         assert!(!render_help(false).contains("/settings"));
         assert!(render_help(true).contains("/settings"));
         assert!(render_help(false).contains("cached tracks and the Apple Music catalog"));
-        assert!(render_help(false).contains("/get [link | id]"));
+        assert!(render_help(false).contains("/get [Apple Music link]"));
         assert!(!render_help(false).contains("/cancel"));
         assert!(!render_help(false).contains("<link | id>"));
     }

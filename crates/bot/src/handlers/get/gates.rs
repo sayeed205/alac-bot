@@ -69,9 +69,9 @@ pub fn feature_gate(
 
 pub fn usage(is_cache_only: bool) -> &'static str {
     if is_cache_only {
-        "<b>Apple Music lossless dumper (admin)</b><br/><br/><blockquote><b>Usage:</b><br/>• <code>/get &lt;link | id&gt;</code><br/>• <code>/zip &lt;album link | id&gt;</code><br/>• Send multiple links or attach a <code>.txt</code> file<br/>• Option: <code>-f</code> (force re-rip)<br/><i>Seeds lossless audio into the dump channel and database.</i></blockquote>"
+        "<b>Apple Music lossless dumper (admin)</b><br/><br/><blockquote><b>Usage:</b><br/>• <code>/get &lt;Apple Music link&gt;</code><br/>• <code>/zip &lt;Apple Music album link&gt;</code><br/>• Send multiple links or attach a <code>.txt</code> file<br/>• Option: <code>-f</code> (force re-rip)<br/><i>Seeds lossless audio into the dump channel and database.</i></blockquote>"
     } else {
-        "<b>Apple Music lossless downloader</b><br/><br/><blockquote><b>Supported inputs:</b><br/>• <code>/get &lt;link | id&gt;</code><br/>• Send multiple links or attach a <code>.txt</code> file<br/>• Album ZIP: <code>-z</code> or <code>--zip</code><br/>• Cancel with the Cancel download button<br/>• Option: <code>-f</code> (force re-rip)</blockquote>"
+        "<b>Apple Music lossless downloader</b><br/><br/><blockquote><b>Supported inputs:</b><br/>• <code>/get &lt;Apple Music link&gt;</code><br/>• Send multiple links or attach a <code>.txt</code> file<br/>• Album ZIP: <code>-z</code> or <code>--zip</code><br/>• Cancel with the Cancel download button<br/>• Option: <code>-f</code> (force re-rip)</blockquote>"
     }
 }
 

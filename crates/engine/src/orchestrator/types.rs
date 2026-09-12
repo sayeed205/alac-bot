@@ -5,7 +5,7 @@ use std::sync::Arc;
 use music::CodecPreference;
 use tokio_util::sync::CancellationToken;
 
-use crate::types::{ParsedTargetItem, TargetKind};
+use crate::types::{ParsedTargetItem, Provider, TargetKind};
 
 /// The non-terminal lifecycle phase of a job.  Terminality is represented by
 /// `terminal_state` below so consumers can retain the last useful phase while
@@ -66,6 +66,7 @@ pub struct ActiveRipJob {
 /// Everything one rip request carries.
 #[derive(Debug, Clone)]
 pub struct RipJobOptions {
+    pub provider: Provider,
     pub chat_id: i64,
     pub user_id: i64,
     pub user_name: Option<String>,
@@ -185,7 +186,7 @@ pub struct ZipDeliveryInfo {
     pub size_bytes: i64,
     pub is_partial: bool,
     pub album_id: String,
-    pub storefront: String,
+    pub album_url: Option<String>,
     pub artwork_url: Option<String>,
     pub genre: Option<String>,
     pub record_label: Option<String>,

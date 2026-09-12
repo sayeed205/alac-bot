@@ -33,8 +33,9 @@ use crate::{
             html_escape, AlbumDetailsCaptionMetadata, DumpCaptionMetadata, DumpZipCaptionMetadata,
         },
         deps::{
-            AlbumUpload, CachedAlbum, DumpUpload, OrchestratorDeps, RequestLog, SaveTrackInput,
-            UploadProgressCallback,
+            AlbumUpload, ArtworkProvider, CachedAlbum, CollectionResolver, DumpUpload,
+            OrchestratorDeps, ProviderComposition, ProviderPresentation, RequestLog,
+            SaveTrackInput, TrackAcquisition, UploadProgressCallback,
         },
         types::{
             ActiveRipJob, EventCallback, FailedTrack, JobPhase, OrchestratorEvent,
@@ -44,7 +45,7 @@ use crate::{
     },
     progress::format_byte_progress,
     queue::{EnqueueOptions, SequentialRipQueue},
-    ripper::RipProgressCallback,
+    ripper::{RipOptions, RipProgressCallback},
     settings::BotSettings,
     types::{AlbumTracks, ArtistTracks, Codec, Provider, TargetKind, TrackKey, TrackRipResult},
     zip::{
@@ -165,7 +166,7 @@ struct JobContext {
     zip_album: String,
     zip_artist: String,
     zip_album_id: String,
-    zip_storefront: String,
+    zip_album_url: Option<String>,
     zip_genre: Option<String>,
     zip_record_label: Option<String>,
     zip_copyright: Option<String>,
@@ -493,6 +494,12 @@ impl RipOrchestrator {
         deps: Arc<D>,
         options: &RipJobOptions,
     ) -> Result<RipJobSummary, OrchestratorError> {
+        if deps.providers().provider() != options.provider {
+            return Err(OrchestratorError::Message(format!(
+                "provider {} is not available",
+                options.provider
+            )));
+        }
         let job_id = cuid2::create_id();
         self.admit(&job_id, options)?;
 
@@ -502,7 +509,11 @@ impl RipOrchestrator {
 
         let job_controller = CancellationToken::new();
         // Initial job header from the parsed targets.
-        let mut job_header = "Apple Music Lossless Rip".to_string();
+        let mut job_header = deps
+            .providers()
+            .presentation()
+            .default_job_header()
+            .to_owned();
         if options.parsed_items.len() == 1 {
             let it = &options.parsed_items[0];
             job_header = match it.kind {
@@ -678,7 +689,12 @@ impl RipOrchestrator {
                     });
                     Ok(())
                 }
-                TargetKind::Album => match deps.fetch_album_tracks(&item.id, &effective_sf).await {
+                TargetKind::Album => match deps
+                    .providers()
+                    .collections()
+                    .fetch_album_tracks(&item.id, &effective_sf)
+                    .await
+                {
                     Ok(AlbumTracks { album, tracks }) => {
                         album_name = Some(album.album.clone());
                         album_artist = Some(album.artist.clone());
@@ -703,7 +719,12 @@ impl RipOrchestrator {
                     Err(e) => Err(e),
                 },
                 TargetKind::Artist => {
-                    match deps.fetch_artist_tracks(&item.id, &effective_sf).await {
+                    match deps
+                        .providers()
+                        .collections()
+                        .fetch_artist_tracks(&item.id, &effective_sf)
+                        .await
+                    {
                         Ok(ArtistTracks {
                             artist_name,
                             tracks,
@@ -725,7 +746,12 @@ impl RipOrchestrator {
                     }
                 }
                 TargetKind::Playlist => {
-                    match deps.fetch_playlist_tracks(&item.id, &effective_sf).await {
+                    match deps
+                        .providers()
+                        .collections()
+                        .fetch_playlist_tracks(&item.id, &effective_sf)
+                        .await
+                    {
                         Ok(data) => {
                             for t in data.tracks {
                                 resolved_tracks.push(ResolvedTrackItem {
@@ -804,12 +830,20 @@ impl RipOrchestrator {
         let header = match (non_empty(&album_name), non_empty(&album_artist)) {
             (Some(name), Some(artist)) => {
                 if let (Some(id), Some(sf)) = (&album_id, &album_sf) {
-                    let album_url = format!("https://music.apple.com/{sf}/album/{id}");
-                    format!(
-                        "Album: <a href=\"{album_url}\"><b>{}</b></a> by <b>{}</b>",
-                        html_escape(name),
-                        html_escape(artist)
-                    )
+                    let album_url = deps.providers().presentation().album_url(id, sf);
+                    if let Some(album_url) = album_url {
+                        format!(
+                            "Album: <a href=\"{album_url}\"><b>{}</b></a> by <b>{}</b>",
+                            html_escape(name),
+                            html_escape(artist)
+                        )
+                    } else {
+                        format!(
+                            "Album: <b>{}</b> by <b>{}</b>",
+                            html_escape(name),
+                            html_escape(artist)
+                        )
+                    }
                 } else {
                     format!(
                         "Album: <b>{}</b> by <b>{}</b>",
@@ -877,7 +911,7 @@ impl RipOrchestrator {
         // parts recorded with this hash can be reused instead of rebuilt.
         let zip_generation_hash = zip_build.then(|| {
             let ids: Vec<&str> = tracks_to_process.iter().map(|t| t.id.as_str()).collect();
-            album_generation_hash(Provider::Apple.as_str(), &options.parsed_items[0].id, &ids)
+            album_generation_hash(options.provider.as_str(), &options.parsed_items[0].id, &ids)
         });
         let zip_dir = if zip_build {
             let dir = std::env::temp_dir().join(format!("zip_job_{}", cuid2::create_id()));
@@ -909,7 +943,7 @@ impl RipOrchestrator {
         };
         let requested_ids: Vec<TrackKey> = tracks_to_process
             .iter()
-            .map(|t| TrackKey::new(Provider::Apple, t.id.clone()).with_codec(target_codec))
+            .map(|t| TrackKey::new(options.provider, t.id.clone()).with_codec(target_codec))
             .collect();
         let mut existing_tracks_map = deps
             .find_cached_tracks(&requested_ids)
@@ -923,7 +957,7 @@ impl RipOrchestrator {
             let mut old_message_ids: Vec<i64> = Vec::new();
             for item in &tracks_to_process {
                 let lookup_key =
-                    TrackKey::new(Provider::Apple, item.id.clone()).with_codec(target_codec);
+                    TrackKey::new(options.provider, item.id.clone()).with_codec(target_codec);
                 if let Some(cached) = existing_tracks_map.remove(&lookup_key) {
                     old_message_ids.push(cached.message_id);
                     // Per-item delete; errors are swallowed.
@@ -961,7 +995,7 @@ impl RipOrchestrator {
             if !options.is_force && existing_tracks_map.len() == tracks_to_process.len() {
                 match deps
                     .find_albums(
-                        Provider::Apple,
+                        options.provider,
                         &options.parsed_items[0].id,
                         Some(target_codec),
                     )
@@ -1003,7 +1037,7 @@ impl RipOrchestrator {
             }
 
             let lookup_key =
-                TrackKey::new(Provider::Apple, item.id.clone()).with_codec(target_codec);
+                TrackKey::new(options.provider, item.id.clone()).with_codec(target_codec);
             let Some(cached) = existing_tracks_map.get(&lookup_key) else {
                 uncached_items.push(item.clone());
                 continue;
@@ -1053,7 +1087,7 @@ impl RipOrchestrator {
                     .log_request(RequestLog {
                         telegram_id: options.user_id,
                         chat_id: options.chat_id,
-                        track_key: TrackKey::new(Provider::Apple, item.id.clone()),
+                        track_key: TrackKey::new(options.provider, item.id.clone()),
                         is_cache_hit: true,
                         duration_ms: Some(0),
                         status: "completed".to_string(),
@@ -1098,7 +1132,7 @@ impl RipOrchestrator {
                     deps.log_request(RequestLog {
                         telegram_id: options.user_id,
                         chat_id: options.chat_id,
-                        track_key: TrackKey::new(Provider::Apple, item.id.clone()),
+                        track_key: TrackKey::new(options.provider, item.id.clone()),
                         is_cache_hit: true,
                         duration_ms: Some(0),
                         status: "completed".to_string(),
@@ -1134,7 +1168,7 @@ impl RipOrchestrator {
                         // longer exists (for example after channel cleanup).
                         // Remove it immediately so a failed re-rip cannot
                         // leave a ghost cache entry behind.
-                        let stale_key = TrackKey::new(Provider::Apple, item.id.clone())
+                        let stale_key = TrackKey::new(options.provider, item.id.clone())
                             .with_codec(cached.codec);
                         if let Err(delete_error) = deps.delete_track(&stale_key).await {
                             tracing::warn!(
@@ -1253,7 +1287,7 @@ impl RipOrchestrator {
                         // instead of skipping staging and failing forever.
                         if let Err(error) = deps
                             .delete_albums(
-                                Provider::Apple,
+                                options.provider,
                                 &options.parsed_items[0].id,
                                 Some(target_codec),
                             )
@@ -1268,11 +1302,16 @@ impl RipOrchestrator {
                             .map(|date| date.chars().take(4).collect())
                             .unwrap_or_default();
                         let total_size: i64 = rows.iter().map(|row| row.file_size).sum();
+                        let album_url = match (&album_id, &album_sf) {
+                            (Some(id), Some(storefront)) => {
+                                deps.providers().presentation().album_url(id, storefront)
+                            }
+                            _ => None,
+                        };
                         let caption_meta = AlbumDetailsCaptionMetadata {
                             album: album_name.as_deref().unwrap_or_default(),
                             artist: album_artist.as_deref().unwrap_or_default(),
-                            album_id: album_id.as_deref().unwrap_or_default(),
-                            storefront: album_sf.as_deref().unwrap_or("us"),
+                            album_url: album_url.as_deref(),
                             total_tracks: tracks_to_process.len(),
                             delivered_tracks: tracks_to_process.len(),
                             size_bytes: total_size,
@@ -1290,7 +1329,9 @@ impl RipOrchestrator {
                         if let Some(artwork_url) =
                             album_artwork_url.as_deref().filter(|url| !url.is_empty())
                         {
-                            if let Some(bytes) = deps.fetch_artwork(artwork_url).await {
+                            if let Some(bytes) =
+                                deps.providers().artwork().fetch_artwork(artwork_url).await
+                            {
                                 if let Err(error) = deps
                                     .sink()
                                     .send_photo_to_chat(
@@ -1316,7 +1357,7 @@ impl RipOrchestrator {
                             size_bytes: total_size,
                             is_partial: false,
                             album_id: album_id.clone().unwrap_or_default(),
-                            storefront: album_sf.clone().unwrap_or_else(|| "us".to_owned()),
+                            album_url,
                             artwork_url: album_artwork_url.clone(),
                             genre: album_genre.clone(),
                             record_label: album_record_label.clone(),
@@ -1421,7 +1462,12 @@ impl RipOrchestrator {
                 .first()
                 .map(|item| item.id.clone())
                 .unwrap_or_default(),
-            zip_storefront: album_sf.clone().unwrap_or_else(|| "us".to_owned()),
+            zip_album_url: match (&album_id, &album_sf) {
+                (Some(id), Some(storefront)) => {
+                    deps.providers().presentation().album_url(id, storefront)
+                }
+                _ => None,
+            },
             zip_genre: album_genre.clone(),
             zip_record_label: album_record_label.clone(),
             zip_copyright: album_copyright.clone(),
@@ -1744,7 +1790,9 @@ async fn run_lane_one<D: OrchestratorDeps>(input: LaneOneContext<'_, D>) -> RipJ
             }
 
             if item.is_streamable == Some(false) {
-                let err_msg = "Unavailable on Apple Music (not streamable)".to_string();
+                let presentation = deps.providers().presentation();
+                let err_msg = presentation.unavailable_track_message().to_owned();
+                let log_message = presentation.unavailable_track_log_message();
                 let duration_ms = 0;
                 {
                     let mut failures = ctx.failed_tracks.lock().expect("failures poisoned");
@@ -1759,13 +1807,13 @@ async fn run_lane_one<D: OrchestratorDeps>(input: LaneOneContext<'_, D>) -> RipJ
                 }
                 tracing::warn!(
                     track_id = %item.track_id,
-                    "Track is not streamable in Apple Music catalog, skipping rip"
+                    "{log_message}",
                 );
                 let _ = deps
                     .log_request(RequestLog {
                         telegram_id: ctx.options.user_id,
                         chat_id: ctx.options.chat_id,
-                        track_key: TrackKey::new(Provider::Apple, item.track_id.clone()),
+                        track_key: TrackKey::new(ctx.options.provider, item.track_id.clone()),
                         is_cache_hit: false,
                         duration_ms: Some(duration_ms),
                         status: "failed".to_string(),
@@ -1849,15 +1897,18 @@ async fn run_lane_one<D: OrchestratorDeps>(input: LaneOneContext<'_, D>) -> RipJ
             };
 
             let storefront = item.storefront.clone().unwrap_or_else(|| "us".to_string());
+            let rip_options = RipOptions {
+                provider: ctx.options.provider,
+                storefront: &storefront,
+                on_progress: Some(&on_progress),
+                signal: Some(queue_signal.clone()),
+                output_dir: Some(&rip_job_dir),
+                codec_preference: ctx.options.codec_preference,
+            };
             match deps
-                .rip(
-                    &item.track_id,
-                    Some(&on_progress),
-                    &storefront,
-                    queue_signal.clone(),
-                    Some(&rip_job_dir),
-                    ctx.options.codec_preference,
-                )
+                .providers()
+                .acquisition()
+                .rip(&item.track_id, rip_options)
                 .await
             {
                 Ok(rip_result) => {
@@ -1964,7 +2015,7 @@ async fn run_lane_one<D: OrchestratorDeps>(input: LaneOneContext<'_, D>) -> RipJ
                         .log_request(RequestLog {
                             telegram_id: ctx.options.user_id,
                             chat_id: ctx.options.chat_id,
-                            track_key: TrackKey::new(Provider::Apple, item.track_id.clone()),
+                            track_key: TrackKey::new(ctx.options.provider, item.track_id.clone()),
                             is_cache_hit: false,
                             duration_ms: Some(duration_ms),
                             status: "failed".to_string(),
@@ -2222,15 +2273,15 @@ async fn finalize_zip<D: OrchestratorDeps>(
     // user jobs) the chat preview. Any failure degrades to a coverless
     // archive.
     let cover_bytes = match &ctx.zip_artwork_url {
-        Some(url) => deps.fetch_artwork(url).await,
+        Some(url) => deps.providers().artwork().fetch_artwork(url).await,
         None => None,
     };
     // Telegram document thumbnail (320x320 artwork, best-effort: failures
     // degrade to a thumbless document).
     let thumb_path = match &ctx.zip_artwork_url {
         Some(url) if !url.is_empty() => {
-            let thumb_url = deps.artwork_url_at_size(url, 320);
-            match deps.fetch_artwork(&thumb_url).await {
+            let thumb_url = deps.providers().artwork().artwork_url_at_size(url, 320);
+            match deps.providers().artwork().fetch_artwork(&thumb_url).await {
                 Some(bytes) if !bytes.is_empty() => {
                     let path = dir.join("cover_thumb.jpg");
                     match tokio::fs::write(&path, bytes).await {
@@ -2290,7 +2341,7 @@ async fn finalize_zip<D: OrchestratorDeps>(
     };
     if complete {
         if let Err(error) = deps
-            .delete_albums(Provider::Apple, &ctx.zip_album_id, Some(album_codec))
+            .delete_albums(ctx.options.provider, &ctx.zip_album_id, Some(album_codec))
             .await
         {
             tracing::warn!(%error, "failed to purge stale album ZIP rows");
@@ -2406,7 +2457,7 @@ async fn finalize_zip<D: OrchestratorDeps>(
                 };
                 let caption = format_zip_dump_caption(
                     &DumpZipCaptionMetadata {
-                        provider: Provider::Apple,
+                        provider: ctx.options.provider,
                         album_id: &ctx.zip_album_id,
                         codec: Some(album_codec.as_str()),
                         album: &ctx.zip_album,
@@ -2548,7 +2599,7 @@ async fn finalize_zip<D: OrchestratorDeps>(
                         }
                         let _ = deps
                             .save_album(AlbumUpload {
-                                provider: Provider::Apple,
+                                provider: ctx.options.provider,
                                 album_id: ctx.zip_album_id.clone(),
                                 codec: album_codec,
                                 part_index: plan.part_index as i32,
@@ -2585,8 +2636,7 @@ async fn finalize_zip<D: OrchestratorDeps>(
         let caption_meta = AlbumDetailsCaptionMetadata {
             album: &ctx.zip_album,
             artist: &ctx.zip_artist,
-            album_id: &ctx.zip_album_id,
-            storefront: &ctx.zip_storefront,
+            album_url: ctx.zip_album_url.as_deref(),
             total_tracks: expected_tracks,
             delivered_tracks: delivered_track_count,
             size_bytes: delivered_size_bytes,
@@ -2622,7 +2672,7 @@ async fn finalize_zip<D: OrchestratorDeps>(
             size_bytes: delivered_size_bytes,
             is_partial: !complete,
             album_id: ctx.zip_album_id.clone(),
-            storefront: ctx.zip_storefront.clone(),
+            album_url: ctx.zip_album_url.clone(),
             artwork_url: ctx.zip_artwork_url.clone(),
             genre: ctx.zip_genre.clone(),
             record_label: ctx.zip_record_label.clone(),
@@ -2637,6 +2687,7 @@ async fn finalize_zip<D: OrchestratorDeps>(
 /// Best-effort cleanup for a cancellation after an upload has completed.
 async fn rollback_cancelled<D: OrchestratorDeps>(
     deps: &Arc<D>,
+    provider: Provider,
     track_id: &str,
     dump_message_id: i64,
     delete_record: bool,
@@ -2648,7 +2699,7 @@ async fn rollback_cancelled<D: OrchestratorDeps>(
         .await
         .is_ok();
     if dump_removed && delete_record {
-        let mut key = TrackKey::new(Provider::Apple, track_id);
+        let mut key = TrackKey::new(provider, track_id);
         if let Some(c) = codec {
             key = key.with_codec(c);
         }
@@ -2680,7 +2731,7 @@ async fn upload_one<D: OrchestratorDeps>(
         || shared.lock().expect("job poisoned").job.is_cancelled || job_controller.is_cancelled();
 
     let caption = format_dump_caption(&DumpCaptionMetadata {
-        track_key: TrackKey::new(Provider::Apple, track_id.clone()),
+        track_key: TrackKey::new(options.provider, track_id.clone()),
         title: &rip_result.title,
         artist: &rip_result.artist,
         album: &rip_result.album,
@@ -2887,6 +2938,7 @@ async fn upload_one<D: OrchestratorDeps>(
             return Err("cancelled".to_owned());
         }
         deps.save_track(SaveTrackInput::from_rip_result(
+            options.provider,
             &track_id,
             rip_result,
             dump_upload.message_id,
@@ -2898,7 +2950,15 @@ async fn upload_one<D: OrchestratorDeps>(
 
         if is_cancelled() {
             let rip_codec = rip_result.codec.parse::<Codec>().ok();
-            rollback_cancelled(deps, &track_id, dump_upload.message_id, true, rip_codec).await;
+            rollback_cancelled(
+                deps,
+                options.provider,
+                &track_id,
+                dump_upload.message_id,
+                true,
+                rip_codec,
+            )
+            .await;
             return Err("cancelled".to_owned());
         }
 
@@ -2927,6 +2987,7 @@ async fn upload_one<D: OrchestratorDeps>(
         if is_cancelled() {
             rollback_cancelled(
                 deps,
+                options.provider,
                 &track_id,
                 dump_upload.message_id,
                 true,
@@ -2940,7 +3001,7 @@ async fn upload_one<D: OrchestratorDeps>(
         deps.log_request(RequestLog {
             telegram_id: options.user_id,
             chat_id: options.chat_id,
-            track_key: TrackKey::new(Provider::Apple, track_id.clone()),
+            track_key: TrackKey::new(options.provider, track_id.clone()),
             is_cache_hit: false,
             duration_ms: Some(total_duration_ms),
             status: "completed".to_string(),
@@ -3049,7 +3110,7 @@ async fn record_failure<D: OrchestratorDeps>(
         .log_request(RequestLog {
             telegram_id: ctx.options.user_id,
             chat_id: ctx.options.chat_id,
-            track_key: TrackKey::new(Provider::Apple, details.track_id),
+            track_key: TrackKey::new(ctx.options.provider, details.track_id),
             is_cache_hit: false,
             duration_ms: Some((now_ms() - details.start_time_ms) as i64),
             status: "failed".to_string(),
@@ -3078,6 +3139,7 @@ mod hardening_tests {
 
     fn options(user_id: i64, is_admin: bool) -> RipJobOptions {
         RipJobOptions {
+            provider: Provider::Apple,
             chat_id: user_id,
             user_id,
             user_name: None,

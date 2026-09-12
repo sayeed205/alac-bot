@@ -312,6 +312,7 @@ async fn run_auto_dump_pipeline_inner(
     .await;
 
     let options = engine::orchestrator::types::RipJobOptions {
+        provider: engine::Provider::Apple,
         chat_id: target_chat,
         user_id: target_user,
         user_name: Some(format!("User {target_user}")),

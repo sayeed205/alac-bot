@@ -17,9 +17,9 @@ Built in Rust: [ferogram](https://github.com/ankit-chaubey/ferogram) (Telegram M
 - **Instant Dump Channel Caching**: Every ripped track is indexed with full metadata and stored in a private Telegram
   dump channel. Cache hits deliver in under 200ms without consuming mirror bandwidth.
 - **Full Album & Playlist Support**:
-    - Individual track URLs or bare track IDs.
+    - Individual track URLs.
     - Full album URLs (`https://music.apple.com/.../album/...`).
-    - Apple Music playlists (`https://music.apple.com/.../playlist/...` or `pl.xxx` / `pl.u-xxx`).
+    - Apple Music playlist URLs (`https://music.apple.com/.../playlist/...`).
     - Upload a `.txt` file containing multiple links for automated batch downloads.
     - Multi-line commands with multiple URLs.
 - **Group Chat Friendly**: When triggered in a group chat, audio files are delivered directly to the user's private chat
@@ -178,10 +178,10 @@ ALAC_WRAPPER_API_KEY=your_secret_api_key
 
 | Command                              | Description                                                                                     |
 |:-------------------------------------|:------------------------------------------------------------------------------------------------|
-| `/alac <url\|id> [-f]`               | Download Apple Music track, album, or playlist in lossless ALAC (`-f` forces re-rip for admins) |
+| `/alac <Apple Music/iTunes URL> [-f]` | Download Apple Music track, album, or playlist in lossless ALAC (`-f` forces re-rip for admins) |
 | `/rip`, `/batch`, `/dl`, `/download` | Aliases for `/alac`                                                                             |
 | `/search <query>`                    | Search the cached library and Apple Music catalog with text-labelled buttons                    |
-| `/info <url\|id>`                    | Show track metadata and cache availability                                                      |
+| `/info <Apple Music/iTunes URL>`      | Show track metadata and cache availability                                                      |
 | `/cancel`                            | Cancel your current active download                                                             |
 | `/help`                              | Display usage instructions and available commands                                               |
 
@@ -202,7 +202,7 @@ ALAC_WRAPPER_API_KEY=your_secret_api_key
 | `/queue`                        | View active and pending download tasks in the sequential queue                                       |
 | `/status`                       | Live download status & queue dashboard                                                               |
 | `/clean`                        | Clean up leftover temporary files in download scratch directory                                      |
-| `/delete <id>`                  | Remove a track from cache and the dump channel                                                       |
+| `/delete <Apple Music/iTunes URL>` | Remove a track from cache and the dump channel                                                       |
 | `/index`                        | Re-index and synchronize existing tracks in the dump channel                                         |
 | `/spec`                         | Reply to audio to generate a frequency spectrogram (aliases: `/spectogram`, `/spectrogram`, `/spek`) |
 | `/report`, `/issue`             | Report a corrupt track to the admin for a re-rip                                                     |

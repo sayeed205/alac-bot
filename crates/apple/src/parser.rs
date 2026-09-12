@@ -1,40 +1,33 @@
 //! Apple Music link/id parser.
 //!
-//! Order of regex checks matters: playlist URL → bare playlist → artist URL →
-//! bare artist → album URL with `?i=` → direct song URL → album URL → bare
-//! numeric id (track). Storefronts are lowercased when captured.
+//! Order of regex checks matters: playlist URL → artist URL → album URL with
+//! `?i=` → direct song URL → album URL. Storefronts are lowercased when
+//! captured.
 
 use std::sync::OnceLock;
 
 use music::{ParsedAlacInput, ParsedTargetItem, TargetKind};
 use regex::Regex;
 
-fn regexes() -> &'static [Regex; 8] {
-    static RE: OnceLock<[Regex; 8]> = OnceLock::new();
+fn regexes() -> &'static [Regex; 5] {
+    static RE: OnceLock<[Regex; 5]> = OnceLock::new();
     RE.get_or_init(|| {
         // 1. music.apple.com/…/playlist/<slug>/pl.xxx or pl.u-xxx
         let playlist = Regex::new(
-            r"(?i)music\.apple\.com/(?:([a-z]{2})/)?playlist/(?:[^/]+/)?(pl\.(?:u-[a-zA-Z0-9]+|[a-zA-Z0-9]+))",
+            r"(?i)(?:music|itunes)\.apple\.com/(?:([a-z]{2})/)?playlist/(?:[^/]+/)?(pl\.(?:u-[a-zA-Z0-9]+|[a-zA-Z0-9]+))",
         )
         .expect("playlist regex");
-        // 2. bare pl.xxx / pl.u-xxx token
-        let bare_playlist = Regex::new(r"(?i)^(pl\.(?:u-[a-zA-Z0-9]+|[a-zA-Z0-9]+))$").expect("bare playlist regex");
-        // 3. music.apple.com/…/artist/<slug>/<id> (also itunes.apple.com)
+        // 2. music.apple.com/…/artist/<slug>/<id> (also itunes.apple.com)
         let artist = Regex::new(r"(?i)(?:music|itunes)\.apple\.com/(?:([a-z]{2})/)?artist/(?:[^/]+/)?(\d+)")
             .expect("artist regex");
-        // 4. bare artist:123 / artist/123 — case-insensitive.
-        let bare_artist =
-            Regex::new(r"(?i)^artist[:/](\d+)$").expect("bare artist regex");
-        // 5. album URL with ?i=<track id>
-        let song_with_album = Regex::new(r"(?i)music\.apple\.com/(?:([a-z]{2})/)?album/(?:[^/]+/)?\d+\?i=(\d+)")
+        // 3. album URL with ?i=<track id>
+        let song_with_album = Regex::new(r"(?i)(?:music|itunes)\.apple\.com/(?:([a-z]{2})/)?album/(?:[^/]+/)?\d+\?i=(\d+)")
             .expect("song with album regex");
-        // 6. direct song URL
-        let song_direct = Regex::new(r"(?i)music\.apple\.com/(?:([a-z]{2})/)?song/(?:[^/]+/)?(\d+)").expect("song direct regex");
-        // 7. album URL
-        let album = Regex::new(r"(?i)music\.apple\.com/(?:([a-z]{2})/)?album/(?:[^/]+/)?(\d+)").expect("album regex");
-        // 8. bare numeric id
-        let bare_id = Regex::new(r"^\d+$").expect("bare id regex");
-        [playlist, bare_playlist, artist, bare_artist, song_with_album, song_direct, album, bare_id]
+        // 4. direct song URL
+        let song_direct = Regex::new(r"(?i)(?:music|itunes)\.apple\.com/(?:([a-z]{2})/)?song/(?:[^/]+/)?(\d+)").expect("song direct regex");
+        // 5. album URL
+        let album = Regex::new(r"(?i)(?:music|itunes)\.apple\.com/(?:([a-z]{2})/)?album/(?:[^/]+/)?(\d+)").expect("album regex");
+        [playlist, artist, song_with_album, song_direct, album]
     })
 }
 
@@ -55,35 +48,16 @@ pub fn parse_single_item(raw_token: &str) -> Option<ParsedTargetItem> {
     if token.is_empty() {
         return None;
     }
-    let [playlist, bare_playlist, artist, bare_artist, song_with_album, song_direct, album, bare_id] =
-        regexes();
+    let [playlist, artist, song_with_album, song_direct, album] = regexes();
 
     if let Some(caps) = playlist.captures(token) {
         if let Some(id) = caps.get(2) {
             return Some(item(id.as_str(), TargetKind::Playlist, &caps));
         }
     }
-    if let Some(caps) = bare_playlist.captures(token) {
-        if let Some(id) = caps.get(1) {
-            return Some(ParsedTargetItem {
-                id: id.as_str().to_owned(),
-                kind: TargetKind::Playlist,
-                storefront: None,
-            });
-        }
-    }
     if let Some(caps) = artist.captures(token) {
         if let Some(id) = caps.get(2) {
             return Some(item(id.as_str(), TargetKind::Artist, &caps));
-        }
-    }
-    if let Some(caps) = bare_artist.captures(token) {
-        if let Some(id) = caps.get(1) {
-            return Some(ParsedTargetItem {
-                id: id.as_str().to_owned(),
-                kind: TargetKind::Artist,
-                storefront: None,
-            });
         }
     }
     if let Some(caps) = song_with_album.captures(token) {
@@ -100,13 +74,6 @@ pub fn parse_single_item(raw_token: &str) -> Option<ParsedTargetItem> {
         if let Some(id) = caps.get(2) {
             return Some(item(id.as_str(), TargetKind::Album, &caps));
         }
-    }
-    if bare_id.is_match(token) {
-        return Some(ParsedTargetItem {
-            id: token.to_owned(),
-            kind: TargetKind::Track,
-            storefront: None,
-        });
     }
     None
 }
@@ -311,18 +278,13 @@ mod tests {
     }
 
     #[test]
-    fn extracts_bare_artist_with_prefix() {
-        let res = parse_alac_input("/alac artist:159260351", None).unwrap();
-        assert_eq!(res.items, vec![artist("159260351", None)]);
-        assert!(res.is_artist);
+    fn rejects_bare_artist_with_prefix() {
+        assert!(parse_alac_input("/alac artist:159260351", None).is_none());
     }
 
     #[test]
-    fn bare_artist_prefix_is_case_insensitive() {
-        // The bare-artist-id pattern is case-insensitive.
-        let res = parse_alac_input("/alac Artist/159260351", None).unwrap();
-        assert_eq!(res.items, vec![artist("159260351", None)]);
-        assert!(res.is_artist);
+    fn rejects_bare_artist_path() {
+        assert!(parse_alac_input("/alac Artist/159260351", None).is_none());
     }
 
     #[test]
@@ -337,19 +299,13 @@ mod tests {
     }
 
     #[test]
-    fn extracts_bare_track_id() {
-        let res = parse_alac_input("/alac 1440841730", None).unwrap();
-        assert_eq!(res.items, vec![track("1440841730", None)]);
-        assert_eq!(res.storefront, None);
+    fn rejects_bare_track_id() {
+        assert!(parse_alac_input("/alac 1440841730", None).is_none());
     }
 
     #[test]
-    fn extracts_bare_playlist_id() {
-        let res = parse_alac_input("/dl pl.f4d106fed2bd41149aaacabb233eb5eb", None).unwrap();
-        assert_eq!(
-            res.items,
-            vec![playlist("pl.f4d106fed2bd41149aaacabb233eb5eb", None)]
-        );
+    fn rejects_bare_playlist_id() {
+        assert!(parse_alac_input("/dl pl.f4d106fed2bd41149aaacabb233eb5eb", None).is_none());
     }
 
     #[test]
@@ -401,7 +357,7 @@ https://music.apple.com/us/artist/taylor-swift/159260351
 
 # Playlist
 https://music.apple.com/us/playlist/todays-hits/pl.f4d106fed2bd41149aaacabb233eb5eb
-1440841730
+not-a-link
 ";
         let items = extract_batch_items(file_content);
         assert_eq!(
@@ -411,7 +367,6 @@ https://music.apple.com/us/playlist/todays-hits/pl.f4d106fed2bd41149aaacabb233eb
                 album("1499378108", Some("us")),
                 artist("159260351", Some("us")),
                 playlist("pl.f4d106fed2bd41149aaacabb233eb5eb", Some("us")),
-                track("1440841730", None),
             ]
         );
     }
@@ -419,12 +374,12 @@ https://music.apple.com/us/playlist/todays-hits/pl.f4d106fed2bd41149aaacabb233eb
     #[test]
     fn batch_deduplicates_identical_entries() {
         let file_content = "
-1440841730
-1440841730
+ not-a-link
+ not-a-link
 https://music.apple.com/us/album/song/1?i=1440841730
 ";
         let items = extract_batch_items(file_content);
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].id, "1440841730");
+        assert_eq!(items[0], track("1440841730", Some("us")));
     }
 }

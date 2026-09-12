@@ -1,23 +1,20 @@
 //! Production composition of the engine's orchestration dependencies.
 
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
-use apple::{AppleProduction, CodecPreference};
 use engine::{
     orchestrator::deps::{
         AlbumUpload, BoxFuture, CachedAlbum, CachedTrack, OrchestratorDeps, RequestLog,
         SaveTrackInput, SinkError, TelegramSink,
     },
-    ripper::{AlacTrackRipper, RipError, RipProgressCallback, RipperConfig},
+    ripper::RipperConfig,
     settings::BotSettings,
-    types::{AlbumTracks, ArtistTracks, TrackKey, TrackRipResult},
+    types::TrackKey,
     Codec, Provider,
 };
 use lyrics::LyricsRegistry;
-use music::PlaylistData;
-use tokio_util::sync::CancellationToken;
 
-use crate::telegram_sink::FerogramTelegramSink;
+use crate::{providers::ProviderRegistry, telegram_sink::FerogramTelegramSink};
 
 /// All environment-owned production dependencies used by the orchestrator.
 pub struct RipDeps {
@@ -26,8 +23,7 @@ pub struct RipDeps {
     tracks: db::TracksRepository,
     requests: db::RequestLogRepository,
     settings: db::SettingsStore,
-    apple: AppleProduction,
-    ripper: AlacTrackRipper,
+    providers: ProviderRegistry,
     /// Shared with `ripper_deps` so health probes observe the same circuit
     /// and cache state the ripper uses.
     mirror_policy: apple::MirrorPolicyManager<apple::ReqwestMirrorHttp>,
@@ -50,7 +46,7 @@ impl RipDeps {
             .await
             .map_err(|error| SinkError(format!("load settings: {error}")))?;
 
-        let apple = AppleProduction::new(apple::AppleProductionConfig::default())
+        let apple = apple::AppleProduction::new(apple::AppleProductionConfig::default())
             .with_lyrics_registry(LyricsRegistry::all_sources());
         let probe_policy = apple.mirror_policy().shared();
         let retry_base_ms = std::env::var("ALAC_RETRY_BASE_MS")
@@ -79,8 +75,7 @@ impl RipDeps {
             tracks,
             requests,
             settings,
-            ripper: AlacTrackRipper::new(ripper_config),
-            apple,
+            providers: ProviderRegistry::new(apple, ripper_config),
             mirror_policy: probe_policy,
             upload_retry_base_ms: retry_base_ms,
             max_retries,
@@ -108,11 +103,6 @@ impl RipDeps {
         self.settings.get_settings()
     }
 
-    /// Exposes the mirror policy for the bot's health probes (dashboard, etc.).
-    pub fn mirror_policy(&self) -> &apple::MirrorPolicyManager<apple::ReqwestMirrorHttp> {
-        &self.mirror_policy
-    }
-
     /// Read-only database access for handlers that need direct queries
     /// outside the orchestrator seam.
     pub fn tracks(&self) -> &db::TracksRepository {
@@ -128,15 +118,21 @@ impl RipDeps {
     }
 
     pub fn catalog(&self) -> &apple::Catalog<apple::ReqwestTransport> {
-        self.apple.catalog()
+        self.providers.catalog()
     }
 
     pub fn playlist(&self) -> &apple::PlaylistClient<apple::ReqwestPlaylistHttp> {
-        self.apple.playlist()
+        self.providers.playlist()
     }
 }
 
 impl OrchestratorDeps for RipDeps {
+    type Providers = ProviderRegistry;
+
+    fn providers(&self) -> &Self::Providers {
+        &self.providers
+    }
+
     async fn get_settings(&self) -> BotSettings {
         self.settings.get_settings()
     }
@@ -236,70 +232,6 @@ impl OrchestratorDeps for RipDeps {
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         })
-    }
-
-    async fn fetch_album_tracks(&self, id: &str, storefront: &str) -> Result<AlbumTracks, String> {
-        self.apple
-            .catalog()
-            .fetch_album_tracks(id, storefront)
-            .await
-            .map_err(|error| error.to_string())
-    }
-
-    async fn fetch_artist_tracks(
-        &self,
-        id: &str,
-        storefront: &str,
-    ) -> Result<ArtistTracks, String> {
-        self.apple
-            .catalog()
-            .fetch_artist_tracks(id, storefront)
-            .await
-            .map_err(|error| error.to_string())
-    }
-
-    async fn fetch_playlist_tracks(
-        &self,
-        id: &str,
-        storefront: &str,
-    ) -> Result<PlaylistData, String> {
-        self.apple
-            .playlist()
-            .fetch_playlist_tracks(id, storefront)
-            .await
-            .map_err(|error| error.to_string())
-    }
-
-    async fn rip(
-        &self,
-        track_id: &str,
-        on_progress: Option<&RipProgressCallback>,
-        storefront: &str,
-        signal: CancellationToken,
-        output_dir: Option<&Path>,
-        codec_preference: CodecPreference,
-    ) -> Result<TrackRipResult, RipError> {
-        self.ripper
-            .rip(
-                self.apple.ripper_deps(),
-                track_id,
-                engine::ripper::RipOptions {
-                    storefront,
-                    on_progress,
-                    signal: Some(signal),
-                    output_dir,
-                    codec_preference,
-                },
-            )
-            .await
-    }
-
-    fn fetch_artwork<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Option<Vec<u8>>> {
-        Box::pin(async move { self.apple.ripper_deps().fetch_artwork_bytes(url).await })
-    }
-
-    fn artwork_url_at_size(&self, url: &str, size: u16) -> String {
-        apple::catalog::artwork_url_at_size(url, size)
     }
 
     fn sink(&self) -> &dyn TelegramSink {

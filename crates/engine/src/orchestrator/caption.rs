@@ -26,10 +26,10 @@ pub struct DumpCaptionMetadata<'a> {
     pub track_count: Option<i64>,
 }
 
-impl<'a> From<(&'a TrackRipResult, &'a str)> for DumpCaptionMetadata<'a> {
-    fn from((rip, track_id): (&'a TrackRipResult, &'a str)) -> Self {
+impl<'a> From<(&'a TrackRipResult, Provider, &'a str)> for DumpCaptionMetadata<'a> {
+    fn from((rip, provider, track_id): (&'a TrackRipResult, Provider, &'a str)) -> Self {
         DumpCaptionMetadata {
-            track_key: TrackKey::new(Provider::Apple, track_id),
+            track_key: TrackKey::new(provider, track_id),
             title: &rip.title,
             artist: &rip.artist,
             album: &rip.album,
@@ -64,8 +64,7 @@ pub struct DumpZipCaptionMetadata<'a> {
 pub struct AlbumDetailsCaptionMetadata<'a> {
     pub album: &'a str,
     pub artist: &'a str,
-    pub album_id: &'a str,
-    pub storefront: &'a str,
+    pub album_url: Option<&'a str>,
     pub total_tracks: usize,
     pub delivered_tracks: usize,
     pub size_bytes: i64,
@@ -129,19 +128,13 @@ pub fn format_requester_mention(user_name: Option<&str>, user_id: i64) -> String
 
 /// Formats the rich album details caption (displayed with album preview photo or fallback text).
 pub fn format_album_details_caption(meta: &AlbumDetailsCaptionMetadata<'_>) -> String {
-    let album_link = if !meta.album_id.is_empty() {
-        let sf = if meta.storefront.is_empty() {
-            "us"
-        } else {
-            meta.storefront
-        };
-        format!(
-            r#"💿 <a href="https://music.apple.com/{sf}/album/{}"><b>{}</b></a>"#,
-            meta.album_id,
+    let album_link = match meta.album_url {
+        Some(url) => format!(
+            r#"💿 <a href="{}"><b>{}</b></a>"#,
+            html_escape(url),
             html_escape(meta.album)
-        )
-    } else {
-        format!("💿 <b>{}</b>", html_escape(meta.album))
+        ),
+        None => format!("💿 <b>{}</b>", html_escape(meta.album)),
     };
 
     let tracks = if meta.is_partial {
@@ -508,8 +501,7 @@ mod tests {
         let meta = AlbumDetailsCaptionMetadata {
             album: "Fossils, Vol. 1",
             artist: "Rupam Islam & Fossils",
-            album_id: "1440828878",
-            storefront: "in",
+            album_url: Some("https://music.apple.com/in/album/1440828878"),
             total_tracks: 8,
             delivered_tracks: 8,
             size_bytes: 289_950_924,
@@ -546,8 +538,7 @@ mod tests {
         let meta = AlbumDetailsCaptionMetadata {
             album: "Greatest Hits",
             artist: "Queen",
-            album_id: "987654321",
-            storefront: "us",
+            album_url: Some("https://music.apple.com/us/album/987654321"),
             total_tracks: 17,
             delivered_tracks: 15,
             size_bytes: 4_294_967_296,

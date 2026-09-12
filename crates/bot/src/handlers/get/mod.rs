@@ -165,6 +165,7 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
     super::ensure_dashboard(&state, chat, sender, admin, super::chat_peer_ref(&msg)).await;
 
     let options = engine::orchestrator::types::RipJobOptions {
+        provider: engine::Provider::Apple,
         chat_id: chat,
         user_id: sender,
         user_name: Some(display_name),

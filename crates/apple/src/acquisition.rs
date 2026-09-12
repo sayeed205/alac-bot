@@ -417,6 +417,35 @@ pub struct AppleProduction {
     mirror_policy: MirrorPolicyManager<ReqwestMirrorHttp>,
 }
 
+/// Apple-owned presentation data used by the provider-neutral orchestrator.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ApplePresentation;
+
+impl engine::orchestrator::deps::ProviderPresentation for ApplePresentation {
+    fn default_job_header(&self) -> &str {
+        "Apple Music Lossless Rip"
+    }
+
+    fn album_url(&self, album_id: &str, storefront: &str) -> Option<String> {
+        (!album_id.is_empty()).then(|| {
+            let storefront = if storefront.is_empty() {
+                "us"
+            } else {
+                storefront
+            };
+            format!("https://music.apple.com/{storefront}/album/{album_id}")
+        })
+    }
+
+    fn unavailable_track_message(&self) -> &str {
+        "Unavailable on Apple Music (not streamable)"
+    }
+
+    fn unavailable_track_log_message(&self) -> &str {
+        "Track is not streamable in Apple Music catalog, skipping rip"
+    }
+}
+
 impl AppleProduction {
     pub fn new(config: AppleProductionConfig) -> Self {
         let catalog = crate::catalog::Catalog::new(crate::catalog::ReqwestTransport::new());

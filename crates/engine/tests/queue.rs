@@ -233,16 +233,21 @@ async fn pending_abort_removes_item_renumbers_and_returns_aborted() {
     };
     wait_for(&started).await;
     let signal = CancellationToken::new();
+    let second_queued = Arc::new(Notify::new());
     let positions = Arc::new(Mutex::new(Vec::new()));
     let second = {
         let queue = queue.clone();
         let signal = signal.clone();
+        let second_queued = second_queued.clone();
         tokio::spawn(async move {
             queue
                 .enqueue(
                     move |_| value(2),
                     Some(EnqueueOptions {
-                        on_position_change: None,
+                        on_position_change: Some(Arc::new(move |position| {
+                            assert_eq!(position, 1);
+                            second_queued.notify_one();
+                        })),
                         on_start: None,
                         signal: Some(signal),
                     }),
@@ -250,16 +255,20 @@ async fn pending_abort_removes_item_renumbers_and_returns_aborted() {
                 .await
         })
     };
+    wait_for(&second_queued).await;
+    let third_queued = Arc::new(Notify::new());
     let third_positions = positions.clone();
     let third = {
         let queue = queue.clone();
+        let third_queued = third_queued.clone();
         tokio::spawn(async move {
             queue
                 .enqueue(
                     move |_| value(3),
                     Some(EnqueueOptions {
                         on_position_change: Some(Arc::new(move |position| {
-                            third_positions.lock().unwrap().push(position)
+                            third_positions.lock().unwrap().push(position);
+                            third_queued.notify_one();
                         })),
                         on_start: None,
                         signal: None,
@@ -268,7 +277,7 @@ async fn pending_abort_removes_item_renumbers_and_returns_aborted() {
                 .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    wait_for(&third_queued).await;
     signal.cancel();
     assert_eq!(second.await.unwrap().unwrap_err(), QueueError::Aborted);
     assert_eq!(&*positions.lock().unwrap(), &[2, 1]);

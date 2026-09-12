@@ -9,7 +9,7 @@ use crate::{
     BotState,
 };
 
-const USAGE: &str = "<b>Track info usage</b><br/><br/><blockquote>• <code>/info &lt;apple_music_link | id&gt;</code><br/>• Reply to an Apple Music link with <code>/info</code></blockquote>";
+const USAGE: &str = "<b>Track info usage</b><br/><br/><blockquote>• <code>/info &lt;Apple Music link&gt;</code><br/>• Reply to an Apple Music link with <code>/info</code></blockquote>";
 
 async fn reply_text(msg: &ferogram::update::IncomingMessage, state: &BotState) -> Option<String> {
     let reply_header = match &msg.raw {
@@ -129,7 +129,9 @@ async fn info(msg: ferogram::update::IncomingMessage, state: Arc<BotState>) {
             ),
             None => (
                 "! <b>Not cached</b>".to_owned(),
-                format!("Use <code>/get {track_id}</code> to download lossless ALAC."),
+                format!(
+                    "Use <code>/get https://music.apple.com/song/{track_id}</code> to download lossless ALAC."
+                ),
             ),
         };
 

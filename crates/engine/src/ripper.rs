@@ -1,6 +1,7 @@
 //! Single-track ripper: metadata → stream → raw file → tagged M4A, with
 
 use std::{
+    collections::BTreeMap,
     future::Future,
     path::{Path, PathBuf},
     sync::Arc,
@@ -110,6 +111,7 @@ pub struct AlacTrackRipper {
 /// Options controlling a track rip operation.
 #[derive(Clone)]
 pub struct RipOptions<'a> {
+    pub provider: Provider,
     pub storefront: &'a str,
     pub on_progress: Option<&'a RipProgressCallback>,
     pub signal: Option<CancellationToken>,
@@ -120,6 +122,7 @@ pub struct RipOptions<'a> {
 impl std::fmt::Debug for RipOptions<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RipOptions")
+            .field("provider", &self.provider)
             .field("storefront", &self.storefront)
             .field("signal", &self.signal)
             .field("output_dir", &self.output_dir)
@@ -129,8 +132,9 @@ impl std::fmt::Debug for RipOptions<'_> {
 }
 
 impl<'a> RipOptions<'a> {
-    pub fn new(storefront: &'a str) -> Self {
+    pub fn new(provider: Provider, storefront: &'a str) -> Self {
         Self {
+            provider,
             storefront,
             on_progress: None,
             signal: None,
@@ -252,6 +256,7 @@ impl AlacTrackRipper {
             signal,
             output_dir,
             codec_preference,
+            provider,
         } = options;
         let on_progress = *on_progress;
         let signal = signal.as_ref();
@@ -298,9 +303,10 @@ impl AlacTrackRipper {
                 artists: vec![meta.artist.clone()],
                 album: Some(meta.album.clone()).filter(|a| !a.is_empty()),
                 duration: Some(meta.duration_secs).filter(|d| *d != 0),
-                provider_ids: [(Provider::Apple.as_str().to_owned(), track_id.to_owned())]
-                    .into_iter()
-                    .collect(),
+                provider_ids: BTreeMap::from([(
+                    provider.as_str().to_owned(),
+                    track_id.to_owned(),
+                )]),
             };
             let lyrics_task = {
                 let lookup = lyrics_lookup.clone();
