@@ -633,10 +633,12 @@ impl RipOrchestrator {
         settings: BotSettings,
     ) -> Result<RipJobSummary, OrchestratorError> {
         self.set_phase(&shared, JobPhase::Resolving);
+        shared.lock().expect("job poisoned").job.active_action_text =
+            Some("🔍 Resolving metadata & tracklist...".to_string());
         self.bus.emit_progress(
             &shared,
             Some("Resolving metadata & tracklist..."),
-            None,
+            Some("🔍 Resolving metadata & tracklist..."),
             None,
         );
 
@@ -891,8 +893,13 @@ impl RipOrchestrator {
 
         // Cache lookup; a DB failure fails the whole job.
         self.set_phase(&shared, JobPhase::CheckingCache);
+        let check_label = {
+            let header = shared.lock().expect("job poisoned").job.job_header.clone();
+            format!("🔍 Checking cache: {header}")
+        };
+        shared.lock().expect("job poisoned").job.active_action_text = Some(check_label.clone());
         self.bus
-            .emit_progress(&shared, Some("Checking local cache..."), None, None);
+            .emit_progress(&shared, Some("Checking local cache..."), Some(&check_label), None);
         let target_codec = match options.codec_preference {
             CodecPreference::Atmos => Codec::Ec3,
             CodecPreference::HighestQuality => Codec::Alac,
@@ -905,6 +912,8 @@ impl RipOrchestrator {
             .find_cached_tracks(&requested_ids)
             .await
             .map_err(OrchestratorError::Message)?;
+
+        shared.lock().expect("job poisoned").job.active_action_text = None;
 
         // Force + admin purge.
         if options.is_force && options.is_admin {
@@ -1798,8 +1807,17 @@ async fn run_lane_one<D: OrchestratorDeps>(input: LaneOneContext<'_, D>) -> RipJ
                             format_byte_progress(d, t, 12)
                         ),
                         _ => {
-                            if status.to_lowercase().contains("tag") {
+                            let lower = status.to_lowercase();
+                            if lower.contains("tag") {
                                 format!("🏷️ Tagging: <b>{}</b>", html_escape(&track_label))
+                            } else if lower.contains("decrypt") || lower.contains("remux") {
+                                format!("🔓 Decrypting: <b>{}</b>", html_escape(&track_label))
+                            } else if lower.contains("connect") || lower.contains("key") {
+                                format!("🌐 Connecting: <b>{}</b>", html_escape(&track_label))
+                            } else if lower.contains("meta") || lower.contains("fetch") {
+                                format!("🔍 Resolving: <b>{}</b>", html_escape(&track_label))
+                            } else if lower.contains("download") {
+                                format!("⬇️ Downloading: <b>{}</b>", html_escape(&track_label))
                             } else {
                                 format!(
                                     "⬇️ <b>{}:</b> {}",

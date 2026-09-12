@@ -83,10 +83,10 @@ pub fn render(
         esc(health)
     );
     if let Some(download) = snapshot.current_download.as_deref() {
-        text.push_str(&format!("<b>⬇️ Downloading:</b> {download}\n"));
+        text.push_str(&format_lane_header(download, "Downloading", "⬇️"));
     }
     if let Some(upload) = snapshot.current_upload.as_deref() {
-        text.push_str(&format!("<b>⬆️ Uploading:</b> {upload}\n"));
+        text.push_str(&format_lane_header(upload, "Uploading", "⬆️"));
     }
     for (offset, job) in snapshot.jobs.iter().skip(start).take(5).enumerate() {
         let number = start + offset + 1;
@@ -177,6 +177,153 @@ pub fn render(
 
 fn esc(s: &str) -> String {
     crate::html::escape(s)
+}
+
+/// Formats an activity description into a rich dashboard lane header line.
+///
+/// If the text indicates a distinct pipeline stage (Tagging, Decrypting, Zipping,
+/// Checking cache, Resolving, Connecting, Uploading, Downloading), it extracts
+/// the appropriate emoji, action verb, and remaining track/progress details.
+/// If no specific stage is recognized, it falls back to the lane's default verb and emoji.
+pub fn format_lane_header(activity: &str, default_verb: &str, default_emoji: &str) -> String {
+    let trimmed = activity.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let stages: [(&str, &str, &[&str]); 8] = [
+        ("🏷️", "Tagging", &["🏷️ Tagging:", "🏷️ Tagging", "Tagging:", "🏷️"]),
+        (
+            "🔓",
+            "Decrypting",
+            &[
+                "🔓 Decrypting:",
+                "🔓 Decrypting",
+                "Decrypting:",
+                "🔓",
+                "🔑 Decrypting:",
+                "🔑",
+            ],
+        ),
+        ("📦", "Zipping", &["📦 Zipping:", "📦 Zipping", "Zipping:", "📦"]),
+        (
+            "🔍",
+            "Checking cache",
+            &[
+                "🔍 Checking cache:",
+                "🔍 Checking cache...",
+                "🔍 Checking cache",
+                "🔍 Checking:",
+                "🔍 Checking",
+                "Checking cache:",
+                "Checking cache...",
+                "Checking cache",
+                "Checking:",
+                "🔍",
+            ],
+        ),
+        (
+            "🔍",
+            "Resolving",
+            &["🔍 Resolving:", "🔍 Resolving", "Resolving:", "🌐 Resolving:"],
+        ),
+        (
+            "🌐",
+            "Connecting",
+            &["🌐 Connecting:", "🌐 Connecting", "Connecting:", "🌐"],
+        ),
+        (
+            "⬆️",
+            "Uploading",
+            &[
+                "⬆️ Uploading:",
+                "⬆️ Uploading",
+                "<b>Uploading:</b>",
+                "Uploading:",
+                "⬆️",
+            ],
+        ),
+        (
+            "⬇️",
+            "Downloading",
+            &[
+                "⬇️ Downloading from TG:",
+                "⬇️ Downloading:",
+                "⬇️ Downloading",
+                "Downloading from TG:",
+                "Downloading:",
+                "⬇️",
+            ],
+        ),
+    ];
+
+    for (emoji, verb, prefixes) in stages {
+        for prefix in prefixes {
+            if let Some(rest) = trimmed.strip_prefix(prefix) {
+                let body = strip_activity_decorations(rest);
+                if body.is_empty() || body == "..." {
+                    return if verb.ends_with("cache") {
+                        format!("<b>{emoji} {verb}...</b>\n")
+                    } else {
+                        format!("<b>{emoji} {verb}</b>\n")
+                    };
+                }
+                return format!("<b>{emoji} {verb}:</b> {body}\n");
+            }
+        }
+    }
+
+    let lower = trimmed.to_lowercase();
+    if lower.contains("tagging") {
+        let body = strip_activity_decorations(trimmed);
+        return format!("<b>🏷️ Tagging:</b> {body}\n");
+    } else if lower.contains("decrypt") {
+        let body = strip_activity_decorations(trimmed);
+        return format!("<b>🔓 Decrypting:</b> {body}\n");
+    } else if lower.contains("zipping") {
+        let body = strip_activity_decorations(trimmed);
+        return format!("<b>📦 Zipping:</b> {body}\n");
+    } else if lower.contains("checking") {
+        let body = strip_activity_decorations(trimmed);
+        return if body.is_empty() || body == "..." {
+            "<b>🔍 Checking cache...</b>\n".to_string()
+        } else {
+            format!("<b>🔍 Checking cache:</b> {body}\n")
+        };
+    }
+
+    format!("<b>{default_emoji} {default_verb}:</b> {trimmed}\n")
+}
+
+fn strip_activity_decorations(text: &str) -> &str {
+    let mut s = text.trim();
+    if let Some(rest) = s.strip_prefix(':') {
+        s = rest.trim();
+    }
+    for prefix in [
+        "<b>Uploading:</b>",
+        "<b>Downloading:</b>",
+        "<b>Tagging:</b>",
+        "<b>Decrypting:</b>",
+        "<b>Zipping:</b>",
+        "<b>Checking:</b>",
+        "Uploading:",
+        "Downloading:",
+        "Tagging:",
+        "Decrypting:",
+        "Zipping:",
+        "Checking:",
+        "cache...",
+        "local cache...",
+    ] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest.trim();
+        }
+    }
+    if let Some(rest) = s.strip_prefix(':') {
+        s = rest.trim();
+    }
+    s
 }
 
 pub fn cancelable_job_ids(
@@ -559,7 +706,7 @@ mod tests {
 
         let (text, _) = render(&snapshot, 2, false);
         assert!(text.contains("<i>6.</i> Track 6"));
-        assert!(!text.contains("<i>1.</i> Track 1"));
+        assert!(!text.contains("<i>1. Track 1</i>"));
     }
 
     #[test]
@@ -626,5 +773,79 @@ mod tests {
         let (text, _) = render(&snapshot, 1, false);
         assert!(text.contains("<b>⬇️ Downloading:</b> <b>Song</b>"));
         assert!(!text.contains("⬆️"));
+    }
+
+    #[test]
+    fn lane_headers_render_dynamic_pipeline_stages() {
+        let base_job = DashboardJob {
+            id: "job-stages".into(),
+            requester_id: 7,
+            requester_name: "Alice".into(),
+            header: "Album".into(),
+            phase: JobPhase::Processing,
+            queue_position: None,
+            cached: 0,
+            ripped: 0,
+            failed: 0,
+            total: 1,
+            percent: 0,
+            downloading: None,
+            uploading: None,
+            is_cancel_allowed_for_viewer: true,
+        };
+
+        // Checking cache
+        let s_checking = DashboardSnapshot {
+            current_download: Some("🔍 Checking cache: <b>Album</b>".into()),
+            jobs: vec![base_job.clone()],
+            ..DashboardSnapshot::default()
+        };
+        let (text, _) = render(&s_checking, 1, false);
+        assert!(text.contains("<b>🔍 Checking cache:</b> <b>Album</b>"));
+
+        // Checking cache without suffix
+        let s_checking_plain = DashboardSnapshot {
+            current_download: Some("🔍 Checking cache...".into()),
+            jobs: vec![base_job.clone()],
+            ..DashboardSnapshot::default()
+        };
+        let (text, _) = render(&s_checking_plain, 1, false);
+        assert!(text.contains("<b>🔍 Checking cache...</b>"));
+
+        // Decrypting
+        let s_decrypt = DashboardSnapshot {
+            current_download: Some("🔓 Decrypting: <b>Track 1</b>".into()),
+            jobs: vec![base_job.clone()],
+            ..DashboardSnapshot::default()
+        };
+        let (text, _) = render(&s_decrypt, 1, false);
+        assert!(text.contains("<b>🔓 Decrypting:</b> <b>Track 1</b>"));
+
+        // Tagging
+        let s_tag = DashboardSnapshot {
+            current_download: Some("🏷️ Tagging: <b>Track 1</b>".into()),
+            jobs: vec![base_job.clone()],
+            ..DashboardSnapshot::default()
+        };
+        let (text, _) = render(&s_tag, 1, false);
+        assert!(text.contains("<b>🏷️ Tagging:</b> <b>Track 1</b>"));
+
+        // Zipping
+        let s_zip = DashboardSnapshot {
+            current_upload: Some("📦 Zipping: <b>Album.zip</b> <code>[===]</code>".into()),
+            jobs: vec![base_job.clone()],
+            ..DashboardSnapshot::default()
+        };
+        let (text, _) = render(&s_zip, 1, false);
+        assert!(text.contains("<b>📦 Zipping:</b> <b>Album.zip</b> <code>[===]</code>"));
+
+        // Uploading
+        let s_upload = DashboardSnapshot {
+            current_upload: Some("⬆️ Uploading: <b>Track 1</b> <code>[===]</code>".into()),
+            jobs: vec![base_job],
+            ..DashboardSnapshot::default()
+        };
+        let (text, _) = render(&s_upload, 1, false);
+        assert!(text.contains("<b>⬆️ Uploading:</b> <b>Track 1</b> <code>[===]</code>"));
     }
 }

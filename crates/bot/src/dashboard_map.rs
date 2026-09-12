@@ -201,6 +201,12 @@ pub fn snapshot_from(
         if let Some(action) = job.active_action_text.as_ref() {
             return Some(clean_activity(action));
         }
+        if job.phase == EnginePhase::CheckingCache {
+            return Some("🔍 Checking cache...".into());
+        }
+        if job.phase == EnginePhase::Resolving {
+            return Some("🔍 Resolving...".into());
+        }
         None
     });
     let current_upload = ordered.iter().find_map(|job| {
@@ -403,6 +409,18 @@ mod tests {
             snapshot.current_upload.as_deref(),
             Some("<b>Uploading:</b> <i>Song - Artist</i>")
         );
+    }
+
+    #[test]
+    fn cache_checking_and_resolving_fallback_to_semantic_status() {
+        let job_cache = engine_job(EnginePhase::CheckingCache, None, 1, Some("Alice"));
+        let contexts = JobContexts::new();
+        let s_cache = snapshot_from(&[job_cache], &contexts, 1, false, "live", None);
+        assert_eq!(s_cache.current_download.as_deref(), Some("🔍 Checking cache..."));
+
+        let job_resolve = engine_job(EnginePhase::Resolving, None, 1, Some("Alice"));
+        let s_resolve = snapshot_from(&[job_resolve], &contexts, 1, false, "live", None);
+        assert_eq!(s_resolve.current_download.as_deref(), Some("🔍 Resolving..."));
     }
 
     #[test]
