@@ -17,7 +17,6 @@ use engine::{
         types::{JobPhase, OrchestratorEvent, RipJobOptions, RipJobSummary},
         OrchestratorError, RipOrchestrator,
     },
-    playlist::{PlaylistData, PlaylistError, PlaylistTrack},
     ripper::{RipError, RipProgressCallback},
     settings::{default_settings, BotSettings, RippingMode},
     types::{
@@ -25,6 +24,7 @@ use engine::{
         TrackRipResult,
     },
 };
+use music::{PlaylistData, PlaylistTrack};
 use tokio_util::sync::CancellationToken;
 
 // fakes
@@ -210,10 +210,11 @@ impl TelegramSink for FakeSink {
         file_path: &'a str,
         title: &'a str,
         performer: &'a str,
-        _duration: i64,
-        _caption_html: &'a str,
-        _on_upload_progress: Option<&'a UploadProgressCallback>,
+        duration: i64,
+        caption_html: &'a str,
+        on_upload_progress: Option<&'a UploadProgressCallback>,
     ) -> Pin<Box<dyn Future<Output = Result<Option<DumpUpload>, SinkError>> + Send + 'a>> {
+        let _ = (duration, caption_html, on_upload_progress);
         let state = Arc::clone(&self.state);
         Box::pin(async move {
             let gate = {
@@ -274,9 +275,10 @@ impl TelegramSink for FakeSink {
         &'a self,
         file_path: &'a str,
         thumb_path: Option<&'a str>,
-        _caption_html: &'a str,
-        _on_upload_progress: Option<&'a UploadProgressCallback>,
+        caption_html: &'a str,
+        on_upload_progress: Option<&'a UploadProgressCallback>,
     ) -> Pin<Box<dyn Future<Output = Result<Option<DumpUpload>, SinkError>> + Send + 'a>> {
+        let _ = (caption_html, on_upload_progress);
         let state = Arc::clone(&self.state);
         let path = file_path.to_owned();
         let thumb = thumb_path.map(str::to_owned);
@@ -298,12 +300,13 @@ impl TelegramSink for FakeSink {
 
     fn send_document_to_chat<'a>(
         &'a self,
-        _chat_id: i64,
+        chat_id: i64,
         file_path: &'a str,
         thumb_path: Option<&'a str>,
-        _caption_html: &'a str,
-        _on_upload_progress: Option<&'a UploadProgressCallback>,
+        caption_html: &'a str,
+        on_upload_progress: Option<&'a UploadProgressCallback>,
     ) -> Pin<Box<dyn Future<Output = Result<i32, SinkError>> + Send + 'a>> {
+        let _ = (chat_id, caption_html, on_upload_progress);
         let state = Arc::clone(&self.state);
         let path = file_path.to_owned();
         let thumb = thumb_path.map(str::to_owned);
@@ -336,10 +339,11 @@ impl TelegramSink for FakeSink {
 
     fn download_dump_file<'a>(
         &'a self,
-        _message_id: i64,
+        message_id: i64,
         destination: &'a std::path::Path,
-        _on_download_progress: Option<&'a UploadProgressCallback>,
+        on_download_progress: Option<&'a UploadProgressCallback>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        let _ = (message_id, on_download_progress);
         Box::pin(async move {
             // Materialize a deterministic fake audio file so ZIP staging has
             // real bytes to archive.
@@ -422,10 +426,11 @@ impl OrchestratorDeps for FakeDeps {
 
     fn find_albums<'a>(
         &'a self,
-        _provider: engine::types::Provider,
+        provider: engine::types::Provider,
         album_id: &'a str,
-        _codec: Option<engine::Codec>,
+        codec: Option<engine::Codec>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<CachedAlbum>, String>> + Send + 'a>> {
+        let _ = (provider, codec);
         let rows = self
             .state
             .lock()
@@ -439,10 +444,11 @@ impl OrchestratorDeps for FakeDeps {
 
     fn delete_albums<'a>(
         &'a self,
-        _provider: engine::types::Provider,
+        provider: engine::types::Provider,
         album_id: &'a str,
-        _codec: Option<engine::Codec>,
+        codec: Option<engine::Codec>,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        let _ = (provider, codec);
         self.state
             .lock()
             .unwrap()
@@ -467,8 +473,9 @@ impl OrchestratorDeps for FakeDeps {
     fn fetch_album_tracks(
         &self,
         id: &str,
-        _storefront: &str,
+        storefront: &str,
     ) -> impl Future<Output = Result<AlbumTracks, String>> + Send {
+        let _ = storefront;
         let result = self.albums.lock().unwrap().get(id).cloned();
         async move { result.ok_or_else(|| format!("Album {id} not found")) }
     }
@@ -476,8 +483,9 @@ impl OrchestratorDeps for FakeDeps {
     fn fetch_artist_tracks(
         &self,
         id: &str,
-        _storefront: &str,
+        storefront: &str,
     ) -> impl Future<Output = Result<ArtistTracks, String>> + Send {
+        let _ = storefront;
         let result = self.artists.lock().unwrap().get(id).cloned();
         async move { result.ok_or_else(|| format!("Artist {id} not found")) }
     }
@@ -485,26 +493,23 @@ impl OrchestratorDeps for FakeDeps {
     fn fetch_playlist_tracks(
         &self,
         id: &str,
-        _storefront: &str,
-    ) -> impl Future<Output = Result<PlaylistData, PlaylistError>> + Send {
+        storefront: &str,
+    ) -> impl Future<Output = Result<PlaylistData, String>> + Send {
+        let _ = storefront;
         let result = self.playlists.lock().unwrap().get(id).cloned();
-        async move {
-            result.ok_or_else(|| PlaylistError::NotFound {
-                playlist_id: id.to_string(),
-                storefront: "us".to_string(),
-            })
-        }
+        async move { result.ok_or_else(|| format!("Playlist {id} not found on storefront 'us'")) }
     }
 
     fn rip(
         &self,
         track_id: &str,
-        _on_progress: Option<&RipProgressCallback>,
-        _storefront: &str,
-        _signal: CancellationToken,
+        on_progress: Option<&RipProgressCallback>,
+        storefront: &str,
+        signal: CancellationToken,
         output_dir: Option<&std::path::Path>,
-        _codec_preference: engine::wrapper::CodecPreference,
+        codec_preference: music::CodecPreference,
     ) -> impl Future<Output = Result<TrackRipResult, RipError>> + Send {
+        let _ = (on_progress, storefront, signal, codec_preference);
         self.state
             .lock()
             .unwrap()
@@ -606,7 +611,7 @@ fn options(items: Vec<ParsedTargetItem>, is_admin: bool) -> RipJobOptions {
         reply_to_message_id: Some(555),
         status_msg_id: 999,
         is_admin,
-        codec_preference: engine::wrapper::CodecPreference::HighestQuality,
+        codec_preference: music::CodecPreference::HighestQuality,
     }
 }
 
@@ -1505,7 +1510,7 @@ fn zip_options(album: &str, cache_only: bool, explicit: bool, force: bool) -> Ri
         reply_to_message_id: Some(555),
         status_msg_id: 999,
         is_admin: true,
-        codec_preference: engine::wrapper::CodecPreference::HighestQuality,
+        codec_preference: music::CodecPreference::HighestQuality,
     }
 }
 

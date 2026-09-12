@@ -182,7 +182,7 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
         // orchestration callers.
         status_msg_id: 0,
         is_admin: admin,
-        codec_preference: engine::wrapper::CodecPreference::HighestQuality,
+        codec_preference: apple::CodecPreference::HighestQuality,
     };
 
     // Engine owns everything from here: resolution, cache-first, queue,

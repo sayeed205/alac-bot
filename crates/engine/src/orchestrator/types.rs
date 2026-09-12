@@ -2,12 +2,10 @@
 
 use std::sync::Arc;
 
+use music::CodecPreference;
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-    types::{ParsedTargetItem, TargetKind},
-    wrapper::CodecPreference,
-};
+use crate::types::{ParsedTargetItem, TargetKind};
 
 /// The non-terminal lifecycle phase of a job.  Terminality is represented by
 /// `terminal_state` below so consumers can retain the last useful phase while

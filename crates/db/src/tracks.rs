@@ -78,10 +78,20 @@ impl TracksRepository {
         let mut map = HashMap::new();
         for track in rows {
             let cached = cached_track(track);
-            map.insert(cached.track_key.clone(), cached.clone());
+            if unique_keys.contains(&cached.track_key) {
+                map.insert(cached.track_key.clone(), cached.clone());
+            }
             let base_key =
                 TrackKey::new(cached.track_key.provider, cached.track_key.track_id.clone());
-            map.entry(base_key).or_insert(cached);
+            if unique_keys.contains(&base_key) {
+                let prefer_cached = map
+                    .get(&base_key)
+                    .map(|current| current.codec != Codec::Alac)
+                    .unwrap_or(true);
+                if prefer_cached {
+                    map.insert(base_key, cached);
+                }
+            }
         }
         Ok(map)
     }

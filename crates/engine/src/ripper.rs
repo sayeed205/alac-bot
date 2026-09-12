@@ -8,21 +8,17 @@ use std::{
 };
 
 use futures_util::{FutureExt, StreamExt};
+use music::CodecPreference;
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::{
-    catalog::{Catalog, CatalogError, ReqwestTransport},
     limits::MAX_AUDIO_BYTES,
-    lyrics::{self, LyricsHttp, LyricsMeta},
-    streaming::{
-        is_non_retryable_error, AudioStreamSource, MirrorEndpoint, MirrorPolicyManager,
-        ProgressCallback, StreamError, StreamTransport,
-    },
+    lyrics::LyricsMeta,
+    streaming::{AudioStreamSource, ProgressCallback, StreamError},
     tagger,
     types::{TrackMeta, TrackRipResult},
-    wrapper::CodecPreference,
 };
 
 /// All rip failures reduce to plain user-facing messages.
@@ -38,23 +34,9 @@ impl From<StreamError> for RipError {
     }
 }
 
-impl From<CatalogError> for RipError {
-    fn from(error: CatalogError) -> Self {
-        RipError::Message(error.to_string())
-    }
-}
-
 impl From<std::io::Error> for RipError {
     fn from(error: std::io::Error) -> Self {
         RipError::Message(error.to_string())
-    }
-}
-
-impl RipError {
-    pub fn is_non_retryable(&self) -> bool {
-        match self {
-            RipError::Message(msg) => is_non_retryable_error(msg),
-        }
     }
 }
 
@@ -85,20 +67,25 @@ impl Default for RipperConfig {
 
 /// Everything a rip needs, behind one seam so tests can fake each step.
 pub trait RipperDeps: Send + Sync {
+    /// Provider-specific permanent failures may opt out of retries.
+    fn is_non_retryable_error(&self, message: &str) -> bool {
+        let lower = message.to_ascii_lowercase();
+        lower.contains("code 404")
+            || lower.contains("code: 404")
+            || lower.contains("http 404")
+            || lower.contains("status 404")
+            || lower.contains("status: 404")
+            || lower.contains("404 not found")
+    }
+
     fn track_meta(
         &self,
         track_id: &str,
         storefront: &str,
     ) -> impl Future<Output = Result<TrackMeta, RipError>> + Send;
-    /// `None` = mirror lookup failed → wrapper fallback path.
-    fn mirror_endpoint(
-        &self,
-        signal: Option<&CancellationToken>,
-    ) -> impl Future<Output = Option<MirrorEndpoint>> + Send;
     fn connect_stream(
         &self,
         track_id: &str,
-        primary: Option<MirrorEndpoint>,
         signal: Option<CancellationToken>,
         on_progress: Option<ProgressCallback>,
         codec_preference: CodecPreference,
@@ -207,7 +194,7 @@ impl AlacTrackRipper {
                     {
                         return Err(err);
                     }
-                    if err.is_non_retryable() {
+                    if deps.is_non_retryable_error(&message) {
                         warn!(
                             track_id,
                             error = %message,
@@ -349,15 +336,6 @@ impl AlacTrackRipper {
                 }
             };
 
-        // Primary mirror (failure is not fatal — wrapper fallback).
-            let primary = deps.mirror_endpoint(signal).await;
-            if primary.is_none() {
-                debug!(
-                    track_id,
-                    "Primary mirror manifest/status lookup failed, will attempt fallback"
-                );
-            }
-
         // Connect the audio stream.
             let stream_start = std::time::Instant::now();
             let stream_progress: Option<ProgressCallback> = on_progress
@@ -366,7 +344,6 @@ impl AlacTrackRipper {
             let mut stream = deps
                 .connect_stream(
                     track_id,
-                    primary,
                     signal.cloned(),
                     stream_progress,
                     codec_preference,
@@ -649,215 +626,4 @@ fn unique_temp_suffix() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
-}
-
-/// Production dependency bundle wiring catalog, mirror policy, stream
-/// transport, lyrics, artwork, and native media finalization.
-pub struct EngineRipperDeps {
-    catalog: Catalog<ReqwestTransport>,
-    mirror_policy: MirrorPolicyManager<crate::streaming::ReqwestHttp>,
-    stream_transport: StreamTransport<crate::streaming::ReqwestHttp>,
-    wrapper_url: Option<String>,
-    wrapper_api_key: Option<String>,
-    artwork_client: reqwest::Client,
-    lyrics_client: reqwest::Client,
-    media: media::MediaProcessor,
-}
-
-impl EngineRipperDeps {
-    pub fn new(
-        catalog: Catalog<ReqwestTransport>,
-        mirror_policy: MirrorPolicyManager<crate::streaming::ReqwestHttp>,
-        stream_transport: StreamTransport<crate::streaming::ReqwestHttp>,
-        wrapper_url: Option<String>,
-        wrapper_api_key: Option<String>,
-    ) -> Self {
-        Self {
-            catalog,
-            mirror_policy,
-            stream_transport,
-            wrapper_url,
-            wrapper_api_key,
-            artwork_client: reqwest::Client::new(),
-            lyrics_client: reqwest::Client::new(),
-            media: media::MediaProcessor::new(),
-        }
-    }
-
-    /// Public artwork passthrough for callers outside the rip pipeline
-    /// (album ZIP covers). Same transport and timeout as the ripper path.
-    pub async fn fetch_artwork_bytes(&self, url: &str) -> Option<Vec<u8>> {
-        RipperDeps::fetch_artwork(self, url).await
-    }
-}
-
-/// reqwest adapter for the lyrics seam.
-struct ReqwestLyricsHttp {
-    client: reqwest::Client,
-}
-
-impl LyricsHttp for ReqwestLyricsHttp {
-    async fn get_json(&self, url: &str) -> Option<String> {
-        let response = self
-            .client
-            .get(url)
-            .header("User-Agent", "AlacBot/1.0")
-            .timeout(Duration::from_secs(5))
-            .send()
-            .await
-            .ok()?;
-        if !response.status().is_success() {
-            return None;
-        }
-        response.text().await.ok()
-    }
-}
-
-impl RipperDeps for EngineRipperDeps {
-    async fn track_meta(&self, track_id: &str, storefront: &str) -> Result<TrackMeta, RipError> {
-        self.catalog
-            .fetch_track_meta(track_id, storefront)
-            .await
-            .map_err(RipError::from)
-    }
-
-    async fn mirror_endpoint(&self, signal: Option<&CancellationToken>) -> Option<MirrorEndpoint> {
-        self.mirror_policy
-            .get_endpoint(false, signal.cloned())
-            .await
-            .ok()
-    }
-
-    async fn connect_stream(
-        &self,
-        track_id: &str,
-        primary: Option<MirrorEndpoint>,
-        signal: Option<CancellationToken>,
-        on_progress: Option<ProgressCallback>,
-        codec_preference: CodecPreference,
-    ) -> Result<AudioStreamSource, RipError> {
-        self.stream_transport
-            .connect_audio_stream(crate::streaming::ConnectStreamOptions {
-                track_id: track_id.to_owned(),
-                primary_mirror: primary,
-                wrapper_url: self.wrapper_url.clone(),
-                wrapper_api_key: self.wrapper_api_key.clone(),
-                signal,
-                on_progress,
-                mirror_policy: Some(&self.mirror_policy),
-                codec_preference,
-            })
-            .await
-            .map_err(RipError::from)
-    }
-
-    async fn fetch_lyrics(&self, track_id: &str, meta: &LyricsMeta) -> Option<String> {
-        let http = ReqwestLyricsHttp {
-            client: self.lyrics_client.clone(),
-        };
-        lyrics::fetch_lyrics(&http, track_id, meta).await
-    }
-
-    async fn fetch_artwork(&self, url: &str) -> Option<Vec<u8>> {
-        let response = self
-            .artwork_client
-            .get(url)
-            .header("User-Agent", "AlacBot/1.0")
-            .timeout(Duration::from_secs(15))
-            .send()
-            .await
-            .ok()?;
-        if !response.status().is_success() {
-            return None;
-        }
-        let bytes = response.bytes().await.ok()?;
-        Some(bytes.to_vec())
-    }
-
-    async fn tag_m4a(
-        &self,
-        raw_path: &Path,
-        output_path: &Path,
-        meta: &TrackMeta,
-        cover: Option<&[u8]>,
-        lyrics: Option<&str>,
-    ) -> Result<(), RipError> {
-        let tags = media::TrackTags {
-            title: (!meta.title.is_empty()).then(|| meta.title.clone()),
-            title_sort: (!meta.title.is_empty()).then(|| meta.title.clone()),
-            artist: (!meta.artist.is_empty()).then(|| meta.artist.clone()),
-            artist_sort: (!meta.artist.is_empty()).then(|| meta.artist.clone()),
-            album: (!meta.album.is_empty()).then(|| meta.album.clone()),
-            album_sort: (!meta.album.is_empty()).then(|| meta.album.clone()),
-            album_artist: (!meta.album_artist.is_empty()).then(|| meta.album_artist.clone()),
-            album_artist_sort: (!meta.album_artist.is_empty()).then(|| meta.album_artist.clone()),
-            release_date: (!meta.release_date.is_empty()).then(|| meta.release_date.clone()),
-            genre: meta.genre.clone().filter(|value| !value.is_empty()),
-            composer: meta.composer.clone().filter(|value| !value.is_empty()),
-            composer_sort: meta.composer.clone().filter(|value| !value.is_empty()),
-            track_number: meta
-                .track_number
-                .filter(|value| *value != 0)
-                .and_then(|value| u16::try_from(value).ok()),
-            track_count: meta
-                .track_count
-                .filter(|value| *value != 0)
-                .and_then(|value| u16::try_from(value).ok()),
-            disc_number: meta
-                .disc_number
-                .filter(|value| *value != 0)
-                .and_then(|value| u16::try_from(value).ok()),
-            disc_count: meta
-                .disc_count
-                .filter(|value| *value != 0)
-                .and_then(|value| u16::try_from(value).ok()),
-            lyrics: lyrics.map(str::to_owned).filter(|value| !value.is_empty()),
-            artwork_jpeg: cover
-                .filter(|value| !value.is_empty())
-                .map(|value| value.to_vec()),
-            isrc: meta.isrc.clone().filter(|value| !value.is_empty()),
-            label: meta.record_label.clone().filter(|value| !value.is_empty()),
-            copyright: meta.copyright.clone().filter(|value| !value.is_empty()),
-            publisher: meta.record_label.clone().filter(|value| !value.is_empty()),
-            performer: (!meta.artist.is_empty()).then(|| meta.artist.clone()),
-            release_time: (!meta.release_date.is_empty()).then(|| meta.release_date.clone()),
-            upc: meta.upc.clone().filter(|value| !value.is_empty()),
-            song_id: meta.id.parse::<u64>().ok(),
-            album_id: meta
-                .album_id
-                .as_deref()
-                .and_then(|value| value.parse().ok()),
-            artist_id: meta
-                .artist_id
-                .as_deref()
-                .and_then(|value| value.parse().ok()),
-            explicit: Some(meta.explicit),
-            advisory: Some(match meta.content_advisory.as_deref() {
-                Some(value) if value.eq_ignore_ascii_case("explicit") => {
-                    media::AdvisoryKind::Explicit
-                }
-                Some(value) if value.eq_ignore_ascii_case("clean") => media::AdvisoryKind::Clean,
-                Some(_) => media::AdvisoryKind::Inoffensive,
-                None if meta.explicit => media::AdvisoryKind::Explicit,
-                None => media::AdvisoryKind::Inoffensive,
-            }),
-            media_kind: Some(media::MediaKind::Music),
-            compilation: Some(
-                meta.album_artist.eq_ignore_ascii_case("Various Artists")
-                    || meta.artist.eq_ignore_ascii_case("Various Artists"),
-            ),
-            gapless: Some(true),
-            genre_id: None,
-            storefront_id: None,
-            encoder: Some("alac-bot".to_string()),
-            comment: None,
-            description: None,
-        };
-        let cancellation = CancellationToken::new();
-        self.media
-            .finalize_m4a(raw_path, output_path, &tags, &cancellation)
-            .await
-            .map(|_| ())
-            .map_err(|error| RipError::Message(error.to_string()))
-    }
 }

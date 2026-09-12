@@ -743,7 +743,7 @@ async fn admin_callback(state: Arc<BotState>, query: CallbackQuery, action: Repo
                 reply_to_message_id: None,
                 status_msg_id: 0,
                 is_admin: true,
-                codec_preference: engine::wrapper::CodecPreference::HighestQuality,
+                codec_preference: apple::CodecPreference::HighestQuality,
             };
             match state
                 .rip_orchestrator

@@ -6,9 +6,8 @@
 
 use std::sync::OnceLock;
 
+use music::{ParsedAlacInput, ParsedTargetItem, TargetKind};
 use regex::Regex;
-
-use crate::types::{ParsedAlacInput, ParsedTargetItem, TargetKind};
 
 fn regexes() -> &'static [Regex; 8] {
     static RE: OnceLock<[Regex; 8]> = OnceLock::new();

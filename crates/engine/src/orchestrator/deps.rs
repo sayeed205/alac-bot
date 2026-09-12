@@ -7,14 +7,13 @@
 
 use std::{collections::HashMap, future::Future, path::Path, pin::Pin};
 
+use music::{CodecPreference, PlaylistData};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    playlist::PlaylistData,
     ripper::{RipError, RipProgressCallback},
     settings::BotSettings,
     types::{AlbumTracks, ArtistTracks, Codec, Provider, TrackKey, TrackRipResult},
-    wrapper::CodecPreference,
 };
 
 /// `(uploaded_bytes, total_bytes)` for upload progress callbacks.
@@ -277,6 +276,13 @@ pub trait OrchestratorDeps: Send + Sync + 'static {
         Box::pin(async { None })
     }
 
+    /// Rewrites an artwork URL for a requested image size. Provider adapters
+    /// own the URL format; the default keeps URLs unchanged.
+    fn artwork_url_at_size(&self, url: &str, size: u16) -> String {
+        let _ = size;
+        url.to_owned()
+    }
+
     // catalog resolution
     fn fetch_album_tracks(
         &self,
@@ -294,7 +300,7 @@ pub trait OrchestratorDeps: Send + Sync + 'static {
         &self,
         id: &str,
         storefront: &str,
-    ) -> impl Future<Output = Result<PlaylistData, crate::playlist::PlaylistError>> + Send;
+    ) -> impl Future<Output = Result<PlaylistData, String>> + Send;
 
     // rip (ITrackRipper.rip)
     fn rip(

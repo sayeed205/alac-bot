@@ -7,7 +7,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use engine::{parser::parse_alac_input, Provider, TrackKey};
+use apple::parse_alac_input;
+use engine::{Provider, TrackKey};
 use ferogram::{
     filters,
     filters::Dispatcher,

@@ -3,7 +3,7 @@
 
 use std::{collections::HashMap, sync::Mutex, time::Duration};
 
-use engine::catalog::{Catalog, CatalogError, Transport, TransportError};
+use apple::catalog::{Catalog, CatalogError, Transport, TransportError};
 
 /// Serves canned JSON by URL substring match; records every served URL.
 struct FakeTransport {
@@ -46,9 +46,10 @@ impl Transport for FakeTransport {
     async fn get(
         &self,
         url: &str,
-        _user_agent: &str,
-        _timeout: Duration,
+        user_agent: &str,
+        timeout: Duration,
     ) -> Result<String, TransportError> {
+        let _ = (user_agent, timeout);
         self.served.lock().unwrap().push(url.to_owned());
         for (needle, route) in &self.routes {
             if url.contains(needle.as_str()) {

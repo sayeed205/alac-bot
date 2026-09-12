@@ -1,5 +1,7 @@
 //! HLS M3U8 playlist parsing for Apple Music ALAC streams.
 
+use music::CodecPreference;
+
 use super::client::WrapperError;
 
 /// One audio variant offered by a master playlist.
@@ -21,16 +23,6 @@ pub struct AlacStreamInfo {
     pub bit_depth: u32,
 }
 
-/// How the ripper should pick a variant when several are offered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CodecPreference {
-    /// Highest quality: ALAC by (sample rate, bit depth), then AAC by
-    /// bitrate, then HE-AAC.
-    #[default]
-    HighestQuality,
-    /// Dolby Atmos (`ec-3` atmos group) when offered.
-    Atmos,
-}
 #[derive(Debug, Clone)]
 pub struct MediaSegmentRef {
     pub uri: String,
@@ -408,11 +400,11 @@ P290437790_A1529441498_audio_en_gr1411.m3u8"#;
 #EXT-X-VERSION:7
 #EXT-X-KEY:METHOD=SAMPLE-AES,URI="skd://itunes.apple.com/P000000000/s1/e1",KEYFORMAT="com.apple.streamingkeydelivery",KEYFORMATVERSIONS="1"
 #EXT-X-MAP:URI="audio.mp4",BYTERANGE="1037@0"
-#EXTINF:14.95365,	
+#EXTINF:14.95365,
 #EXT-X-BYTERANGE:1300622@1037
 audio.mp4
 #EXT-X-KEY:METHOD=SAMPLE-AES,URI="skd://itunes.apple.com/P290437790/c6",KEYFORMAT="com.apple.streamingkeydelivery",KEYFORMATVERSIONS="1"
-#EXTINF:14.95365,	
+#EXTINF:14.95365,
 #EXT-X-BYTERANGE:1532212@1301659
 audio.mp4"#;
 

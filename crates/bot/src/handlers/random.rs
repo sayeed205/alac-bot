@@ -11,7 +11,6 @@ use ferogram::{
     update::{CallbackQuery, IncomingMessage},
     InputMessage, PeerRef,
 };
-use serde_json::Value;
 
 use crate::{
     html::{escape, parse_dynamic_html},
@@ -227,71 +226,28 @@ fn retry_keyboard(source: &str, storefront: &str) -> ferogram::tl::enums::ReplyM
 
 /// fetchSearchAlbum (iTunes album-entity search, random pick).
 async fn fetch_search_album(
-    http: &reqwest::Client,
+    state: &BotState,
     query: &str,
     storefront: &str,
     rng: &mut u64,
 ) -> Result<RandomAlbumCandidate, String> {
     let sf = storefront.to_lowercase();
-    let url = format!(
-        "https://itunes.apple.com/search?term={}&entity=album&limit=50&country={}",
-        urlencode(query),
-        urlencode(&sf),
-    );
-    let response = http
-        .get(&url)
-        .header("User-Agent", engine::catalog::ITUNES_USER_AGENT)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
+    let mut candidates: Vec<RandomAlbumCandidate> = state
+        .rip_deps
+        .catalog()
+        .search_albums(query, 50, &sf)
         .await
-        .map_err(|error| error.to_string())?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(format!("Failed to search iTunes catalog (HTTP {status})"));
-    }
-    let body_text = response.text().await.map_err(|e| e.to_string())?;
-    let body: Value = serde_json::from_str(&body_text).map_err(|e| e.to_string())?;
-    let results = body
-        .get("results")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut candidates: Vec<RandomAlbumCandidate> = results
+        .map_err(|error| error.to_string())?
         .into_iter()
-        .filter_map(|item| {
-            let id = item.get("collectionId")?.as_i64()?.to_string();
-            let url = item
-                .get("collectionViewUrl")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("https://music.apple.com/{sf}/album/{id}"));
-            Some(RandomAlbumCandidate {
-                id,
-                title: item
-                    .get("collectionName")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Unknown Album")
-                    .to_owned(),
-                artist: item
-                    .get("artistName")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Unknown Artist")
-                    .to_owned(),
-                url,
-                release_date: item
-                    .get("releaseDate")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                genre: item
-                    .get("primaryGenreName")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                track_count: item
-                    .get("trackCount")
-                    .and_then(Value::as_i64)
-                    .map(|n| n as usize),
-                storefront: sf.clone(),
-            })
+        .map(|item| RandomAlbumCandidate {
+            id: item.id,
+            title: item.title,
+            artist: item.artist,
+            url: item.url,
+            release_date: item.release_date,
+            genre: item.genre,
+            track_count: item.track_count,
+            storefront: item.storefront,
         })
         .collect();
     if candidates.is_empty() {
@@ -333,18 +289,17 @@ async fn fetch_charts_album(
 }
 
 async fn fetch_wild_album(
-    http: &reqwest::Client,
+    state: &BotState,
     storefront: &str,
     rng: &mut u64,
 ) -> Result<RandomAlbumCandidate, String> {
     let seed = WILD_SEEDS[pick_index(rng, WILD_SEEDS.len())];
-    fetch_search_album(http, seed, storefront, rng).await
+    fetch_search_album(state, seed, storefront, rng).await
 }
 
 /// Fetch one candidate album for a fixed source term.
 async fn fetch_candidate_by_source(
     state: &BotState,
-    http: &reqwest::Client,
     source: &str,
     storefront: &str,
     rng: &mut u64,
@@ -352,10 +307,10 @@ async fn fetch_candidate_by_source(
     let source = source.to_lowercase();
     match source.as_str() {
         "charts" | "top" => fetch_charts_album(state, storefront, rng).await,
-        "wild" | "random" => fetch_wild_album(http, storefront, rng).await,
+        "wild" | "random" => fetch_wild_album(state, storefront, rng).await,
         _ => {
             let term = source_search_term(&source).unwrap_or(source.as_str());
-            fetch_search_album(http, term, storefront, rng).await
+            fetch_search_album(state, term, storefront, rng).await
         }
     }
 }
@@ -363,7 +318,6 @@ async fn fetch_candidate_by_source(
 /// Pick and validate a candidate album, ensuring it has tracks available.
 async fn discover_valid_candidate(
     state: &BotState,
-    http: &reqwest::Client,
     source: &str,
     storefront: &str,
     rng: &mut u64,
@@ -372,7 +326,7 @@ async fn discover_valid_candidate(
     let mut last_err = String::new();
 
     for attempt in 1..=MAX_ATTEMPTS {
-        match fetch_candidate_by_source(state, http, source, storefront, rng).await {
+        match fetch_candidate_by_source(state, source, storefront, rng).await {
             Ok(mut candidate) => {
                 match state
                     .rip_deps
@@ -424,23 +378,6 @@ async fn discover_valid_candidate(
     Err(format!(
         "Failed to find an album with available tracks after {MAX_ATTEMPTS} attempts: {last_err}"
     ))
-}
-
-fn urlencode(value: &str) -> String {
-    let mut out = String::new();
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
-}
-
-fn http_client() -> reqwest::Client {
-    reqwest::Client::new()
 }
 
 pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
@@ -503,10 +440,8 @@ async fn random(state: Arc<BotState>, msg: IncomingMessage) {
     let Ok(loading) = loading else { return };
 
     let mut rng = now_seed();
-    let http = http_client();
     let peer = super::chat_peer_ref(&msg);
-    let result =
-        discover_valid_candidate(&state, &http, &source_arg, &storefront_arg, &mut rng).await;
+    let result = discover_valid_candidate(&state, &source_arg, &storefront_arg, &mut rng).await;
     match result {
         Ok(candidate) => {
             let text = build_preview_text(&candidate);
@@ -610,8 +545,7 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery, action: Discov
                 .await;
 
             let mut rng = now_seed();
-            let http = http_client();
-            match discover_valid_candidate(&state, &http, &source, &storefront, &mut rng).await {
+            match discover_valid_candidate(&state, &source, &storefront, &mut rng).await {
                 Ok(candidate) => {
                     let text = build_preview_text(&candidate);
                     let keyboard = preview_keyboard(&candidate.id, &candidate.storefront, &source);
@@ -675,7 +609,7 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery, action: Discov
                 // The shared dashboard is the only live status surface.
                 status_msg_id: 0,
                 is_admin: true,
-                codec_preference: engine::wrapper::CodecPreference::HighestQuality,
+                codec_preference: apple::CodecPreference::HighestQuality,
             };
             super::ensure_dashboard(&state, marked_chat, query.user_id, true, peer.clone()).await;
 
@@ -804,12 +738,5 @@ mod tests {
         assert_eq!(WILD_SEEDS.len(), 50);
         assert!(WILD_SEEDS.contains(&"future"));
         assert!(WILD_SEEDS.contains(&"memory"));
-    }
-
-    #[test]
-    fn urlencode_encodes_like_js() {
-        assert_eq!(urlencode("rock album"), "rock%20album");
-        assert_eq!(urlencode("hip hop album"), "hip%20hop%20album");
-        assert_eq!(urlencode("us"), "us");
     }
 }

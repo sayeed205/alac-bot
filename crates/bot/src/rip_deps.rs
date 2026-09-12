@@ -2,19 +2,18 @@
 
 use std::{collections::HashMap, path::Path, sync::Arc};
 
+use apple::{AppleProduction, CodecPreference};
 use engine::{
-    catalog::{Catalog, ReqwestTransport},
     orchestrator::deps::{
         AlbumUpload, BoxFuture, CachedAlbum, CachedTrack, OrchestratorDeps, RequestLog,
         SaveTrackInput, SinkError, TelegramSink,
     },
-    playlist::{PlaylistClient, PlaylistData, PlaylistError, ReqwestPlaylistHttp},
-    ripper::{AlacTrackRipper, EngineRipperDeps, RipError, RipProgressCallback, RipperConfig},
+    ripper::{AlacTrackRipper, RipError, RipProgressCallback, RipperConfig},
     settings::BotSettings,
     types::{AlbumTracks, ArtistTracks, TrackKey, TrackRipResult},
-    wrapper::CodecPreference,
     Codec, Provider,
 };
+use music::PlaylistData;
 use tokio_util::sync::CancellationToken;
 
 use crate::telegram_sink::FerogramTelegramSink;
@@ -26,13 +25,11 @@ pub struct RipDeps {
     tracks: db::TracksRepository,
     requests: db::RequestLogRepository,
     settings: db::SettingsStore,
-    catalog: Catalog<ReqwestTransport>,
-    playlist: PlaylistClient<ReqwestPlaylistHttp>,
+    apple: AppleProduction,
     ripper: AlacTrackRipper,
-    ripper_deps: EngineRipperDeps,
     /// Shared with `ripper_deps` so health probes observe the same circuit
     /// and cache state the ripper uses.
-    mirror_policy: engine::streaming::MirrorPolicyManager<engine::streaming::ReqwestHttp>,
+    mirror_policy: apple::MirrorPolicyManager<apple::ReqwestMirrorHttp>,
     upload_retry_base_ms: u64,
     max_retries: u32,
 }
@@ -52,29 +49,8 @@ impl RipDeps {
             .await
             .map_err(|error| SinkError(format!("load settings: {error}")))?;
 
-        let catalog = Catalog::new(ReqwestTransport::new());
-        let ripper_catalog = Catalog::new(ReqwestTransport::new());
-        // The wrapper default is
-        // `http://127.0.0.1:12340`; the mirror key is `ALAC_API_KEY`.
-        let wrapper_url = Some(
-            env_option("ALAC_WRAPPER_URL").unwrap_or_else(|| "http://127.0.0.1:12340".to_owned()),
-        );
-        let wrapper_api_key = env_option("ALAC_WRAPPER_API_KEY");
-        let stream_transport =
-            engine::streaming::StreamTransport::new(engine::streaming::ReqwestHttp::new());
-        let mirror_policy = engine::streaming::MirrorPolicyManager::new(
-            engine::streaming::ReqwestHttp::new(),
-            env_option("ALAC_MIRROR_URL").zip(env_option("ALAC_API_KEY")),
-        );
-        // The ripper and the dashboard health probe share one policy state.
-        let probe_policy = mirror_policy.shared();
-        let ripper_deps = EngineRipperDeps::new(
-            ripper_catalog,
-            mirror_policy,
-            stream_transport,
-            wrapper_url,
-            wrapper_api_key,
-        );
+        let apple = AppleProduction::new(apple::AppleProductionConfig::default());
+        let probe_policy = apple.mirror_policy().shared();
         let retry_base_ms = std::env::var("ALAC_RETRY_BASE_MS")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -101,10 +77,8 @@ impl RipDeps {
             tracks,
             requests,
             settings,
-            catalog,
-            playlist: PlaylistClient::new(ReqwestPlaylistHttp::new()),
             ripper: AlacTrackRipper::new(ripper_config),
-            ripper_deps,
+            apple,
             mirror_policy: probe_policy,
             upload_retry_base_ms: retry_base_ms,
             max_retries,
@@ -133,9 +107,7 @@ impl RipDeps {
     }
 
     /// Exposes the mirror policy for the bot's health probes (dashboard, etc.).
-    pub fn mirror_policy(
-        &self,
-    ) -> &engine::streaming::MirrorPolicyManager<engine::streaming::ReqwestHttp> {
+    pub fn mirror_policy(&self) -> &apple::MirrorPolicyManager<apple::ReqwestMirrorHttp> {
         &self.mirror_policy
     }
 
@@ -153,19 +125,13 @@ impl RipDeps {
         &self.requests
     }
 
-    pub fn catalog(&self) -> &Catalog<ReqwestTransport> {
-        &self.catalog
+    pub fn catalog(&self) -> &apple::Catalog<apple::ReqwestTransport> {
+        self.apple.catalog()
     }
 
-    pub fn playlist(&self) -> &PlaylistClient<ReqwestPlaylistHttp> {
-        &self.playlist
+    pub fn playlist(&self) -> &apple::PlaylistClient<apple::ReqwestPlaylistHttp> {
+        self.apple.playlist()
     }
-}
-
-fn env_option(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
 }
 
 impl OrchestratorDeps for RipDeps {
@@ -271,7 +237,8 @@ impl OrchestratorDeps for RipDeps {
     }
 
     async fn fetch_album_tracks(&self, id: &str, storefront: &str) -> Result<AlbumTracks, String> {
-        self.catalog
+        self.apple
+            .catalog()
             .fetch_album_tracks(id, storefront)
             .await
             .map_err(|error| error.to_string())
@@ -282,7 +249,8 @@ impl OrchestratorDeps for RipDeps {
         id: &str,
         storefront: &str,
     ) -> Result<ArtistTracks, String> {
-        self.catalog
+        self.apple
+            .catalog()
             .fetch_artist_tracks(id, storefront)
             .await
             .map_err(|error| error.to_string())
@@ -292,8 +260,12 @@ impl OrchestratorDeps for RipDeps {
         &self,
         id: &str,
         storefront: &str,
-    ) -> Result<PlaylistData, PlaylistError> {
-        self.playlist.fetch_playlist_tracks(id, storefront).await
+    ) -> Result<PlaylistData, String> {
+        self.apple
+            .playlist()
+            .fetch_playlist_tracks(id, storefront)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn rip(
@@ -307,7 +279,7 @@ impl OrchestratorDeps for RipDeps {
     ) -> Result<TrackRipResult, RipError> {
         self.ripper
             .rip(
-                &self.ripper_deps,
+                self.apple.ripper_deps(),
                 track_id,
                 engine::ripper::RipOptions {
                     storefront,
@@ -321,7 +293,11 @@ impl OrchestratorDeps for RipDeps {
     }
 
     fn fetch_artwork<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Option<Vec<u8>>> {
-        Box::pin(async move { self.ripper_deps.fetch_artwork_bytes(url).await })
+        Box::pin(async move { self.apple.ripper_deps().fetch_artwork_bytes(url).await })
+    }
+
+    fn artwork_url_at_size(&self, url: &str, size: u16) -> String {
+        apple::catalog::artwork_url_at_size(url, size)
     }
 
     fn sink(&self) -> &dyn TelegramSink {

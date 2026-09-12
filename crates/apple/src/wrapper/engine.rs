@@ -11,15 +11,16 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use bytes::Bytes;
+use engine::streaming::{AudioStreamSource, ProgressCallback, StreamError};
+use music::CodecPreference;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use super::{
     client::WrapperLiteClient,
     decryptor::{decrypt_fragment, transform_init_segment},
-    playlist::{parse_master_playlist, parse_media_playlist, AlacStreamInfo, CodecPreference},
+    playlist::{parse_master_playlist, parse_media_playlist, AlacStreamInfo},
 };
-use crate::streaming::{AudioStreamSource, ProgressCallback, StreamError};
 
 pub struct WrapperEngine {
     client: WrapperLiteClient,
@@ -380,7 +381,7 @@ impl WrapperEngine {
     fn decrypt_single_file_stream(
         &self,
         raw_data: &[u8],
-        media_info: &crate::wrapper::playlist::MediaPlaylistInfo,
+        media_info: &super::playlist::MediaPlaylistInfo,
         key_templates: &HashMap<String, Arc<temari::rounds::Template>>,
         track_id: &str,
     ) -> Result<Vec<u8>, StreamError> {
@@ -444,7 +445,7 @@ impl WrapperEngine {
 
     async fn decrypt_multi_segment_stream(
         &self,
-        media_info: &crate::wrapper::playlist::MediaPlaylistInfo,
+        media_info: &super::playlist::MediaPlaylistInfo,
         key_templates: &HashMap<String, Arc<temari::rounds::Template>>,
         track_id: &str,
         _: Option<&ProgressCallback>,

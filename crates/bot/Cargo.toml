@@ -12,6 +12,8 @@ path = "src/main.rs"
 [dependencies]
 db = { path = "../db" }
 engine = { path = "../engine" }
+apple = { path = "../apple" }
+music = { path = "../music" }
 media = { path = "../media" }
 ferogram.workspace = true
 regex.workspace = true

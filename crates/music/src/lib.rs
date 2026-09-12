@@ -76,6 +76,15 @@ pub enum Codec {
     Flac,
 }
 
+/// Audio variant selected when a provider offers more than one representation.
+/// Apple uses this for its highest-quality and Dolby Atmos streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum CodecPreference {
+    #[default]
+    HighestQuality,
+    Atmos,
+}
+
 impl Codec {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -252,6 +261,25 @@ pub struct ArtistTracks {
     pub artist_id: String,
     pub artist_name: String,
     pub tracks: Vec<TrackMeta>,
+}
+
+/// One track inside a playlist.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaylistTrack {
+    pub id: String,
+    pub title: String,
+    pub artist: String,
+    pub duration: Option<u64>,
+}
+
+/// Playlist metadata and its ordered track list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaylistData {
+    pub id: String,
+    pub title: String,
+    pub curator_name: Option<String>,
+    pub description: Option<String>,
+    pub tracks: Vec<PlaylistTrack>,
 }
 
 /// Result of a completed single-track rip.

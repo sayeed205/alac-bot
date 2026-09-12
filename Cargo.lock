@@ -57,6 +57,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "apple"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "base64 0.23.1",
+ "bytes",
+ "cbc",
+ "cmac",
+ "ctr",
+ "engine",
+ "futures-util",
+ "indexmap",
+ "media",
+ "music",
+ "rand 0.10.2",
+ "regex",
+ "reqwest",
+ "rsa",
+ "serde",
+ "serde_json",
+ "sha1 0.10.7",
+ "temari",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -170,6 +199,7 @@ name = "bot"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "apple",
  "chrono",
  "cuid2",
  "db",
@@ -178,6 +208,7 @@ dependencies = [
  "ferogram",
  "futures-util",
  "media",
+ "music",
  "regex",
  "reqwest",
  "serde_json",
@@ -670,26 +701,17 @@ checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 name = "engine"
 version = "0.1.0"
 dependencies = [
- "aes",
- "base64 0.23.1",
  "bytes",
- "cbc",
- "cmac",
- "ctr",
  "cuid2",
  "futures-util",
  "indexmap",
  "media",
  "music",
- "rand 0.10.2",
  "regex",
  "reqwest",
- "rsa",
  "serde",
  "serde_json",
- "sha1 0.10.7",
  "sha2",
- "temari",
  "tempfile",
  "thiserror",
  "tokio",

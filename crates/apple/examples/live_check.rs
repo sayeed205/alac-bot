@@ -1,9 +1,9 @@
 //! One-off live smoke check for the production transport + catalog mapping
 //! against the real iTunes API. NOT part of the test suite (network).
 //!
-//! Run: `cargo run -p engine --example live_check`
+//! Run: `cargo run -p apple --example live_check`
 
-use engine::catalog::{Catalog, ReqwestTransport};
+use apple::catalog::{Catalog, ReqwestTransport};
 
 #[tokio::main]
 async fn main() {

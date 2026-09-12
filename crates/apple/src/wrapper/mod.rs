@@ -10,6 +10,7 @@ pub mod widevine;
 pub use client::{WrapperError, WrapperLiteClient};
 pub use decryptor::{decrypt_fragment, transform_init_segment};
 pub use engine::WrapperEngine;
+pub use music::CodecPreference;
 pub use playlist::{
-    parse_master_playlist, parse_media_playlist, AlacStreamInfo, CodecPreference, MediaPlaylistInfo,
+    parse_master_playlist, parse_media_playlist, AlacStreamInfo, MediaPlaylistInfo,
 };

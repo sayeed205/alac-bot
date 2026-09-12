@@ -17,10 +17,10 @@ use engine::{
         types::{JobPhase, OrchestratorEvent, RipJobOptions},
         RipOrchestrator,
     },
-    playlist::{PlaylistData, PlaylistError},
     settings::BotSettings,
     types::{AlbumTracks, ArtistTracks, ParsedTargetItem, TargetKind, TrackKey},
 };
+use music::PlaylistData;
 
 /// Fake deps whose rip can be held mid-flight from the test.
 #[derive(Clone)]
@@ -37,52 +37,53 @@ impl OrchestratorDeps for RaceDeps {
     }
     async fn find_cached_tracks(
         &self,
-        _keys: &[TrackKey],
+        keys: &[TrackKey],
     ) -> Result<HashMap<TrackKey, CachedTrack>, String> {
+        let _ = keys;
         Ok(HashMap::new())
     }
-    async fn save_track(&self, _input: SaveTrackInput) -> Result<(), String> {
+    async fn save_track(&self, input: SaveTrackInput) -> Result<(), String> {
+        let _ = input;
         Ok(())
     }
-    async fn delete_track(&self, _key: &TrackKey) -> Result<bool, String> {
+    async fn delete_track(&self, key: &TrackKey) -> Result<bool, String> {
+        let _ = key;
         Ok(true)
     }
-    async fn log_request(&self, _log: RequestLog) -> Result<(), String> {
+    async fn log_request(&self, log: RequestLog) -> Result<(), String> {
+        let _ = log;
         Ok(())
     }
-    async fn fetch_album_tracks(
-        &self,
-        _id: &str,
-        _storefront: &str,
-    ) -> Result<AlbumTracks, String> {
+    async fn fetch_album_tracks(&self, id: &str, storefront: &str) -> Result<AlbumTracks, String> {
+        let _ = (id, storefront);
         Err("no albums".to_owned())
     }
     async fn fetch_artist_tracks(
         &self,
-        _id: &str,
-        _storefront: &str,
+        id: &str,
+        storefront: &str,
     ) -> Result<ArtistTracks, String> {
+        let _ = (id, storefront);
         Err("no artists".to_owned())
     }
     async fn fetch_playlist_tracks(
         &self,
-        _id: &str,
-        _storefront: &str,
-    ) -> Result<PlaylistData, PlaylistError> {
-        Err(PlaylistError::TimedOut {
-            elapsed_ms: 1,
-            message: "no playlists".to_owned(),
-        })
+        id: &str,
+        storefront: &str,
+    ) -> Result<PlaylistData, String> {
+        let _ = (id, storefront);
+        Err("Playlist lookup timed out after 1ms: no playlists".to_owned())
     }
     async fn rip(
         &self,
-        _id: &str,
-        _progress: Option<&engine::ripper::RipProgressCallback>,
-        _storefront: &str,
-        _signal: tokio_util::sync::CancellationToken,
-        _temp_dir: Option<&std::path::Path>,
-        _codec_preference: engine::wrapper::CodecPreference,
+        id: &str,
+        progress: Option<&engine::ripper::RipProgressCallback>,
+        storefront: &str,
+        signal: tokio_util::sync::CancellationToken,
+        temp_dir: Option<&std::path::Path>,
+        codec_preference: music::CodecPreference,
     ) -> Result<engine::types::TrackRipResult, engine::ripper::RipError> {
+        let _ = (id, progress, storefront, signal, temp_dir, codec_preference);
         self.rip_calls.fetch_add(1, Ordering::SeqCst);
         // Hold until the test flips the gate or the safety deadline passes.
         // The signal is deliberately NOT observed: the race under test is
@@ -120,7 +121,7 @@ fn race_options() -> RipJobOptions {
         reply_to_message_id: Some(555),
         status_msg_id: 999,
         is_admin: true,
-        codec_preference: engine::wrapper::CodecPreference::HighestQuality,
+        codec_preference: music::CodecPreference::HighestQuality,
     }
 }
 

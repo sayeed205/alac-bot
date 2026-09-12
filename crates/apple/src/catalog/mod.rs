@@ -25,16 +25,40 @@ use std::{
 };
 
 use cache::Cache;
+use music::{AlbumTracks, ArtistTracks, TrackMeta};
 use serde::Deserialize;
 use tracing::{debug, error, info, info_span};
 pub use transport::{
     ReqwestTransport, Transport, TransportError, CHARTS_USER_AGENT, ITUNES_USER_AGENT,
 };
 
-use crate::types::{AlbumTracks, ArtistTracks, ChartAlbum, TrackMeta};
-
 /// Regional storefronts tried after `us` in the fallback chain, in order.
 pub const REGIONAL_STOREFRONTS: [&str; 7] = ["jp", "gb", "in", "ca", "de", "fr", "au"];
+
+/// One album returned by an iTunes album search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlbumSearchResult {
+    pub id: String,
+    pub title: String,
+    pub artist: String,
+    pub url: String,
+    pub release_date: Option<String>,
+    pub genre: Option<String>,
+    pub track_count: Option<usize>,
+    pub storefront: String,
+}
+
+/// An album entry returned by Apple's RSS charts feed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChartAlbum {
+    pub id: String,
+    pub title: String,
+    pub artist: String,
+    pub url: String,
+    pub artwork_url: Option<String>,
+    pub release_date: Option<String>,
+    pub genre: Option<String>,
+}
 
 const TRACK_TIMEOUT: Duration = Duration::from_secs(15);
 const ALBUM_TIMEOUT: Duration = Duration::from_secs(25);
@@ -69,6 +93,7 @@ struct ItunesRawItem {
     collection_artist_id: Option<i64>,
     track_name: Option<String>,
     collection_name: Option<String>,
+    collection_view_url: Option<String>,
     artist_name: Option<String>,
     collection_artist_name: Option<String>,
     composer_name: Option<String>,
@@ -798,6 +823,59 @@ impl<T: Transport> Catalog<T> {
         Ok(tracks)
     }
 
+    /// Search iTunes albums without applying the track-search storefront
+    /// fallback. This is the narrow catalog operation used by the random
+    /// album explorer.
+    pub async fn search_albums(
+        &self,
+        term: &str,
+        limit: i64,
+        storefront: &str,
+    ) -> Result<Vec<AlbumSearchResult>, CatalogError> {
+        let sf = normalize_storefront(storefront);
+        let url = format!(
+            "https://itunes.apple.com/search?term={}&entity=album&limit={}&country={}",
+            urlencode(term),
+            urlencode(&limit.to_string()),
+            urlencode(&sf),
+        );
+        let body = self
+            .transport
+            .get(&url, ITUNES_USER_AGENT, Duration::from_secs(10))
+            .await
+            .map_err(|error| match error {
+                TransportError::Fetch { source, .. } => CatalogError::Message(source.to_string()),
+                TransportError::Status { status } => CatalogError::Message(format!(
+                    "Failed to search iTunes catalog (HTTP {status})"
+                )),
+            })?;
+        let results = Self::parse_results(&body)?;
+        Ok(results
+            .into_iter()
+            .filter_map(|item| {
+                let id = item.collection_id?.to_string();
+                Some(AlbumSearchResult {
+                    id: id.clone(),
+                    title: item
+                        .collection_name
+                        .unwrap_or_else(|| "Unknown Album".to_owned()),
+                    artist: item
+                        .artist_name
+                        .unwrap_or_else(|| "Unknown Artist".to_owned()),
+                    url: item
+                        .collection_view_url
+                        .unwrap_or_else(|| format!("https://music.apple.com/{sf}/album/{id}")),
+                    release_date: item.release_date,
+                    genre: item.primary_genre_name,
+                    track_count: item
+                        .track_count
+                        .and_then(|count| usize::try_from(count).ok()),
+                    storefront: sf.clone(),
+                })
+            })
+            .collect())
+    }
+
     /// Search the catalog. Never errors on transport/HTTP failures —
     /// degrades to an empty list; empty results trigger storefront
     /// fallbacks. The final (possibly empty) result is cached.
@@ -899,3 +977,75 @@ impl<T: Transport> Catalog<T> {
 
 /// Production catalog handle shared across handlers/worker tasks.
 pub type SharedCatalog = Arc<Catalog<ReqwestTransport>>;
+
+/// Fetch the legacy Marketing Tools RSS album feed used by release discovery.
+/// This remains separate from [`Catalog::fetch_charts_albums`] because the bot
+/// historically used this endpoint and treats all failures as a skipped feed.
+pub async fn fetch_marketing_tools_albums(
+    http: &reqwest::Client,
+    storefront: &str,
+    limit: usize,
+) -> Result<Vec<ChartAlbum>, String> {
+    let url = format!(
+        "https://rss.applemarketingtools.com/api/v2/{storefront}/music/most-played/{limit}/albums.json"
+    );
+    let response = http
+        .get(url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}", response.status()));
+    }
+    let body = response.text().await.map_err(|error| error.to_string())?;
+    let data: ChartsResponse = serde_json::from_str(&body).map_err(|error| error.to_string())?;
+    Ok(data
+        .feed
+        .and_then(|feed| feed.results)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|album| ChartAlbum {
+            id: album.id,
+            title: album.name,
+            artist: album.artist_name,
+            url: album.url,
+            artwork_url: album
+                .artwork_url_100
+                .as_deref()
+                .map(|url| format_artwork_url(Some(url))),
+            release_date: album.release_date,
+            genre: album.genres.first().and_then(|genre| genre.name.clone()),
+        })
+        .collect())
+}
+
+/// Look up the tracks for one Marketing Tools album. Release discovery uses
+/// this narrow operation so its legacy eight-second request and no-fallback
+/// behavior stay separate from the user-facing catalog lookup.
+pub async fn fetch_discovery_album_tracks(
+    http: &reqwest::Client,
+    storefront: &str,
+    album_id: &str,
+) -> Result<Vec<TrackMeta>, String> {
+    let url =
+        format!("https://itunes.apple.com/lookup?id={album_id}&entity=song&country={storefront}");
+    let response = http
+        .get(url)
+        .header("User-Agent", ITUNES_USER_AGENT)
+        .timeout(Duration::from_secs(8))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}", response.status()));
+    }
+    let body = response.text().await.map_err(|error| error.to_string())?;
+    let results =
+        Catalog::<ReqwestTransport>::parse_results(&body).map_err(|error| error.to_string())?;
+    Ok(results
+        .into_iter()
+        .filter(|item| item.wrapper_type.as_deref() == Some("track"))
+        .map(|item| map_itunes_item(&item))
+        .collect())
+}

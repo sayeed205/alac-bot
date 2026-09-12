@@ -15,10 +15,29 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use music::{PlaylistData, PlaylistTrack};
 use serde::Deserialize;
 
 /// Chrome UA used by every request here.
 pub const APPLE_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/145.0.0.0";
+
+/// User-facing playlist resolution failures.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PlaylistError {
+    #[error("Playlist lookup timed out after {elapsed_ms}ms: {message}")]
+    TimedOut { elapsed_ms: u64, message: String },
+    #[error("Playlist {playlist_id} not found on storefront '{storefront}'")]
+    NotFound {
+        playlist_id: String,
+        storefront: String,
+    },
+    #[error("Apple Music API returned HTTP {status}")]
+    Http { status: u16 },
+    #[error("No playlist found matching ID {playlist_id}")]
+    NoData { playlist_id: String },
+    #[error("{0}")]
+    Other(String),
+}
 
 /// One header for an HTTP GET.
 pub type Header = (String, String);
@@ -86,42 +105,6 @@ impl PlaylistHttp for ReqwestPlaylistHttp {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum PlaylistError {
-    #[error("Playlist lookup timed out after {elapsed_ms}ms: {message}")]
-    TimedOut { elapsed_ms: u64, message: String },
-    #[error("Playlist {playlist_id} not found on storefront '{storefront}'")]
-    NotFound {
-        playlist_id: String,
-        storefront: String,
-    },
-    #[error("Apple Music API returned HTTP {status}")]
-    Http { status: u16 },
-    #[error("No playlist found matching ID {playlist_id}")]
-    NoData { playlist_id: String },
-    #[error("{0}")]
-    Other(String),
-}
-
-/// One track inside a playlist.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PlaylistTrack {
-    pub id: String,
-    pub title: String,
-    pub artist: String,
-    pub duration: Option<u64>,
-}
-
-/// Playlist metadata + full track list.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PlaylistData {
-    pub id: String,
-    pub title: String,
-    pub curator_name: Option<String>,
-    pub description: Option<String>,
-    pub tracks: Vec<PlaylistTrack>,
-}
-
 #[derive(Debug, Default)]
 struct TokenCache {
     token: Option<String>,
@@ -171,7 +154,8 @@ impl<H: PlaylistHttp> PlaylistClient<H> {
     /// committed bearer token. Callers that observe an authentication failure
     /// should invalidate the cache and retry once.
     pub async fn get_developer_token(&self) -> Result<String, String> {
-        let _refresh_guard = self.token_refresh.lock().await;
+        let refresh_guard = self.token_refresh.lock().await;
+        let _ = &refresh_guard;
         let now = now_ms();
         {
             let cache = self.token_cache.lock().expect("token cache poisoned");
@@ -660,8 +644,9 @@ mod tests {
             &self,
             url: &str,
             headers: &[Header],
-            _timeout: Duration,
+            timeout: Duration,
         ) -> Result<String, PlaylistHttpError> {
+            let _ = timeout;
             self.requested
                 .lock()
                 .unwrap()

@@ -23,10 +23,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use music::CodecPreference;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    catalog::artwork_url_at_size,
     orchestrator::{
         caption::{
             format_album_details_caption, format_dump_caption, format_zip_dump_caption,
@@ -47,7 +47,6 @@ use crate::{
     ripper::RipProgressCallback,
     settings::BotSettings,
     types::{AlbumTracks, ArtistTracks, Codec, Provider, TargetKind, TrackKey, TrackRipResult},
-    wrapper::CodecPreference,
     zip::{
         album_generation_hash, create_zip_archive, plan_zip_parts_with_codec,
         sanitize_archive_filename, ZipTrackEntry, TELEGRAM_SPLIT_THRESHOLD_BYTES,
@@ -739,7 +738,7 @@ impl RipOrchestrator {
                             }
                             Ok(())
                         }
-                        Err(e) => Err(e.to_string()),
+                        Err(e) => Err(e),
                     }
                 }
             };
@@ -2230,7 +2229,7 @@ async fn finalize_zip<D: OrchestratorDeps>(
     // degrade to a thumbless document).
     let thumb_path = match &ctx.zip_artwork_url {
         Some(url) if !url.is_empty() => {
-            let thumb_url = artwork_url_at_size(url, 320);
+            let thumb_url = deps.artwork_url_at_size(url, 320);
             match deps.fetch_artwork(&thumb_url).await {
                 Some(bytes) if !bytes.is_empty() => {
                     let path = dir.join("cover_thumb.jpg");

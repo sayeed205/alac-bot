@@ -1,8 +1,10 @@
-use std::{collections::HashMap, sync::Mutex, time::Duration};
-
-use engine::streaming::{
-    MirrorError, MirrorHttp, MirrorHttpError, MirrorPolicyManager, MANIFEST_URL,
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
 };
+
+use apple::{MirrorError, MirrorHttp, MirrorHttpError, MirrorPolicyManager, MANIFEST_URL};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
@@ -11,16 +13,17 @@ enum Reply {
     Error(MirrorHttpError),
 }
 
+#[derive(Clone)]
 struct FakeHttp {
     routes: HashMap<String, Reply>,
-    calls: Mutex<Vec<String>>,
+    calls: Arc<Mutex<Vec<String>>>,
 }
 
 impl FakeHttp {
     fn new() -> Self {
         Self {
             routes: HashMap::new(),
-            calls: Mutex::new(Vec::new()),
+            calls: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -37,10 +40,11 @@ impl MirrorHttp for FakeHttp {
     async fn get(
         &self,
         url: &str,
-        _headers: &[(&str, String)],
-        _timeout: Duration,
-        _signal: Option<&CancellationToken>,
+        headers: &[(&str, String)],
+        timeout: Duration,
+        signal: Option<&CancellationToken>,
     ) -> Result<String, MirrorHttpError> {
+        let _ = (headers, timeout, signal);
         self.calls.lock().unwrap().push(url.to_owned());
         self.routes
             .iter()
@@ -260,4 +264,27 @@ async fn malformed_manifest_json_propagates_without_opening_circuit() {
     ));
     assert!(!manager.is_circuit_open());
     assert_eq!(manager.http().calls().len(), 1);
+}
+
+#[tokio::test]
+async fn shared_clone_observes_and_updates_the_same_policy_state() {
+    let manager = MirrorPolicyManager::new(ready_http(), None);
+    let shared = manager.shared();
+
+    manager.record_failure("shared failure");
+    assert!(shared.is_circuit_open());
+    assert_eq!(
+        shared
+            .get_endpoint(false, None)
+            .await
+            .unwrap_err()
+            .to_string(),
+        "shared failure"
+    );
+
+    shared.clear_cache();
+    assert!(!manager.is_circuit_open());
+    manager.get_endpoint(false, None).await.unwrap();
+    shared.get_endpoint(false, None).await.unwrap();
+    assert_eq!(manager.http().calls().len(), 2, "cache is shared by clones");
 }

@@ -8,7 +8,7 @@ use std::{
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use super::http::{MirrorHttp, MirrorHttpError, CHROME_USER_AGENT};
+use crate::mirror_http::{MirrorHttp, MirrorHttpError, CHROME_USER_AGENT};
 
 /// The decoded manifest URL used by the TypeScript implementation.
 pub const MANIFEST_URL: &str =

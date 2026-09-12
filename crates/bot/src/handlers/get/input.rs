@@ -1,6 +1,6 @@
 //! Input handling for the `/get` and `/zip` commands.
 //!
-//! The parser itself lives in `engine`; this module only deals with Telegram
+//! The parser itself lives in `apple`; this module only deals with Telegram
 //! replies and text documents .
 
 use std::{
@@ -8,11 +8,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use engine::{
-    limits::MAX_DOCUMENT_BYTES,
-    parser::{extract_batch_items, parse_alac_input},
-    types::ParsedTargetItem,
-};
+use apple::{extract_batch_items, parse_alac_input};
+use engine::{limits::MAX_DOCUMENT_BYTES, types::ParsedTargetItem};
 use ferogram::update::IncomingMessage;
 
 #[derive(Debug, Clone)]

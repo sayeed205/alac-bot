@@ -1,17 +1,12 @@
-//! Mirror-policy discovery and failover audio streaming.
+//! Provider-neutral HTTP and audio streaming primitives.
 
 mod http;
-mod mirror_policy;
 mod stream_transport;
 
 pub use http::{
-    ByteStream, MirrorHttp, MirrorHttpError, ReqwestHttp, StreamBodyError, StreamHttp,
-    StreamHttpError, StreamHttpResponse, CHROME_USER_AGENT,
-};
-pub use mirror_policy::{
-    MirrorEndpoint, MirrorError, MirrorPolicy, MirrorPolicyManager, MANIFEST_URL,
+    ByteStream, ReqwestHttp, StreamBodyError, StreamHttp, StreamHttpError, StreamHttpResponse,
+    CHROME_USER_AGENT,
 };
 pub use stream_transport::{
-    is_non_retryable_error, AudioStreamSource, ConnectStreamOptions, FetchEndpointOptions,
-    ProgressCallback, StreamError, StreamRetryConfig, StreamTransport,
+    AudioStreamSource, FetchEndpointOptions, ProgressCallback, StreamError, StreamTransport,
 };

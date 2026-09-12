@@ -135,53 +135,16 @@ async fn discover_album_tracks_via_itunes(
     map: &mut HashMap<String, String>,
     counts: &mut HashMap<String, usize>,
 ) {
-    let url =
-        format!("https://itunes.apple.com/lookup?id={album_id}&entity=song&country={storefront}");
-    let Ok(response) = http
-        .get(&url)
-        .header("User-Agent", engine::catalog::ITUNES_USER_AGENT)
-        .timeout(std::time::Duration::from_secs(8))
-        .send()
-        .await
+    let Ok(tracks) = apple::catalog::fetch_discovery_album_tracks(http, storefront, album_id).await
     else {
         return;
     };
-    if !response.status().is_success() {
-        return;
-    }
-    let Ok(body) = response.text().await else {
-        return;
-    };
-    let Ok(body) = serde_json::from_str::<Value>(&body) else {
-        return;
-    };
-    let results = body
-        .get("results")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    for item in results {
-        let wrapper = item
-            .get("wrapperType")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let Some(track_id) = item.get("trackId").and_then(Value::as_i64) else {
-            continue;
-        };
-        if wrapper != "track" {
-            continue;
-        }
-        let track_release: String = item
-            .get("releaseDate")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .chars()
-            .take(10)
-            .collect();
+    for track in tracks {
+        let track_release = track.release_date;
         let qualifies =
             track_release.is_empty() || track_release.as_str() >= cutoff || album_release >= cutoff;
         if qualifies {
-            let id = track_id.to_string();
+            let id = track.id;
             let inserted = map.insert(id, storefront.to_owned()).is_none();
             if inserted {
                 *counts.entry(storefront.to_owned()).or_insert(0) += 1;
@@ -199,48 +162,20 @@ async fn discover_from_rss_albums(
     map: &mut HashMap<String, String>,
     counts: &mut HashMap<String, usize>,
 ) {
-    let url = format!(
-        "https://rss.applemarketingtools.com/api/v2/{storefront}/music/most-played/50/albums.json"
-    );
-    let Ok(response) = http
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
+    let Ok(albums) = apple::catalog::fetch_marketing_tools_albums(http, storefront, 50).await
     else {
         return;
     };
-    if !response.status().is_success() {
-        return;
-    }
-    let Ok(body) = response.text().await else {
-        return;
-    };
-    let Ok(body) = serde_json::from_str::<Value>(&body) else {
-        return;
-    };
-    let albums = body
-        .get("feed")
-        .and_then(|feed| feed.get("results"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
     for album in albums {
-        let Some(album_id) = album.get("id").and_then(Value::as_str) else {
-            continue;
-        };
-        if album_id.is_empty() {
+        if album.id.is_empty() {
             continue;
         }
-        let album_release = album
-            .get("releaseDate")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        let album_release = album.release_date.as_deref().unwrap_or_default();
         if album_release >= cutoff {
             discover_album_tracks_via_itunes(
                 http,
                 storefront,
-                album_id,
+                &album.id,
                 album_release,
                 cutoff,
                 map,
@@ -399,7 +334,7 @@ async fn run_auto_dump_pipeline_inner(
         reply_to_message_id: None,
         status_msg_id: 0,
         is_admin: true,
-        codec_preference: engine::wrapper::CodecPreference::HighestQuality,
+        codec_preference: apple::CodecPreference::HighestQuality,
     };
     let job = state
         .rip_orchestrator

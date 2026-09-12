@@ -133,25 +133,28 @@ async fn save_find_delete_search_and_prune_tracks() {
     );
     let ids = repository.get_all_track_ids().await.expect("all ids");
     assert!(
-        ids.contains(&TrackKey::apple(first.clone()))
-            && ids.contains(&TrackKey::apple(second.clone()))
+        ids.contains(&TrackKey::apple_codec(first.clone(), Codec::Alac))
+            && ids.contains(&TrackKey::apple_codec(second.clone(), Codec::Alac))
     );
     // Global prune. This shared test
     // database can retain rows from interrupted earlier runs, so only assert
     // that our second row was pruned rather than an exact global count.
     assert!(
         repository
-            .delete_tracks_not_in(std::slice::from_ref(&TrackKey::apple(first.clone())))
+            .delete_tracks_not_in(std::slice::from_ref(&TrackKey::apple_codec(
+                first.clone(),
+                Codec::Alac,
+            )))
             .await
             .expect("prune")
             >= 1
     );
     assert!(repository
-        .delete_track(&TrackKey::apple(first.clone()))
+        .delete_track(&TrackKey::apple_codec(first.clone(), Codec::Alac))
         .await
         .expect("delete hit"));
     assert!(!repository
-        .delete_track(&TrackKey::apple(first.clone()))
+        .delete_track(&TrackKey::apple_codec(first.clone(), Codec::Alac))
         .await
         .expect("delete miss"));
     clean_tracks(&client, &prefix).await;

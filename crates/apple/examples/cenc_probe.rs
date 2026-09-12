@@ -1,14 +1,12 @@
 //! One-off live validation of the Widevine/CENC webplayback path.
 //!
-//! Usage: `cargo run -p engine --example cenc_probe -- <adamId> [out.m4a]`
+//! Usage: `cargo run -p apple --example cenc_probe -- <adamId> [out.m4a]`
 //! Rips via wrapper-lite (`ALAC_WRAPPER_URL`, default
 //! `http://localhost:12340`) and writes the decrypted stream to the output
 //! path (default `/tmp/opencode/cenc_probe.m4a`).
 
-use engine::{
-    streaming::StreamError,
-    wrapper::{CodecPreference, WrapperEngine},
-};
+use apple::wrapper::{CodecPreference, WrapperEngine};
+use engine::streaming::StreamError;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

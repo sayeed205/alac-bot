@@ -9,17 +9,15 @@
 //!     duplicate when it matches the default rip's codec)
 //!
 //! Usage:
-//!   cargo run -p engine --example listen_test -- [outdir] [trackId...]
+//!   cargo run -p apple --example listen_test -- [outdir] [trackId...]
 //!
 //! Defaults: outdir `/tmp/opencode/listen`, tracks `1499378607`
 //! (ALAC + Atmos capable) and `1561413895` (no lossless → CENC AAC).
 //! Wrapper URL comes from `ALAC_WRAPPER_URL` (default
 //! `http://localhost:12340`).
 
-use engine::{
-    streaming::StreamError,
-    wrapper::{CodecPreference, WrapperEngine},
-};
+use apple::wrapper::{CodecPreference, WrapperEngine};
+use engine::streaming::StreamError;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

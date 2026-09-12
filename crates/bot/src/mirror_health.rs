@@ -4,7 +4,7 @@
 //! explicit (`/status` open/refresh and terminal job refreshes); there is no
 //! background poller, so an unreachable mirror never floods the transport.
 //!
-//! The probe reuses the engine's `MirrorPolicyManager` endpoint resolution
+//! The probe reuses Apple's `MirrorPolicyManager` endpoint resolution
 //! (manifest + `/status` + wrapper availability) and adds a lightweight HEAD
 //! reachability check against the resolved mirror URL, mirroring the TS
 //! `HEAD mirrorUrl` probe. Both layers are behind one trait so tests run
@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use engine::streaming::{MirrorEndpoint, MirrorError, MirrorPolicyManager};
+use apple::{MirrorEndpoint, MirrorError, MirrorHttp, MirrorPolicyManager};
 
 /// One health observation. `label` matches the mirrorStatus strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,17 +56,17 @@ pub trait MirrorHealthProbe: Send + Sync {
 /// Production probe over the engine policy manager shared with the ripper.
 /// The 4s ceiling is the policy manager's health timeout (the oracles
 /// HEAD probe timeout), so no separate field is needed.
-pub struct PolicyProbe<H: engine::streaming::MirrorHttp> {
+pub struct PolicyProbe<H: MirrorHttp> {
     policy: MirrorPolicyManager<H>,
 }
 
-impl<H: engine::streaming::MirrorHttp> PolicyProbe<H> {
+impl<H: MirrorHttp> PolicyProbe<H> {
     pub fn new(policy: MirrorPolicyManager<H>) -> Self {
         Self { policy }
     }
 }
 
-impl<H: engine::streaming::MirrorHttp> MirrorHealthProbe for PolicyProbe<H> {
+impl<H: MirrorHttp> MirrorHealthProbe for PolicyProbe<H> {
     fn probe(&self) -> futures_util::future::BoxFuture<'_, HealthReport> {
         Box::pin(async move {
             let started = Instant::now();

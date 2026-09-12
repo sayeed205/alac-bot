@@ -15,11 +15,11 @@ use engine::{
     ripper::{
         AlacTrackRipper, RipError, RipOptions, RipProgressCallback, RipperConfig, RipperDeps,
     },
-    streaming::{AudioStreamSource, ByteStream, MirrorEndpoint, ProgressCallback},
+    streaming::{AudioStreamSource, ByteStream, ProgressCallback},
     types::TrackMeta,
-    wrapper::CodecPreference,
 };
 use futures_util::stream;
+use music::CodecPreference;
 use tokio_util::sync::CancellationToken;
 
 fn meta() -> TrackMeta {
@@ -70,7 +70,6 @@ struct FakeDeps {
     meta: TrackMeta,
     meta_failures: u32, // first N track_meta calls fail
     meta_calls: AtomicU32,
-    mirror: Option<MirrorEndpoint>,
     stream_chunks: Vec<Bytes>,
     stream_content_length: Option<u64>,
     connect_fails: u32, // first N connect calls fail with a stall message
@@ -88,10 +87,6 @@ impl FakeDeps {
             meta: meta(),
             meta_failures: 0,
             meta_calls: AtomicU32::new(0),
-            mirror: Some(MirrorEndpoint {
-                mirror_url: "https://mirror".into(),
-                api_key: "k".into(),
-            }),
             stream_chunks: vec![Bytes::from(vec![1u8; 10]), Bytes::from(vec![2u8; 5])],
             stream_content_length: None,
             connect_fails: 0,
@@ -106,7 +101,8 @@ impl FakeDeps {
 }
 
 impl RipperDeps for FakeDeps {
-    async fn track_meta(&self, _track_id: &str, _storefront: &str) -> Result<TrackMeta, RipError> {
+    async fn track_meta(&self, track_id: &str, storefront: &str) -> Result<TrackMeta, RipError> {
+        let _ = (track_id, storefront);
         let n = self.meta_calls.fetch_add(1, Ordering::SeqCst);
         if n < self.meta_failures {
             return Err(RipError::Message("catalog down".into()));
@@ -114,18 +110,14 @@ impl RipperDeps for FakeDeps {
         Ok(self.meta.clone())
     }
 
-    async fn mirror_endpoint(&self, _signal: Option<&CancellationToken>) -> Option<MirrorEndpoint> {
-        self.mirror.clone()
-    }
-
     async fn connect_stream(
         &self,
-        _track_id: &str,
-        primary: Option<MirrorEndpoint>,
-        _signal: Option<CancellationToken>,
-        _on_progress: Option<ProgressCallback>,
-        _codec_preference: CodecPreference,
+        track_id: &str,
+        signal: Option<CancellationToken>,
+        on_progress: Option<ProgressCallback>,
+        codec_preference: CodecPreference,
     ) -> Result<AudioStreamSource, RipError> {
+        let _ = (track_id, signal, on_progress, codec_preference);
         let n = self.connect_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(ref err) = self.connect_error {
             return Err(RipError::Message(err.clone()));
@@ -135,7 +127,6 @@ impl RipperDeps for FakeDeps {
                 "Audio stream stalled on test: no data received for 45s".into(),
             ));
         }
-        assert_eq!(primary.is_some(), self.mirror.is_some());
         Ok(fake_stream_with_length(
             self.stream_chunks.clone(),
             self.stream_content_length,
@@ -144,13 +135,15 @@ impl RipperDeps for FakeDeps {
 
     async fn fetch_lyrics(
         &self,
-        _track_id: &str,
-        _meta: &engine::lyrics::LyricsMeta,
+        track_id: &str,
+        meta: &engine::lyrics::LyricsMeta,
     ) -> Option<String> {
+        let _ = (track_id, meta);
         self.lyrics.clone()
     }
 
-    async fn fetch_artwork(&self, _url: &str) -> Option<Vec<u8>> {
+    async fn fetch_artwork(&self, url: &str) -> Option<Vec<u8>> {
+        let _ = url;
         self.artwork.clone()
     }
 
@@ -158,10 +151,11 @@ impl RipperDeps for FakeDeps {
         &self,
         raw_path: &Path,
         output_path: &Path,
-        _meta: &TrackMeta,
-        _cover: Option<&[u8]>,
-        _lyrics: Option<&str>,
+        meta: &TrackMeta,
+        cover: Option<&[u8]>,
+        lyrics: Option<&str>,
     ) -> Result<(), RipError> {
+        let _ = (meta, cover, lyrics);
         self.tag_calls
             .lock()
             .unwrap()
@@ -338,21 +332,24 @@ async fn cancelled_message_bypasses_retries() {
     // Simulate: connect fails with the cancelled message.
     struct CancelledDeps(FakeDeps);
     impl RipperDeps for CancelledDeps {
-        async fn track_meta(&self, _t: &str, _s: &str) -> Result<TrackMeta, RipError> {
-            self.0.track_meta(_t, _s).await
-        }
-        async fn mirror_endpoint(&self, s: Option<&CancellationToken>) -> Option<MirrorEndpoint> {
-            self.0.mirror_endpoint(s).await
+        async fn track_meta(
+            &self,
+            track_id: &str,
+            storefront: &str,
+        ) -> Result<TrackMeta, RipError> {
+            self.0.track_meta(track_id, storefront).await
         }
         async fn connect_stream(
             &self,
-            _t: &str,
-            p: Option<MirrorEndpoint>,
-            s: Option<CancellationToken>,
-            o: Option<ProgressCallback>,
-            cp: engine::wrapper::CodecPreference,
+            track_id: &str,
+            signal: Option<CancellationToken>,
+            on_progress: Option<ProgressCallback>,
+            codec_preference: music::CodecPreference,
         ) -> Result<AudioStreamSource, RipError> {
-            let _ = self.0.connect_stream(_t, p, s, o, cp).await?;
+            let _ = self
+                .0
+                .connect_stream(track_id, signal, on_progress, codec_preference)
+                .await?;
             Err(RipError::Message("Download was cancelled".into()))
         }
         async fn fetch_lyrics(&self, t: &str, m: &engine::lyrics::LyricsMeta) -> Option<String> {
@@ -403,20 +400,6 @@ async fn cancellation_mid_rip_no_retry() {
 }
 
 #[tokio::test]
-async fn mirror_none_still_connects() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut deps = FakeDeps::ok();
-    deps.mirror = None;
-    let ripper = AlacTrackRipper::new(config(dir.path(), 3, 1));
-    let result = ripper
-        .rip(&deps, "42", RipOptions::new("us"))
-        .await
-        .unwrap();
-    assert_eq!(result.title, "Title");
-    assert_eq!(deps.connect_calls.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
 async fn artwork_empty_vec_means_no_cover() {
     let dir = tempfile::tempdir().unwrap();
     let mut deps = FakeDeps::ok();
@@ -440,17 +423,14 @@ async fn stalled_stream_is_retryable() {
         async fn track_meta(&self, t: &str, s: &str) -> Result<TrackMeta, RipError> {
             self.0.track_meta(t, s).await
         }
-        async fn mirror_endpoint(&self, s: Option<&CancellationToken>) -> Option<MirrorEndpoint> {
-            self.0.mirror_endpoint(s).await
-        }
         async fn connect_stream(
             &self,
-            _t: &str,
-            _p: Option<MirrorEndpoint>,
-            _s: Option<CancellationToken>,
-            _o: Option<ProgressCallback>,
-            _cp: engine::wrapper::CodecPreference,
+            track_id: &str,
+            signal: Option<CancellationToken>,
+            on_progress: Option<ProgressCallback>,
+            codec_preference: music::CodecPreference,
         ) -> Result<AudioStreamSource, RipError> {
+            let _ = (track_id, signal, on_progress, codec_preference);
             self.0.connect_calls.fetch_add(1, Ordering::SeqCst);
             let pending: ByteStream = Box::pin(stream::pending());
             Ok(AudioStreamSource {
