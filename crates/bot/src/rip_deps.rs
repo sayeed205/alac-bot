@@ -13,6 +13,7 @@ use engine::{
     types::{AlbumTracks, ArtistTracks, TrackKey, TrackRipResult},
     Codec, Provider,
 };
+use lyrics::LyricsRegistry;
 use music::PlaylistData;
 use tokio_util::sync::CancellationToken;
 
@@ -49,7 +50,8 @@ impl RipDeps {
             .await
             .map_err(|error| SinkError(format!("load settings: {error}")))?;
 
-        let apple = AppleProduction::new(apple::AppleProductionConfig::default());
+        let apple = AppleProduction::new(apple::AppleProductionConfig::default())
+            .with_lyrics_registry(LyricsRegistry::all_sources());
         let probe_policy = apple.mirror_policy().shared();
         let retry_base_ms = std::env::var("ALAC_RETRY_BASE_MS")
             .ok()

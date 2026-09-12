@@ -10,6 +10,7 @@ use engine::streaming::{
     AudioStreamSource, FetchEndpointOptions, ProgressCallback, StreamError, StreamHttp,
     StreamTransport,
 };
+use lyrics::{LyricsFuture, LyricsHttp, LyricsLookup, LyricsRegistry};
 use music::CodecPreference;
 use tokio_util::sync::CancellationToken;
 
@@ -338,6 +339,7 @@ pub struct AppleRipperDeps {
     acquisition: AppleStreamAcquisition<engine::streaming::ReqwestHttp, ReqwestMirrorHttp>,
     artwork_client: reqwest::Client,
     lyrics_client: reqwest::Client,
+    lyrics_registry: LyricsRegistry,
     media: media::MediaProcessor,
 }
 
@@ -351,6 +353,7 @@ impl AppleRipperDeps {
             acquisition,
             artwork_client: reqwest::Client::new(),
             lyrics_client: reqwest::Client::new(),
+            lyrics_registry: LyricsRegistry::default(),
             media: media::MediaProcessor::new(),
         }
     }
@@ -361,6 +364,11 @@ impl AppleRipperDeps {
 
     pub fn mirror_policy(&self) -> &MirrorPolicyManager<ReqwestMirrorHttp> {
         self.acquisition.mirror_policy()
+    }
+
+    pub fn with_lyrics_registry(mut self, registry: LyricsRegistry) -> Self {
+        self.lyrics_registry = registry;
+        self
     }
 
     pub fn catalog(&self) -> &crate::catalog::Catalog<crate::catalog::ReqwestTransport> {
@@ -433,6 +441,11 @@ impl AppleProduction {
         }
     }
 
+    pub fn with_lyrics_registry(mut self, registry: LyricsRegistry) -> Self {
+        self.ripper_deps = self.ripper_deps.with_lyrics_registry(registry);
+        self
+    }
+
     pub fn catalog(&self) -> &crate::catalog::Catalog<crate::catalog::ReqwestTransport> {
         self.ripper_deps.catalog()
     }
@@ -462,20 +475,22 @@ struct ReqwestLyricsHttp {
     client: reqwest::Client,
 }
 
-impl engine::lyrics::LyricsHttp for ReqwestLyricsHttp {
-    async fn get_json(&self, url: &str) -> Option<String> {
-        let response = self
-            .client
-            .get(url)
-            .header("User-Agent", "AlacBot/1.0")
-            .timeout(Duration::from_secs(5))
-            .send()
-            .await
-            .ok()?;
-        if !response.status().is_success() {
-            return None;
-        }
-        response.text().await.ok()
+impl LyricsHttp for ReqwestLyricsHttp {
+    fn get_json<'a>(&'a self, url: &'a str) -> LyricsFuture<'a, Option<String>> {
+        Box::pin(async move {
+            let response = self
+                .client
+                .get(url)
+                .header("User-Agent", "AlacBot/1.0")
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await
+                .ok()?;
+            if !response.status().is_success() {
+                return None;
+            }
+            response.text().await.ok()
+        })
     }
 }
 
@@ -508,15 +523,11 @@ impl engine::ripper::RipperDeps for AppleRipperDeps {
             .map_err(engine::ripper::RipError::from)
     }
 
-    async fn fetch_lyrics(
-        &self,
-        track_id: &str,
-        meta: &engine::lyrics::LyricsMeta,
-    ) -> Option<String> {
+    async fn fetch_lyrics(&self, lookup: &LyricsLookup) -> Option<String> {
         let http = ReqwestLyricsHttp {
             client: self.lyrics_client.clone(),
         };
-        engine::lyrics::fetch_lyrics(&http, track_id, meta).await
+        lyrics::lookup(&http, &self.lyrics_registry, lookup).await
     }
 
     async fn fetch_artwork(&self, url: &str) -> Option<Vec<u8>> {

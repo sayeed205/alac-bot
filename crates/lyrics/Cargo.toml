@@ -1,0 +1,21 @@
+[package]
+name = "lyrics"
+description = "Provider-agnostic lyrics lookup, ranking, and rendering"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["lrclib"]
+lrclib = []
+betterlyrics = []
+paxsenix = []
+
+[dependencies]
+futures-util.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time", "test-util"] }

@@ -2,7 +2,7 @@
 //! orchestration. Provider implementations live in separate crates.
 
 pub mod limits;
-pub mod lyrics;
+pub use lyrics;
 pub mod orchestrator;
 pub mod progress;
 pub mod queue;

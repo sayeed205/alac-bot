@@ -76,6 +76,7 @@ struct FakeDeps {
     connect_error: Option<String>,
     connect_calls: AtomicU32,
     lyrics: Option<String>,
+    lyrics_lookups: Mutex<Vec<engine::lyrics::LyricsLookup>>,
     artwork: Option<Vec<u8>>,
     tag_calls: Mutex<Vec<(PathBuf, PathBuf)>>,
     tag_should_fail: bool,
@@ -93,6 +94,7 @@ impl FakeDeps {
             connect_error: None,
             connect_calls: AtomicU32::new(0),
             lyrics: Some("la\nla".into()),
+            lyrics_lookups: Mutex::new(Vec::new()),
             artwork: Some(vec![1, 2, 3]),
             tag_calls: Mutex::new(Vec::new()),
             tag_should_fail: false,
@@ -133,12 +135,8 @@ impl RipperDeps for FakeDeps {
         ))
     }
 
-    async fn fetch_lyrics(
-        &self,
-        track_id: &str,
-        meta: &engine::lyrics::LyricsMeta,
-    ) -> Option<String> {
-        let _ = (track_id, meta);
+    async fn fetch_lyrics(&self, lookup: &engine::lyrics::LyricsLookup) -> Option<String> {
+        self.lyrics_lookups.lock().unwrap().push(lookup.clone());
         self.lyrics.clone()
     }
 
@@ -352,8 +350,8 @@ async fn cancelled_message_bypasses_retries() {
                 .await?;
             Err(RipError::Message("Download was cancelled".into()))
         }
-        async fn fetch_lyrics(&self, t: &str, m: &engine::lyrics::LyricsMeta) -> Option<String> {
-            self.0.fetch_lyrics(t, m).await
+        async fn fetch_lyrics(&self, lookup: &engine::lyrics::LyricsLookup) -> Option<String> {
+            self.0.fetch_lyrics(lookup).await
         }
         async fn fetch_artwork(&self, u: &str) -> Option<Vec<u8>> {
             self.0.fetch_artwork(u).await
@@ -442,8 +440,8 @@ async fn stalled_stream_is_retryable() {
                 content_length: None,
             })
         }
-        async fn fetch_lyrics(&self, t: &str, m: &engine::lyrics::LyricsMeta) -> Option<String> {
-            self.0.fetch_lyrics(t, m).await
+        async fn fetch_lyrics(&self, lookup: &engine::lyrics::LyricsLookup) -> Option<String> {
+            self.0.fetch_lyrics(lookup).await
         }
         async fn fetch_artwork(&self, u: &str) -> Option<Vec<u8>> {
             self.0.fetch_artwork(u).await

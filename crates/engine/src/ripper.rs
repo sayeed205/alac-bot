@@ -8,14 +8,14 @@ use std::{
 };
 
 use futures_util::{FutureExt, StreamExt};
-use music::CodecPreference;
+use music::{CodecPreference, Provider};
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::{
     limits::MAX_AUDIO_BYTES,
-    lyrics::LyricsMeta,
+    lyrics::LyricsLookup,
     streaming::{AudioStreamSource, ProgressCallback, StreamError},
     tagger,
     types::{TrackMeta, TrackRipResult},
@@ -90,11 +90,7 @@ pub trait RipperDeps: Send + Sync {
         on_progress: Option<ProgressCallback>,
         codec_preference: CodecPreference,
     ) -> impl Future<Output = Result<AudioStreamSource, RipError>> + Send;
-    fn fetch_lyrics(
-        &self,
-        track_id: &str,
-        meta: &LyricsMeta,
-    ) -> impl Future<Output = Option<String>> + Send;
+    fn fetch_lyrics(&self, lookup: &LyricsLookup) -> impl Future<Output = Option<String>> + Send;
     fn fetch_artwork(&self, url: &str) -> impl Future<Output = Option<Vec<u8>>> + Send;
     fn tag_m4a(
         &self,
@@ -297,17 +293,20 @@ impl AlacTrackRipper {
             );
 
         // Concurrent prefetch: lyrics + artwork run while the audio streams.
-            let lyrics_meta = LyricsMeta {
+            let lyrics_lookup = LyricsLookup {
                 title: meta.title.clone(),
-                artist: meta.artist.clone(),
+                artists: vec![meta.artist.clone()],
                 album: Some(meta.album.clone()).filter(|a| !a.is_empty()),
                 duration: Some(meta.duration_secs).filter(|d| *d != 0),
+                provider_ids: [(Provider::Apple.as_str().to_owned(), track_id.to_owned())]
+                    .into_iter()
+                    .collect(),
             };
             let lyrics_task = {
-                let meta = lyrics_meta.clone();
+                let lookup = lyrics_lookup.clone();
                 let track_id = track_id.to_owned();
                 async move {
-                    match deps.fetch_lyrics(&track_id, &meta).await {
+                    match deps.fetch_lyrics(&lookup).await {
                         Some(l) => {
                             debug!(track_id, found = true, "Lyrics prefetch completed");
                             Some(l)

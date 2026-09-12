@@ -13,6 +13,7 @@ path = "src/main.rs"
 db = { path = "../db" }
 engine = { path = "../engine" }
 apple = { path = "../apple" }
+lyrics = { path = "../lyrics", features = ["lrclib", "betterlyrics", "paxsenix"] }
 music = { path = "../music" }
 media = { path = "../media" }
 ferogram.workspace = true
