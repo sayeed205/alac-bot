@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use music::CodecPreference;
+pub use music::{Rendition, RenditionPolicy, RenditionWorkPlan, RenditionWorkUnit};
 use tokio_util::sync::CancellationToken;
 
 use crate::types::{ParsedTargetItem, Provider, TargetKind};
@@ -89,9 +89,48 @@ pub struct RipJobOptions {
     pub reply_to_message_id: Option<i64>,
     pub status_msg_id: i64,
     pub is_admin: bool,
-    /// Audio variant the ripper selects when several are offered
-    /// (highest quality vs Dolby Atmos).
-    pub codec_preference: CodecPreference,
+    /// Renditions to acquire for this request. Primary is always required;
+    /// Atmos, when selected, is optional.
+    pub rendition_policy: RenditionPolicy,
+}
+
+#[cfg(test)]
+mod rendition_tests {
+    use music::Codec;
+
+    use super::*;
+
+    #[test]
+    fn optional_atmos_plan_is_track_major_and_constrained() {
+        let plan = RenditionPolicy::PrimaryWithOptionalAtmos.work_plan(["one", "two"]);
+        assert_eq!(
+            plan.units()
+                .iter()
+                .map(|unit| (unit.track_id(), unit.rendition(), unit.required()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("one", Rendition::Primary, true),
+                ("one", Rendition::Atmos, false),
+                ("two", Rendition::Primary, true),
+                ("two", Rendition::Atmos, false),
+            ]
+        );
+        assert_eq!(
+            plan.units()[0].accepted_cache_codecs(),
+            &[Codec::Alac, Codec::Aac]
+        );
+        assert_eq!(plan.units()[1].accepted_cache_codecs(), &[Codec::Ec3]);
+    }
+
+    #[test]
+    fn primary_only_plan_has_no_atmos_unit() {
+        let plan = RenditionPolicy::PrimaryOnly.work_plan(["one"]);
+        assert_eq!(plan.units().len(), 1);
+        assert_eq!(
+            plan.units()[0].codec_preference(),
+            music::CodecPreference::HighestQuality
+        );
+    }
 }
 
 /// A progress snapshot; every display field is optional.

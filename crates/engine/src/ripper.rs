@@ -27,11 +27,17 @@ use crate::{
 pub enum RipError {
     #[error("{0}")]
     Message(String),
+    #[error("{0}")]
+    Unavailable(String),
 }
 
 impl From<StreamError> for RipError {
     fn from(error: StreamError) -> Self {
-        RipError::Message(error.to_string())
+        match error {
+            StreamError::Message(message) => RipError::Message(message),
+            StreamError::Unavailable(message) => RipError::Unavailable(message),
+            other => RipError::Message(other.to_string()),
+        }
     }
 }
 
@@ -188,6 +194,9 @@ impl AlacTrackRipper {
             match self.rip_once(deps, track_id, &options).await {
                 Ok(result) => return Ok(result),
                 Err(err) => {
+                    if matches!(err, RipError::Unavailable(_)) {
+                        return Err(err);
+                    }
                     let message = err.to_string();
                     if options.signal.as_ref().is_some_and(|t| t.is_cancelled())
                         || message == "Download was cancelled"

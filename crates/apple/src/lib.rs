@@ -26,7 +26,7 @@ pub use mirror_policy::{
 };
 pub use music::{
     AlbumTracks, ArtistTracks, CodecPreference, ParsedAlacInput, ParsedTargetItem, PlaylistData,
-    PlaylistTrack, TrackMeta,
+    PlaylistTrack, Rendition, RenditionPolicy, TrackMeta,
 };
 pub use parser::{extract_batch_items, parse_alac_input, parse_single_item};
 pub use playlist::{
@@ -35,5 +35,5 @@ pub use playlist::{
 };
 pub use wrapper::{
     parse_master_playlist, parse_media_playlist, AlacStreamInfo, MediaPlaylistInfo, WrapperEngine,
-    WrapperError, WrapperLiteClient,
+    WrapperError, WrapperLiteClient, WrapperTrackOutcome, WrapperUnavailableReason,
 };

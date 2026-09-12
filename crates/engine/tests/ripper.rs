@@ -74,6 +74,7 @@ struct FakeDeps {
     stream_content_length: Option<u64>,
     connect_fails: u32, // first N connect calls fail with a stall message
     connect_error: Option<String>,
+    connect_unavailable: bool,
     connect_calls: AtomicU32,
     lyrics: Option<String>,
     lyrics_lookups: Mutex<Vec<engine::lyrics::LyricsLookup>>,
@@ -92,6 +93,7 @@ impl FakeDeps {
             stream_content_length: None,
             connect_fails: 0,
             connect_error: None,
+            connect_unavailable: false,
             connect_calls: AtomicU32::new(0),
             lyrics: Some("la\nla".into()),
             lyrics_lookups: Mutex::new(Vec::new()),
@@ -121,6 +123,9 @@ impl RipperDeps for FakeDeps {
     ) -> Result<AudioStreamSource, RipError> {
         let _ = (track_id, signal, on_progress, codec_preference);
         let n = self.connect_calls.fetch_add(1, Ordering::SeqCst);
+        if self.connect_unavailable {
+            return Err(RipError::Unavailable("Dolby Atmos is unavailable".into()));
+        }
         if let Some(ref err) = self.connect_error {
             return Err(RipError::Message(err.clone()));
         }
@@ -631,4 +636,24 @@ async fn not_found_404_skips_retries_completely() {
         1,
         "should have stopped on attempt 0 without retrying"
     );
+}
+
+#[tokio::test]
+async fn typed_unavailable_outcome_bypasses_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut deps = FakeDeps::ok();
+    deps.connect_unavailable = true;
+    let ripper = AlacTrackRipper::new(config(dir.path(), 4, 1000));
+
+    let error = ripper
+        .rip(
+            &deps,
+            "42",
+            RipOptions::new(Provider::Apple, "us").with_codec_preference(CodecPreference::Atmos),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, RipError::Unavailable(_)));
+    assert_eq!(deps.connect_calls.load(Ordering::SeqCst), 1);
 }

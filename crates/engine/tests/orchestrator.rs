@@ -674,7 +674,7 @@ fn options(items: Vec<ParsedTargetItem>, is_admin: bool) -> RipJobOptions {
         reply_to_message_id: Some(555),
         status_msg_id: 999,
         is_admin,
-        codec_preference: music::CodecPreference::HighestQuality,
+        rendition_policy: engine::orchestrator::types::RenditionPolicy::PrimaryOnly,
     }
 }
 
@@ -1574,7 +1574,7 @@ fn zip_options(album: &str, cache_only: bool, explicit: bool, force: bool) -> Ri
         reply_to_message_id: Some(555),
         status_msg_id: 999,
         is_admin: true,
-        codec_preference: music::CodecPreference::HighestQuality,
+        rendition_policy: engine::orchestrator::types::RenditionPolicy::PrimaryOnly,
     }
 }
 

@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     mirror_http::MirrorHttp,
     mirror_policy::{MirrorEndpoint, MirrorPolicyManager},
-    wrapper::WrapperEngine,
+    wrapper::{WrapperEngine, WrapperTrackOutcome, WrapperUnavailableReason},
     ReqwestMirrorHttp,
 };
 
@@ -27,6 +27,15 @@ pub struct AppleStreamAcquisition<S: StreamHttp, M: MirrorHttp> {
     wrapper_url: Option<String>,
     wrapper_api_key: Option<String>,
     retry_config: AppleAcquisitionConfig,
+}
+
+/// Outcome of one acquisition round. Keeping optional absence separate from
+/// ordinary failures prevents a successful response from an untrusted/direct
+/// endpoint from being mistaken for a provider-confirmed missing rendition.
+enum AcquisitionAttempt {
+    Source(AudioStreamSource),
+    OptionalUnavailable(WrapperUnavailableReason),
+    NoSource,
 }
 
 /// Retry settings for one Apple stream acquisition.
@@ -147,7 +156,7 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
             }
 
             let mut round_errors = Vec::new();
-            if let Some(stream) = self
+            match self
                 .connect_once(
                     track_id,
                     signal.clone(),
@@ -158,7 +167,11 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
                 )
                 .await
             {
-                return Ok(stream);
+                AcquisitionAttempt::Source(stream) => return Ok(stream),
+                AcquisitionAttempt::OptionalUnavailable(reason) => {
+                    return Err(StreamError::Unavailable(reason.to_string()));
+                }
+                AcquisitionAttempt::NoSource => {}
             }
             for message in round_errors {
                 if !all_errors.contains(&message) {
@@ -211,7 +224,7 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
         codec_preference: CodecPreference,
         primary: Option<&MirrorEndpoint>,
         errors: &mut Vec<String>,
-    ) -> Option<AudioStreamSource> {
+    ) -> AcquisitionAttempt {
         if let Some(primary) = primary {
             if codec_preference == CodecPreference::Atmos {
                 errors.push("Skipping primary mirror: Atmos requested".to_owned());
@@ -230,7 +243,7 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
                 match result {
                     Ok(stream) => {
                         self.mirror_policy.record_success();
-                        return Some(stream);
+                        return Self::accept_stream(stream, codec_preference, errors);
                     }
                     Err(error) => {
                         let message = error.to_string();
@@ -248,12 +261,15 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
             );
         }
 
-        let clean_wrapper = self
+        let Some(clean_wrapper) = self
             .wrapper_url
             .as_deref()
             .map(str::trim)
             .map(|url| url.trim_end_matches('/'))
-            .filter(|url| !url.is_empty())?;
+            .filter(|url| !url.is_empty())
+        else {
+            return AcquisitionAttempt::NoSource;
+        };
         if let Some(callback) = on_progress.as_ref() {
             callback("Primary mirror unavailable. Connecting to fallback wrapper...");
         }
@@ -264,13 +280,18 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
         if is_wrapper_lite {
             let wrapper_engine = WrapperEngine::new(clean_wrapper, self.wrapper_api_key.as_deref());
             match wrapper_engine
-                .rip_track(track_id, signal, on_progress, codec_preference)
+                .rip_track_with_outcome(track_id, signal, on_progress, codec_preference)
                 .await
             {
-                Ok(source) => Some(source),
+                Ok(WrapperTrackOutcome::Source(source)) => {
+                    Self::accept_stream(source, codec_preference, errors)
+                }
+                Ok(WrapperTrackOutcome::Unavailable(reason)) => {
+                    AcquisitionAttempt::OptionalUnavailable(reason)
+                }
                 Err(error) => {
                     errors.push(format!("Native wrapper engine failed: {error}"));
-                    None
+                    AcquisitionAttempt::NoSource
                 }
             }
         } else {
@@ -295,13 +316,38 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
                     })
                     .await
                 {
-                    Ok(stream) => return Some(stream),
+                    Ok(stream) => match Self::accept_stream(stream, codec_preference, errors) {
+                        AcquisitionAttempt::Source(source) => {
+                            return AcquisitionAttempt::Source(source)
+                        }
+                        AcquisitionAttempt::OptionalUnavailable(reason) => {
+                            return AcquisitionAttempt::OptionalUnavailable(reason)
+                        }
+                        AcquisitionAttempt::NoSource => {}
+                    },
                     Err(error) => {
                         errors.push(format!("Wrapper candidate ({endpoint}) failed: {error}"))
                     }
                 }
             }
-            None
+            AcquisitionAttempt::NoSource
+        }
+    }
+
+    fn accept_stream(
+        stream: AudioStreamSource,
+        codec_preference: CodecPreference,
+        errors: &mut Vec<String>,
+    ) -> AcquisitionAttempt {
+        if codec_preference == CodecPreference::Atmos && !stream.codec.eq_ignore_ascii_case("ec-3")
+        {
+            errors.push(format!(
+                "Rejected non-EC-3 stream from {} for Atmos request (technical mismatch)",
+                stream.source_name
+            ));
+            AcquisitionAttempt::NoSource
+        } else {
+            AcquisitionAttempt::Source(stream)
         }
     }
 }

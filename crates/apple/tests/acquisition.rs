@@ -9,7 +9,8 @@ use apple::{
 };
 use bytes::Bytes;
 use engine::streaming::{
-    ByteStream, ProgressCallback, StreamHttp, StreamHttpError, StreamHttpResponse, StreamTransport,
+    ByteStream, ProgressCallback, StreamError, StreamHttp, StreamHttpError, StreamHttpResponse,
+    StreamTransport,
 };
 use futures_util::stream;
 use tokio_util::sync::CancellationToken;
@@ -41,6 +42,7 @@ impl MirrorHttp for FakeMirror {
 struct FakeStream {
     calls: Arc<Mutex<Vec<String>>>,
     failures: Mutex<Vec<String>>,
+    success_codecs: Mutex<Vec<String>>,
     cancel_on_fetch: bool,
 }
 
@@ -49,6 +51,16 @@ impl FakeStream {
         Self {
             calls,
             failures: Mutex::new(failures.iter().map(|url| (*url).to_owned()).collect()),
+            success_codecs: Mutex::new(Vec::new()),
+            cancel_on_fetch: false,
+        }
+    }
+
+    fn with_success_codecs(codecs: &[&str], calls: Arc<Mutex<Vec<String>>>) -> Self {
+        Self {
+            calls,
+            failures: Mutex::new(Vec::new()),
+            success_codecs: Mutex::new(codecs.iter().map(|codec| (*codec).to_owned()).collect()),
             cancel_on_fetch: false,
         }
     }
@@ -80,12 +92,20 @@ impl StreamHttp for FakeStream {
             self.failures.lock().unwrap().remove(index);
             return Err(StreamHttpError::Network("transient".to_owned()));
         }
+        let codec = {
+            let mut success_codecs = self.success_codecs.lock().unwrap();
+            if success_codecs.is_empty() {
+                "alac".to_owned()
+            } else {
+                success_codecs.remove(0)
+            }
+        };
         let body: ByteStream = Box::pin(stream::once(
             async move { Ok(Bytes::from_static(b"audio")) },
         ));
         Ok(StreamHttpResponse {
             status: 200,
-            codec: Some("alac".to_owned()),
+            codec: Some(codec),
             bit_depth: Some("24".to_owned()),
             sample_rate: Some("96000".to_owned()),
             content_length: Some(5),
@@ -205,6 +225,7 @@ async fn cancellation_does_not_retry_or_open_primary_circuit() {
     let stream = FakeStream {
         calls: Arc::clone(&calls),
         failures: Mutex::new(Vec::new()),
+        success_codecs: Mutex::new(Vec::new()),
         cancel_on_fetch: true,
     };
     let acquisition = AppleStreamAcquisition::with_config(
@@ -300,6 +321,49 @@ async fn fallback_reports_progress_when_primary_is_unavailable() {
         *messages.lock().unwrap(),
         vec!["Primary mirror unavailable. Connecting to fallback wrapper..."]
     );
+}
+
+#[tokio::test]
+async fn atmos_non_ec3_response_retries_wrapper_candidates() {
+    let (acquisition, calls) = acquisition(
+        &[],
+        FakeMirror { available: false },
+        Some("https://wrapper"),
+        3,
+    );
+    let error = acquisition
+        .connect_stream("42", None, None, apple::CodecPreference::Atmos)
+        .await
+        .expect_err("non-EC-3 responses must remain retryable");
+
+    assert!(
+        matches!(error, StreamError::Message(message) if message.contains("technical mismatch"))
+    );
+    assert_eq!(calls.lock().unwrap().len(), 6);
+}
+
+#[tokio::test]
+async fn atmos_non_ec3_wrapper_candidate_falls_back_to_ec3_candidate() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let policy = MirrorPolicyManager::new(FakeMirror { available: false }, None);
+    let stream = FakeStream::with_success_codecs(&["mp4a.40.2", "ec-3"], Arc::clone(&calls));
+    let acquisition = AppleStreamAcquisition::with_config(
+        StreamTransport::new(stream),
+        policy,
+        Some("https://wrapper".to_owned()),
+        None,
+        AppleAcquisitionConfig {
+            retry_rounds: 1,
+            retry_base_delay_ms: 0,
+        },
+    );
+
+    let source = acquisition
+        .connect_stream("42", None, None, apple::CodecPreference::Atmos)
+        .await
+        .expect("the second wrapper candidate is a valid Atmos stream");
+    assert_eq!(source.codec, "ec-3");
+    assert_eq!(calls.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]

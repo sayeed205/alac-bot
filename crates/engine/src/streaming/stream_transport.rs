@@ -20,6 +20,11 @@ pub struct FetchEndpointOptions {
 pub enum StreamError {
     #[error("{0}")]
     Message(String),
+    /// The requested optional rendition is known not to exist. This is
+    /// distinct from a transport or provider failure so callers can skip
+    /// the rendition without consuming retry budget.
+    #[error("{0}")]
+    Unavailable(String),
     #[error(
         "incomplete audio body from {source_name}: expected {expected} bytes, received {received}"
     )]

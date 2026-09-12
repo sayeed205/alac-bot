@@ -427,7 +427,7 @@ async fn get(state: Arc<BotState>, query: CallbackQuery, track_id: String) {
         reply_to_message_id: None,
         status_msg_id: 0,
         is_admin,
-        codec_preference: apple::CodecPreference::HighestQuality,
+        rendition_policy: engine::orchestrator::types::RenditionPolicy::PrimaryOnly,
     };
     match state
         .rip_orchestrator

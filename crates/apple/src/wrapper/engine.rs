@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use super::{
-    client::WrapperLiteClient,
+    client::{WrapperError, WrapperLiteClient, WrapperUnavailableReason},
     decryptor::{decrypt_fragment, transform_init_segment},
     playlist::{parse_master_playlist, parse_media_playlist, AlacStreamInfo},
 };
@@ -25,6 +25,14 @@ use super::{
 pub struct WrapperEngine {
     client: WrapperLiteClient,
     http_client: reqwest::Client,
+}
+
+/// Result of wrapper acquisition while retaining the only provenance that can
+/// justify an optional-unavailable outcome.
+#[derive(Debug)]
+pub enum WrapperTrackOutcome {
+    Source(AudioStreamSource),
+    Unavailable(WrapperUnavailableReason),
 }
 
 impl WrapperEngine {
@@ -55,6 +63,25 @@ impl WrapperEngine {
         on_progress: Option<ProgressCallback>,
         preference: CodecPreference,
     ) -> Result<AudioStreamSource, StreamError> {
+        match self
+            .rip_track_with_outcome(track_id, signal, on_progress, preference)
+            .await?
+        {
+            WrapperTrackOutcome::Source(source) => Ok(source),
+            WrapperTrackOutcome::Unavailable(reason) => {
+                Err(StreamError::Unavailable(reason.to_string()))
+            }
+        }
+    }
+
+    /// Acquire a stream without erasing playlist-selection provenance.
+    pub(crate) async fn rip_track_with_outcome(
+        &self,
+        track_id: &str,
+        signal: Option<CancellationToken>,
+        on_progress: Option<ProgressCallback>,
+        preference: CodecPreference,
+    ) -> Result<WrapperTrackOutcome, StreamError> {
         if signal.as_ref().is_some_and(|s| s.is_cancelled()) {
             return Err(StreamError::Message("Download was cancelled".into()));
         }
@@ -87,6 +114,9 @@ impl WrapperEngine {
         // master playlist; fall back to the web playback playlist.
         let stream_info = match parse_master_playlist(&master_text, &master_url, preference) {
             Ok(info) => info,
+            Err(WrapperError::Unavailable(reason)) => {
+                return Ok(WrapperTrackOutcome::Unavailable(reason));
+            }
             Err(error) => {
                 if !looks_like_master_playlist(&master_text) {
                     self.webplayback_fallback(track_id, signal.as_ref(), on_progress.as_ref())
@@ -141,7 +171,8 @@ impl WrapperEngine {
                     signal.as_ref(),
                     on_progress.as_ref(),
                 )
-                .await;
+                .await
+                .map(WrapperTrackOutcome::Source);
         }
 
         let mut key_templates: HashMap<String, Arc<temari::rounds::Template>> = HashMap::new();
@@ -204,14 +235,14 @@ impl WrapperEngine {
             Ok(Bytes::from(decrypted_bytes))
         }));
 
-        Ok(AudioStreamSource {
+        Ok(WrapperTrackOutcome::Source(AudioStreamSource {
             stream,
             source_name: format!("wrapper ({})", self.client.base_url()),
             codec: alac_info.codec,
             bit_depth: alac_info.bit_depth,
             sample_rate: alac_info.sample_rate,
             content_length: Some(total_size),
-        })
+        }))
     }
 
     /// Handles stores with no lossless HLS: `/m3u8` hands out a direct

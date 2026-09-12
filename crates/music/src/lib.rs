@@ -85,6 +85,115 @@ pub enum CodecPreference {
     Atmos,
 }
 
+/// Renditions requested by one orchestration job. Atmos is deliberately an
+/// optional addition to the required primary rendition; there is no
+/// Atmos-only policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RenditionPolicy {
+    #[default]
+    PrimaryOnly,
+    PrimaryWithOptionalAtmos,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rendition {
+    Primary,
+    Atmos,
+}
+
+impl Rendition {
+    pub const fn codec_preference(self) -> CodecPreference {
+        match self {
+            Self::Primary => CodecPreference::HighestQuality,
+            Self::Atmos => CodecPreference::Atmos,
+        }
+    }
+
+    pub const fn required(self) -> bool {
+        matches!(self, Self::Primary)
+    }
+
+    pub const fn accepted_cache_codecs(self) -> &'static [Codec] {
+        match self {
+            Self::Primary => &[Codec::Alac, Codec::Aac],
+            Self::Atmos => &[Codec::Ec3],
+        }
+    }
+}
+
+impl RenditionPolicy {
+    pub const fn renditions(self) -> &'static [Rendition] {
+        match self {
+            Self::PrimaryOnly => &[Rendition::Primary],
+            Self::PrimaryWithOptionalAtmos => &[Rendition::Primary, Rendition::Atmos],
+        }
+    }
+}
+
+/// One ordered acquisition unit for an orchestration request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenditionWorkUnit {
+    track_id: String,
+    rendition: Rendition,
+}
+
+impl RenditionWorkUnit {
+    pub fn track_id(&self) -> &str {
+        &self.track_id
+    }
+
+    pub const fn rendition(&self) -> Rendition {
+        self.rendition
+    }
+
+    pub const fn codec_preference(&self) -> CodecPreference {
+        self.rendition.codec_preference()
+    }
+
+    pub const fn required(&self) -> bool {
+        self.rendition.required()
+    }
+
+    pub const fn accepted_cache_codecs(&self) -> &'static [Codec] {
+        self.rendition.accepted_cache_codecs()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenditionWorkPlan {
+    units: Vec<RenditionWorkUnit>,
+}
+
+impl RenditionPolicy {
+    pub fn work_plan<I, S>(self, track_ids: I) -> RenditionWorkPlan
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut units = Vec::new();
+        for track_id in track_ids {
+            let track_id = track_id.into();
+            for &rendition in self.renditions() {
+                units.push(RenditionWorkUnit {
+                    track_id: track_id.clone(),
+                    rendition,
+                });
+            }
+        }
+        RenditionWorkPlan { units }
+    }
+}
+
+impl RenditionWorkPlan {
+    pub fn units(&self) -> &[RenditionWorkUnit] {
+        &self.units
+    }
+
+    pub fn into_units(self) -> Vec<RenditionWorkUnit> {
+        self.units
+    }
+}
+
 impl Codec {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -315,5 +424,41 @@ mod tests {
         let key = TrackKey::apple("123");
         assert_eq!(key.codec, None);
         assert_eq!(key.clone().with_codec(Codec::Alac).track_id, "123");
+    }
+
+    #[test]
+    fn rendition_policy_constrains_atmos_to_an_optional_ec3_unit() {
+        assert_eq!(
+            RenditionPolicy::PrimaryOnly.renditions(),
+            &[Rendition::Primary]
+        );
+        assert_eq!(
+            RenditionPolicy::PrimaryWithOptionalAtmos.renditions(),
+            &[Rendition::Primary, Rendition::Atmos]
+        );
+        assert!(Rendition::Primary.required());
+        assert!(!Rendition::Atmos.required());
+        assert_eq!(
+            Rendition::Primary.accepted_cache_codecs(),
+            &[Codec::Alac, Codec::Aac]
+        );
+        assert_eq!(Rendition::Atmos.accepted_cache_codecs(), &[Codec::Ec3]);
+    }
+
+    #[test]
+    fn work_unit_derives_policy_from_rendition_identity() {
+        let units = RenditionPolicy::PrimaryWithOptionalAtmos
+            .work_plan(["track"])
+            .into_units();
+
+        assert_eq!(units[0].track_id(), "track");
+        assert_eq!(units[0].rendition(), Rendition::Primary);
+        assert_eq!(units[0].codec_preference(), CodecPreference::HighestQuality);
+        assert!(units[0].required());
+        assert_eq!(units[0].accepted_cache_codecs(), &[Codec::Alac, Codec::Aac]);
+        assert_eq!(units[1].rendition(), Rendition::Atmos);
+        assert_eq!(units[1].codec_preference(), CodecPreference::Atmos);
+        assert!(!units[1].required());
+        assert_eq!(units[1].accepted_cache_codecs(), &[Codec::Ec3]);
     }
 }

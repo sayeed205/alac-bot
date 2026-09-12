@@ -937,10 +937,7 @@ impl RipOrchestrator {
             Some(&check_label),
             None,
         );
-        let target_codec = match options.codec_preference {
-            CodecPreference::Atmos => Codec::Ec3,
-            CodecPreference::HighestQuality => Codec::Alac,
-        };
+        let target_codec = Codec::Alac;
         let requested_ids: Vec<TrackKey> = tracks_to_process
             .iter()
             .map(|t| TrackKey::new(options.provider, t.id.clone()).with_codec(target_codec))
@@ -1903,7 +1900,7 @@ async fn run_lane_one<D: OrchestratorDeps>(input: LaneOneContext<'_, D>) -> RipJ
                 on_progress: Some(&on_progress),
                 signal: Some(queue_signal.clone()),
                 output_dir: Some(&rip_job_dir),
-                codec_preference: ctx.options.codec_preference,
+                codec_preference: CodecPreference::HighestQuality,
             };
             match deps
                 .providers()
@@ -1940,17 +1937,6 @@ async fn run_lane_one<D: OrchestratorDeps>(input: LaneOneContext<'_, D>) -> RipJ
                         };
                         if better {
                             *codec = Some(rip_result.codec.clone());
-                        }
-                    }
-                    if ctx.options.codec_preference == CodecPreference::Atmos
-                        && rip_result.codec != "ec-3"
-                    {
-                        let mut warnings = ctx.atmos_warning.lock().expect("atmos poisoned");
-                        if warnings.is_none() {
-                            *warnings = Some(
-                                "Dolby Atmos was not available for this track; delivered the highest available quality instead."
-                                    .to_owned(),
-                            );
                         }
                     }
                     let upload_item = PipelineRipResult {
@@ -2334,11 +2320,7 @@ async fn finalize_zip<D: OrchestratorDeps>(
     // Before republishing complete parts, drop the previous rows so a
     // shrinking part count cannot leave stale parts behind. The upsert
     // below re-saves each fresh part.
-    let album_codec = if ctx.options.codec_preference == CodecPreference::Atmos {
-        Codec::Ec3
-    } else {
-        zip_codec.parse::<Codec>().unwrap_or(Codec::Alac)
-    };
+    let album_codec = zip_codec.parse::<Codec>().unwrap_or(Codec::Alac);
     if complete {
         if let Err(error) = deps
             .delete_albums(ctx.options.provider, &ctx.zip_album_id, Some(album_codec))
@@ -2446,15 +2428,12 @@ async fn finalize_zip<D: OrchestratorDeps>(
                     let _ = tokio::fs::remove_file(&output).await;
                     continue;
                 }
-                let album_codec = if ctx.options.codec_preference == CodecPreference::Atmos {
-                    Codec::Ec3
-                } else {
-                    ctx.zip_codec
-                        .lock()
-                        .ok()
-                        .and_then(|c| c.as_deref().and_then(|s| s.parse().ok()))
-                        .unwrap_or(Codec::Alac)
-                };
+                let album_codec = ctx
+                    .zip_codec
+                    .lock()
+                    .ok()
+                    .and_then(|c| c.as_deref().and_then(|s| s.parse().ok()))
+                    .unwrap_or(Codec::Alac);
                 let caption = format_zip_dump_caption(
                     &DumpZipCaptionMetadata {
                         provider: ctx.options.provider,
@@ -3154,7 +3133,7 @@ mod hardening_tests {
             reply_to_message_id: None,
             status_msg_id: 0,
             is_admin,
-            codec_preference: CodecPreference::HighestQuality,
+            rendition_policy: music::RenditionPolicy::PrimaryOnly,
         }
     }
 

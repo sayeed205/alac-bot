@@ -5,11 +5,30 @@
 //! - `/m3u8?adamId={id}` -> master playlist URL
 //! - `/key?adamId={id}&uri={uri}` -> FairPlay key templates for Temari
 
-use std::time::Duration;
+use std::{fmt, fmt::Display, time::Duration};
 
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
+
+/// A typed absence that is safe to propagate to an optional rendition.
+///
+/// This value is only constructed after a syntactically valid master playlist
+/// has been parsed and variant selection found no Atmos stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrapperUnavailableReason {
+    NoAtmosVariantInValidMaster,
+}
+
+impl Display for WrapperUnavailableReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoAtmosVariantInValidMaster => {
+                formatter.write_str("No Dolby Atmos stream variant found in master playlist")
+            }
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum WrapperError {
@@ -21,6 +40,11 @@ pub enum WrapperError {
     Api { code: i64, message: String },
     #[error("Temari template error: {0}")]
     Template(String),
+    /// The requested rendition is not present in the provider playlist.
+    /// This is distinct from a malformed playlist or transport failure so
+    /// optional renditions can be skipped without retrying.
+    #[error("{0}")]
+    Unavailable(WrapperUnavailableReason),
     #[error("{0}")]
     Message(String),
 }
