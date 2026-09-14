@@ -156,7 +156,7 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
             }
 
             let mut round_errors = Vec::new();
-            match self
+            let attempt = self
                 .connect_once(
                     track_id,
                     signal.clone(),
@@ -165,11 +165,21 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
                     primary.as_ref(),
                     &mut round_errors,
                 )
-                .await
-            {
+                .await;
+            if signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                return Err(StreamError::Message("Download was cancelled".to_owned()));
+            }
+            match attempt {
                 AcquisitionAttempt::Source(stream) => return Ok(stream),
                 AcquisitionAttempt::OptionalUnavailable(reason) => {
-                    return Err(StreamError::Unavailable(reason.to_string()));
+                    // A typed absence is conclusive only when no earlier
+                    // candidate failed technically.  Otherwise preserve the
+                    // transport/parse/decrypt failure and its retry budget;
+                    // a later non-EC-3 response cannot prove absence after a
+                    // failed candidate was never resolved.
+                    if all_errors.is_empty() {
+                        return Err(StreamError::Unavailable(reason.to_string()));
+                    }
                 }
                 AcquisitionAttempt::NoSource => {}
             }
@@ -204,6 +214,9 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
             .wrapper_url
             .as_deref()
             .is_none_or(|url| url.trim().trim_end_matches('/').is_empty());
+        if signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
+            return Err(StreamError::Message("Download was cancelled".to_owned()));
+        }
         if wrapper_missing {
             return Err(StreamError::Message(format!(
                 "Audio streaming failed and no wrapper URL is configured. Errors: {}",
@@ -243,7 +256,7 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
                 match result {
                     Ok(stream) => {
                         self.mirror_policy.record_success();
-                        return Self::accept_stream(stream, codec_preference, errors);
+                        return Self::accept_stream(stream, codec_preference);
                     }
                     Err(error) => {
                         let message = error.to_string();
@@ -284,7 +297,7 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
                 .await
             {
                 Ok(WrapperTrackOutcome::Source(source)) => {
-                    Self::accept_stream(source, codec_preference, errors)
+                    Self::accept_stream(source, codec_preference)
                 }
                 Ok(WrapperTrackOutcome::Unavailable(reason)) => {
                     AcquisitionAttempt::OptionalUnavailable(reason)
@@ -295,15 +308,17 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
                 }
             }
         } else {
+            let mut only_unavailable = true;
+            let mut unavailable_reason = None;
             for endpoint in [
                 format!("{clean_wrapper}/api/stream/{track_id}"),
                 format!("{clean_wrapper}/stream/{track_id}"),
             ] {
                 if signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
                     errors.push(format!(
-                        "Wrapper candidate ({endpoint}) failed: Download was cancelled"
+                        "Wrapper candidate iteration cancelled before {endpoint}: Download was cancelled"
                     ));
-                    continue;
+                    return AcquisitionAttempt::NoSource;
                 }
                 match self
                     .stream_transport
@@ -316,18 +331,38 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
                     })
                     .await
                 {
-                    Ok(stream) => match Self::accept_stream(stream, codec_preference, errors) {
-                        AcquisitionAttempt::Source(source) => {
-                            return AcquisitionAttempt::Source(source)
+                    Ok(stream) => {
+                        if signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                            errors.push(format!(
+                                "Wrapper candidate ({endpoint}) cancelled after resolution: Download was cancelled"
+                            ));
+                            return AcquisitionAttempt::NoSource;
                         }
-                        AcquisitionAttempt::OptionalUnavailable(reason) => {
-                            return AcquisitionAttempt::OptionalUnavailable(reason)
+                        match Self::accept_stream(stream, codec_preference) {
+                            AcquisitionAttempt::Source(source) => {
+                                return AcquisitionAttempt::Source(source)
+                            }
+                            AcquisitionAttempt::OptionalUnavailable(reason) => {
+                                unavailable_reason = Some(reason);
+                            }
+                            AcquisitionAttempt::NoSource => only_unavailable = false,
                         }
-                        AcquisitionAttempt::NoSource => {}
-                    },
+                    }
                     Err(error) => {
+                        only_unavailable = false;
                         errors.push(format!("Wrapper candidate ({endpoint}) failed: {error}"))
                     }
+                }
+            }
+            if signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                errors.push(
+                    "Wrapper candidate iteration cancelled: Download was cancelled".to_owned(),
+                );
+                return AcquisitionAttempt::NoSource;
+            }
+            if only_unavailable {
+                if let Some(reason) = unavailable_reason {
+                    return AcquisitionAttempt::OptionalUnavailable(reason);
                 }
             }
             AcquisitionAttempt::NoSource
@@ -337,15 +372,10 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
     fn accept_stream(
         stream: AudioStreamSource,
         codec_preference: CodecPreference,
-        errors: &mut Vec<String>,
     ) -> AcquisitionAttempt {
         if codec_preference == CodecPreference::Atmos && !stream.codec.eq_ignore_ascii_case("ec-3")
         {
-            errors.push(format!(
-                "Rejected non-EC-3 stream from {} for Atmos request (technical mismatch)",
-                stream.source_name
-            ));
-            AcquisitionAttempt::NoSource
+            AcquisitionAttempt::OptionalUnavailable(WrapperUnavailableReason::NonEc3StreamForAtmos)
         } else {
             AcquisitionAttempt::Source(stream)
         }
@@ -364,7 +394,8 @@ fn hostname(url: &str) -> String {
 
 pub fn is_non_retryable_error(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    lower.contains("code 404")
+    engine::ripper::is_non_retryable_local_error(message)
+        || lower.contains("code 404")
         || lower.contains("code: 404")
         || lower.contains("http 404")
         || lower.contains("status 404")
@@ -703,5 +734,23 @@ impl engine::ripper::RipperDeps for AppleRipperDeps {
             .await
             .map(|_| ())
             .map_err(|error| engine::ripper::RipError::Message(error.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_non_retryable_error;
+
+    #[test]
+    fn master_playlist_parse_errors_remain_retryable_without_matching_transient_wrapper_errors() {
+        assert!(!is_non_retryable_error(
+            "Native wrapper engine failed: Parse master playlist: Master playlist has invalid audio group bitrate: 256-binaural"
+        ));
+        assert!(!is_non_retryable_error(
+            "Native wrapper engine failed: Fetch master playlist: connection reset"
+        ));
+        assert!(!is_non_retryable_error(
+            "Wrapper candidate (https://wrapper/stream/42) failed: transient"
+        ));
     }
 }

@@ -1,5 +1,8 @@
 use std::{
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -9,7 +12,9 @@ use db::{
 };
 use diesel::{sql_query, sql_types::Text};
 use diesel_async::RunQueryDsl;
-use engine::orchestrator::deps::{RequestLog, SaveTrackInput};
+use engine::orchestrator::deps::{
+    AlbumReplacementExpectation, AlbumReplacementResult, AlbumUpload, RequestLog, SaveTrackInput,
+};
 use music::{Codec, Provider, TrackKey};
 use serde_json::json;
 
@@ -342,4 +347,266 @@ async fn albums_repository_save_find_delete() {
         .await
         .expect("find after delete");
     assert_eq!(parts_after.len(), 0);
+}
+
+#[tokio::test]
+async fn albums_repository_replacement_rolls_back_and_preserves_old_rows() {
+    let client = client().await;
+    let repo = AlbumsRepository::new(client.clone());
+    let album_id = unique_prefix("replace");
+    let old_uid = format!("{album_id}old");
+
+    let old = NewAlbum {
+        provider: Provider::Apple,
+        album_id: &album_id,
+        codec: Codec::Alac,
+        part_index: 1,
+        total_parts: 1,
+        message_id: 100,
+        file_id: "old-file",
+        file_unique_id: &old_uid,
+        file_size: 5_000,
+        file_name: "old.zip",
+        generation_hash: "old-generation",
+    };
+    repo.save_album(&old).await.expect("save old archive row");
+
+    // The message-id check fails during the insert after the transaction has
+    // deleted the old rendition. A rollback must make that delete invisible.
+    let replacement = AlbumUpload {
+        provider: Provider::Apple,
+        album_id: album_id.clone(),
+        codec: Codec::Alac,
+        part_index: 1,
+        total_parts: 1,
+        message_id: 0,
+        file_id: "new-file".into(),
+        file_unique_id: format!("{album_id}new"),
+        file_size: 6_000,
+        file_name: "new.zip".into(),
+        generation_hash: "new-generation".into(),
+    };
+    assert!(
+        repo.replace_albums(
+            Provider::Apple,
+            &album_id,
+            Codec::Alac,
+            &AlbumReplacementExpectation::Generation("old-generation".into()),
+            &[replacement],
+        )
+        .await
+        .is_err(),
+        "invalid replacement must fail"
+    );
+
+    let rows = repo
+        .find_albums(Provider::Apple, &album_id, Some(Codec::Alac))
+        .await
+        .expect("find rolled-back archive row");
+    assert_eq!(
+        rows.len(),
+        1,
+        "the old row remains after replacement failure"
+    );
+    assert_eq!(rows[0].message_id, 100);
+    assert_eq!(rows[0].file_unique_id, old_uid);
+    assert_eq!(rows[0].generation_hash, "old-generation");
+}
+
+#[tokio::test]
+async fn albums_repository_replacement_switches_primary_codec_and_keeps_atmos() {
+    let client = client().await;
+    let repo = AlbumsRepository::new(client.clone());
+    let album_id = unique_prefix("codec-switch");
+    let old_alac_uid = format!("{album_id}-old-alac");
+    let old_atmos_uid = format!("{album_id}-old-atmos");
+
+    repo.save_album(&NewAlbum {
+        provider: Provider::Apple,
+        album_id: &album_id,
+        codec: Codec::Alac,
+        part_index: 1,
+        total_parts: 1,
+        message_id: 201,
+        file_id: "old-alac-file",
+        file_unique_id: &old_alac_uid,
+        file_size: 5_000,
+        file_name: "old-alac.zip",
+        generation_hash: "old-generation",
+    })
+    .await
+    .expect("save ALAC row");
+    repo.save_album(&NewAlbum {
+        provider: Provider::Apple,
+        album_id: &album_id,
+        codec: Codec::Ec3,
+        part_index: 1,
+        total_parts: 1,
+        message_id: 202,
+        file_id: "old-atmos-file",
+        file_unique_id: &old_atmos_uid,
+        file_size: 5_000,
+        file_name: "old-atmos.zip",
+        generation_hash: "old-generation",
+    })
+    .await
+    .expect("save Atmos row");
+
+    let replacement = AlbumUpload {
+        provider: Provider::Apple,
+        album_id: album_id.clone(),
+        codec: Codec::Aac,
+        part_index: 1,
+        total_parts: 1,
+        message_id: 203,
+        file_id: "new-aac-file".into(),
+        file_unique_id: format!("{album_id}-new-aac"),
+        file_size: 6_000,
+        file_name: "new-aac.zip".into(),
+        generation_hash: "new-generation".into(),
+    };
+    repo.replace_albums(
+        Provider::Apple,
+        &album_id,
+        Codec::Aac,
+        &AlbumReplacementExpectation::Generation("old-generation".into()),
+        &[replacement],
+    )
+    .await
+    .expect("replace primary codec");
+
+    let rows = repo
+        .find_albums(Provider::Apple, &album_id, None)
+        .await
+        .expect("find switched rows");
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().any(|row| row.codec == Codec::Aac));
+    assert!(rows.iter().any(|row| row.codec == Codec::Ec3));
+    assert!(!rows.iter().any(|row| row.codec == Codec::Alac));
+}
+
+#[tokio::test]
+async fn albums_repository_concurrent_replacement_commits_one_generation() {
+    let client = client().await;
+    let repo = AlbumsRepository::new(client.clone());
+    let album_id = unique_prefix("concurrent-replace");
+    let old_uid = format!("{album_id}-old");
+    repo.save_album(&NewAlbum {
+        provider: Provider::Apple,
+        album_id: &album_id,
+        codec: Codec::Alac,
+        part_index: 1,
+        total_parts: 1,
+        message_id: 300,
+        file_id: "old-file",
+        file_unique_id: &old_uid,
+        file_size: 5_000,
+        file_name: "old.zip",
+        generation_hash: "base-generation",
+    })
+    .await
+    .expect("save old archive row");
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let first_repo = repo.clone();
+    let first_barrier = Arc::clone(&barrier);
+    let first_album = album_id.clone();
+    let first = tokio::spawn(async move {
+        let upload = AlbumUpload {
+            provider: Provider::Apple,
+            album_id: first_album.clone(),
+            codec: Codec::Alac,
+            part_index: 1,
+            total_parts: 1,
+            message_id: 301,
+            file_id: "first-file".into(),
+            file_unique_id: format!("{first_album}-first"),
+            file_size: 6_000,
+            file_name: "first.zip".into(),
+            generation_hash: "first-generation".into(),
+        };
+        first_barrier.wait().await;
+        first_repo
+            .replace_albums(
+                Provider::Apple,
+                &first_album,
+                Codec::Alac,
+                &AlbumReplacementExpectation::Generation("base-generation".into()),
+                &[upload],
+            )
+            .await
+            .expect("first replacement transaction")
+    });
+
+    let second_repo = repo.clone();
+    let second_barrier = Arc::clone(&barrier);
+    let second_album = album_id.clone();
+    let second = tokio::spawn(async move {
+        let upload = AlbumUpload {
+            provider: Provider::Apple,
+            album_id: second_album.clone(),
+            codec: Codec::Alac,
+            part_index: 1,
+            total_parts: 1,
+            message_id: 302,
+            file_id: "second-file".into(),
+            file_unique_id: format!("{second_album}-second"),
+            file_size: 6_000,
+            file_name: "second.zip".into(),
+            generation_hash: "second-generation".into(),
+        };
+        second_barrier.wait().await;
+        second_repo
+            .replace_albums(
+                Provider::Apple,
+                &second_album,
+                Codec::Alac,
+                &AlbumReplacementExpectation::Generation("base-generation".into()),
+                &[upload],
+            )
+            .await
+            .expect("second replacement transaction")
+    });
+
+    barrier.wait().await;
+    let (first, second) = tokio::join!(first, second);
+    let first = first.expect("first task");
+    let second = second.expect("second task");
+    let outcomes = [first, second];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, AlbumReplacementResult::Committed { .. }))
+            .count(),
+        1,
+        "one compare-and-replace wins and the other is stale"
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, AlbumReplacementResult::Stale))
+            .count(),
+        1
+    );
+    let committed = outcomes
+        .iter()
+        .find_map(|outcome| match outcome {
+            AlbumReplacementResult::Committed {
+                displaced_message_ids,
+            } => Some(displaced_message_ids),
+            AlbumReplacementResult::Stale => None,
+        })
+        .expect("committed outcome");
+    assert_eq!(committed, &[300]);
+
+    let rows = repo
+        .find_albums(Provider::Apple, &album_id, Some(Codec::Alac))
+        .await
+        .expect("find winning row");
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(rows[0].message_id, 301 | 302));
+    assert!(matches!(
+        rows[0].generation_hash.as_str(),
+        "first-generation" | "second-generation"
+    ));
 }

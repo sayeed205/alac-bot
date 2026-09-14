@@ -130,7 +130,7 @@ async fn info(msg: ferogram::update::IncomingMessage, state: Arc<BotState>) {
             None => (
                 "! <b>Not cached</b>".to_owned(),
                 format!(
-                    "Use <code>/get https://music.apple.com/song/{track_id}</code> to download lossless ALAC."
+                    "Use <code>/get https://music.apple.com/song/{track_id}</code> to download the primary rendition and optional Dolby Atmos."
                 ),
             ),
         };

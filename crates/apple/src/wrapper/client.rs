@@ -13,11 +13,15 @@ use tracing::debug;
 
 /// A typed absence that is safe to propagate to an optional rendition.
 ///
-/// This value is only constructed after a syntactically valid master playlist
-/// has been parsed and variant selection found no Atmos stream.
+/// The valid-master variant retains provider-playlist provenance; the
+/// non-EC-3 variant is only produced after a wrapper candidate has resolved a
+/// successful stream response that cannot satisfy an Atmos request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WrapperUnavailableReason {
     NoAtmosVariantInValidMaster,
+    /// A wrapper endpoint resolved successfully, but only returned a stream
+    /// that cannot satisfy an Atmos request.
+    NonEc3StreamForAtmos,
 }
 
 impl Display for WrapperUnavailableReason {
@@ -25,6 +29,9 @@ impl Display for WrapperUnavailableReason {
         match self {
             Self::NoAtmosVariantInValidMaster => {
                 formatter.write_str("No Dolby Atmos stream variant found in master playlist")
+            }
+            Self::NonEc3StreamForAtmos => {
+                formatter.write_str("Wrapper returned a non-EC-3 stream for Atmos request")
             }
         }
     }

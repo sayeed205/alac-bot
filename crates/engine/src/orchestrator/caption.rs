@@ -66,7 +66,7 @@ pub struct AlbumDetailsCaptionMetadata<'a> {
     pub artist: &'a str,
     pub album_url: Option<&'a str>,
     pub total_tracks: usize,
-    pub delivered_tracks: usize,
+    pub delivered_tracks: Option<usize>,
     pub size_bytes: i64,
     pub total_parts: usize,
     pub release_year: &'a str,
@@ -75,7 +75,7 @@ pub struct AlbumDetailsCaptionMetadata<'a> {
     pub is_partial: bool,
     pub user_name: Option<&'a str>,
     pub user_id: i64,
-    /// Highest codec delivered in the archive (`alac`, `mp4a.40.2`, `ec-3`).
+    /// Highest codec delivered in the archive (`alac`, `aac`, `mp4a.40.2`, `ec-3`).
     pub codec: Option<&'a str>,
 }
 
@@ -137,10 +137,11 @@ pub fn format_album_details_caption(meta: &AlbumDetailsCaptionMetadata<'_>) -> S
         None => format!("💿 <b>{}</b>", html_escape(meta.album)),
     };
 
-    let tracks = if meta.is_partial {
-        format!("{}/{} tracks", meta.delivered_tracks, meta.total_tracks)
-    } else {
-        format!("{} tracks", meta.delivered_tracks)
+    let tracks = match meta.delivered_tracks {
+        Some(delivered) if meta.is_partial => format!("{delivered}/{} tracks", meta.total_tracks),
+        Some(delivered) => format!("{delivered} tracks"),
+        None if meta.is_partial => format!("?/{total} tracks", total = meta.total_tracks),
+        None => "unknown tracks".to_owned(),
     };
 
     let size = crate::progress::format_bytes(meta.size_bytes.max(0) as u64);
@@ -503,7 +504,7 @@ mod tests {
             artist: "Rupam Islam & Fossils",
             album_url: Some("https://music.apple.com/in/album/1440828878"),
             total_tracks: 8,
-            delivered_tracks: 8,
+            delivered_tracks: Some(8),
             size_bytes: 289_950_924,
             total_parts: 1,
             release_year: "2001",
@@ -540,7 +541,7 @@ mod tests {
             artist: "Queen",
             album_url: Some("https://music.apple.com/us/album/987654321"),
             total_tracks: 17,
-            delivered_tracks: 15,
+            delivered_tracks: Some(15),
             size_bytes: 4_294_967_296,
             total_parts: 3,
             release_year: "1981",
@@ -558,6 +559,28 @@ mod tests {
         assert!(
             html.contains(r#"• <b>Requested by:</b> <a href="tg://user?id=78910">John Doe</a>"#)
         );
+    }
+
+    #[test]
+    fn format_album_details_caption_does_not_fabricate_unknown_track_count() {
+        let meta = AlbumDetailsCaptionMetadata {
+            album: "Legacy Atmos",
+            artist: "Artist",
+            album_url: None,
+            total_tracks: 2,
+            delivered_tracks: None,
+            size_bytes: 1024,
+            total_parts: 1,
+            release_year: "2024",
+            genre: None,
+            record_label: None,
+            is_partial: false,
+            user_name: None,
+            user_id: 0,
+            codec: Some("ec-3"),
+        };
+        let html = format_album_details_caption(&meta);
+        assert!(html.contains("• <b>Tracks:</b> unknown tracks"));
     }
 
     #[test]

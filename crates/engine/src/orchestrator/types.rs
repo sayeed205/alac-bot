@@ -76,14 +76,6 @@ pub struct RipJobOptions {
     pub is_group: bool,
     pub is_force: bool,
     pub is_cache_only: bool,
-    /// Request album ZIP packaging. Cache-only `/dump` jobs may set this to
-    /// automatically publish a complete ZIP, but never deliver it to users.
-    pub zip: bool,
-    /// The user explicitly asked for ZIP packaging (`/zip` command or the
-    /// `-z`/`--zip` token). The engine uses this only to warn when the
-    /// album turns out to have a single track; implicit auto-attempts
-    /// (cache-only `/dump`) never warn.
-    pub zip_explicit: bool,
     pub single_storefront: Option<String>,
     pub parsed_items: Vec<ParsedTargetItem>,
     pub reply_to_message_id: Option<i64>,
@@ -221,8 +213,10 @@ pub struct ZipDeliveryInfo {
     /// First four characters of the album release date, may be empty.
     pub release_year: String,
     pub total_tracks: usize,
-    /// Tracks actually present in the delivered archive.
-    pub delivered_tracks: usize,
+    /// Tracks actually present in the delivered archive. `None` means the
+    /// archive was reused but its sparse track count could not be derived from
+    /// the per-track cache.
+    pub delivered_tracks: Option<usize>,
     pub total_parts: usize,
     /// Total delivered archive bytes.
     pub size_bytes: i64,
@@ -234,7 +228,7 @@ pub struct ZipDeliveryInfo {
     pub record_label: Option<String>,
     pub copyright: Option<String>,
     pub photo_delivered: bool,
-    /// Highest-quality codec in the archive (`alac`, `mp4a.40.2`, `ec-3`).
+    /// Highest-quality codec in the archive (`alac`, `aac`, `mp4a.40.2`, `ec-3`).
     pub codec: Option<String>,
 }
 

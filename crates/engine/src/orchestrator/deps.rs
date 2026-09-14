@@ -120,6 +120,29 @@ pub struct AlbumUpload {
     pub generation_hash: String,
 }
 
+/// The generation a ZIP replacement observed before it started building.
+///
+/// `Mixed` is deliberately not treated as a wildcard.  A mixed group means
+/// the cache did not have one coherent committed generation to compare with,
+/// so replacing it would risk deleting a concurrent winner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlbumReplacementExpectation {
+    Empty,
+    Generation(String),
+    Mixed,
+}
+
+/// Result of a compare-and-replace of one album ZIP rendition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlbumReplacementResult {
+    /// The supplied generation became the committed cache generation.  The
+    /// returned message IDs belonged to rows displaced by this transaction.
+    Committed { displaced_message_ids: Vec<i64> },
+    /// A different generation committed after the caller's snapshot.  No
+    /// rows were changed and the caller must clean only its own uploads.
+    Stale,
+}
+
 /// One cached album ZIP part read back for reuse decisions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedAlbum {
@@ -315,6 +338,20 @@ pub trait OrchestratorDeps: Send + Sync + 'static {
     fn save_album<'a>(&'a self, _upload: AlbumUpload) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async { Ok(()) })
     }
+
+    /// Atomically compare-and-replaces every cached part for one
+    /// album/rendition. The implementation must serialize replacements for
+    /// the group, capture displaced rows inside the transaction, and return
+    /// `Stale` without changing rows when the observed generation no longer
+    /// matches.
+    fn replace_albums<'a>(
+        &'a self,
+        provider: Provider,
+        album_id: &'a str,
+        codec: Codec,
+        expected: AlbumReplacementExpectation,
+        uploads: Vec<AlbumUpload>,
+    ) -> BoxFuture<'a, Result<AlbumReplacementResult, String>>;
 
     /// Lists cached ZIP parts for an album, ordered by part_index ascending.
     fn find_albums<'a>(

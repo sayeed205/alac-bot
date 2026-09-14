@@ -4,8 +4,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use engine::{
     orchestrator::deps::{
-        AlbumUpload, BoxFuture, CachedAlbum, CachedTrack, OrchestratorDeps, RequestLog,
-        SaveTrackInput, SinkError, TelegramSink,
+        AlbumReplacementExpectation, AlbumReplacementResult, AlbumUpload, BoxFuture, CachedAlbum,
+        CachedTrack, OrchestratorDeps, RequestLog, SaveTrackInput, SinkError, TelegramSink,
     },
     ripper::RipperConfig,
     settings::BotSettings,
@@ -188,6 +188,22 @@ impl OrchestratorDeps for RipDeps {
                 .save_album(&new_album)
                 .await
                 .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn replace_albums<'a>(
+        &'a self,
+        provider: Provider,
+        album_id: &'a str,
+        codec: Codec,
+        expected: AlbumReplacementExpectation,
+        uploads: Vec<AlbumUpload>,
+    ) -> BoxFuture<'a, Result<AlbumReplacementResult, String>> {
+        Box::pin(async move {
+            self.albums
+                .replace_albums(provider, album_id, codec, &expected, &uploads)
+                .await
                 .map_err(|error| error.to_string())
         })
     }

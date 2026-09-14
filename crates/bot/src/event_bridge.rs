@@ -356,6 +356,52 @@ fn format_failed_track(failed: &FailedTrack) -> String {
     }
 }
 
+/// Prefer the ordered multi-rendition view, while retaining the singular
+/// field as a compatibility fallback for summaries produced by older engine
+/// callers.  The returned order is the delivery order and must not be
+/// reconstructed through a map or sorted by codec.
+fn zip_delivery_entries(
+    summary: &RipJobSummary,
+) -> Vec<&engine::orchestrator::types::ZipDeliveryInfo> {
+    if summary.zip_deliveries.is_empty() {
+        summary.zip_delivery.iter().collect()
+    } else {
+        summary.zip_deliveries.iter().collect()
+    }
+}
+
+fn zip_delivery_details_html(
+    job: &ActiveRipJob,
+    zip: &engine::orchestrator::types::ZipDeliveryInfo,
+    include_label: bool,
+) -> String {
+    let caption_meta = engine::orchestrator::caption::AlbumDetailsCaptionMetadata {
+        album: &zip.album,
+        artist: &zip.artist,
+        album_url: zip.album_url.as_deref(),
+        total_tracks: zip.total_tracks,
+        delivered_tracks: zip.delivered_tracks,
+        size_bytes: zip.size_bytes,
+        total_parts: zip.total_parts,
+        release_year: &zip.release_year,
+        genre: zip.genre.as_deref(),
+        record_label: zip.record_label.as_deref(),
+        is_partial: zip.is_partial,
+        user_name: job.user_name.as_deref(),
+        user_id: job.user_id,
+        codec: zip.codec.as_deref(),
+    };
+    let details_html = engine::orchestrator::caption::format_album_details_caption(&caption_meta);
+    if include_label {
+        format!(
+            "<b>{} archive</b><br/>{details_html}",
+            crate::presentation::rendition_label(zip.codec.as_deref())
+        )
+    } else {
+        details_html
+    }
+}
+
 /// Send one terminal completion notice to the originating chat. Reply to the
 /// command when it still exists; otherwise mention the requester explicitly
 /// so completion remains visible even after message cleanup.
@@ -453,28 +499,15 @@ async fn notify_job_completed(state: &BotState, job: &ActiveRipJob, summary: &Ri
     };
 
     // ZIP jobs: the album preview photo + rich details caption was delivered
-    // alongside the ZIP files. If the photo could not be delivered, fall back
-    // to sending the rich album details as a text message (no webpage preview).
-    if let Some(zip) = summary.zip_delivery.as_ref() {
+    // alongside each ZIP rendition. If a photo could not be delivered, fall
+    // back to the corresponding rich album details as a text message (no
+    // webpage preview). Iterate the engine's vector directly so primary then
+    // Atmos order and each rendition's codec label are preserved.
+    let zip_deliveries = zip_delivery_entries(summary);
+    let multiple_renditions = zip_deliveries.len() > 1;
+    for zip in zip_deliveries {
         if !summary.is_cache_only && zip.total_parts > 0 && !zip.photo_delivered {
-            let caption_meta = engine::orchestrator::caption::AlbumDetailsCaptionMetadata {
-                album: &zip.album,
-                artist: &zip.artist,
-                album_url: zip.album_url.as_deref(),
-                total_tracks: zip.total_tracks,
-                delivered_tracks: zip.delivered_tracks,
-                size_bytes: zip.size_bytes,
-                total_parts: zip.total_parts,
-                release_year: &zip.release_year,
-                genre: zip.genre.as_deref(),
-                record_label: zip.record_label.as_deref(),
-                is_partial: zip.is_partial,
-                user_name: job.user_name.as_deref(),
-                user_id: job.user_id,
-                codec: zip.codec.as_deref(),
-            };
-            let details_html =
-                engine::orchestrator::caption::format_album_details_caption(&caption_meta);
+            let details_html = zip_delivery_details_html(job, zip, multiple_renditions);
             let details_msg = ferogram::InputMessage::html(details_html).no_webpage(true);
             if let Err(error) = state
                 .client
@@ -556,6 +589,30 @@ mod tests {
             active_download_text: None,
             active_upload_text: None,
             activity_override: None,
+        }
+    }
+
+    fn zip_delivery(
+        codec: &str,
+        delivered_tracks: usize,
+    ) -> engine::orchestrator::types::ZipDeliveryInfo {
+        engine::orchestrator::types::ZipDeliveryInfo {
+            album: "Album".into(),
+            artist: "Artist".into(),
+            release_year: "2024".into(),
+            total_tracks: 2,
+            delivered_tracks: Some(delivered_tracks),
+            total_parts: 1,
+            size_bytes: 1024,
+            is_partial: false,
+            album_id: "album".into(),
+            album_url: None,
+            artwork_url: None,
+            genre: None,
+            record_label: None,
+            copyright: None,
+            photo_delivered: false,
+            codec: Some(codec.into()),
         }
     }
 
@@ -643,5 +700,45 @@ mod tests {
             format_failed_track(&ft5),
             r#"<a href="https://music.apple.com/song/999">Tom &amp; Jerry &lt;Special&gt; - AC/DC &amp; Friends</a>"#
         );
+    }
+
+    #[test]
+    fn sparse_zip_details_keep_delivery_order_and_rendition_labels() {
+        let primary = zip_delivery("alac", 2);
+        let atmos = zip_delivery("ec-3", 1);
+        let summary = RipJobSummary {
+            job_id: "dual.zip".into(),
+            job_header: "Album".into(),
+            total_tracks: 2,
+            cached_count: 0,
+            ripped_count: 0,
+            failed_count: 0,
+            failed_tracks: Vec::new(),
+            skipped_uncached_tracks: Vec::new(),
+            total_elapsed_sec: "0.1".into(),
+            capped_count: 0,
+            max_collection_limit: 50,
+            is_cache_only: false,
+            is_group: false,
+            warnings: Vec::new(),
+            zip_delivery: Some(primary.clone()),
+            zip_deliveries: vec![primary, atmos],
+            first_delivered_msg_id: Some(1),
+        };
+
+        let entries = zip_delivery_entries(&summary);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].codec.as_deref(), Some("alac"));
+        assert_eq!(entries[1].codec.as_deref(), Some("ec-3"));
+
+        let owner = job("dual.zip");
+        let rendered = entries
+            .iter()
+            .map(|entry| zip_delivery_details_html(&owner, entry, true))
+            .collect::<Vec<_>>();
+        assert!(rendered[0].starts_with("<b>ALAC archive</b>"));
+        assert!(rendered[0].contains("Quality:</b> Lossless · ALAC"));
+        assert!(rendered[1].starts_with("<b>Dolby Atmos archive</b>"));
+        assert!(rendered[1].contains("Quality:</b> Dolby Atmos"));
     }
 }

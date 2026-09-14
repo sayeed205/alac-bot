@@ -15,10 +15,15 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
+use crate::tagger::{bound_filename_with_suffix, MAX_FILENAME_BYTES};
+
 /// Conservative ceiling for the current bot-only uploader.
 pub const TELEGRAM_SPLIT_THRESHOLD_BYTES: u64 = 1_900_000_000;
 const ENTRY_OVERHEAD_BYTES: u64 = 512;
 const ARCHIVE_HEADROOM_BYTES: u64 = 64 * 1024;
+const PARTIAL_ARCHIVE_SUFFIX: &str = " [Partial]";
+/// Keep generated ZIP entry names below the existing validation ceiling.
+pub const MAX_ZIP_ENTRY_FILENAME_BYTES: usize = 240;
 
 #[derive(Debug, Clone)]
 pub struct ZipTrackEntry {
@@ -84,7 +89,7 @@ pub fn build_album_archive_base_name(artist: &str, album: &str, release_date: &s
 }
 
 /// Same as [`build_album_archive_base_name`], labeled with the highest
-/// codec delivered in the archive (`alac`, `mp4a.40.2`, `ec-3`).
+/// codec delivered in the archive (`alac`, `aac`, `mp4a.40.2`, `ec-3`).
 pub fn build_album_archive_base_name_with_codec(
     artist: &str,
     album: &str,
@@ -97,12 +102,18 @@ pub fn build_album_archive_base_name_with_codec(
     } else {
         String::new()
     };
-    let label = match codec {
+    let label = archive_codec_label(codec);
+    let suffix = format!(" [{label}]");
+    let name = sanitize_archive_filename(&format!("{artist} - {album}{year_part}{suffix}"));
+    bound_filename_with_suffix(&name, &suffix, MAX_FILENAME_BYTES)
+}
+
+fn archive_codec_label(codec: &str) -> &'static str {
+    match codec {
         "ec-3" => "Atmos",
         "aac" | "mp4a.40.2" | "mp4a.40.5" => "AAC",
         _ => "ALAC",
-    };
-    sanitize_archive_filename(&format!("{artist} - {album}{year_part} [{label}]"))
+    }
 }
 
 /// Deterministic identity of the resolved track set a ZIP was built from.
@@ -160,7 +171,7 @@ fn hash_file(path: &Path) -> Result<String, ZipError> {
 
 fn validate_entry_name(name: &str) -> Result<(), ZipError> {
     if name.is_empty()
-        || name.len() > 240
+        || name.len() > MAX_ZIP_ENTRY_FILENAME_BYTES
         || name.bytes().any(|b| b == 0 || b.is_ascii_control())
         || Path::new(name).is_absolute()
         || Path::new(name).components().any(|c| {
@@ -278,17 +289,28 @@ pub fn plan_zip_parts_with_codec(
     }
 
     let total_parts = groups.len();
-    let base_name = build_album_archive_base_name_with_codec(artist, album, release_date, codec);
+    let year = release_date.chars().take(4).collect::<String>();
+    let year_part = if year.len() == 4 && year.chars().all(|c| c.is_ascii_digit()) {
+        format!(" ({year})")
+    } else {
+        String::new()
+    };
+    let label = archive_codec_label(codec);
+    // Finalization may append ` [Partial]` before `.zip`; reserve that room
+    // now so the later local output path remains within one-component limits.
+    let archive_max_bytes = MAX_FILENAME_BYTES.saturating_sub(PARTIAL_ARCHIVE_SUFFIX.len());
     Ok(groups
         .into_iter()
         .enumerate()
         .map(|(index, tracks)| {
             let part_index = index + 1;
-            let archive_filename = if total_parts == 1 {
-                format!("{base_name}.zip")
+            let suffix = if total_parts == 1 {
+                format!(" [{label}].zip")
             } else {
-                format!("{base_name} (Part {part_index} of {total_parts}).zip")
+                format!(" [{label}] (Part {part_index} of {total_parts}).zip")
             };
+            let name = sanitize_archive_filename(&format!("{artist} - {album}{year_part}{suffix}"));
+            let archive_filename = bound_filename_with_suffix(&name, &suffix, archive_max_bytes);
             ZipPartPlan {
                 part_index,
                 total_parts,
@@ -372,7 +394,10 @@ pub fn create_zip_archive(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("archive");
-    let temp_path = parent.join(format!(".{output_name}.{}.part", cuid2::create_id()));
+    let temp_suffix = format!(".{}.part", cuid2::create_id());
+    let temp_name = format!(".{output_name}{temp_suffix}");
+    let temp_name = bound_filename_with_suffix(&temp_name, &temp_suffix, MAX_FILENAME_BYTES);
+    let temp_path = parent.join(temp_name);
     let result = (|| {
         let file = OpenOptions::new()
             .write(true)
@@ -470,6 +495,25 @@ mod tests {
             build_album_archive_base_name("AC/DC", "Back in Black: Live?", "1980"),
             "AC_DC - Back in Black_ Live_ (1980) [ALAC]"
         );
+    }
+
+    #[test]
+    fn long_archive_names_are_bounded_with_codec_suffix() {
+        let artist = "é".repeat(200);
+        let base = build_album_archive_base_name_with_codec(&artist, "Album", "", "ec-3");
+        assert!(base.len() <= MAX_FILENAME_BYTES);
+        assert!(base.ends_with(" [Atmos]"));
+
+        let root = std::env::temp_dir().join(format!("zip-test-{}", cuid2::create_id()));
+        fs::create_dir_all(&root).unwrap();
+        let track_path = root.join("track.m4a");
+        fs::write(&track_path, b"audio-bytes").unwrap();
+        let tracks = [entry(&track_path, "01 - Track.m4a", 11)];
+        let plan = plan_zip_parts_with_codec(&artist, "Album", "", &tracks, None, 100_000, "ec-3")
+            .unwrap();
+        assert!(plan[0].archive_filename.len() <= MAX_FILENAME_BYTES);
+        assert!(plan[0].archive_filename.ends_with(" [Atmos].zip"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

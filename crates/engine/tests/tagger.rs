@@ -1,7 +1,10 @@
 //! Filename policy tests.
 
 use engine::{
-    tagger::{build_track_filename, sanitize_filename},
+    tagger::{
+        bound_filename_component, bound_filename_with_suffix, build_track_filename,
+        build_track_filename_with_codec, sanitize_filename,
+    },
     types::TrackMeta,
 };
 
@@ -58,5 +61,27 @@ fn filename_explicit_and_number_padding() {
     assert_eq!(
         build_track_filename(&value),
         "123. Song - Artist [ALAC].m4a"
+    );
+}
+
+#[test]
+fn filename_labels_canonical_aac_primary_codec() {
+    assert_eq!(
+        build_track_filename_with_codec(&meta(), "aac"),
+        "03. Song - Artist [AAC].m4a"
+    );
+}
+
+#[test]
+fn bounds_filename_at_utf8_boundary_without_losing_suffix() {
+    let name = format!("{} [AAC].m4a", "é".repeat(200));
+    let suffix = " [AAC].m4a";
+    let bounded = bound_filename_with_suffix(&name, suffix, 255);
+
+    assert!(bounded.len() <= 255);
+    assert!(bounded.ends_with(suffix));
+    assert_eq!(
+        bounded,
+        format!("{}{}", bound_filename_component(&name[..400], 244), suffix)
     );
 }

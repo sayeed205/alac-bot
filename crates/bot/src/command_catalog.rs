@@ -24,14 +24,8 @@ pub const COMMANDS: &[CommandDescriptor] = &[
     CommandDescriptor {
         name: "get",
         role: CommandRole::User,
-        summary: "Download a track, album, playlist, or artist",
-        usage: "/get <Apple Music link> [--zip]",
-    },
-    CommandDescriptor {
-        name: "zip",
-        role: CommandRole::User,
-        summary: "Package a multi-track album as a ZIP",
-        usage: "/zip <Apple Music album link>",
+        summary: "Download primary audio plus optional Dolby Atmos",
+        usage: "/get <Apple Music link> [-f]",
     },
     CommandDescriptor {
         name: "search",
@@ -161,7 +155,9 @@ pub fn render_help(is_admin: bool) -> String {
             command.summary
         ));
     }
-    out.push_str("\n<i>Audio requested in a group is delivered to your private chat.</i>");
+    out.push_str(
+        "\n<i>/get delivers the highest available primary rendition plus optional Dolby Atmos. Multi-track albums are delivered as ZIP archives; missing Atmos is silent. Audio requested in a group is delivered to your private chat.</i>",
+    );
     if is_admin {
         out.push_str("\n\n<b>Admin commands</b>\n");
         for command in COMMANDS
@@ -198,6 +194,11 @@ mod tests {
         assert!(render_help(true).contains("/settings"));
         assert!(render_help(false).contains("cached tracks and the Apple Music catalog"));
         assert!(render_help(false).contains("/get [Apple Music link]"));
+        assert!(render_help(false).contains("optional Dolby Atmos"));
+        assert!(render_help(false).contains("Multi-track albums are delivered as ZIP archives"));
+        assert!(!render_help(false).contains("/zip"));
+        assert!(!render_help(false).contains("/alac"));
+        assert!(!render_help(false).contains("/rip"));
         assert!(!render_help(false).contains("/cancel"));
         assert!(!render_help(false).contains("<link | id>"));
     }
@@ -211,9 +212,9 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "start", "get", "zip", "search", "status", "info", "spec", "report", "help",
-                "settings", "dump", "random", "delete", "auth", "revoke", "authlist", "stats",
-                "clean", "ping", "index", "export", "import",
+                "start", "get", "search", "status", "info", "spec", "report", "help", "settings",
+                "dump", "random", "delete", "auth", "revoke", "authlist", "stats", "clean", "ping",
+                "index", "export", "import",
             ]
         );
     }

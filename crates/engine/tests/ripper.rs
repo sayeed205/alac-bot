@@ -16,6 +16,7 @@ use engine::{
         AlacTrackRipper, RipError, RipOptions, RipProgressCallback, RipperConfig, RipperDeps,
     },
     streaming::{AudioStreamSource, ByteStream, ProgressCallback},
+    tagger::MAX_FILENAME_BYTES,
     types::TrackMeta,
 };
 use futures_util::stream;
@@ -567,6 +568,28 @@ async fn output_dir_override_used() {
 }
 
 #[tokio::test]
+async fn long_metadata_filename_is_bounded_and_rip_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut deps = FakeDeps::ok();
+    deps.meta.title = "曲".repeat(150);
+    let ripper = AlacTrackRipper::new(config(dir.path(), 0, 1));
+
+    let result = ripper
+        .rip(&deps, "42", RipOptions::new(Provider::Apple, "us"))
+        .await
+        .expect("long metadata should produce a bounded output name");
+    let filename = Path::new(&result.file_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("bounded output filename is valid UTF-8");
+
+    assert!(!filename.is_empty());
+    assert!(filename.len() <= MAX_FILENAME_BYTES);
+    assert!(filename.ends_with(" [ALAC].m4a"));
+    assert!(Path::new(&result.file_path).is_file());
+}
+
+#[tokio::test]
 async fn tag_failure_is_retryable_and_exhausts() {
     let dir = tempfile::tempdir().unwrap();
     let mut deps = FakeDeps::ok();
@@ -585,6 +608,32 @@ async fn tag_failure_is_retryable_and_exhausts() {
         .filter(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(".raw")))
         .collect();
     assert!(raw_left.is_empty());
+}
+
+#[tokio::test]
+async fn local_filename_error_is_non_retryable() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut deps = FakeDeps::ok();
+    deps.connect_error = Some("local path error: ENAMETOOLONG (File name too long)".into());
+    let ripper = AlacTrackRipper::new(config(dir.path(), 4, 1));
+    let (cb, log) = record();
+
+    let error = ripper
+        .rip(
+            &deps,
+            "42",
+            RipOptions::new(Provider::Apple, "us").with_progress(&cb),
+        )
+        .await
+        .expect_err("a local filename error should fail without retries");
+
+    assert!(error.to_string().contains("ENAMETOOLONG"));
+    assert_eq!(deps.connect_calls.load(Ordering::SeqCst), 1);
+    assert!(log
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(status, _, _)| !status.starts_with("⚠️")));
 }
 
 #[tokio::test]

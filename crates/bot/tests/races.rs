@@ -14,9 +14,9 @@ use std::{
 use engine::{
     orchestrator::{
         deps::{
-            ArtworkProvider, CachedTrack, CollectionResolver, OrchestratorDeps,
-            ProviderComposition, ProviderPresentation, RequestLog, SaveTrackInput,
-            TrackAcquisition,
+            AlbumReplacementExpectation, AlbumReplacementResult, ArtworkProvider, CachedTrack,
+            CollectionResolver, OrchestratorDeps, ProviderComposition, ProviderPresentation,
+            RequestLog, SaveTrackInput, TrackAcquisition,
         },
         types::{JobPhase, OrchestratorEvent, RipJobOptions},
         RipOrchestrator,
@@ -83,6 +83,17 @@ impl OrchestratorDeps for RaceDeps {
     async fn log_request(&self, log: RequestLog) -> Result<(), String> {
         let _ = log;
         Ok(())
+    }
+    fn replace_albums<'a>(
+        &'a self,
+        provider: Provider,
+        album_id: &'a str,
+        codec: engine::Codec,
+        expected: AlbumReplacementExpectation,
+        uploads: Vec<engine::orchestrator::deps::AlbumUpload>,
+    ) -> engine::orchestrator::deps::BoxFuture<'a, Result<AlbumReplacementResult, String>> {
+        let _ = (provider, album_id, codec, expected, uploads);
+        Box::pin(async { Ok(AlbumReplacementResult::Stale) })
     }
     fn sink(&self) -> &dyn engine::orchestrator::deps::TelegramSink {
         unreachable!("sink not reached in race tests")
@@ -184,8 +195,6 @@ fn race_options() -> RipJobOptions {
         is_group: false,
         is_force: false,
         is_cache_only: false,
-        zip: false,
-        zip_explicit: false,
         single_storefront: None,
         parsed_items: vec![ParsedTargetItem {
             id: "track1".to_owned(),
@@ -195,7 +204,7 @@ fn race_options() -> RipJobOptions {
         reply_to_message_id: Some(555),
         status_msg_id: 999,
         is_admin: true,
-        rendition_policy: engine::orchestrator::types::RenditionPolicy::PrimaryOnly,
+        rendition_policy: engine::orchestrator::types::RenditionPolicy::PrimaryWithOptionalAtmos,
     }
 }
 

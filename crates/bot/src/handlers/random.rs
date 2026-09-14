@@ -598,8 +598,6 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery, action: Discov
                 is_group: marked_chat != query.user_id,
                 is_force: false,
                 is_cache_only: true,
-                zip: true,
-                zip_explicit: false,
                 single_storefront: Some(storefront.clone()),
                 parsed_items: vec![ParsedTargetItem {
                     id: album_id,

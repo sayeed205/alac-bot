@@ -1,10 +1,13 @@
-//! Rip orchestrator for the live `/alac` command contract.
+//! Rip orchestrator for the live `/get` command contract.
 //!
 //! Owns job bookkeeping, resolves parsed items to tracks, feeds cache hits and
-//! misses through one ordered pipeline, and runs two concurrent lanes: lane 1 rips and tags (one job
-//! at a time, through the sequential rip queue) while lane 2 performs every
-//! Telegram upload/ZIP/delivery item from all jobs on a single global
-//! dispatcher — so downloads never wait on uploads and vice versa.
+//! misses through one ordered pipeline, and runs two concurrent lanes: lane 1
+//! rips and tags (one job at a time, through the sequential rip queue) while
+//! lane 2 performs fresh-track Telegram uploads and ZIP work from all jobs on
+//! a single global dispatcher — so downloads never wait on uploads and vice
+//! versa. Cache hits become ordered lane-2 tasks; a failed cache delivery or
+//! archive-source materialization schedules a lane-1 rerip continuation without
+//! losing FIFO ordering.
 //!
 //! Upload retry exhaustion records a failed track and continues later tasks
 //! instead of rejecting the whole job: one bad upload never strands the
@@ -15,9 +18,10 @@ pub mod deps;
 pub mod types;
 
 use std::{
-    collections::{HashMap, HashSet},
+    any::Any,
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -33,9 +37,10 @@ use crate::{
             html_escape, AlbumDetailsCaptionMetadata, DumpCaptionMetadata, DumpZipCaptionMetadata,
         },
         deps::{
-            AlbumUpload, ArtworkProvider, CachedAlbum, CachedTrack, CollectionResolver, DumpUpload,
-            OrchestratorDeps, ProviderComposition, ProviderPresentation, RequestLog,
-            SaveTrackInput, TrackAcquisition, UploadProgressCallback,
+            AlbumReplacementExpectation, AlbumReplacementResult, AlbumUpload, ArtworkProvider,
+            CachedAlbum, CachedTrack, CollectionResolver, DumpUpload, OrchestratorDeps,
+            ProviderComposition, ProviderPresentation, RequestLog, SaveTrackInput,
+            TrackAcquisition, UploadProgressCallback,
         },
         types::{
             ActiveRipJob, EventCallback, FailedTrack, JobPhase, OrchestratorEvent,
@@ -47,10 +52,12 @@ use crate::{
     queue::{EnqueueOptions, SequentialRipQueue},
     ripper::{RipOptions, RipProgressCallback},
     settings::BotSettings,
+    tagger::{bound_filename_with_suffix, MAX_FILENAME_BYTES},
     types::{AlbumTracks, ArtistTracks, Codec, Provider, TargetKind, TrackKey, TrackRipResult},
     zip::{
         album_generation_hash, create_zip_archive, plan_zip_parts_with_codec,
-        sanitize_archive_filename, ZipTrackEntry, TELEGRAM_SPLIT_THRESHOLD_BYTES,
+        sanitize_archive_filename, ZipTrackEntry, MAX_ZIP_ENTRY_FILENAME_BYTES,
+        TELEGRAM_SPLIT_THRESHOLD_BYTES,
     },
 };
 
@@ -165,6 +172,11 @@ struct JobContext {
     zip_deliver: bool,
     zip_states: Vec<Arc<ZipState>>,
     zip_reuse: HashMap<Rendition, Vec<CachedAlbum>>,
+    zip_expectations: HashMap<Rendition, AlbumReplacementExpectation>,
+    /// Number of tracks in a reused sparse Atmos archive, derived from the
+    /// persisted EC-3 track cache. `None` is retained when the archive has no
+    /// matching per-track rows (for example, a legacy/indexed ZIP).
+    zip_reuse_atmos_track_count: Option<usize>,
     zip_album: String,
     zip_artist: String,
     zip_album_id: String,
@@ -178,6 +190,17 @@ struct JobContext {
     /// Set once when an Atmos-requested job delivers a non-Atmos rip; folded
     /// into the summary warnings.
     atmos_warning: Arc<std::sync::Mutex<Option<String>>>,
+    /// Rendition currently being finalized. The marker uses this only to
+    /// classify an unexpected panic: Atmos remains best-effort, while a
+    /// primary panic fails the job instead of reporting a false completion.
+    finalizing_rendition: Arc<Mutex<Option<Rendition>>>,
+    /// A lane-2 panic or a required ZIP staging failure makes the whole job
+    /// fail. Keeping this separate from per-track failures prevents the
+    /// finalize marker from mistaking an unsettled lane task for a successful
+    /// partial job.
+    fatal_error: Arc<Mutex<Option<String>>>,
+    primary_zip_error: Arc<Mutex<Option<String>>>,
+    zip_new_dump_messages: Arc<Mutex<Vec<i64>>>,
     is_multi_track: bool,
     max_collection_limit: u32,
     capped_count: usize,
@@ -194,6 +217,100 @@ impl JobContext {
         self.zip_states
             .iter()
             .find(|state| state.rendition == rendition)
+    }
+}
+
+fn set_fatal_error(ctx: &JobContext, error: impl Into<String>) {
+    let mut fatal_error = ctx.fatal_error.lock().expect("fatal error poisoned");
+    if fatal_error.is_none() {
+        *fatal_error = Some(error.into());
+    }
+}
+
+fn fatal_error(ctx: &JobContext) -> Option<String> {
+    ctx.fatal_error
+        .lock()
+        .expect("fatal error poisoned")
+        .clone()
+}
+
+fn set_primary_zip_error(ctx: &JobContext, error: impl Into<String>) {
+    let mut primary_zip_error = ctx
+        .primary_zip_error
+        .lock()
+        .expect("primary ZIP error poisoned");
+    if primary_zip_error.is_none() {
+        *primary_zip_error = Some(error.into());
+    }
+}
+
+fn primary_zip_error(ctx: &JobContext) -> Option<String> {
+    ctx.primary_zip_error
+        .lock()
+        .expect("primary ZIP error poisoned")
+        .clone()
+}
+
+fn remember_zip_dump_message(ctx: &JobContext, message_id: i64) {
+    ctx.zip_new_dump_messages
+        .lock()
+        .expect("ZIP messages poisoned")
+        .push(message_id);
+}
+
+/// Transfer exactly one ownership record for every committed message. A
+/// vector is intentionally used instead of a set because test adapters (and
+/// a retried fake transport) may expose the same numeric id more than once;
+/// one committed upload must not accidentally transfer a different pending
+/// upload with the same id.
+fn transfer_zip_dump_messages(ctx: &JobContext, committed: &[i64]) {
+    let mut pending = ctx
+        .zip_new_dump_messages
+        .lock()
+        .expect("ZIP messages poisoned");
+    for message_id in committed {
+        if let Some(index) = pending
+            .iter()
+            .position(|pending_id| pending_id == message_id)
+        {
+            pending.remove(index);
+        }
+    }
+}
+
+fn take_uncommitted_zip_dump_messages(ctx: &JobContext) -> Vec<i64> {
+    let mut pending = ctx
+        .zip_new_dump_messages
+        .lock()
+        .expect("ZIP messages poisoned");
+    std::mem::take(&mut *pending)
+}
+
+fn archive_codec_replaced(replacement: Codec, existing: Codec) -> bool {
+    match replacement {
+        Codec::Alac | Codec::Aac => matches!(existing, Codec::Alac | Codec::Aac),
+        other => existing == other,
+    }
+}
+
+fn record_lane_task_panic(
+    shared: &Arc<Mutex<JobShared>>,
+    ctx: &JobContext,
+    item_id: &str,
+    message: String,
+) {
+    let error = format!("lane-2 task panicked for {item_id}: {message}");
+    set_fatal_error(ctx, error.clone());
+    let mut failures = ctx.failed_tracks.lock().expect("failures poisoned");
+    if !failures.iter().any(|failure| failure.id == item_id) {
+        failures.push(FailedTrack {
+            id: item_id.to_owned(),
+            error,
+            title: None,
+            artist: None,
+            storefront: None,
+        });
+        shared.lock().expect("job poisoned").job.failed_count = failures.len();
     }
 }
 
@@ -276,7 +393,11 @@ impl EventBus {
             .expect("subscribers poisoned")
             .iter()
         {
-            cb(event);
+            let callback_result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(event)));
+            if callback_result.is_err() {
+                tracing::error!("orchestrator event subscriber panicked");
+            }
         }
     }
 
@@ -347,6 +468,173 @@ struct LaneTask {
     run: Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>,
     /// Label for panic diagnostics only.
     label: &'static str,
+    /// Settles the item/job when the task itself panics. A swallowed panic is
+    /// otherwise indistinguishable from a successful no-op to the marker.
+    on_panic: Option<Box<dyn FnOnce(String) + Send>>,
+}
+
+type FinalizeResult = Result<RipJobSummary, String>;
+type FinalizeSender = tokio::sync::oneshot::Sender<FinalizeResult>;
+
+/// Owns the one result that closes a job's two-lane pipeline.
+///
+/// The marker is deliberately the only normal owner that can settle this
+/// sender. Keeping the workspace paths in the same guard closes the two
+/// failure holes around a bounded queue: a marker can be dropped before it
+/// starts, or its future can panic after it starts. In either case `Drop`
+/// both wakes `start_job` with an error and removes the files synchronously as
+/// a last-resort cleanup. The normal path uses the async cleanup below.
+struct FinalizationGuard {
+    summary_tx: Arc<Mutex<Option<FinalizeSender>>>,
+    workspace_paths: Vec<PathBuf>,
+}
+
+impl FinalizationGuard {
+    fn new(
+        summary_tx: Arc<Mutex<Option<FinalizeSender>>>,
+        rip_job_dir: PathBuf,
+        zip_states: &[Arc<ZipState>],
+    ) -> Self {
+        let mut workspace_paths = Vec::with_capacity(zip_states.len() + 1);
+        workspace_paths.push(rip_job_dir);
+        workspace_paths.extend(zip_states.iter().map(|state| state.dir.clone()));
+        Self {
+            summary_tx,
+            workspace_paths,
+        }
+    }
+
+    fn send(&mut self, result: FinalizeResult) {
+        if let Some(tx) = self
+            .summary_tx
+            .lock()
+            .expect("summary sender poisoned")
+            .take()
+        {
+            let _ = tx.send(result);
+        }
+    }
+
+    async fn finish(&mut self, result: FinalizeResult) {
+        for path in &self.workspace_paths {
+            let _ = tokio::fs::remove_dir_all(path).await;
+        }
+        self.send(result);
+    }
+}
+
+/// Releases a global admission slot if a job unwinds before the ordinary
+/// `start_job` epilogue gets to do so.
+struct AdmissionGuard {
+    admissions: Arc<Mutex<Admissions>>,
+    job_id: String,
+    armed: bool,
+}
+
+impl AdmissionGuard {
+    fn new(admissions: Arc<Mutex<Admissions>>, job_id: String) -> Self {
+        Self {
+            admissions,
+            job_id,
+            armed: true,
+        }
+    }
+
+    fn release(&mut self) {
+        if self.armed {
+            self.admissions
+                .lock()
+                .expect("admissions poisoned")
+                .jobs
+                .remove(&self.job_id);
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Removes a job table entry if setup or a dependency panics after admission.
+struct JobTableGuard {
+    jobs: Arc<Mutex<HashMap<String, Arc<Mutex<JobShared>>>>>,
+    job_id: String,
+    armed: bool,
+}
+
+impl JobTableGuard {
+    fn new(jobs: Arc<Mutex<HashMap<String, Arc<Mutex<JobShared>>>>>, job_id: String) -> Self {
+        Self {
+            jobs,
+            job_id,
+            armed: true,
+        }
+    }
+
+    fn remove(&mut self) {
+        if self.armed {
+            self.jobs
+                .lock()
+                .expect("jobs poisoned")
+                .remove(&self.job_id);
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for JobTableGuard {
+    fn drop(&mut self) {
+        self.remove();
+    }
+}
+
+/// Synchronous last-resort cleanup for workspaces created before the marker
+/// takes ownership. The normal marker path uses async removal.
+struct WorkspaceGuard {
+    paths: Vec<PathBuf>,
+    armed: bool,
+}
+
+impl WorkspaceGuard {
+    fn new() -> Self {
+        Self {
+            paths: Vec::new(),
+            armed: true,
+        }
+    }
+
+    fn add(&mut self, path: PathBuf) {
+        self.paths.push(path);
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WorkspaceGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            for path in &self.paths {
+                let _ = std::fs::remove_dir_all(path);
+            }
+        }
+    }
+}
+
+impl Drop for FinalizationGuard {
+    fn drop(&mut self) {
+        // This path is used only when a marker is dropped or panics. The
+        // directories are temporary workspaces, and synchronous removal is
+        // preferable to leaving a live job and its files stranded.
+        for path in &self.workspace_paths {
+            let _ = std::fs::remove_dir_all(path);
+        }
+        self.send(Err("finalize marker stopped unexpectedly".to_owned()));
+    }
 }
 
 /// Push one item into the global upload lane (FIFO across all jobs, so a
@@ -359,6 +647,9 @@ struct LaneTask {
 async fn push_lane_task(
     lane: &Arc<Mutex<Option<tokio::sync::mpsc::Sender<LaneTask>>>>,
     label: &'static str,
+    on_panic: Option<Box<dyn FnOnce(String) + Send>>,
+    job_cancellation: Option<&CancellationToken>,
+    queue_cancellation: Option<&CancellationToken>,
     run: impl FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static,
 ) -> bool {
     let tx = {
@@ -371,8 +662,31 @@ async fn push_lane_task(
     let task = LaneTask {
         run: Box::new(run),
         label,
+        on_panic,
     };
-    match tx.send(task).await {
+    let send_result = match (job_cancellation, queue_cancellation) {
+        (Some(job_cancellation), Some(queue_cancellation)) => {
+            tokio::select! {
+                result = tx.send(task) => result,
+                _ = job_cancellation.cancelled() => return false,
+                _ = queue_cancellation.cancelled() => return false,
+            }
+        }
+        (Some(job_cancellation), None) => {
+            tokio::select! {
+                result = tx.send(task) => result,
+                _ = job_cancellation.cancelled() => return false,
+            }
+        }
+        (None, Some(queue_cancellation)) => {
+            tokio::select! {
+                result = tx.send(task) => result,
+                _ = queue_cancellation.cancelled() => return false,
+            }
+        }
+        (None, None) => tx.send(task).await,
+    };
+    match send_result {
         Ok(()) => true,
         Err(_) => {
             tracing::error!(
@@ -405,14 +719,24 @@ impl RipOrchestrator {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<LaneTask>(16);
         tokio::spawn(async move {
             while let Some(task) = rx.recv().await {
+                let LaneTask {
+                    run,
+                    label,
+                    on_panic,
+                } = task;
                 let result = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
-                    (task.run)(),
+                    async move { run().await },
                 ))
                 .await;
-                if result.is_err() {
+                if let Err(panic) = result {
+                    let message = panic_message(panic);
+                    if let Some(on_panic) = on_panic {
+                        on_panic(message.clone());
+                    }
                     tracing::error!(
                         lane = "upload",
-                        item = task.label,
+                        item = label,
+                        error = %message,
                         "upload lane task panicked; lane continues"
                     );
                 }
@@ -467,14 +791,25 @@ impl RipOrchestrator {
         summary: Option<&RipJobSummary>,
         error: Option<&str>,
     ) -> bool {
-        let (job, cancelled_by) = {
+        let (job, cancelled_by, state) = {
             let mut guard = shared.lock().expect("job poisoned");
             if guard.job.terminal_state.is_some() {
                 return false;
             }
+            // The shared job mutex is the linearization point for both
+            // cancellation and terminalization. A cancellation accepted
+            // before this lock is acquired wins; one accepted afterwards
+            // observes the terminal state and is rejected.
+            let state = if state != TerminalJobState::Cancelled
+                && (guard.job.is_cancelled || guard.job.controller.is_cancelled())
+            {
+                TerminalJobState::Cancelled
+            } else {
+                state
+            };
             guard.job.terminal_state = Some(state);
             guard.job.completed = true;
-            (guard.job.clone(), guard.job.cancelled_by.clone())
+            (guard.job.clone(), guard.job.cancelled_by.clone(), state)
         };
         match state {
             TerminalJobState::Completed => {
@@ -495,7 +830,9 @@ impl RipOrchestrator {
         true
     }
 
-    /// Cancel a job; false when missing, already cancelled, or completed.
+    /// Request cancellation; false when missing, already cancelled, or
+    /// completed. The terminal event and admission slot are retained until
+    /// the lane-2 finalization marker has cleaned up the job's workspaces.
     pub fn cancel_job(&self, id: &str, cancelled_by: Option<&str>) -> bool {
         let Some(shared) = self.jobs.lock().expect("jobs poisoned").get(id).cloned() else {
             return false;
@@ -508,17 +845,8 @@ impl RipOrchestrator {
         }
         guard.job.is_cancelled = true;
         guard.job.cancelled_by = cancelled_by;
-        guard.job.terminal_state = Some(TerminalJobState::Cancelled);
-        guard.job.completed = true;
         guard.job.controller.cancel();
-        let event_job = guard.job.clone();
-        let by = guard.job.cancelled_by.clone();
         drop(guard);
-
-        self.jobs.lock().expect("jobs poisoned").remove(id);
-        self.release_admission(id);
-        self.bus
-            .emit(&OrchestratorEvent::Cancelled(&event_job, &by));
         true
     }
 
@@ -536,6 +864,7 @@ impl RipOrchestrator {
         }
         let job_id = cuid2::create_id();
         self.admit(&job_id, options)?;
+        let mut admission_guard = AdmissionGuard::new(Arc::clone(&self.admissions), job_id.clone());
 
         // Settings are a snapshot.  The live-availability decision is made
         // after resolution and cache delivery, not as an early gate.
@@ -592,47 +921,55 @@ impl RipOrchestrator {
             .lock()
             .expect("jobs poisoned")
             .insert(job_id.clone(), Arc::clone(&shared));
+        let mut job_table_guard = JobTableGuard::new(Arc::clone(&self.jobs), job_id.clone());
         {
             let guard = shared.lock().expect("job poisoned");
             self.bus.emit(&OrchestratorEvent::Created(&guard.job));
         }
 
-        let result = self
-            .run_job(
+        let result =
+            match futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(self.run_job(
                 Arc::clone(&deps),
                 options,
                 Arc::clone(&shared),
                 job_controller,
                 settings,
-            )
-            .await;
+            )))
+            .await
+            {
+                Ok(result) => result,
+                Err(panic) => Err(OrchestratorError::Message(panic_message(panic))),
+            };
 
-        match &result {
-            Ok(summary) => {
-                self.terminalize(&shared, TerminalJobState::Completed, Some(summary), None);
-            }
-            Err(err) => {
-                let message = err.to_string();
-                let cancelled = shared
-                    .lock()
-                    .expect("job poisoned")
-                    .job
-                    .terminal_state
-                    .is_some_and(|state| state == TerminalJobState::Cancelled);
-                if !cancelled {
+        let cancelled = shared.lock().expect("job poisoned").job.is_cancelled;
+        let result = if cancelled {
+            self.terminalize(&shared, TerminalJobState::Cancelled, None, None);
+            // Preserve the existing caller contract: a cancellation that
+            // reached the marker still resolves the pipeline's summary, but
+            // its sole terminal event is Cancelled. Queue/admission failures
+            // before a marker remain errors and are returned unchanged.
+            result
+        } else {
+            match &result {
+                Ok(summary) => {
+                    self.terminalize(&shared, TerminalJobState::Completed, Some(summary), None);
+                }
+                Err(err) => {
+                    let message = err.to_string();
                     self.terminalize(&shared, TerminalJobState::Failed, None, Some(&message));
                 }
             }
-        }
-        self.jobs.lock().expect("jobs poisoned").remove(&job_id);
-        self.release_admission(&job_id);
+            result
+        };
+        job_table_guard.remove();
+        admission_guard.release();
         result
     }
 
     fn admit(&self, job_id: &str, options: &RipJobOptions) -> Result<(), OrchestratorError> {
         let mut admissions = self.admissions.lock().expect("admissions poisoned");
         // Admins bypass every admission cap (user + global). Their jobs still
-        // occupy a slot so `/cancel` bookkeeping and the dashboard can find
+        // occupy a slot so `/cancel_<id>` bookkeeping and the dashboard can find
         // them, but they never crowd anyone out nor get crowded out.
         if !options.is_admin {
             let non_admin_jobs = admissions
@@ -658,7 +995,7 @@ impl RipOrchestrator {
         Ok(())
     }
 
-    fn release_admission(&self, job_id: &str) {
+    pub fn release_admission(&self, job_id: &str) {
         self.admissions
             .lock()
             .expect("admissions poisoned")
@@ -915,39 +1252,25 @@ impl RipOrchestrator {
 
         // Two-lane ZIP semantics:
         // - `zip_build`: every single-album job with >1 track packages and
-        //   caches the archive in the dump channel (the always-zip rule), so
-        //   any later `-z` request is a cache hit.
-        // - `zip_deliver`: the user asked for the archive (`-z`, `/zip`,
-        //   `/dump`) — individual track delivery is replaced by the ZIP.
+        //   caches the archive in the dump channel.
+        // - `zip_deliver`: a multi-track album is a ZIP delivery job, so
+        //   individual track delivery is replaced by the archive.
         let is_album_job = options.parsed_items.len() == 1
             && options.parsed_items[0].kind == TargetKind::Album
             && tracks_to_process.len() > 1;
         let zip_build = is_album_job;
-        // Delivery only happens when the user asked for it AND the archive
-        // will actually be built (single-track albums can't zip).
-        let zip_deliver = options.zip && is_album_job;
-        // Warn only when the user explicitly asked for a ZIP and the
-        // album turned out to have a single track (implicit auto-attempts
-        // never warn).
-        let mut warnings = Vec::new();
-        if options.zip_explicit
-            && options.zip
-            && options.parsed_items.len() == 1
-            && options.parsed_items[0].kind == TargetKind::Album
-            && tracks_to_process.len() == 1
-        {
-            warnings.push(
-                "ZIP packaging skipped: album has a single track; delivered as a normal track download."
-                    .to_owned(),
-            );
-        }
+        // A single-track album remains an ordinary track delivery; it does
+        // not create an empty or one-track archive.
+        let zip_deliver = is_album_job && !options.is_cache_only;
+        let warnings = Vec::new();
         // Generation identity of the resolved track set. Cached ZIP
         // parts recorded with this hash can be reused instead of rebuilt.
         let zip_generation_hash = zip_build.then(|| {
             let ids: Vec<&str> = tracks_to_process.iter().map(|t| t.id.as_str()).collect();
             album_generation_hash(options.provider.as_str(), &options.parsed_items[0].id, &ids)
         });
-        let mut zip_states = Vec::new();
+        let mut workspace_guard = WorkspaceGuard::new();
+        let mut zip_states: Vec<Arc<ZipState>> = Vec::new();
         if zip_build {
             for rendition in options.rendition_policy.renditions() {
                 let dir = std::env::temp_dir().join(format!(
@@ -958,9 +1281,12 @@ impl RipOrchestrator {
                         Rendition::Atmos => "atmos",
                     }
                 ));
-                tokio::fs::create_dir_all(&dir).await.map_err(|error| {
-                    OrchestratorError::Message(format!("create ZIP workspace: {error}"))
-                })?;
+                workspace_guard.add(dir.clone());
+                if let Err(error) = tokio::fs::create_dir_all(&dir).await {
+                    return Err(OrchestratorError::Message(format!(
+                        "create ZIP workspace: {error}"
+                    )));
+                }
                 zip_states.push(Arc::new(ZipState {
                     rendition: *rendition,
                     dir,
@@ -998,10 +1324,12 @@ impl RipOrchestrator {
                     })
             })
             .collect();
-        let mut existing_tracks_map = deps
-            .find_cached_tracks(&requested_ids)
-            .await
-            .map_err(OrchestratorError::Message)?;
+        let mut existing_tracks_map = match deps.find_cached_tracks(&requested_ids).await {
+            Ok(existing) => existing,
+            Err(error) => {
+                return Err(OrchestratorError::Message(error));
+            }
+        };
 
         shared.lock().expect("job poisoned").job.active_action_text = None;
 
@@ -1018,13 +1346,6 @@ impl RipOrchestrator {
                             let _ = deps.delete_track(&lookup_key).await;
                         }
                     }
-                }
-            }
-            if let Some(album_id) = options.parsed_items.first().map(|item| item.id.as_str()) {
-                for codec in [Codec::Alac, Codec::Aac, Codec::Ec3] {
-                    let _ = deps
-                        .delete_albums(options.provider, album_id, Some(codec))
-                        .await;
                 }
             }
             if !old_message_ids.is_empty() {
@@ -1045,6 +1366,58 @@ impl RipOrchestrator {
         let is_multi_track = tracks_to_process.len() > 1;
         let first_delivered_msg_id: Option<i32> = None;
 
+        // Take one snapshot of all archive rows for the replacement groups.
+        // Besides powering reuse, this is the compare-and-swap generation
+        // observed before the potentially long rebuild.  The repository
+        // rechecks it while holding the replacement key lock.
+        let existing_album_rows = if zip_build {
+            match deps
+                .find_albums(options.provider, &options.parsed_items[0].id, None)
+                .await
+            {
+                Ok(rows) => rows,
+                Err(error) => {
+                    return Err(OrchestratorError::Message(format!(
+                        "album ZIP cache lookup failed: {error}"
+                    )));
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        let zip_expectations: HashMap<Rendition, AlbumReplacementExpectation> = if zip_build {
+            options
+                .rendition_policy
+                .renditions()
+                .iter()
+                .map(|rendition| {
+                    let replacement_codec = match rendition {
+                        Rendition::Primary => Codec::Alac,
+                        Rendition::Atmos => Codec::Ec3,
+                    };
+                    let rows = existing_album_rows
+                        .iter()
+                        .filter(|row| archive_codec_replaced(replacement_codec, row.codec))
+                        .collect::<Vec<_>>();
+                    let expectation = match rows.first() {
+                        None => AlbumReplacementExpectation::Empty,
+                        Some(first)
+                            if rows
+                                .iter()
+                                .all(|row| row.generation_hash == first.generation_hash) =>
+                        {
+                            AlbumReplacementExpectation::Generation(first.generation_hash.clone())
+                        }
+                        Some(_) => AlbumReplacementExpectation::Mixed,
+                    };
+                    (*rendition, expectation)
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
         // A complete archive can be reused independently for each codec. The
         // Atmos archive is allowed to be sparse, so a non-empty valid archive
         // is sufficient to reuse it.
@@ -1057,29 +1430,20 @@ impl RipOrchestrator {
                         Rendition::Atmos => &[Codec::Ec3],
                     };
                     for codec in codecs {
-                        match deps
-                            .find_albums(
-                                options.provider,
-                                &options.parsed_items[0].id,
-                                Some(*codec),
-                            )
-                            .await
+                        let rows = existing_album_rows
+                            .iter()
+                            .filter(|row| row.codec == *codec)
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        if !rows.is_empty()
+                            && rows.iter().all(|row| row.generation_hash == *hash)
+                            && rows.len() == rows[0].total_parts.max(1) as usize
+                            && (1..=rows.len())
+                                .zip(&rows)
+                                .all(|(n, row)| row.part_index as usize == n)
                         {
-                            Ok(rows)
-                                if !rows.is_empty()
-                                    && rows.iter().all(|row| row.generation_hash == *hash)
-                                    && rows.len() == rows[0].total_parts.max(1) as usize
-                                    && (1..=rows.len())
-                                        .zip(&rows)
-                                        .all(|(n, row)| row.part_index as usize == n) =>
-                            {
-                                zip_reuse.insert(*rendition, rows);
-                                break;
-                            }
-                            Ok(_) => {}
-                            Err(error) => {
-                                tracing::warn!(%error, "album ZIP cache lookup failed; rebuilding")
-                            }
+                            zip_reuse.insert(*rendition, rows);
+                            break;
                         }
                     }
                 }
@@ -1123,6 +1487,27 @@ impl RipOrchestrator {
                 zip_reuse.remove(rendition);
             }
         }
+        // Album rows only describe archive parts. For a reused sparse Atmos
+        // archive, derive the actual file count from the persisted EC-3 track
+        // rows instead of treating the number of parts as the number of
+        // tracks. If those rows are unavailable, keep the value unknown rather
+        // than fabricating a count.
+        let zip_reuse_atmos_track_count = if zip_reuse.contains_key(&Rendition::Atmos) {
+            let count = tracks_to_process
+                .iter()
+                .filter(|item| {
+                    existing_tracks_map
+                        .get(
+                            &TrackKey::new(options.provider, item.id.clone())
+                                .with_codec(Codec::Ec3),
+                        )
+                        .is_some_and(|cached| cached.codec == Codec::Ec3)
+                })
+                .count();
+            (count > 0).then_some(count)
+        } else {
+            None
+        };
         if zip_reuse.contains_key(&Rendition::Atmos) {
             pipeline_items.retain(|item| item.rendition != Rendition::Atmos);
         }
@@ -1191,9 +1576,6 @@ impl RipOrchestrator {
             );
             // No staging or packaging will happen for the skipped tracks;
             // drop the zip workspace too.
-            for state in &zip_states {
-                let _ = tokio::fs::remove_dir_all(&state.dir).await;
-            }
             return Ok(summary(
                 cached_count,
                 0,
@@ -1247,6 +1629,8 @@ impl RipOrchestrator {
             zip_deliver,
             zip_states: zip_states.clone(),
             zip_reuse: zip_reuse.clone(),
+            zip_expectations: zip_expectations.clone(),
+            zip_reuse_atmos_track_count,
             zip_album: album_name.clone().unwrap_or_else(|| "Album".to_owned()),
             zip_artist: album_artist
                 .clone()
@@ -1269,6 +1653,10 @@ impl RipOrchestrator {
             zip_release_date: album_release_date.clone().unwrap_or_default(),
             warnings: warnings.clone(),
             atmos_warning: Arc::new(std::sync::Mutex::new(None)),
+            finalizing_rendition: Arc::new(Mutex::new(None)),
+            fatal_error: Arc::new(Mutex::new(None)),
+            primary_zip_error: Arc::new(Mutex::new(None)),
+            zip_new_dump_messages: Arc::new(Mutex::new(Vec::new())),
             is_multi_track,
             max_collection_limit,
             capped_count,
@@ -1280,9 +1668,20 @@ impl RipOrchestrator {
             zip_delivery_infos: Arc::new(Mutex::new(Vec::new())),
         });
 
+        // Create lane-1's workspace before submitting the queue item so an
+        // admission/queue failure has a path it can clean. The finalization
+        // guard receives the same path after the marker is enqueued.
+        let rip_job_dir =
+            std::env::temp_dir().join(format!("rip_job_{id}", id = cuid2::create_id()));
+        workspace_guard.add(rip_job_dir.clone());
+        if let Err(error) = tokio::fs::create_dir_all(&rip_job_dir).await {
+            return Err(OrchestratorError::Message(format!(
+                "create rip workspace: {error}"
+            )));
+        }
         // The finalize marker (last lane-2 item for this job) resolves the
         // job summary; `start_job` awaits it after the enqueue returns.
-        let (summary_tx, summary_rx) = tokio::sync::oneshot::channel::<RipJobSummary>();
+        let (summary_tx, summary_rx) = tokio::sync::oneshot::channel::<FinalizeResult>();
         let summary_tx = Arc::new(Mutex::new(Some(summary_tx)));
 
         // The queue task must be 'static — move everything it needs.
@@ -1293,7 +1692,10 @@ impl RipOrchestrator {
         let task_bus = self.bus.clone();
         let task_job_ctx = Arc::clone(&job_ctx);
         let task_upload_lane = self.upload_lane.clone();
+        let task_queue = self.queue.clone();
+        let task_workspace_guard = workspace_guard;
         let task_summary_tx = Arc::clone(&summary_tx);
+        let task_rip_job_dir = rip_job_dir.clone();
 
         let callback_shared = Arc::clone(&shared);
         let callback_bus = self.bus.clone();
@@ -1333,16 +1735,19 @@ impl RipOrchestrator {
                     queue_signal,
                     ctx: task_job_ctx,
                     upload_lane: task_upload_lane,
+                    queue: task_queue,
+                    workspace_guard: task_workspace_guard,
                     summary_tx: task_summary_tx,
+                    rip_job_dir: task_rip_job_dir,
                 })
                 .await
-            })
-                as std::pin::Pin<Box<dyn std::future::Future<Output = RipJobSummary> + Send>>
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
         };
 
-        // Lane 1 always resolves a summary (possibly with failures); the
-        // finalize marker in lane 2 later upgrades it if it runs at all.
-        let lane_one_summary = match self
+        // Lane 1 returns as soon as its ordered work feed has been handed to
+        // lane 2. The marker is queued after that feed and is the only source
+        // of the final summary.
+        match self
             .queue
             .enqueue(
                 task,
@@ -1354,42 +1759,52 @@ impl RipOrchestrator {
             )
             .await
         {
-            Ok(summary) => summary,
+            Ok(_) => {}
             Err(error) => {
                 // The task never ran (aborted while pending, queue cleared,
-                // or it panicked): the rip workspace was never created, but
-                // the zip workspace exists since the pre-queue phase and no
-                // marker will ever clean it — remove it here. Any staged
-                // downloads for the archive never happened either.
+                // or it panicked). No marker owns the workspaces in this
+                // case, so remove both the pre-created rip workspace and any
+                // ZIP workspaces here.
+                let _ = tokio::fs::remove_dir_all(&rip_job_dir).await;
                 for state in &zip_states {
                     let _ = tokio::fs::remove_dir_all(&state.dir).await;
                 }
                 return Err(error.into());
             }
-        };
+        }
 
         // Wait for the finalize marker (the last lane-2 item for this job)
         // so the job only goes terminal once every upload and the ZIP are
-        // done. If the marker was dropped without resolving (dispatcher
-        // panic), fall back to lane 1's snapshot so `start_job` still
-        // settles instead of hanging forever.
-        let final_summary = match summary_rx.await {
-            Ok(summary) => summary,
-            Err(_) => lane_one_summary,
-        };
-        Ok(final_summary)
+        // done. A missing marker is an error, never a successful lane-1
+        // fallback: reporting completion here would strand uploads and hide
+        // a broken dispatcher.
+        match summary_rx.await {
+            Ok(Ok(summary)) => Ok(summary),
+            Ok(Err(error)) => Err(OrchestratorError::Message(error)),
+            Err(_) => {
+                let _ = tokio::fs::remove_dir_all(&rip_job_dir).await;
+                for state in &zip_states {
+                    let _ = tokio::fs::remove_dir_all(&state.dir).await;
+                }
+                Err(OrchestratorError::Message(
+                    "finalize marker stopped unexpectedly".to_owned(),
+                ))
+            }
+        }
     }
 }
 
-/// Lane 1: staged-cache downloads running concurrently with the rip loop.
+/// Lane 1: the rip loop and bounded handoff to lane 2.
 /// Runs as the sequential rip queue's task (one job at a time), so the
 /// queue slot is held only while rips happen: each finished rip hands its
 /// upload off to lane 2 (the global upload dispatcher), and the job's
 /// finalize marker — pushed after the last rip — completes the archive,
 /// cleans both workspaces, and resolves the summary `start_job` awaits.
 ///
-/// Staging failures are fed back into the work feed as re-rip items, so an
-/// undownloadable cache row still leaves the archive a chance to complete.
+/// A cache task that cannot deliver/materialize its source hands the fallback
+/// to a detached continuation. Lane 2 never submits or waits for a rip
+/// continuation behind the active queue item, and the sequential queue is
+/// free while cache I/O is pending.
 ///
 struct LaneOneContext<'a, D: OrchestratorDeps> {
     deps: Arc<D>,
@@ -1400,12 +1815,725 @@ struct LaneOneContext<'a, D: OrchestratorDeps> {
     queue_signal: CancellationToken,
     ctx: Arc<JobContext>,
     upload_lane: Arc<Mutex<Option<tokio::sync::mpsc::Sender<LaneTask>>>>,
-    summary_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<RipJobSummary>>>>,
+    queue: SequentialRipQueue,
+    workspace_guard: WorkspaceGuard,
+    summary_tx: Arc<Mutex<Option<FinalizeSender>>>,
+    rip_job_dir: PathBuf,
 }
 
-/// Upload retry exhaustion is recorded as a track failure and the job
-/// drains the remaining results.
-async fn run_lane_one<D: OrchestratorDeps>(input: LaneOneContext<'_, D>) -> RipJobSummary {
+enum RipLaneOutcome {
+    Ripped(Box<PipelineRipResult>),
+    Finished,
+    Cancelled,
+    Stop,
+}
+
+enum CacheResolution {
+    Hit,
+    Rerip,
+    Cancelled,
+    Failed(String),
+}
+
+struct CacheResolutionGuard {
+    sender: Option<tokio::sync::oneshot::Sender<CacheResolution>>,
+}
+
+impl CacheResolutionGuard {
+    fn new(sender: tokio::sync::oneshot::Sender<CacheResolution>) -> Self {
+        Self {
+            sender: Some(sender),
+        }
+    }
+
+    fn send(&mut self, result: CacheResolution) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(result);
+        }
+    }
+}
+
+impl Drop for CacheResolutionGuard {
+    fn drop(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(CacheResolution::Failed(
+                "cached lane task stopped unexpectedly".to_owned(),
+            ));
+        }
+    }
+}
+
+struct FinalizingRenditionGuard {
+    rendition: Arc<Mutex<Option<Rendition>>>,
+}
+
+impl FinalizingRenditionGuard {
+    fn new(rendition: Arc<Mutex<Option<Rendition>>>) -> Self {
+        Self { rendition }
+    }
+}
+
+impl Drop for FinalizingRenditionGuard {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            if let Ok(mut rendition) = self.rendition.lock() {
+                *rendition = None;
+            }
+        }
+    }
+}
+
+fn is_lane_cancelled(
+    shared: &Arc<Mutex<JobShared>>,
+    job_controller: &CancellationToken,
+    queue_signal: &CancellationToken,
+) -> bool {
+    shared.lock().expect("job poisoned").job.is_cancelled
+        || job_controller.is_cancelled()
+        || queue_signal.is_cancelled()
+}
+
+struct RipFreshInput<'a, D: OrchestratorDeps> {
+    deps: &'a Arc<D>,
+    bus: &'a EventBus,
+    shared: &'a Arc<Mutex<JobShared>>,
+    ctx: &'a Arc<JobContext>,
+    job_controller: &'a CancellationToken,
+    queue_signal: &'a CancellationToken,
+    item: PipelineItem,
+    rip_job_dir: &'a Path,
+}
+
+/// Rip one item on lane 1. There is deliberately no cache, Telegram, ZIP, or
+/// filesystem operation here; the result is handed to lane 2 by the caller.
+async fn rip_fresh_item<D: OrchestratorDeps>(input: RipFreshInput<'_, D>) -> RipLaneOutcome {
+    let RipFreshInput {
+        deps,
+        bus,
+        shared,
+        ctx,
+        job_controller,
+        queue_signal,
+        item,
+        rip_job_dir,
+    } = input;
+    if is_lane_cancelled(shared, job_controller, queue_signal) {
+        return RipLaneOutcome::Cancelled;
+    }
+    if item.is_streamable == Some(false) {
+        if item.rendition == Rendition::Atmos {
+            return RipLaneOutcome::Finished;
+        }
+        let presentation = deps.providers().presentation();
+        let err_msg = presentation.unavailable_track_message().to_owned();
+        let log_message = presentation.unavailable_track_log_message();
+        {
+            let mut failures = ctx.failed_tracks.lock().expect("failures poisoned");
+            failures.push(FailedTrack {
+                id: item.track_id.clone(),
+                error: err_msg.clone(),
+                title: item.meta_title.clone(),
+                artist: item.meta_artist.clone(),
+                storefront: item.storefront.clone(),
+            });
+            shared.lock().expect("job poisoned").job.failed_count = failures.len();
+        }
+        tracing::warn!(track_id = %item.track_id, "{log_message}");
+        let _ = deps
+            .log_request(RequestLog {
+                telegram_id: ctx.options.user_id,
+                chat_id: ctx.options.chat_id,
+                track_key: TrackKey::new(ctx.options.provider, item.track_id.clone()),
+                is_cache_hit: false,
+                duration_ms: Some(0),
+                status: "failed".to_owned(),
+                error_reason: Some(err_msg),
+            })
+            .await;
+        let (download_text, upload_text) = ctx.texts.snapshot();
+        bus.emit_progress(
+            shared,
+            None,
+            download_text.as_deref(),
+            upload_text.as_deref(),
+        );
+        return RipLaneOutcome::Finished;
+    }
+
+    let track_start_time = now_ms();
+    let track_label = match (&item.meta_title, &item.meta_artist) {
+        (Some(title), Some(artist)) if !title.is_empty() && !artist.is_empty() => {
+            format!("{title} - {artist}")
+        }
+        _ => format!("Track {}", item.track_id),
+    };
+    let dynamic_label = Arc::new(Mutex::new(track_label.clone()));
+    let update_single_track_header =
+        !ctx.is_multi_track && item.meta_title.is_none() && item.meta_artist.is_none();
+
+    let on_progress: RipProgressCallback = {
+        let texts = Arc::clone(&ctx.texts);
+        let shared = Arc::clone(shared);
+        let bus = bus.clone();
+        let dynamic_label = Arc::clone(&dynamic_label);
+        Arc::new(move |status, downloaded, total| {
+            if let Some(label) = stream_display_label(status) {
+                *dynamic_label.lock().expect("label poisoned") = label.to_owned();
+                if update_single_track_header {
+                    shared.lock().expect("job poisoned").job.job_header =
+                        format!("<b>{}</b>", html_escape(label));
+                }
+            }
+            let track_label = dynamic_label.lock().expect("label poisoned").clone();
+            let text = match (downloaded, total) {
+                (Some(downloaded), Some(total)) => format!(
+                    "⬇️ Downloading: <b>{}</b> <code>{}</code>",
+                    html_escape(&track_label),
+                    format_byte_progress(downloaded, total, 12)
+                ),
+                _ => {
+                    let lower = status.to_lowercase();
+                    if lower.contains("tag") {
+                        format!("🏷️ Tagging: <b>{}</b>", html_escape(&track_label))
+                    } else if lower.contains("decrypt") || lower.contains("remux") {
+                        format!("🔓 Decrypting: <b>{}</b>", html_escape(&track_label))
+                    } else if lower.contains("connect") || lower.contains("key") {
+                        format!("🌐 Connecting: <b>{}</b>", html_escape(&track_label))
+                    } else if lower.contains("meta") || lower.contains("fetch") {
+                        format!("🔍 Resolving: <b>{}</b>", html_escape(&track_label))
+                    } else if lower.contains("download") {
+                        format!("⬇️ Downloading: <b>{}</b>", html_escape(&track_label))
+                    } else {
+                        format!(
+                            "⬇️ <b>{}:</b> {}",
+                            html_escape(&track_label),
+                            html_escape(status)
+                        )
+                    }
+                }
+            };
+            *texts.download.lock().expect("texts poisoned") = Some(text.clone());
+            shared.lock().expect("job poisoned").job.active_action_text = Some(text);
+            let (download_text, upload_text) = texts.snapshot();
+            bus.emit_progress(
+                &shared,
+                None,
+                download_text.as_deref(),
+                upload_text.as_deref(),
+            );
+        })
+    };
+
+    let storefront = item.storefront.clone().unwrap_or_else(|| "us".to_owned());
+    let rip_options = RipOptions {
+        provider: ctx.options.provider,
+        storefront: &storefront,
+        on_progress: Some(&on_progress),
+        signal: Some(queue_signal.clone()),
+        output_dir: Some(rip_job_dir),
+        codec_preference: item.rendition.codec_preference(),
+    };
+    let rip_result = match deps
+        .providers()
+        .acquisition()
+        .rip(&item.track_id, rip_options)
+        .await
+    {
+        Ok(rip_result) => rip_result,
+        Err(error) => {
+            *ctx.texts.download.lock().expect("texts poisoned") = None;
+            if is_lane_cancelled(shared, job_controller, queue_signal) {
+                return RipLaneOutcome::Cancelled;
+            }
+            if item.rendition == Rendition::Atmos
+                && matches!(&error, crate::ripper::RipError::Unavailable(_))
+            {
+                tracing::debug!(track_id = %item.track_id, "Atmos rendition unavailable");
+                return RipLaneOutcome::Finished;
+            }
+
+            let err_msg = error.to_string();
+            let duration_ms = (now_ms() - track_start_time) as i64;
+            if item.rendition == Rendition::Primary {
+                let mut failures = ctx.failed_tracks.lock().expect("failures poisoned");
+                failures.push(FailedTrack {
+                    id: item.track_id.clone(),
+                    error: err_msg.clone(),
+                    title: item.meta_title.clone(),
+                    artist: item.meta_artist.clone(),
+                    storefront: item.storefront.clone(),
+                });
+                shared.lock().expect("job poisoned").job.failed_count = failures.len();
+            }
+            tracing::error!(
+                track_id = %item.track_id,
+                duration_ms,
+                error = %err_msg,
+                "Rip job failed"
+            );
+            let _ = deps
+                .log_request(RequestLog {
+                    telegram_id: ctx.options.user_id,
+                    chat_id: ctx.options.chat_id,
+                    track_key: if item.rendition == Rendition::Primary {
+                        TrackKey::new(ctx.options.provider, item.track_id.clone())
+                    } else {
+                        TrackKey::new(ctx.options.provider, item.track_id.clone())
+                            .with_codec(item.rendition.accepted_cache_codecs()[0])
+                    },
+                    is_cache_hit: false,
+                    duration_ms: Some(duration_ms),
+                    status: "failed".to_owned(),
+                    error_reason: Some(err_msg.clone()),
+                })
+                .await;
+
+            let (download_text, upload_text) = ctx.texts.snapshot();
+            bus.emit_progress(
+                shared,
+                Some("Processing next track..."),
+                download_text.as_deref(),
+                upload_text.as_deref(),
+            );
+            let mirror_down = [
+                "Mirror /status check timed out",
+                "Mirror health check failed",
+                "Lossless wrapper is currently offline",
+                "Mirror manifest lookup timed out",
+                "Mirror service is currently offline",
+                "Failed to connect to mirror stream",
+            ]
+            .iter()
+            .any(|phrase| err_msg.contains(phrase));
+            if mirror_down && item.rendition == Rendition::Primary {
+                let mut failures = ctx.failed_tracks.lock().expect("failures poisoned");
+                failures.push(FailedTrack {
+                    id: "Remaining tracks".to_owned(),
+                    error: "Mirror service offline / unreachable (stopped remaining batch)"
+                        .to_owned(),
+                    title: None,
+                    artist: None,
+                    storefront: None,
+                });
+                shared.lock().expect("job poisoned").job.failed_count = failures.len();
+                tracing::error!(
+                    track_id = %item.track_id,
+                    error = %err_msg,
+                    "Lossless mirror appears to be down, aborting remaining batch to prevent repeated timeouts"
+                );
+                return RipLaneOutcome::Stop;
+            }
+            return RipLaneOutcome::Finished;
+        }
+    };
+
+    *ctx.texts.download.lock().expect("texts poisoned") = None;
+    shared.lock().expect("job poisoned").job.active_action_text = None;
+    let (download_text, upload_text) = ctx.texts.snapshot();
+    bus.emit_progress(
+        shared,
+        None,
+        download_text.as_deref(),
+        upload_text.as_deref(),
+    );
+    if is_lane_cancelled(shared, job_controller, queue_signal) {
+        return RipLaneOutcome::Cancelled;
+    }
+    RipLaneOutcome::Ripped(Box::new(PipelineRipResult {
+        track_id: item.track_id,
+        rip_result,
+        start_time_ms: track_start_time,
+        rendition: item.rendition,
+    }))
+}
+
+struct UploadLaneInput<D: OrchestratorDeps> {
+    deps: Arc<D>,
+    bus: EventBus,
+    shared: Arc<Mutex<JobShared>>,
+    ctx: Arc<JobContext>,
+    job_controller: CancellationToken,
+    queue_cancellation: Option<CancellationToken>,
+    upload_lane: Arc<Mutex<Option<tokio::sync::mpsc::Sender<LaneTask>>>>,
+    upload_item: PipelineRipResult,
+}
+
+async fn enqueue_upload_task<D: OrchestratorDeps>(input: UploadLaneInput<D>) -> bool {
+    let UploadLaneInput {
+        deps,
+        bus,
+        shared,
+        ctx,
+        job_controller,
+        queue_cancellation,
+        upload_lane,
+        upload_item,
+    } = input;
+    let panic_shared = Arc::clone(&shared);
+    let panic_ctx = Arc::clone(&ctx);
+    let panic_track_id = upload_item.track_id.clone();
+    let panic_rendition = upload_item.rendition;
+    let panic_title = upload_item.rip_result.title.clone();
+    let panic_artist = upload_item.rip_result.artist.clone();
+    let item_ctx = Arc::clone(&ctx);
+    let task_controller = job_controller.clone();
+    let pushed = push_lane_task(
+        &upload_lane,
+        "upload_track",
+        Some(Box::new(move |message| {
+            record_lane_task_panic(&panic_shared, &panic_ctx, &panic_track_id, message);
+            if panic_rendition == Rendition::Primary {
+                let mut failures = panic_ctx.failed_tracks.lock().expect("failures poisoned");
+                if let Some(failure) = failures
+                    .iter_mut()
+                    .find(|failure| failure.id == panic_track_id)
+                {
+                    failure.title = Some(panic_title.clone());
+                    failure.artist = Some(panic_artist.clone());
+                }
+            }
+        })),
+        Some(&job_controller),
+        queue_cancellation.as_ref(),
+        move || {
+            Box::pin(async move {
+                run_upload_item(deps, bus, shared, item_ctx, task_controller, upload_item).await;
+            })
+        },
+    )
+    .await;
+    pushed
+}
+
+struct CachedResolutionInput<'a, D: OrchestratorDeps> {
+    deps: &'a Arc<D>,
+    bus: &'a EventBus,
+    shared: &'a Arc<Mutex<JobShared>>,
+    ctx: &'a Arc<JobContext>,
+    job_controller: &'a CancellationToken,
+    queue_signal: &'a CancellationToken,
+    item: &'a PipelineItem,
+    cached: &'a CachedTrack,
+}
+
+async fn resolve_cached_item<D: OrchestratorDeps>(
+    input: CachedResolutionInput<'_, D>,
+) -> CacheResolution {
+    let CachedResolutionInput {
+        deps,
+        bus,
+        shared,
+        ctx,
+        job_controller,
+        queue_signal,
+        item,
+        cached,
+    } = input;
+    let is_cancelled = || {
+        shared.lock().expect("job poisoned").job.is_cancelled
+            || job_controller.is_cancelled()
+            || queue_signal.is_cancelled()
+    };
+    let cache_key = cached.track_key.clone();
+    if is_cancelled() {
+        return CacheResolution::Cancelled;
+    }
+    if !codec_allowed_for_rendition(item.rendition, cached.codec) {
+        tracing::warn!(
+            track_id = %item.track_id,
+            codec = %cached.codec.as_str(),
+            "cached track codec does not match rendition; reripping"
+        );
+        let _ = deps.delete_track(&cache_key).await;
+        return CacheResolution::Rerip;
+    }
+
+    if !ctx.options.is_cache_only && !ctx.zip_deliver {
+        let reply_to = (ctx.options.delivery_chat_id == ctx.options.chat_id)
+            .then_some(ctx.options.reply_to_message_id)
+            .flatten();
+        let copy_result = tokio::select! {
+            result = deps.sink().send_dump_copy(
+                ctx.options.delivery_chat_id,
+                cached.message_id,
+                reply_to,
+                ctx.is_multi_track,
+            ) => result,
+            _ = job_controller.cancelled() => return CacheResolution::Cancelled,
+            _ = queue_signal.cancelled() => return CacheResolution::Cancelled,
+        };
+        let sent_id = match copy_result {
+            Ok(sent_id) => sent_id,
+            Err(_) => {
+                tracing::warn!(track_id = %item.track_id, "cached track delivery failed; reripping");
+                let _ = deps.delete_track(&cache_key).await;
+                return CacheResolution::Rerip;
+            }
+        };
+        if is_cancelled() {
+            return CacheResolution::Cancelled;
+        }
+        let _ = tokio::select! {
+            result = deps.log_request(RequestLog {
+                telegram_id: ctx.options.user_id,
+                chat_id: ctx.options.chat_id,
+                track_key: cache_key.clone(),
+                is_cache_hit: true,
+                duration_ms: Some(0),
+                status: "completed".to_owned(),
+                error_reason: None,
+            }) => result,
+            _ = job_controller.cancelled() => return CacheResolution::Cancelled,
+            _ = queue_signal.cancelled() => return CacheResolution::Cancelled,
+        };
+        if is_cancelled() {
+            return CacheResolution::Cancelled;
+        }
+        if ctx
+            .first_delivered_msg_id
+            .lock()
+            .expect("first message poisoned")
+            .is_none()
+        {
+            *ctx.first_delivered_msg_id
+                .lock()
+                .expect("first message poisoned") = Some(sent_id);
+        }
+    } else if !ctx.options.is_cache_only && ctx.zip_deliver {
+        let _ = tokio::select! {
+            result = deps.log_request(RequestLog {
+                telegram_id: ctx.options.user_id,
+                chat_id: ctx.options.chat_id,
+                track_key: cache_key.clone(),
+                is_cache_hit: true,
+                duration_ms: Some(0),
+                status: "completed".to_owned(),
+                error_reason: None,
+            }) => result,
+            _ = job_controller.cancelled() => return CacheResolution::Cancelled,
+            _ = queue_signal.cancelled() => return CacheResolution::Cancelled,
+        };
+        if is_cancelled() {
+            return CacheResolution::Cancelled;
+        }
+    }
+
+    if ctx.zip_build && !ctx.zip_reuse.contains_key(&item.rendition) {
+        if let Some(state) = ctx.zip_state(item.rendition) {
+            let suffix = format!(" [{}].m4a", item.track_id);
+            let name = format!(
+                "{} - {}{suffix}",
+                sanitize_archive_filename(&cached.title),
+                sanitize_archive_filename(&cached.artist)
+            );
+            let filename = bound_filename_with_suffix(&name, &suffix, MAX_ZIP_ENTRY_FILENAME_BYTES);
+            let destination = state.dir.join(&filename);
+            let download_result = tokio::select! {
+                result = deps.sink().download_dump_file(cached.message_id, &destination, None) => result,
+                _ = job_controller.cancelled() => {
+                    let _ = tokio::fs::remove_file(&destination).await;
+                    return CacheResolution::Cancelled;
+                }
+                _ = queue_signal.cancelled() => {
+                    let _ = tokio::fs::remove_file(&destination).await;
+                    return CacheResolution::Cancelled;
+                }
+            };
+            if let Err(error) = download_result {
+                tracing::warn!(
+                    track_id = %item.track_id,
+                    %error,
+                    "cached ZIP source unavailable; reripping"
+                );
+                let _ = tokio::fs::remove_file(&destination).await;
+                let _ = deps.delete_track(&cache_key).await;
+                return CacheResolution::Rerip;
+            }
+            if is_cancelled() {
+                let _ = tokio::fs::remove_file(&destination).await;
+                return CacheResolution::Cancelled;
+            }
+            match tokio::fs::metadata(&destination).await {
+                Ok(metadata) => {
+                    seed_zip_codec(state, cached.codec);
+                    state
+                        .sources
+                        .lock()
+                        .expect("zip sources poisoned")
+                        .push(ZipTrackEntry {
+                            file_path: destination,
+                            archive_filename: filename,
+                            file_size: metadata.len(),
+                        });
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        track_id = %item.track_id,
+                        %error,
+                        "cached ZIP source disappeared; reripping"
+                    );
+                    let _ = tokio::fs::remove_file(&destination).await;
+                    let _ = deps.delete_track(&cache_key).await;
+                    return CacheResolution::Rerip;
+                }
+            }
+        }
+    }
+    if is_cancelled() {
+        return CacheResolution::Cancelled;
+    }
+    if item.rendition == Rendition::Primary {
+        shared.lock().expect("job poisoned").job.cached_count += 1;
+    }
+    bus.emit_progress(shared, Some("Delivered cached tracks..."), None, None);
+    CacheResolution::Hit
+}
+
+struct CachedLaneInput<D: OrchestratorDeps> {
+    deps: Arc<D>,
+    bus: EventBus,
+    shared: Arc<Mutex<JobShared>>,
+    ctx: Arc<JobContext>,
+    job_controller: CancellationToken,
+    queue_signal: CancellationToken,
+    upload_lane: Arc<Mutex<Option<tokio::sync::mpsc::Sender<LaneTask>>>>,
+    item: PipelineItem,
+    cached: CachedTrack,
+}
+
+/// One item in a job's ordered output stream.  Cache work is described here,
+/// rather than started immediately by lane 1, so a later cache task cannot
+/// perform a copy or ZIP staging operation ahead of a fallback rerip.
+enum OrderedSlot {
+    Cached {
+        item: PipelineItem,
+        cached: CachedTrack,
+    },
+    Fresh(PipelineRipResult),
+    Finished,
+}
+
+const ORDERED_SLOT_CAPACITY: usize = 16;
+
+/// The ordered handoff must be able to drain a whole resolved collection when
+/// its head is waiting for a cache fallback.  Keeping this tied to the number
+/// of items in the already-capped collection makes the per-job buffer bounded
+/// without imposing a second, smaller limit on output ordering.
+fn ordered_slot_capacity(item_count: usize) -> usize {
+    item_count.saturating_add(1).max(ORDERED_SLOT_CAPACITY)
+}
+
+struct PendingCachedItem {
+    resolution: tokio::sync::oneshot::Receiver<CacheResolution>,
+}
+
+enum CacheEnqueueResult {
+    Pending(Box<PendingCachedItem>),
+    Cancelled,
+    Failed(String),
+}
+
+/// Per-job ordered dispatcher.  It is deliberately separate from both the
+/// sequential rip queue and the global Telegram lane: it may wait for this
+/// job's cache result or fallback rerip while the global upload lane remains
+/// free to process other jobs.
+struct OrderedDispatchInput<D: OrchestratorDeps> {
+    deps: Arc<D>,
+    bus: EventBus,
+    shared: Arc<Mutex<JobShared>>,
+    ctx: Arc<JobContext>,
+    job_controller: CancellationToken,
+    upload_lane: Arc<Mutex<Option<tokio::sync::mpsc::Sender<LaneTask>>>>,
+    queue: SequentialRipQueue,
+    slots: tokio::sync::mpsc::Receiver<OrderedSlot>,
+    ordered_capacity: usize,
+    rip_job_dir: PathBuf,
+    finalization_guard: FinalizationGuard,
+}
+
+/// Hand a cache hit to lane 2 and return an explicit result handoff.
+///
+/// A failed cache operation is a request for the *active* lane-1 task to
+/// rerip the item.  It must not submit another task to `SequentialRipQueue`:
+/// that queue is already running this job, and lane 2 would otherwise wait on
+/// a continuation that cannot start until this function returns.  The
+/// one-shot is the handoff: lane 2 reports the cache outcome and immediately
+/// becomes available for other jobs; a detached continuation later submits
+/// the fallback to lane 1.
+async fn enqueue_cached_lane_task<D: OrchestratorDeps>(
+    input: CachedLaneInput<D>,
+) -> CacheEnqueueResult {
+    let CachedLaneInput {
+        deps,
+        bus,
+        shared,
+        ctx,
+        job_controller,
+        queue_signal,
+        upload_lane,
+        item,
+        cached,
+    } = input;
+    let (resolution_tx, resolution_rx) = tokio::sync::oneshot::channel();
+    let resolution_guard = CacheResolutionGuard::new(resolution_tx);
+    let cache_deps = Arc::clone(&deps);
+    let cache_bus = bus.clone();
+    let cache_shared = Arc::clone(&shared);
+    let cache_ctx = Arc::clone(&ctx);
+    let cache_controller = job_controller.clone();
+    let cache_queue_signal = queue_signal.clone();
+    let cache_item = item.clone();
+    let cache_value = cached.clone();
+    let panic_shared = Arc::clone(&shared);
+    let panic_ctx = Arc::clone(&ctx);
+    let panic_track_id = item.track_id.clone();
+    let pushed = push_lane_task(
+        &upload_lane,
+        "cached_item",
+        Some(Box::new(move |message| {
+            record_lane_task_panic(&panic_shared, &panic_ctx, &panic_track_id, message);
+        })),
+        Some(&job_controller),
+        Some(&queue_signal),
+        move || {
+            Box::pin(async move {
+                let mut resolution = resolution_guard;
+                let result = resolve_cached_item(CachedResolutionInput {
+                    deps: &cache_deps,
+                    bus: &cache_bus,
+                    shared: &cache_shared,
+                    ctx: &cache_ctx,
+                    job_controller: &cache_controller,
+                    queue_signal: &cache_queue_signal,
+                    item: &cache_item,
+                    cached: &cache_value,
+                })
+                .await;
+                resolution.send(result);
+            })
+        },
+    )
+    .await;
+    if !pushed {
+        return if shared.lock().expect("job poisoned").job.is_cancelled
+            || job_controller.is_cancelled()
+            || queue_signal.is_cancelled()
+        {
+            CacheEnqueueResult::Cancelled
+        } else {
+            CacheEnqueueResult::Failed("cached lane task could not be queued".to_owned())
+        };
+    }
+    CacheEnqueueResult::Pending(Box::new(PendingCachedItem {
+        resolution: resolution_rx,
+    }))
+}
+
+/// Upload retry exhaustion is recorded as a track failure and the job drains
+/// the remaining results.  Results are handed to a bounded, per-job ordered
+/// dispatcher; lane 1 never waits for a Telegram operation or a fallback
+/// rerip.
+async fn run_lane_one<D: OrchestratorDeps>(input: LaneOneContext<'_, D>) {
     let LaneOneContext {
         deps,
         bus,
@@ -1415,9 +2543,36 @@ async fn run_lane_one<D: OrchestratorDeps>(input: LaneOneContext<'_, D>) -> RipJ
         queue_signal,
         ctx,
         upload_lane,
+        queue,
+        mut workspace_guard,
         summary_tx,
+        rip_job_dir,
     } = input;
     tracing::debug!("Rip job started from queue");
+
+    let ordered_capacity = ordered_slot_capacity(uncached_items.len());
+    let (slot_tx, slot_rx) = tokio::sync::mpsc::channel(ordered_capacity);
+    let finalization_guard = FinalizationGuard::new(
+        Arc::clone(&summary_tx),
+        rip_job_dir.clone(),
+        &ctx.zip_states,
+    );
+    // The detached dispatcher now owns cleanup and the summary sender.  The
+    // lane-1 guard remains armed only until that ownership transfer.
+    workspace_guard.disarm();
+    tokio::spawn(run_ordered_dispatch(OrderedDispatchInput {
+        deps: Arc::clone(&deps),
+        bus: bus.clone(),
+        shared: Arc::clone(&shared),
+        ctx: Arc::clone(&ctx),
+        job_controller: job_controller.clone(),
+        upload_lane: Arc::clone(&upload_lane),
+        queue,
+        slots: slot_rx,
+        ordered_capacity,
+        rip_job_dir: rip_job_dir.clone(),
+        finalization_guard,
+    }));
 
     let is_cancelled = || {
         shared.lock().expect("job poisoned").job.is_cancelled
@@ -1425,483 +2580,505 @@ async fn run_lane_one<D: OrchestratorDeps>(input: LaneOneContext<'_, D>) -> RipJ
             || queue_signal.is_cancelled()
     };
 
-    let rip_job_dir: PathBuf =
-        std::env::temp_dir().join(format!("rip_job_{id}", id = cuid2::create_id()));
-    let _ = tokio::fs::create_dir_all(&rip_job_dir).await;
-
-    // The work feed: the producer streams uncached items in, the staging
-    // task feeds failures back for a re-rip. The rip loop ends once both
-    // senders drop (the join below settles them all).
-    let (work_tx, mut work_rx) = tokio::sync::mpsc::channel::<PipelineItem>(2);
-
-    // Producer
-    let producer_tx = work_tx.clone();
-    let producer = async {
-        // The sender is MOVED into the block (async blocks otherwise
-        // capture borrows, keeping the channel open and wedging the rip
-        // loop's recv): when the producer finishes, the last work-feed
-        // sender drops and the rip loop ends.
-        let producer_tx = producer_tx;
-        for item in uncached_items {
-            if is_cancelled() {
-                break;
-            }
-            if producer_tx.send(item.clone()).await.is_err() {
-                break;
-            }
+    // Ripping remains sequential, but handoff is bounded.  If the ordered
+    // dispatcher is waiting on an earlier cache slot, at most sixteen later
+    // artifacts are retained before lane 1 applies backpressure and stops
+    // producing more files.
+    for item in uncached_items {
+        if is_cancelled() {
+            break;
         }
-    };
-    drop(work_tx);
-
-    // Rip loop (lane 1)
-    let rip_loop = async {
-        let mut pending_uploads: Vec<tokio::sync::oneshot::Receiver<()>> = Vec::new();
-        while let Some(mut item) = work_rx.recv().await {
-            if is_cancelled() {
-                break;
+        let slot = if let Some(cached) = item.cached.clone() {
+            OrderedSlot::Cached {
+                item: item.clone(),
+                cached,
             }
-
-            // Cache hits deliberately pass through the same ordered loop as
-            // fresh rips. This is the ordering barrier between a cached
-            // Atmos rendition and a later uncached primary rendition.
-            if let Some(cached) = item.cached.take() {
-                for pending in pending_uploads.drain(..) {
-                    let _ = pending.await;
-                }
-                if is_cancelled() {
-                    break;
-                }
-                let cache_key = cached.track_key.clone();
-                let mut cache_ok = true;
-                if !codec_allowed_for_rendition(item.rendition, cached.codec) {
-                    tracing::warn!(
-                        track_id = %item.track_id,
-                        codec = %cached.codec.as_str(),
-                        "cached track codec does not match rendition; reripping"
-                    );
-                    cache_ok = false;
-                }
-                if cache_ok && !ctx.options.is_cache_only && !ctx.zip_deliver {
-                    if is_cancelled() {
-                        break;
-                    }
-                    let reply_to = (ctx.options.delivery_chat_id == ctx.options.chat_id)
-                        .then_some(ctx.options.reply_to_message_id)
-                        .flatten();
-                    if let Ok(sent_id) = deps
-                        .sink()
-                        .send_dump_copy(
-                            ctx.options.delivery_chat_id,
-                            cached.message_id,
-                            reply_to,
-                            ctx.is_multi_track,
-                        )
-                        .await
-                    {
-                        if is_cancelled() {
-                            break;
-                        }
-                        let _ = deps
-                            .log_request(RequestLog {
-                                telegram_id: ctx.options.user_id,
-                                chat_id: ctx.options.chat_id,
-                                track_key: cache_key.clone(),
-                                is_cache_hit: true,
-                                duration_ms: Some(0),
-                                status: "completed".to_owned(),
-                                error_reason: None,
-                            })
-                            .await;
-                        if ctx.first_delivered_msg_id.lock().unwrap().is_none() {
-                            *ctx.first_delivered_msg_id.lock().unwrap() = Some(sent_id);
-                        }
-                    } else {
-                        tracing::warn!(track_id = %item.track_id, "cached track delivery failed; reripping");
-                        cache_ok = false;
-                    }
-                }
-                if cache_ok && !ctx.options.is_cache_only && ctx.zip_deliver {
-                    if is_cancelled() {
-                        break;
-                    }
-                    let _ = deps
-                        .log_request(RequestLog {
-                            telegram_id: ctx.options.user_id,
-                            chat_id: ctx.options.chat_id,
-                            track_key: cache_key.clone(),
-                            is_cache_hit: true,
-                            duration_ms: Some(0),
-                            status: "completed".to_owned(),
-                            error_reason: None,
-                        })
-                        .await;
-                }
-                if cache_ok && ctx.zip_build && !ctx.zip_reuse.contains_key(&item.rendition) {
-                    if let Some(state) = ctx.zip_state(item.rendition) {
-                        seed_zip_codec(state, cached.codec);
-                        let filename = format!(
-                            "{} - {} [{}].m4a",
-                            sanitize_archive_filename(&cached.title),
-                            sanitize_archive_filename(&cached.artist),
-                            item.track_id
-                        );
-                        let destination = state.dir.join(&filename);
-                        if let Err(error) = deps
-                            .sink()
-                            .download_dump_file(cached.message_id, &destination, None)
-                            .await
-                        {
-                            tracing::warn!(track_id = %item.track_id, %error, "cached ZIP source unavailable; reripping");
-                            cache_ok = false;
-                        } else if is_cancelled() {
-                            let _ = tokio::fs::remove_file(&destination).await;
-                            break;
-                        } else if let Ok(size) =
-                            tokio::fs::metadata(&destination).await.map(|m| m.len())
-                        {
-                            state.sources.lock().expect("zip sources poisoned").push(
-                                ZipTrackEntry {
-                                    file_path: destination,
-                                    archive_filename: filename,
-                                    file_size: size,
-                                },
-                            );
-                        }
-                    }
-                }
-                if cache_ok {
-                    if item.rendition == Rendition::Primary {
-                        let mut guard = shared.lock().expect("job poisoned");
-                        guard.job.cached_count += 1;
-                    }
-                    bus.emit_progress(&shared, Some("Delivered cached tracks..."), None, None);
-                    continue;
-                }
-                let _ = deps.delete_track(&cache_key).await;
-                item.cached = None;
-            }
-
-            if item.is_streamable == Some(false) {
-                if item.rendition == Rendition::Atmos {
-                    continue;
-                }
-                let presentation = deps.providers().presentation();
-                let err_msg = presentation.unavailable_track_message().to_owned();
-                let log_message = presentation.unavailable_track_log_message();
-                let duration_ms = 0;
-                {
-                    let mut failures = ctx.failed_tracks.lock().expect("failures poisoned");
-                    failures.push(FailedTrack {
-                        id: item.track_id.clone(),
-                        error: err_msg.clone(),
-                        title: item.meta_title.clone(),
-                        artist: item.meta_artist.clone(),
-                        storefront: item.storefront.clone(),
-                    });
-                    shared.lock().expect("job poisoned").job.failed_count = failures.len();
-                }
-                tracing::warn!(
-                    track_id = %item.track_id,
-                    "{log_message}",
-                );
-                let _ = deps
-                    .log_request(RequestLog {
-                        telegram_id: ctx.options.user_id,
-                        chat_id: ctx.options.chat_id,
-                        track_key: TrackKey::new(ctx.options.provider, item.track_id.clone()),
-                        is_cache_hit: false,
-                        duration_ms: Some(duration_ms),
-                        status: "failed".to_string(),
-                        error_reason: Some(err_msg.clone()),
-                    })
-                    .await;
-                let (download_text, upload_text) = ctx.texts.snapshot();
-                bus.emit_progress(
-                    &shared,
-                    None,
-                    download_text.as_deref(),
-                    upload_text.as_deref(),
-                );
-                continue;
-            }
-
-            let track_start_time = now_ms();
-            let track_label = match (&item.meta_title, &item.meta_artist) {
-                // An empty title or artist counts as absent.
-                (Some(title), Some(artist)) if !title.is_empty() && !artist.is_empty() => {
-                    format!("{title} - {artist}")
-                }
-                _ => format!("Track {}", item.track_id),
-            };
-            let dynamic_label = Arc::new(Mutex::new(track_label.clone()));
-            let update_single_track_header =
-                !ctx.is_multi_track && item.meta_title.is_none() && item.meta_artist.is_none();
-
-            let on_progress: RipProgressCallback = {
-                let texts = Arc::clone(&ctx.texts);
-                let shared = Arc::clone(&shared);
-                let bus = bus.clone();
-                let dynamic_label = Arc::clone(&dynamic_label);
-                Arc::new(move |status, downloaded, total| {
-                    if let Some(label) = stream_display_label(status) {
-                        *dynamic_label.lock().expect("label poisoned") = label.to_owned();
-                        if update_single_track_header {
-                            shared.lock().expect("job poisoned").job.job_header =
-                                format!("<b>{}</b>", html_escape(label));
-                        }
-                    }
-                    let track_label = dynamic_label.lock().expect("label poisoned").clone();
-                    let text = match (downloaded, total) {
-                        (Some(d), Some(t)) => format!(
-                            "⬇️ Downloading: <b>{}</b> <code>{}</code>",
-                            html_escape(&track_label),
-                            format_byte_progress(d, t, 12)
-                        ),
-                        _ => {
-                            let lower = status.to_lowercase();
-                            if lower.contains("tag") {
-                                format!("🏷️ Tagging: <b>{}</b>", html_escape(&track_label))
-                            } else if lower.contains("decrypt") || lower.contains("remux") {
-                                format!("🔓 Decrypting: <b>{}</b>", html_escape(&track_label))
-                            } else if lower.contains("connect") || lower.contains("key") {
-                                format!("🌐 Connecting: <b>{}</b>", html_escape(&track_label))
-                            } else if lower.contains("meta") || lower.contains("fetch") {
-                                format!("🔍 Resolving: <b>{}</b>", html_escape(&track_label))
-                            } else if lower.contains("download") {
-                                format!("⬇️ Downloading: <b>{}</b>", html_escape(&track_label))
-                            } else {
-                                format!(
-                                    "⬇️ <b>{}:</b> {}",
-                                    html_escape(&track_label),
-                                    html_escape(status)
-                                )
-                            }
-                        }
-                    };
-                    *texts.download.lock().expect("texts poisoned") = Some(text.clone());
-                    shared.lock().expect("job poisoned").job.active_action_text =
-                        Some(text.clone());
-                    let (download_text, upload_text) = texts.snapshot();
-                    bus.emit_progress(
-                        &shared,
-                        None,
-                        download_text.as_deref(),
-                        upload_text.as_deref(),
-                    );
-                })
-            };
-
-            let storefront = item.storefront.clone().unwrap_or_else(|| "us".to_string());
-            let rip_options = RipOptions {
-                provider: ctx.options.provider,
-                storefront: &storefront,
-                on_progress: Some(&on_progress),
-                signal: Some(queue_signal.clone()),
-                output_dir: Some(&rip_job_dir),
-                codec_preference: item.rendition.codec_preference(),
-            };
-            match deps
-                .providers()
-                .acquisition()
-                .rip(&item.track_id, rip_options)
-                .await
+        } else {
+            match rip_fresh_item(RipFreshInput {
+                deps: &deps,
+                bus: &bus,
+                shared: &shared,
+                ctx: &ctx,
+                job_controller: &job_controller,
+                queue_signal: &queue_signal,
+                item: item.clone(),
+                rip_job_dir: &rip_job_dir,
+            })
+            .await
             {
-                Ok(rip_result) => {
-                    // activeDownloadText = ''.
-                    *ctx.texts.download.lock().expect("texts poisoned") = None;
-                    shared.lock().expect("job poisoned").job.active_action_text = None;
-                    let (download_text, upload_text) = ctx.texts.snapshot();
-                    bus.emit_progress(
-                        &shared,
-                        None,
-                        download_text.as_deref(),
-                        upload_text.as_deref(),
-                    );
-
-                    // Hand the finished rip to lane 2 — FIFO behind this
-                    // job's earlier items. Back-pressure (16 pending
-                    // items) pauses ripping until uploads drain.
-                    if let Some(state) = ctx.zip_state(item.rendition) {
-                        if let Ok(codec) = rip_result.codec.parse::<Codec>() {
-                            if codec_allowed_for_rendition(item.rendition, codec) {
-                                seed_zip_codec(state, codec);
-                            }
-                        }
-                    }
-                    let upload_item = PipelineRipResult {
-                        track_id: item.track_id.clone(),
-                        rip_result,
-                        start_time_ms: track_start_time,
-                        rendition: item.rendition,
-                    };
-                    let item_deps = Arc::clone(&deps);
-                    let item_bus = bus.clone();
-                    let item_shared = Arc::clone(&shared);
-                    let item_ctx = Arc::clone(&ctx);
-                    let item_controller = job_controller.clone();
-                    let lane = Arc::clone(&upload_lane);
-                    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-                    let pushed = push_lane_task(&lane, "upload_track", move || {
-                        Box::pin(async move {
-                            run_upload_item(
-                                item_deps,
-                                item_bus,
-                                item_shared,
-                                item_ctx,
-                                item_controller,
-                                upload_item,
-                            )
-                            .await;
-                            let _ = done_tx.send(());
-                        })
-                    })
-                    .await;
-                    if !pushed {
-                        // The dispatcher is gone (runtime shutdown); the
-                        // upload can never run, so stop ripping.
-                        break;
-                    }
-                    pending_uploads.push(done_rx);
-                }
-                Err(err) => {
-                    *ctx.texts.download.lock().expect("texts poisoned") = None;
-                    if is_cancelled() {
-                        break;
-                    }
-
-                    // A provider-confirmed absence of an optional Atmos
-                    // variant is not a failure and never creates cache state.
-                    if item.rendition == Rendition::Atmos
-                        && matches!(&err, crate::ripper::RipError::Unavailable(_))
-                    {
-                        tracing::debug!(track_id = %item.track_id, "Atmos rendition unavailable");
-                        continue;
-                    }
-
-                    let err_msg = err.to_string();
-                    let duration_ms = (now_ms() - track_start_time) as i64;
-                    {
-                        if item.rendition == Rendition::Primary {
-                            let mut failures = ctx.failed_tracks.lock().expect("failures poisoned");
-                            failures.push(FailedTrack {
-                                id: item.track_id.clone(),
-                                error: err_msg.clone(),
-                                title: item.meta_title.clone(),
-                                artist: item.meta_artist.clone(),
-                                storefront: item.storefront.clone(),
-                            });
-                            shared.lock().expect("job poisoned").job.failed_count = failures.len();
-                        }
-                    }
-
-                    tracing::error!(
-                        track_id = %item.track_id,
-                        duration_ms,
-                        error = %err_msg,
-                        "Rip job failed"
-                    );
-
-                    let _ = deps
-                        .log_request(RequestLog {
-                            telegram_id: ctx.options.user_id,
-                            chat_id: ctx.options.chat_id,
-                            track_key: if item.rendition == Rendition::Primary {
-                                TrackKey::new(ctx.options.provider, item.track_id.clone())
-                            } else {
-                                TrackKey::new(ctx.options.provider, item.track_id.clone())
-                                    .with_codec(item.rendition.accepted_cache_codecs()[0])
-                            },
-                            is_cache_hit: false,
-                            duration_ms: Some(duration_ms),
-                            status: "failed".to_string(),
-                            error_reason: Some(err_msg.clone()),
-                        })
-                        .await;
-
-                    let (download_text, upload_text) = ctx.texts.snapshot();
-                    bus.emit_progress(
-                        &shared,
-                        Some("Processing next track..."),
-                        download_text.as_deref(),
-                        upload_text.as_deref(),
-                    );
-
-                    // Circuit breaker: abort the remaining batch when the
-                    // mirror looks offline.
-                    let is_mirror_down = [
-                        "Mirror /status check timed out",
-                        "Mirror health check failed",
-                        "Lossless wrapper is currently offline",
-                        "Mirror manifest lookup timed out",
-                        "Mirror service is currently offline",
-                        "Failed to connect to mirror stream",
-                    ]
-                    .iter()
-                    .any(|phrase| err_msg.contains(phrase));
-                    if is_mirror_down && item.rendition == Rendition::Primary {
-                        {
-                            let mut failures = ctx.failed_tracks.lock().expect("failures poisoned");
-                            failures.push(FailedTrack {
-                                id: "Remaining tracks".to_string(),
-                                error:
-                                    "Mirror service offline / unreachable (stopped remaining batch)"
-                                        .to_string(),
-                                title: None,
-                                artist: None,
-                                storefront: None,
-                            });
-                            shared.lock().expect("job poisoned").job.failed_count = failures.len();
-                        }
-                        tracing::error!(
-                            track_id = %item.track_id,
-                            error = %err_msg,
-                            "Lossless mirror appears to be down, aborting remaining batch to prevent repeated timeouts"
-                        );
-                        break;
-                    }
-                }
+                RipLaneOutcome::Ripped(upload_item) => OrderedSlot::Fresh(*upload_item),
+                RipLaneOutcome::Finished => continue,
+                RipLaneOutcome::Cancelled | RipLaneOutcome::Stop => break,
             }
-        }
-        for pending in pending_uploads {
-            let _ = pending.await;
-        }
-    };
+        };
 
-    // All three stages settle (channel drops propagate end-to-end).
-    let _: ((), ()) = tokio::join!(producer, rip_loop);
+        let sent = tokio::select! {
+            result = slot_tx.send(slot) => result.is_ok(),
+            _ = job_controller.cancelled() => false,
+            _ = queue_signal.cancelled() => false,
+        };
+        if !sent {
+            break;
+        }
+    }
 
-    // Finalize marker: the last lane-2 item for this job (FIFO after all
-    // of its track uploads). Builds the archive, publishes it, cleans both
-    // workspaces, and resolves the summary `start_job` awaits. Pushed even
-    // after cancellation — the workspace still needs cleanup.
-    let marker_deps = Arc::clone(&deps);
-    let marker_bus = bus.clone();
-    let marker_shared = Arc::clone(&shared);
-    let marker_ctx = Arc::clone(&ctx);
+    // Do not select cancellation here: the dispatcher must receive this
+    // marker even after cancellation so it can enqueue the terminal marker,
+    // clean staged files, and settle start_job's summary receiver.
+    let _ = slot_tx.send(OrderedSlot::Finished).await;
+}
+
+async fn enqueue_finalize_marker<D: OrchestratorDeps>(
+    deps: Arc<D>,
+    bus: EventBus,
+    shared: Arc<Mutex<JobShared>>,
+    ctx: Arc<JobContext>,
+    job_controller: CancellationToken,
+    upload_lane: Arc<Mutex<Option<tokio::sync::mpsc::Sender<LaneTask>>>>,
+    finalization_guard: FinalizationGuard,
+) {
+    let marker_panic_shared = Arc::clone(&shared);
+    let marker_panic_ctx = Arc::clone(&ctx);
     let marker_controller = job_controller.clone();
-    let marker_job_dir = rip_job_dir;
-    let marker_summary_tx = Arc::clone(&summary_tx);
-    let marker_lane = Arc::clone(&upload_lane);
-    let _ = push_lane_task(&marker_lane, "finalize_job", move || {
+    let pushed = push_lane_task(&upload_lane, "finalize_job", None, None, None, move || {
         Box::pin(async move {
-            finalize_job(
-                marker_deps,
-                marker_bus,
-                marker_shared,
-                marker_ctx,
-                marker_controller,
-                marker_job_dir,
-                marker_summary_tx,
-            )
-            .await;
+            let mut finalization_guard = finalization_guard;
+            let result = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                finalize_job(deps, bus, shared, ctx, marker_controller),
+            ))
+            .await
+            .unwrap_or_else(|_| {
+                let optional_atmos = marker_panic_ctx
+                    .finalizing_rendition
+                    .lock()
+                    .ok()
+                    .and_then(|rendition| *rendition)
+                    == Some(Rendition::Atmos);
+                if optional_atmos {
+                    tracing::warn!(
+                        "optional Atmos ZIP finalization panicked; keeping primary result"
+                    );
+                    Ok(build_job_summary(
+                        &marker_panic_shared,
+                        &marker_panic_ctx,
+                        None,
+                    ))
+                } else {
+                    Err("finalize marker panicked".to_owned())
+                }
+            });
+            finalization_guard.finish(result).await;
         })
     })
     .await;
+    if !pushed {
+        tracing::error!(lane = "upload", "failed to enqueue finalize marker");
+    }
+}
 
-    // Lane-1 fallback summary (counts at the last rip). Normally
-    // superseded by the finalize marker's resolution; used only if the
-    // marker was dropped without resolving (dispatcher panic).
-    build_job_summary(&shared, &ctx, None)
+struct OrderedReripInput<D: OrchestratorDeps> {
+    deps: Arc<D>,
+    bus: EventBus,
+    shared: Arc<Mutex<JobShared>>,
+    ctx: Arc<JobContext>,
+    job_controller: CancellationToken,
+    queue: SequentialRipQueue,
+    item: PipelineItem,
+    rip_job_dir: PathBuf,
+}
+
+fn submit_ordered_rerip_item<D: OrchestratorDeps>(
+    input: OrderedReripInput<D>,
+) -> crate::queue::TaskReceiver {
+    let OrderedReripInput {
+        deps,
+        bus,
+        shared,
+        ctx,
+        job_controller,
+        queue,
+        item,
+        rip_job_dir,
+    } = input;
+    let task_deps = Arc::clone(&deps);
+    let task_bus = bus.clone();
+    let task_shared = Arc::clone(&shared);
+    let task_ctx = Arc::clone(&ctx);
+    let task_controller = job_controller.clone();
+    let task_rip_job_dir = rip_job_dir;
+    queue.submit(
+        move |queue_signal| {
+            Box::pin(async move {
+                rip_fresh_item(RipFreshInput {
+                    deps: &task_deps,
+                    bus: &task_bus,
+                    shared: &task_shared,
+                    ctx: &task_ctx,
+                    job_controller: &task_controller,
+                    queue_signal: &queue_signal,
+                    item,
+                    rip_job_dir: &task_rip_job_dir,
+                })
+                .await
+            })
+        },
+        Some(EnqueueOptions {
+            on_position_change: None,
+            on_start: None,
+            signal: Some(job_controller),
+        }),
+    )
+}
+
+fn ordered_rerip_result(
+    result: Result<crate::queue::TaskResult, tokio::sync::oneshot::error::RecvError>,
+    shared: &Arc<Mutex<JobShared>>,
+    ctx: &Arc<JobContext>,
+    job_controller: &CancellationToken,
+) -> RipLaneOutcome {
+    let cancelled =
+        || shared.lock().expect("job poisoned").job.is_cancelled || job_controller.is_cancelled();
+    match result {
+        Ok(Ok(value)) => match value.downcast::<RipLaneOutcome>() {
+            Ok(outcome) => *outcome,
+            Err(_) => {
+                set_fatal_error(
+                    ctx,
+                    "ordered fallback rip returned an invalid result".to_owned(),
+                );
+                RipLaneOutcome::Stop
+            }
+        },
+        Ok(Err(error)) => {
+            if cancelled() {
+                RipLaneOutcome::Cancelled
+            } else {
+                set_fatal_error(ctx, format!("ordered fallback rip failed: {error}"));
+                RipLaneOutcome::Stop
+            }
+        }
+        Err(_) => {
+            if cancelled() {
+                RipLaneOutcome::Cancelled
+            } else {
+                set_fatal_error(
+                    ctx,
+                    "ordered fallback rip queue stopped unexpectedly".to_owned(),
+                );
+                RipLaneOutcome::Stop
+            }
+        }
+    }
+}
+
+struct OrderedSlotDrain<'a> {
+    slots: &'a mut tokio::sync::mpsc::Receiver<OrderedSlot>,
+    buffered: &'a mut VecDeque<OrderedSlot>,
+    received_finished: &'a mut bool,
+    ordered_capacity: usize,
+}
+
+/// Keep consuming the lane-1 handoff while an earlier cache operation is
+/// unresolved.  The cache task itself runs on the global lane, so waiting here
+/// must not let the bounded handoff fill and pin the sequential rip queue.
+async fn wait_for_cache_resolution(
+    mut resolution: tokio::sync::oneshot::Receiver<CacheResolution>,
+    drain: &mut OrderedSlotDrain<'_>,
+    job_controller: &CancellationToken,
+    ctx: &Arc<JobContext>,
+) -> CacheResolution {
+    loop {
+        tokio::select! {
+            result = &mut resolution => {
+                return result.unwrap_or_else(|_| CacheResolution::Failed(
+                    "cached result channel closed unexpectedly".to_owned(),
+                ));
+            }
+            slot = drain.slots.recv(), if !*drain.received_finished => {
+                match slot {
+                    Some(OrderedSlot::Finished) => *drain.received_finished = true,
+                    Some(slot) => {
+                        if drain.buffered.len() < drain.ordered_capacity {
+                            drain.buffered.push_back(slot);
+                        } else {
+                            set_fatal_error(
+                                ctx,
+                                "ordered dispatcher buffer exhausted while resolving cache".to_owned(),
+                            );
+                        }
+                    }
+                    None => {
+                        return CacheResolution::Failed(
+                            "ordered dispatcher stopped before its finish marker".to_owned(),
+                        );
+                    }
+                }
+            }
+            _ = job_controller.cancelled() => return CacheResolution::Cancelled,
+        }
+    }
+}
+
+/// Wait for a fallback submitted to the sequential rip queue while draining
+/// later lane-1 results.  Later results remain buffered and are not handed to
+/// Telegram/ZIP work until this missing ordinal has settled.
+async fn wait_for_ordered_rerip(
+    mut completion: crate::queue::TaskReceiver,
+    drain: &mut OrderedSlotDrain<'_>,
+    job_controller: &CancellationToken,
+    shared: &Arc<Mutex<JobShared>>,
+    ctx: &Arc<JobContext>,
+) -> RipLaneOutcome {
+    let mut cancelled = false;
+    loop {
+        tokio::select! {
+            result = &mut completion => {
+                let outcome = ordered_rerip_result(result, shared, ctx, job_controller);
+                if cancelled {
+                    return RipLaneOutcome::Cancelled;
+                }
+                return outcome;
+            }
+            slot = drain.slots.recv(), if !*drain.received_finished => {
+                match slot {
+                    Some(OrderedSlot::Finished) => *drain.received_finished = true,
+                    Some(slot) => {
+                        if drain.buffered.len() < drain.ordered_capacity {
+                            drain.buffered.push_back(slot);
+                        } else {
+                            set_fatal_error(
+                                ctx,
+                                "ordered dispatcher buffer exhausted while reripping".to_owned(),
+                            );
+                        }
+                    }
+                    None => {
+                        return if cancelled {
+                            RipLaneOutcome::Cancelled
+                        } else {
+                            set_fatal_error(
+                                ctx,
+                                "ordered dispatcher stopped before its finish marker".to_owned(),
+                            );
+                            RipLaneOutcome::Stop
+                        };
+                    }
+                }
+            }
+            _ = job_controller.cancelled(), if !cancelled => {
+                // Keep the queue receiver alive until the queue item settles;
+                // otherwise a marker could run while a cancelled fallback is
+                // still writing into the shared workspace.
+                cancelled = true;
+            }
+        }
+    }
+}
+
+/// Drive one job's ordered output stream.  This task may wait for a cache
+/// operation or for its own fallback to obtain the sequential rip queue, but
+/// it never runs in the global lane-2 worker.  Consequently another job's
+/// uploads remain dispatchable while this job's missing slot is settling.
+async fn run_ordered_dispatch<D: OrchestratorDeps>(input: OrderedDispatchInput<D>) {
+    let OrderedDispatchInput {
+        deps,
+        bus,
+        shared,
+        ctx,
+        job_controller,
+        upload_lane,
+        queue,
+        mut slots,
+        ordered_capacity,
+        rip_job_dir,
+        mut finalization_guard,
+    } = input;
+    let mut received_finished = false;
+    let mut stop_dispatch = false;
+    let mut buffered = VecDeque::with_capacity(ordered_capacity);
+
+    loop {
+        let slot = if let Some(slot) = buffered.pop_front() {
+            slot
+        } else if received_finished {
+            break;
+        } else {
+            match slots.recv().await {
+                Some(slot) => slot,
+                None => break,
+            }
+        };
+        if matches!(&slot, OrderedSlot::Finished) {
+            received_finished = true;
+            continue;
+        }
+        if stop_dispatch
+            || shared.lock().expect("job poisoned").job.is_cancelled
+            || job_controller.is_cancelled()
+        {
+            // Keep receiving until the terminal marker so lane 1 can apply
+            // bounded backpressure without getting stranded on cancellation.
+            stop_dispatch = true;
+            continue;
+        }
+
+        match slot {
+            OrderedSlot::Fresh(upload_item) => {
+                let pushed = enqueue_upload_task(UploadLaneInput {
+                    deps: Arc::clone(&deps),
+                    bus: bus.clone(),
+                    shared: Arc::clone(&shared),
+                    ctx: Arc::clone(&ctx),
+                    job_controller: job_controller.clone(),
+                    queue_cancellation: None,
+                    upload_lane: Arc::clone(&upload_lane),
+                    upload_item,
+                })
+                .await;
+                if !pushed {
+                    if !shared.lock().expect("job poisoned").job.is_cancelled
+                        && !job_controller.is_cancelled()
+                    {
+                        set_fatal_error(&ctx, "ordered upload could not be queued".to_owned());
+                    }
+                    stop_dispatch = true;
+                }
+            }
+            OrderedSlot::Cached { item, cached } => {
+                let cache_result = enqueue_cached_lane_task(CachedLaneInput {
+                    deps: Arc::clone(&deps),
+                    bus: bus.clone(),
+                    shared: Arc::clone(&shared),
+                    ctx: Arc::clone(&ctx),
+                    job_controller: job_controller.clone(),
+                    // The original queue child is no longer the owner of the
+                    // detached dispatcher.  The job token is its lifetime
+                    // signal instead.
+                    queue_signal: job_controller.clone(),
+                    upload_lane: Arc::clone(&upload_lane),
+                    item: item.clone(),
+                    cached,
+                })
+                .await;
+                let cache_result = match cache_result {
+                    CacheEnqueueResult::Pending(pending) => {
+                        let mut drain = OrderedSlotDrain {
+                            slots: &mut slots,
+                            buffered: &mut buffered,
+                            received_finished: &mut received_finished,
+                            ordered_capacity,
+                        };
+                        wait_for_cache_resolution(
+                            pending.resolution,
+                            &mut drain,
+                            &job_controller,
+                            &ctx,
+                        )
+                        .await
+                    }
+                    CacheEnqueueResult::Cancelled => CacheResolution::Cancelled,
+                    CacheEnqueueResult::Failed(error) => CacheResolution::Failed(error),
+                };
+
+                match cache_result {
+                    CacheResolution::Hit => {}
+                    CacheResolution::Failed(error) => set_fatal_error(&ctx, error),
+                    CacheResolution::Cancelled => stop_dispatch = true,
+                    CacheResolution::Rerip => {
+                        // Submit the fallback behind the currently active
+                        // lane-1 task, then keep draining that task's bounded
+                        // handoff while it finishes.  Waiting on `queue` here
+                        // without draining would deadlock once the handoff is
+                        // full: lane 1 owns the queue and cannot return, while
+                        // the fallback waits behind it.
+                        let completion = submit_ordered_rerip_item(OrderedReripInput {
+                            deps: Arc::clone(&deps),
+                            bus: bus.clone(),
+                            shared: Arc::clone(&shared),
+                            ctx: Arc::clone(&ctx),
+                            job_controller: job_controller.clone(),
+                            queue: queue.clone(),
+                            item: PipelineItem {
+                                cached: None,
+                                ..item
+                            },
+                            rip_job_dir: rip_job_dir.clone(),
+                        });
+                        let mut drain = OrderedSlotDrain {
+                            slots: &mut slots,
+                            buffered: &mut buffered,
+                            received_finished: &mut received_finished,
+                            ordered_capacity,
+                        };
+                        match wait_for_ordered_rerip(
+                            completion,
+                            &mut drain,
+                            &job_controller,
+                            &shared,
+                            &ctx,
+                        )
+                        .await
+                        {
+                            RipLaneOutcome::Ripped(upload_item) => {
+                                if !enqueue_upload_task(UploadLaneInput {
+                                    deps: Arc::clone(&deps),
+                                    bus: bus.clone(),
+                                    shared: Arc::clone(&shared),
+                                    ctx: Arc::clone(&ctx),
+                                    job_controller: job_controller.clone(),
+                                    queue_cancellation: None,
+                                    upload_lane: Arc::clone(&upload_lane),
+                                    upload_item: *upload_item,
+                                })
+                                .await
+                                {
+                                    if !shared.lock().expect("job poisoned").job.is_cancelled
+                                        && !job_controller.is_cancelled()
+                                    {
+                                        set_fatal_error(
+                                            &ctx,
+                                            "ordered fallback upload could not be queued"
+                                                .to_owned(),
+                                        );
+                                    }
+                                    stop_dispatch = true;
+                                }
+                            }
+                            RipLaneOutcome::Finished => {}
+                            RipLaneOutcome::Cancelled | RipLaneOutcome::Stop => {
+                                stop_dispatch = true;
+                            }
+                        }
+                    }
+                }
+            }
+            OrderedSlot::Finished => unreachable!("finished slot handled above"),
+        }
+    }
+
+    if !received_finished
+        && !shared.lock().expect("job poisoned").job.is_cancelled
+        && !job_controller.is_cancelled()
+    {
+        finalization_guard
+            .finish(Err("ordered dispatcher stopped unexpectedly".to_owned()))
+            .await;
+        return;
+    }
+
+    // The marker is ordered after every task submitted by this coordinator.
+    // On cancellation it also performs the normal ZIP rollback and workspace
+    // cleanup before resolving the summary receiver.
+    enqueue_finalize_marker(
+        deps,
+        bus,
+        shared,
+        ctx,
+        job_controller,
+        upload_lane,
+        finalization_guard,
+    )
+    .await;
 }
 
 /// Snapshot the shared job state into a `RipJobSummary` for the given
@@ -1965,36 +3142,84 @@ async fn run_upload_item<D: OrchestratorDeps>(
         shared.lock().expect("job poisoned").job.is_cancelled || job_controller.is_cancelled();
     if uploaded_ok && ctx.zip_build && !cancelled {
         if let Some(state) = ctx.zip_state(upload_item.rendition) {
-            let filename = format!(
-                "{:02} - {} - {} [{}].m4a",
+            let suffix = format!(" [{}].m4a", upload_item.track_id);
+            let name = format!(
+                "{:02} - {} - {}{suffix}",
                 upload_item.rip_result.track_number,
                 sanitize_archive_filename(&upload_item.rip_result.title),
-                sanitize_archive_filename(&upload_item.rip_result.artist),
-                upload_item.track_id
+                sanitize_archive_filename(&upload_item.rip_result.artist)
             );
+            let filename = bound_filename_with_suffix(&name, &suffix, MAX_ZIP_ENTRY_FILENAME_BYTES);
             let destination = state.dir.join(&filename);
             if let Err(error) =
                 tokio::fs::copy(&upload_item.rip_result.file_path, &destination).await
             {
-                tracing::warn!(%error, track_id = %upload_item.track_id, "failed to stage track for ZIP");
+                tracing::warn!(
+                    %error,
+                    track_id = %upload_item.track_id,
+                    rendition = ?upload_item.rendition,
+                    "failed to stage track for ZIP"
+                );
+                if upload_item.rendition == Rendition::Primary {
+                    set_primary_zip_error(
+                        &ctx,
+                        format!(
+                            "primary ZIP staging failed for {}: {error}",
+                            upload_item.track_id
+                        ),
+                    );
+                } else {
+                    *ctx.atmos_warning.lock().expect("atmos poisoned") = Some(format!(
+                        "optional Atmos ZIP staging failed for {}: {error}",
+                        upload_item.track_id
+                    ));
+                }
             } else if shared.lock().expect("job poisoned").job.is_cancelled
                 || job_controller.is_cancelled()
             {
                 let _ = tokio::fs::remove_file(&destination).await;
             } else {
-                let size = tokio::fs::metadata(&destination)
-                    .await
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-                state
-                    .sources
-                    .lock()
-                    .expect("zip sources poisoned")
-                    .push(ZipTrackEntry {
-                        file_path: destination,
-                        archive_filename: filename,
-                        file_size: size,
-                    });
+                match tokio::fs::metadata(&destination).await {
+                    Ok(metadata) => {
+                        if let Ok(codec) = upload_item.rip_result.codec.parse::<Codec>() {
+                            if codec_allowed_for_rendition(upload_item.rendition, codec) {
+                                seed_zip_codec(state, codec);
+                            }
+                        }
+                        state
+                            .sources
+                            .lock()
+                            .expect("zip sources poisoned")
+                            .push(ZipTrackEntry {
+                                file_path: destination,
+                                archive_filename: filename,
+                                file_size: metadata.len(),
+                            });
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            track_id = %upload_item.track_id,
+                            rendition = ?upload_item.rendition,
+                            "staged ZIP source disappeared"
+                        );
+                        let _ = tokio::fs::remove_file(&destination).await;
+                        if upload_item.rendition == Rendition::Primary {
+                            set_primary_zip_error(
+                                &ctx,
+                                format!(
+                                    "primary ZIP source metadata failed for {}: {error}",
+                                    upload_item.track_id
+                                ),
+                            );
+                        } else {
+                            *ctx.atmos_warning.lock().expect("atmos poisoned") = Some(format!(
+                                "optional Atmos ZIP source metadata failed for {}: {error}",
+                                upload_item.track_id
+                            ));
+                        }
+                    }
+                }
             }
         }
     }
@@ -2009,10 +3234,10 @@ async fn run_upload_item<D: OrchestratorDeps>(
 ///
 /// Publication gating (the always-zip rule):
 /// - Complete archive → always uploaded to the dump and `save_album`'d
-///   (the cache), regardless of who asked; user copies/details only when
-///   the user asked for the archive (`zip_deliver`) on a user job.
+///   (the cache), regardless of who asked; user copies/details are sent for
+///   multi-track album requests (`zip_deliver`).
 /// - Incomplete archive → never cached; delivered as `[Partial].zip`
-///   straight to the delivery chat only for `zip_deliver` user jobs;
+///   straight to the delivery chat only for user-facing `zip_deliver` jobs;
 ///   otherwise skipped entirely.
 async fn finalize_job<D: OrchestratorDeps>(
     deps: Arc<D>,
@@ -2020,48 +3245,74 @@ async fn finalize_job<D: OrchestratorDeps>(
     shared: Arc<Mutex<JobShared>>,
     ctx: Arc<JobContext>,
     job_controller: CancellationToken,
-    rip_job_dir: PathBuf,
-    summary_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<RipJobSummary>>>>,
-) {
-    let zip_delivery = finalize_zip(&deps, &bus, &shared, &ctx, &job_controller).await;
-
-    // Cleanup both workspaces. Runs on every path, including cancellation.
-    let _ = tokio::fs::remove_dir_all(&rip_job_dir).await;
-    for state in &ctx.zip_states {
-        let _ = tokio::fs::remove_dir_all(&state.dir).await;
+) -> FinalizeResult {
+    if let Some(error) = fatal_error(&ctx) {
+        return Err(error);
     }
-
-    let summary = build_job_summary(&shared, &ctx, zip_delivery);
-    if let Some(tx) = summary_tx.lock().expect("summary sender poisoned").take() {
-        let _ = tx.send(summary);
+    let zip_delivery = finalize_zip(&deps, &bus, &shared, &ctx, &job_controller).await?;
+    if let Some(error) = fatal_error(&ctx) {
+        return Err(error);
     }
+    Ok(build_job_summary(&shared, &ctx, zip_delivery))
 }
 
-/// The archive half of the finalize marker. Returns the delivery info for
-/// the summary when parts reached the user, `None` otherwise.
+/// The archive half of the finalize marker. A failed publication removes only
+/// messages uploaded by this attempt; old cached rows/messages are never
+/// deleted before the replacement transaction commits.
 async fn finalize_zip<D: OrchestratorDeps>(
     deps: &Arc<D>,
     bus: &EventBus,
     shared: &Arc<Mutex<JobShared>>,
     ctx: &Arc<JobContext>,
     job_controller: &CancellationToken,
-) -> Option<ZipDeliveryInfo> {
+) -> Result<Option<ZipDeliveryInfo>, String> {
+    let result = finalize_zip_inner(deps, bus, shared, ctx, job_controller).await;
+    let cancelled =
+        shared.lock().expect("job poisoned").job.is_cancelled || job_controller.is_cancelled();
+    if result.is_err() || cancelled {
+        let message_ids = take_uncommitted_zip_dump_messages(ctx);
+        if !message_ids.is_empty() {
+            let _ = deps.sink().delete_dump_messages(&message_ids).await;
+        }
+    }
+    result
+}
+
+/// Builds/delivers one archive rendition. Cache publication is staged in
+/// memory and replaced only after every required primary part succeeded.
+async fn finalize_zip_inner<D: OrchestratorDeps>(
+    deps: &Arc<D>,
+    bus: &EventBus,
+    shared: &Arc<Mutex<JobShared>>,
+    ctx: &Arc<JobContext>,
+    job_controller: &CancellationToken,
+) -> Result<Option<ZipDeliveryInfo>, String> {
     let options = &ctx.options;
     if !ctx.zip_build {
-        return None;
+        return Ok(None);
     }
+    if let Some(error) = primary_zip_error(ctx) {
+        return Err(error);
+    }
+    let finalizing_guard = FinalizingRenditionGuard::new(Arc::clone(&ctx.finalizing_rendition));
     let is_cancelled =
         || shared.lock().expect("job poisoned").job.is_cancelled || job_controller.is_cancelled();
     if is_cancelled() {
-        return None;
+        return Ok(None);
     }
     let expected_tracks = shared.lock().expect("job poisoned").job.total_tracks;
     let failures = ctx.failed_tracks.lock().expect("failures poisoned").clone();
     let mut first_delivery = None;
 
     for state in &ctx.zip_states {
+        *ctx.finalizing_rendition
+            .lock()
+            .expect("finalizing rendition poisoned") = Some(state.rendition);
         if is_cancelled() {
-            return first_delivery;
+            return Ok(first_delivery);
+        }
+        if let Some(error) = primary_zip_error(ctx) {
+            return Err(error);
         }
         if let Some(rows) = ctx.zip_reuse.get(&state.rendition) {
             if ctx.zip_deliver && !options.is_cache_only {
@@ -2072,9 +3323,9 @@ async fn finalize_zip<D: OrchestratorDeps>(
                 let mut size = 0i64;
                 for row in rows {
                     if is_cancelled() {
-                        return first_delivery;
+                        return Ok(first_delivery);
                     }
-                    if let Ok(sent_id) = deps
+                    match deps
                         .sink()
                         .send_dump_copy(
                             options.delivery_chat_id,
@@ -2084,15 +3335,27 @@ async fn finalize_zip<D: OrchestratorDeps>(
                         )
                         .await
                     {
-                        if is_cancelled() {
-                            return first_delivery;
+                        Ok(sent_id) => {
+                            if is_cancelled() {
+                                return Ok(first_delivery);
+                            }
+                            let mut first = ctx.first_delivered_msg_id.lock().unwrap();
+                            if first.is_none() {
+                                *first = Some(sent_id);
+                            }
+                            delivered += 1;
+                            size += row.file_size;
                         }
-                        let mut first = ctx.first_delivered_msg_id.lock().unwrap();
-                        if first.is_none() {
-                            *first = Some(sent_id);
+                        Err(error) if state.rendition == Rendition::Primary => {
+                            return Err(format!("primary ZIP delivery failed: {error}"));
                         }
-                        delivered += 1;
-                        size += row.file_size;
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                rendition = ?state.rendition,
+                                "optional Atmos ZIP delivery failed"
+                            );
+                        }
                     }
                 }
                 if delivered > 0 {
@@ -2103,9 +3366,9 @@ async fn finalize_zip<D: OrchestratorDeps>(
                         release_year: ctx.zip_release_date.chars().take(4).collect(),
                         total_tracks: expected_tracks,
                         delivered_tracks: if state.rendition == Rendition::Primary {
-                            expected_tracks
+                            Some(expected_tracks)
                         } else {
-                            rows.len()
+                            ctx.zip_reuse_atmos_track_count
                         },
                         total_parts: delivered,
                         size_bytes: size,
@@ -2127,6 +3390,8 @@ async fn finalize_zip<D: OrchestratorDeps>(
             }
             continue;
         }
+        let mut replacement_uploads = Vec::new();
+        let mut rendition_dump_messages = Vec::new();
         let mut entries = state.sources.lock().expect("zip sources poisoned").clone();
         if entries.is_empty() {
             // In particular, never publish an empty Atmos archive.
@@ -2148,7 +3413,7 @@ async fn finalize_zip<D: OrchestratorDeps>(
             None => None,
         };
         if is_cancelled() {
-            return first_delivery;
+            return Ok(first_delivery);
         }
         let cover_path = match &cover_bytes {
             Some(bytes) => {
@@ -2171,7 +3436,7 @@ async fn finalize_zip<D: OrchestratorDeps>(
             _ => None,
         };
         if is_cancelled() {
-            return first_delivery;
+            return Ok(first_delivery);
         }
         let thumb_path_str = thumb_path
             .as_deref()
@@ -2184,9 +3449,6 @@ async fn finalize_zip<D: OrchestratorDeps>(
             .or_else(|| (state.rendition == Rendition::Atmos).then(|| "ec-3".to_owned()))
             .unwrap_or_else(|| "alac".to_owned());
         let album_codec = codec.parse::<Codec>().unwrap_or(Codec::Alac);
-        let _ = deps
-            .delete_albums(options.provider, &ctx.zip_album_id, Some(album_codec))
-            .await;
         let plans = match plan_zip_parts_with_codec(
             &ctx.zip_artist,
             &ctx.zip_album,
@@ -2198,20 +3460,33 @@ async fn finalize_zip<D: OrchestratorDeps>(
         ) {
             Ok(plans) => plans,
             Err(error) => {
-                tracing::warn!(%error, "ZIP planning failed");
+                if state.rendition == Rendition::Primary {
+                    return Err(format!("primary ZIP planning failed: {error}"));
+                }
+                tracing::warn!(%error, "optional Atmos ZIP planning failed");
                 continue;
             }
         };
         let mut delivered_parts = 0usize;
         let mut delivered_size = 0i64;
+        let expected_parts = plans.len();
+        let mut all_parts_uploaded = true;
         for original in plans {
             let mut plan = original;
             if !complete {
                 plan.archive_filename = plan
                     .archive_filename
                     .strip_suffix(".zip")
-                    .map(|name| format!("{name} [Partial].zip"))
-                    .unwrap_or_else(|| format!("{} [Partial]", plan.archive_filename));
+                    .map(|name| {
+                        let suffix = " [Partial].zip";
+                        let partial_name = format!("{name}{suffix}");
+                        bound_filename_with_suffix(&partial_name, suffix, MAX_FILENAME_BYTES)
+                    })
+                    .unwrap_or_else(|| {
+                        let suffix = " [Partial]";
+                        let partial_name = format!("{}{suffix}", plan.archive_filename);
+                        bound_filename_with_suffix(&partial_name, suffix, MAX_FILENAME_BYTES)
+                    });
             }
             let output = state.dir.join(&plan.archive_filename);
             let zip_title = if plan.total_parts > 1 {
@@ -2230,7 +3505,7 @@ async fn finalize_zip<D: OrchestratorDeps>(
             let plan_clone = plan.clone();
             let title_clone = zip_title.clone();
             if is_cancelled() {
-                return first_delivery;
+                return Ok(first_delivery);
             }
             let build = tokio::task::spawn_blocking(move || {
                 let text = format!("📦 Zipping: <b>{}</b>", html_escape(&title_clone));
@@ -2269,11 +3544,36 @@ async fn finalize_zip<D: OrchestratorDeps>(
             .await;
             if is_cancelled() {
                 let _ = tokio::fs::remove_file(&output).await;
-                return first_delivery;
+                return Ok(first_delivery);
             }
-            let Ok(Ok(size)) = build else { continue };
+            let size = match build {
+                Ok(Ok(size)) => size,
+                Ok(Err(error)) => {
+                    let _ = tokio::fs::remove_file(&output).await;
+                    if state.rendition == Rendition::Primary {
+                        return Err(format!("primary ZIP build failed: {error}"));
+                    }
+                    all_parts_uploaded = false;
+                    tracing::warn!(%error, "optional Atmos ZIP build failed");
+                    continue;
+                }
+                Err(error) => {
+                    let _ = tokio::fs::remove_file(&output).await;
+                    if state.rendition == Rendition::Primary {
+                        return Err(format!("primary ZIP build task failed: {error}"));
+                    }
+                    all_parts_uploaded = false;
+                    tracing::warn!(%error, "optional Atmos ZIP build task failed");
+                    continue;
+                }
+            };
             if size > TELEGRAM_SPLIT_THRESHOLD_BYTES {
                 let _ = tokio::fs::remove_file(&output).await;
+                if state.rendition == Rendition::Primary {
+                    return Err("primary ZIP exceeds the upload size limit".to_owned());
+                }
+                all_parts_uploaded = false;
+                tracing::warn!("optional Atmos ZIP exceeds the upload size limit");
                 continue;
             }
             let caption = format_zip_dump_caption(
@@ -2294,7 +3594,7 @@ async fn finalize_zip<D: OrchestratorDeps>(
             let path = output.to_string_lossy().into_owned();
             if is_cancelled() {
                 let _ = tokio::fs::remove_file(&output).await;
-                return first_delivery;
+                return Ok(first_delivery);
             }
             let on_upload: UploadProgressCallback = {
                 let texts = Arc::clone(&ctx.texts);
@@ -2329,26 +3629,30 @@ async fn finalize_zip<D: OrchestratorDeps>(
                 upload_text.as_deref(),
             );
             let upload = if complete {
-                deps.sink()
-                    .send_document_to_dump(
+                tokio::select! {
+                    result = deps.sink().send_document_to_dump(
                         &path,
                         thumb_path_str.as_deref(),
                         &caption,
                         Some(&on_upload),
-                    )
-                    .await
+                    ) => result,
+                    _ = job_controller.cancelled() => {
+                        *ctx.texts.upload.lock().expect("texts poisoned") = None;
+                        return Ok(first_delivery);
+                    }
+                }
             } else {
-                match deps
-                    .sink()
-                    .send_document_to_chat(
+                let chat_upload = tokio::select! {
+                    result = deps.sink().send_document_to_chat(
                         options.delivery_chat_id,
                         &path,
                         thumb_path_str.as_deref(),
                         &caption,
                         Some(&on_upload),
-                    )
-                    .await
-                {
+                    ) => result,
+                    _ = job_controller.cancelled() => return Ok(first_delivery),
+                };
+                match chat_upload {
                     Ok(sent_id) => {
                         let mut first = ctx.first_delivered_msg_id.lock().unwrap();
                         if first.is_none() {
@@ -2360,73 +3664,159 @@ async fn finalize_zip<D: OrchestratorDeps>(
                 }
             };
             *ctx.texts.upload.lock().expect("texts poisoned") = None;
-            if is_cancelled() {
-                if let Some(message_id) = upload
-                    .as_ref()
-                    .ok()
-                    .and_then(|result| result.as_ref().map(|sent| sent.message_id))
-                {
-                    let _ = deps.sink().delete_dump_messages(&[message_id]).await;
-                }
-                return first_delivery;
-            }
             match upload {
                 Ok(Some(upload)) if complete => {
+                    rendition_dump_messages.push(upload.message_id);
+                    remember_zip_dump_message(ctx, upload.message_id);
                     if is_cancelled() {
-                        let _ = deps.sink().delete_dump_messages(&[upload.message_id]).await;
-                        return first_delivery;
+                        return Ok(first_delivery);
                     }
                     if ctx.zip_deliver && !options.is_cache_only {
                         if is_cancelled() {
-                            return first_delivery;
+                            return Ok(first_delivery);
                         }
                         let reply_to = (options.delivery_chat_id == options.chat_id)
                             .then_some(options.reply_to_message_id)
                             .flatten();
-                        if let Ok(sent_id) = deps
-                            .sink()
-                            .send_dump_copy(
+                        let copy_result = tokio::select! {
+                            result = deps.sink().send_dump_copy(
                                 options.delivery_chat_id,
                                 upload.message_id,
                                 reply_to,
                                 plan.total_parts > 1,
-                            )
-                            .await
-                        {
-                            if is_cancelled() {
-                                return first_delivery;
+                            ) => result,
+                            _ = job_controller.cancelled() => return Ok(first_delivery),
+                        };
+                        match copy_result {
+                            Ok(sent_id) => {
+                                if is_cancelled() {
+                                    return Ok(first_delivery);
+                                }
+                                let mut first = ctx.first_delivered_msg_id.lock().unwrap();
+                                if first.is_none() {
+                                    *first = Some(sent_id);
+                                }
+                                delivered_parts += 1;
+                                delivered_size += size as i64;
                             }
-                            let mut first = ctx.first_delivered_msg_id.lock().unwrap();
-                            if first.is_none() {
-                                *first = Some(sent_id);
+                            Err(error) if state.rendition == Rendition::Primary => {
+                                return Err(format!("primary ZIP delivery failed: {error}"));
                             }
-                            delivered_parts += 1;
-                            delivered_size += size as i64;
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    "optional Atmos ZIP delivery failed"
+                                );
+                            }
                         }
                     }
-                    let _ = deps
-                        .save_album(AlbumUpload {
-                            provider: options.provider,
-                            album_id: ctx.zip_album_id.clone(),
-                            codec: album_codec,
-                            part_index: plan.part_index as i32,
-                            total_parts: plan.total_parts as i32,
-                            message_id: upload.message_id,
-                            file_id: upload.file_id,
-                            file_unique_id: upload.file_unique_id,
-                            file_size: size as i64,
-                            file_name: plan.archive_filename.clone(),
-                            generation_hash: state.generation_hash.clone().unwrap_or_default(),
-                        })
-                        .await;
+                    replacement_uploads.push(AlbumUpload {
+                        provider: options.provider,
+                        album_id: ctx.zip_album_id.clone(),
+                        codec: album_codec,
+                        part_index: plan.part_index as i32,
+                        total_parts: plan.total_parts as i32,
+                        message_id: upload.message_id,
+                        file_id: upload.file_id,
+                        file_unique_id: upload.file_unique_id,
+                        file_size: size as i64,
+                        file_name: plan.archive_filename.clone(),
+                        generation_hash: state.generation_hash.clone().unwrap_or_default(),
+                    });
                 }
                 Ok(_) if !complete && !options.is_cache_only => {
                     delivered_parts += 1;
                     delivered_size += size as i64;
                 }
-                Err(error) => tracing::warn!(%error, "ZIP upload failed"),
+                Ok(None) if complete => {
+                    if state.rendition == Rendition::Primary {
+                        return Err("primary ZIP upload returned no document".to_owned());
+                    }
+                    all_parts_uploaded = false;
+                    tracing::warn!("optional Atmos ZIP upload returned no document");
+                }
+                Err(error) if state.rendition == Rendition::Primary => {
+                    return Err(format!("primary ZIP upload failed: {error}"));
+                }
+                Err(error) => {
+                    all_parts_uploaded = false;
+                    tracing::warn!(%error, "optional Atmos ZIP upload failed");
+                }
                 _ => {}
             }
+        }
+        if complete && all_parts_uploaded && replacement_uploads.len() == expected_parts {
+            let new_message_ids = replacement_uploads
+                .iter()
+                .map(|upload| upload.message_id)
+                .collect::<Vec<_>>();
+            let expected = ctx
+                .zip_expectations
+                .get(&state.rendition)
+                .cloned()
+                .unwrap_or(AlbumReplacementExpectation::Mixed);
+            let replacement = deps
+                .replace_albums(
+                    options.provider,
+                    &ctx.zip_album_id,
+                    album_codec,
+                    expected,
+                    replacement_uploads,
+                )
+                .await;
+            match replacement {
+                Err(error) => {
+                    if state.rendition == Rendition::Primary {
+                        return Err(format!("primary ZIP cache replacement failed: {error}"));
+                    }
+                    tracing::warn!(%error, "optional Atmos ZIP cache replacement failed");
+                    let _ = deps
+                        .sink()
+                        .delete_dump_messages(&rendition_dump_messages)
+                        .await;
+                    transfer_zip_dump_messages(ctx, &rendition_dump_messages);
+                }
+                Ok(AlbumReplacementResult::Stale) => {
+                    // Another rebuild won after this job took its snapshot.
+                    // Its rows/messages are not ours to remove; only the
+                    // documents uploaded by this attempt are cleaned.
+                    let _ = deps
+                        .sink()
+                        .delete_dump_messages(&rendition_dump_messages)
+                        .await;
+                    transfer_zip_dump_messages(ctx, &rendition_dump_messages);
+                    tracing::info!(
+                        rendition = ?state.rendition,
+                        "discarded stale ZIP replacement"
+                    );
+                }
+                Ok(AlbumReplacementResult::Committed {
+                    displaced_message_ids,
+                }) => {
+                    // The transaction has committed. These messages are now
+                    // the cache's owners, so cancellation or a later
+                    // rendition failure must never include them in rollback
+                    // cleanup.  Displaced IDs were captured by that same
+                    // transaction, not by a racy preflight query.
+                    transfer_zip_dump_messages(ctx, &new_message_ids);
+                    let old_message_ids = displaced_message_ids
+                        .into_iter()
+                        .filter(|message_id| !new_message_ids.contains(message_id))
+                        .collect::<Vec<_>>();
+                    if !old_message_ids.is_empty() {
+                        let _ = deps.sink().delete_dump_messages(&old_message_ids).await;
+                    }
+                }
+            }
+        } else if complete && state.rendition == Rendition::Atmos {
+            let _ = deps
+                .sink()
+                .delete_dump_messages(&rendition_dump_messages)
+                .await;
+            transfer_zip_dump_messages(ctx, &rendition_dump_messages);
+            tracing::warn!("optional Atmos ZIP publication was incomplete");
+        } else if state.rendition == Rendition::Primary && complete {
+            return Err("primary ZIP publication was incomplete".to_owned());
         }
         if ctx.zip_deliver && !options.is_cache_only && delivered_parts > 0 {
             let release_year = ctx.zip_release_date.chars().take(4).collect::<String>();
@@ -2435,7 +3825,7 @@ async fn finalize_zip<D: OrchestratorDeps>(
                 artist: &ctx.zip_artist,
                 album_url: ctx.zip_album_url.as_deref(),
                 total_tracks: expected_tracks,
-                delivered_tracks: entries.len(),
+                delivered_tracks: Some(entries.len()),
                 size_bytes: delivered_size,
                 total_parts: delivered_parts,
                 release_year: &release_year,
@@ -2449,15 +3839,18 @@ async fn finalize_zip<D: OrchestratorDeps>(
             let details = format_album_details_caption(&caption_meta);
             let photo_delivered = if let Some(bytes) = &cover_bytes {
                 if is_cancelled() {
-                    return first_delivery;
+                    return Ok(first_delivery);
                 }
-                let delivered = deps
-                    .sink()
-                    .send_photo_to_chat(options.delivery_chat_id, bytes, &details)
-                    .await
-                    .is_ok();
+                let delivered = tokio::select! {
+                    result = deps.sink().send_photo_to_chat(
+                        options.delivery_chat_id,
+                        bytes,
+                        &details,
+                    ) => result.is_ok(),
+                    _ = job_controller.cancelled() => return Ok(first_delivery),
+                };
                 if is_cancelled() {
-                    return first_delivery;
+                    return Ok(first_delivery);
                 }
                 delivered
             } else {
@@ -2468,7 +3861,7 @@ async fn finalize_zip<D: OrchestratorDeps>(
                 artist: ctx.zip_artist.clone(),
                 release_year,
                 total_tracks: expected_tracks,
-                delivered_tracks: entries.len(),
+                delivered_tracks: Some(entries.len()),
                 total_parts: delivered_parts,
                 size_bytes: delivered_size,
                 is_partial: !complete,
@@ -2487,7 +3880,8 @@ async fn finalize_zip<D: OrchestratorDeps>(
             ctx.zip_delivery_infos.lock().unwrap().push(info);
         }
     }
-    first_delivery
+    drop(finalizing_guard);
+    Ok(first_delivery)
 }
 
 /// Best-effort cleanup for a cancellation after an upload has completed.
@@ -2605,18 +3999,18 @@ async fn upload_one<D: OrchestratorDeps>(
             })
         };
 
-        match deps
-            .sink()
-            .send_audio_to_dump(
+        let upload_result = tokio::select! {
+            result = deps.sink().send_audio_to_dump(
                 &rip_result.file_path,
                 &rip_result.title,
                 &rip_result.artist,
                 rip_result.duration,
                 &current_caption,
                 Some(&on_upload),
-            )
-            .await
-        {
+            ) => result,
+            _ = job_controller.cancelled() => break 'upload,
+        };
+        match upload_result {
             Ok(upload) => {
                 outcome = Some(match upload {
                     Some(dump) => SendOutcome::Audio(dump),
@@ -2945,6 +4339,16 @@ fn kind_str(kind: TargetKind) -> &'static str {
     }
 }
 
+fn panic_message(panic: Box<dyn Any + Send>) -> String {
+    if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = panic.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else {
+        "task panicked".to_owned()
+    }
+}
+
 async fn delete_file_if_exists(path: &str) {
     let _ = tokio::fs::remove_file(std::path::Path::new(path)).await;
 }
@@ -2963,8 +4367,6 @@ mod hardening_tests {
             is_group: false,
             is_force: false,
             is_cache_only: false,
-            zip: false,
-            zip_explicit: false,
             single_storefront: None,
             parsed_items: Vec::new(),
             reply_to_message_id: None,
@@ -3012,7 +4414,7 @@ mod hardening_tests {
         ));
 
         // Admins bypass both caps (per-user and global) but still occupy a
-        // slot for `/cancel` bookkeeping.
+        // slot for `/cancel_<id>` bookkeeping.
         let admin = options(2, true);
         for job in ["a1", "a2", "a3", "a4", "a5"] {
             orchestrator.admit(job, &admin).expect("admin job");

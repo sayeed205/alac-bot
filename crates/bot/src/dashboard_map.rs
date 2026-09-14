@@ -118,6 +118,12 @@ fn clean_activity(text: &str) -> String {
     stripped.to_owned()
 }
 
+fn is_upload_activity(text: &str) -> bool {
+    let trimmed = text.trim();
+    let stripped = trimmed.strip_prefix("⬆️ ").unwrap_or(trimmed);
+    stripped.starts_with("Uploading:") || stripped.starts_with("<b>Uploading:")
+}
+
 /// Map an engine job snapshot into a dashboard row for a specific viewer.
 ///
 /// Cancel permission is `viewer == requester || viewer_is_admin` .
@@ -187,7 +193,9 @@ pub fn snapshot_from(
     // active job's lane-2 text, independently — downloads and uploads
     // now run concurrently on different jobs. Queued jobs never carry
     // lane activity. `active_action_text` (engine's legacy single field)
-    // only seeds the download line when no lane text was remembered.
+    // seeds whichever lane has no remembered text. Upload activity must never
+    // fall through to the download line just because it is the legacy field's
+    // current value.
     let current_download = ordered.iter().find_map(|job| {
         if job.phase == EnginePhase::Queued {
             return None;
@@ -197,9 +205,12 @@ pub fn snapshot_from(
             return Some(downloading.clone());
         }
         // The remembered lane texts are already cleaned; the legacy
-        // single-field fallback still carries its own decoration.
+        // single-field fallback still carries its own decoration. It is not
+        // safe to use an upload action as a download fallback.
         if let Some(action) = job.active_action_text.as_ref() {
-            return Some(clean_activity(action));
+            if !is_upload_activity(action) {
+                return Some(clean_activity(action));
+            }
         }
         if job.phase == EnginePhase::CheckingCache {
             return Some("🔍 Checking cache...".into());
@@ -213,10 +224,16 @@ pub fn snapshot_from(
         if job.phase == EnginePhase::Queued {
             return None;
         }
-        contexts
+        let remembered = contexts
             .get(&job.id)
             .and_then(|c| c.uploading.as_ref())
-            .cloned()
+            .cloned();
+        remembered.or_else(|| {
+            job.active_action_text
+                .as_deref()
+                .filter(|action| is_upload_activity(action))
+                .map(clean_activity)
+        })
     });
     let jobs = ordered
         .iter()
@@ -408,6 +425,40 @@ mod tests {
         assert_eq!(
             snapshot.current_upload.as_deref(),
             Some("<b>Uploading:</b> <i>Song - Artist</i>")
+        );
+    }
+
+    #[test]
+    fn upload_only_progress_stays_in_the_upload_lane() {
+        let mut job = engine_job(EnginePhase::Processing, Some(0), 7, Some("Alice"));
+        job.active_action_text =
+            Some("⬆️ Uploading: <b>Song - Artist</b> <code>4 MB</code>".into());
+        let mut contexts = JobContexts::new();
+        contexts.remember(&job);
+        contexts.remember_progress(&RipJobProgress {
+            job_id: job.id.clone(),
+            total_tracks: 1,
+            completed_tracks: 0,
+            cached_count: 0,
+            ripped_count: 0,
+            failed_count: 0,
+            skipped_count: 0,
+            percent: 0,
+            active_download_text: None,
+            active_upload_text: Some("⬆️ Uploading: <b>Song - Artist</b> <code>4 MB</code>".into()),
+            activity_override: None,
+        });
+
+        let snapshot = snapshot_from(&[job], &contexts, 7, false, "live", None);
+        assert_eq!(snapshot.current_download, None);
+        assert_eq!(
+            snapshot.current_upload.as_deref(),
+            Some("<b>Song - Artist</b> <code>4 MB</code>")
+        );
+        assert_eq!(snapshot.jobs[0].downloading, None);
+        assert_eq!(
+            snapshot.jobs[0].uploading.as_deref(),
+            Some("<b>Song - Artist</b> <code>4 MB</code>")
         );
     }
 

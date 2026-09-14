@@ -1,4 +1,4 @@
-//! `/get` and `/zip` command policy and pipeline entry point.
+//! `/get` command policy and pipeline entry point.
 //!
 //! M5c: the bot owns only preflight policy and input parsing. Status is
 //! rendered by one shared dashboard message per chat. All download semantics —
@@ -20,13 +20,11 @@ use ferogram::{
 use crate::BotState;
 
 pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
-    for command in ["get", "zip"] {
-        let state = Arc::clone(&state);
-        dp.on_message(filters::command(command), move |msg| {
-            let state = Arc::clone(&state);
-            async move { handle_command(state, msg).await }
-        });
-    }
+    let get_state = Arc::clone(&state);
+    dp.on_message(filters::command("get"), move |msg| {
+        let state = Arc::clone(&get_state);
+        async move { handle_command(state, msg).await }
+    });
     let cancel_state = Arc::clone(&state);
     dp.on_message(
         filters::custom(|msg| {
@@ -55,9 +53,8 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
         return;
     }
 
-    let command = input::command_name(msg.text().unwrap_or_default()).unwrap_or_default();
     let admin = state.auth.is_admin(sender);
-    // Administrative get/zip requests seed the dump channel only. The engine
+    // Administrative get requests seed the dump channel only. The engine
     // suppresses all user-facing media for cache-only jobs.
     let is_cache_only = admin;
 
@@ -67,22 +64,9 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
         return;
     }
     let parsed = input::parse_message(&state.client, &msg, chat, false).await;
-    let zip_command = command == "zip";
-    let explicit_zip_valid =
-        parsed.items.len() == 1 && parsed.items[0].kind == engine::types::TargetKind::Album;
-    let zip_requested = (zip_command || parsed.zip) && explicit_zip_valid;
     if parsed.items.is_empty() {
         reply(&msg, gates::usage(is_cache_only)).await;
         return;
-    }
-    if (parsed.zip || zip_command)
-        && (parsed.items.len() != 1 || parsed.items[0].kind != engine::types::TargetKind::Album)
-    {
-        reply(
-            &msg,
-            "ZIP packaging is available for albums with more than one track. The request will continue without ZIP packaging.",
-        )
-        .await;
     }
     if let Some(text) = gates::force_gate(parsed.force, admin) {
         reply(&msg, text).await;
@@ -173,8 +157,6 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
         is_group,
         is_force: parsed.force,
         is_cache_only,
-        zip: zip_requested,
-        zip_explicit: zip_command || parsed.zip,
         single_storefront: parsed.storefront,
         parsed_items: parsed.items,
         reply_to_message_id: Some(i64::from(msg.id())),
@@ -183,7 +165,7 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
         // orchestration callers.
         status_msg_id: 0,
         is_admin: admin,
-        rendition_policy: engine::orchestrator::types::RenditionPolicy::PrimaryOnly,
+        rendition_policy: engine::orchestrator::types::RenditionPolicy::PrimaryWithOptionalAtmos,
     };
 
     // Engine owns everything from here: resolution, cache-first, queue,

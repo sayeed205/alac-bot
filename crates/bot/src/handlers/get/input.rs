@@ -1,4 +1,4 @@
-//! Input handling for the `/get` and `/zip` commands.
+//! Input handling for the `/get` command.
 //!
 //! The parser itself lives in `apple`; this module only deals with Telegram
 //! replies and text documents .
@@ -18,25 +18,10 @@ pub struct ParsedCommand {
     pub force: bool,
     pub storefront: Option<String>,
     pub document: bool,
-    pub zip: bool,
-}
-
-pub fn command_name(text: &str) -> Option<String> {
-    text.split_whitespace().next().map(|s| {
-        s.trim_start_matches('/')
-            .split('@')
-            .next()
-            .unwrap_or(s)
-            .to_ascii_lowercase()
-    })
 }
 
 pub fn has_force_token(text: &str) -> bool {
     text.split_whitespace().any(|t| t == "-f" || t == "--force")
-}
-
-pub fn has_zip_token(text: &str) -> bool {
-    text.split_whitespace().any(|t| t == "-z" || t == "--zip")
 }
 
 pub fn parse_text(text: &str, reply: Option<&str>, force_override: bool) -> Option<ParsedCommand> {
@@ -44,7 +29,6 @@ pub fn parse_text(text: &str, reply: Option<&str>, force_override: bool) -> Opti
     Some(ParsedCommand {
         items: parsed.items,
         force: force_override || parsed.force,
-        zip: parsed.zip,
         storefront: parsed.storefront,
         document: false,
     })
@@ -120,7 +104,6 @@ pub async fn parse_message(
                 return ParsedCommand {
                     items: extract_batch_items(&content),
                     force: force_override || message.text().is_some_and(has_force_token),
-                    zip: message.text().is_some_and(has_zip_token),
                     storefront: None,
                     document: true,
                 };
@@ -137,7 +120,6 @@ pub async fn parse_message(
         force: force_override,
         storefront: None,
         document: false,
-        zip: false,
     })
 }
 
@@ -145,9 +127,7 @@ pub async fn parse_message(
 mod tests {
     use super::*;
     #[test]
-    fn command_and_flags_are_case_insensitive() {
-        assert_eq!(command_name("/GET@bot 1"), Some("get".into()));
+    fn force_token_is_recognized() {
         assert!(has_force_token("/get --force 1"));
-        assert!(has_zip_token("/get --zip 1"));
     }
 }

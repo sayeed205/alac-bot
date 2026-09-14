@@ -73,6 +73,18 @@ pub fn action_label(action: &str, target: Option<&str>) -> String {
     }
 }
 
+/// Human-readable label for a delivered rendition.  Album delivery metadata
+/// stores the canonical codec string so the bot can keep labels stable even
+/// when the primary rendition falls back from ALAC to AAC.
+pub fn rendition_label(codec: Option<&str>) -> &'static str {
+    match codec {
+        Some("ec-3") => "Dolby Atmos",
+        Some("aac") | Some("mp4a.40.2") | Some("mp4a.40.5") => "AAC",
+        Some("alac") | None => "ALAC",
+        Some(_) => "Audio",
+    }
+}
+
 /// Humanize a byte count the way mirror-leech does: two decimals, 1024-based
 /// units (B, KB, MB, GB, TB, PB).
 pub fn readable_file_size(bytes: u64) -> String {
@@ -179,6 +191,14 @@ mod tests {
     fn action_labels_use_words() {
         assert_eq!(action_label("Cancel download", None), "Cancel download");
         assert_eq!(action_label("Cached", Some("Song")), "Cached · Song");
+    }
+
+    #[test]
+    fn rendition_labels_keep_codec_fallbacks_visible() {
+        assert_eq!(rendition_label(Some("alac")), "ALAC");
+        assert_eq!(rendition_label(Some("aac")), "AAC");
+        assert_eq!(rendition_label(Some("ec-3")), "Dolby Atmos");
+        assert_eq!(rendition_label(None), "ALAC");
     }
 
     #[test]

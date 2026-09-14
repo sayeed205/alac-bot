@@ -44,6 +44,7 @@ struct FakeStream {
     failures: Mutex<Vec<String>>,
     success_codecs: Mutex<Vec<String>>,
     cancel_on_fetch: bool,
+    cancel_after_second_candidate: bool,
 }
 
 impl FakeStream {
@@ -53,6 +54,7 @@ impl FakeStream {
             failures: Mutex::new(failures.iter().map(|url| (*url).to_owned()).collect()),
             success_codecs: Mutex::new(Vec::new()),
             cancel_on_fetch: false,
+            cancel_after_second_candidate: false,
         }
     }
 
@@ -62,6 +64,7 @@ impl FakeStream {
             failures: Mutex::new(Vec::new()),
             success_codecs: Mutex::new(codecs.iter().map(|codec| (*codec).to_owned()).collect()),
             cancel_on_fetch: false,
+            cancel_after_second_candidate: false,
         }
     }
 }
@@ -74,7 +77,7 @@ impl StreamHttp for FakeStream {
         timeout: Duration,
         signal: Option<&CancellationToken>,
     ) -> Result<StreamHttpResponse, StreamHttpError> {
-        let _ = (api_key, timeout, signal);
+        let _ = (api_key, timeout);
         self.calls.lock().unwrap().push(url.to_owned());
         if self.cancel_on_fetch {
             if let Some(token) = signal {
@@ -103,6 +106,14 @@ impl StreamHttp for FakeStream {
         let body: ByteStream = Box::pin(stream::once(
             async move { Ok(Bytes::from_static(b"audio")) },
         ));
+        if self.cancel_after_second_candidate
+            && url.ends_with("/stream/42")
+            && !url.contains("/api/")
+        {
+            if let Some(token) = signal {
+                token.cancel();
+            }
+        }
         Ok(StreamHttpResponse {
             status: 200,
             codec: Some(codec),
@@ -227,6 +238,7 @@ async fn cancellation_does_not_retry_or_open_primary_circuit() {
         failures: Mutex::new(Vec::new()),
         success_codecs: Mutex::new(Vec::new()),
         cancel_on_fetch: true,
+        cancel_after_second_candidate: false,
     };
     let acquisition = AppleStreamAcquisition::with_config(
         StreamTransport::new(stream),
@@ -324,7 +336,7 @@ async fn fallback_reports_progress_when_primary_is_unavailable() {
 }
 
 #[tokio::test]
-async fn atmos_non_ec3_response_retries_wrapper_candidates() {
+async fn atmos_all_non_ec3_wrapper_candidates_are_unavailable_without_retry() {
     let (acquisition, calls) = acquisition(
         &[],
         FakeMirror { available: false },
@@ -334,12 +346,60 @@ async fn atmos_non_ec3_response_retries_wrapper_candidates() {
     let error = acquisition
         .connect_stream("42", None, None, apple::CodecPreference::Atmos)
         .await
-        .expect_err("non-EC-3 responses must remain retryable");
+        .expect_err("all non-EC-3 candidates must be unavailable");
+
+    assert!(matches!(error, StreamError::Unavailable(message) if message.contains("non-EC-3")));
+    assert_eq!(calls.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn atmos_non_ec3_candidate_does_not_hide_technical_wrapper_failure() {
+    let (acquisition, calls) = acquisition(
+        &["/api/stream/42"],
+        FakeMirror { available: false },
+        Some("https://wrapper"),
+        2,
+    );
+    let error = acquisition
+        .connect_stream("42", None, None, apple::CodecPreference::Atmos)
+        .await
+        .expect_err("a technical candidate failure must remain retryable");
+
+    assert!(matches!(error, StreamError::Message(message) if message.contains("transient")));
+    assert_eq!(calls.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn cancellation_after_non_ec3_candidate_is_not_typed_unavailable() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let policy = MirrorPolicyManager::new(FakeMirror { available: false }, None);
+    let stream = FakeStream {
+        calls: Arc::clone(&calls),
+        failures: Mutex::new(Vec::new()),
+        success_codecs: Mutex::new(vec!["mp4a.40.2".to_owned(), "mp4a.40.2".to_owned()]),
+        cancel_on_fetch: false,
+        cancel_after_second_candidate: true,
+    };
+    let acquisition = AppleStreamAcquisition::with_config(
+        StreamTransport::new(stream),
+        policy,
+        Some("https://wrapper".to_owned()),
+        None,
+        AppleAcquisitionConfig {
+            retry_rounds: 3,
+            retry_base_delay_ms: 0,
+        },
+    );
+    let signal = CancellationToken::new();
+    let error = acquisition
+        .connect_stream("42", Some(signal), None, apple::CodecPreference::Atmos)
+        .await
+        .expect_err("cancellation must not become optional absence");
 
     assert!(
-        matches!(error, StreamError::Message(message) if message.contains("technical mismatch"))
+        matches!(error, StreamError::Message(message) if message.contains("Download was cancelled"))
     );
-    assert_eq!(calls.lock().unwrap().len(), 6);
+    assert_eq!(calls.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]

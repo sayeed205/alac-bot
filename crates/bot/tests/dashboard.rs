@@ -97,3 +97,17 @@ fn header_renders_both_lane_lines_independently() {
     assert!(!text.contains("⬇️"));
     assert!(!text.contains("⬆️"));
 }
+
+#[test]
+fn upload_only_header_does_not_render_a_downloading_lane() {
+    let snapshot = DashboardSnapshot {
+        current_download: None,
+        current_upload: Some("<b>Song</b> <code>4 MB</code>".into()),
+        jobs: vec![job(0, true)],
+        ..DashboardSnapshot::default()
+    };
+
+    let (text, _) = render(&snapshot, 1, false);
+    assert!(!text.contains("⬇️"));
+    assert!(text.contains("<b>⬆️ Uploading:</b> <b>Song</b> <code>4 MB</code>"));
+}

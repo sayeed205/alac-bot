@@ -416,8 +416,6 @@ async fn get(state: Arc<BotState>, query: CallbackQuery, track_id: String) {
         is_group: marked_chat != query.user_id,
         is_force: false,
         is_cache_only: false,
-        zip: false,
-        zip_explicit: false,
         single_storefront: None,
         parsed_items: vec![ParsedTargetItem {
             id: track_id.clone(),

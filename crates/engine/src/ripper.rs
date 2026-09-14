@@ -18,7 +18,7 @@ use crate::{
     limits::MAX_AUDIO_BYTES,
     lyrics::LyricsLookup,
     streaming::{AudioStreamSource, ProgressCallback, StreamError},
-    tagger,
+    tagger::{self, bound_filename_with_suffix, MAX_FILENAME_BYTES},
     types::{TrackMeta, TrackRipResult},
 };
 
@@ -77,7 +77,8 @@ pub trait RipperDeps: Send + Sync {
     /// Provider-specific permanent failures may opt out of retries.
     fn is_non_retryable_error(&self, message: &str) -> bool {
         let lower = message.to_ascii_lowercase();
-        lower.contains("code 404")
+        is_non_retryable_local_error(message)
+            || lower.contains("code 404")
             || lower.contains("code: 404")
             || lower.contains("http 404")
             || lower.contains("status 404")
@@ -135,6 +136,14 @@ impl std::fmt::Debug for RipOptions<'_> {
             .field("codec_preference", &self.codec_preference)
             .finish_non_exhaustive()
     }
+}
+
+/// Local filesystem failures cannot be repaired by retrying the same rip.
+pub fn is_non_retryable_local_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("file name too long")
+        || lower.contains("enametoolong")
+        || lower.contains("os error 36")
 }
 
 impl<'a> RipOptions<'a> {
@@ -390,10 +399,16 @@ impl AlacTrackRipper {
             // Keep the human-readable track id for diagnostics, but always add a
             // monotonic/time component. Track ids are external input and must not
             // be allowed to select a path or collide within one job.
-            let temp_raw_path = track_dir.join(format!(
+            let temp_raw_name = format!(
                 "stream_{safe_track_id}_{unix_ms}_{}.raw",
                 unique_temp_suffix()
-            ));
+            );
+            let temp_raw_name = bound_filename_with_suffix(
+                &temp_raw_name,
+                ".raw",
+                MAX_FILENAME_BYTES,
+            );
+            let temp_raw_path = track_dir.join(temp_raw_name);
             // The raw stream is staged in the private lane, but the completed
             // file must live outside it: callers consume this path after `rip`
             // returns, while the lane is removed on every outcome. Reserve the
@@ -411,8 +426,27 @@ impl AlacTrackRipper {
                 {
                     Ok(_) => break,
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                        final_path = target_dir
-                            .join(format!("{stem}_{}.m4a", unique_temp_suffix()));
+                        let collision_id = unique_temp_suffix();
+                        let legacy_collision_name = format!("{stem}_{collision_id}.m4a");
+                        let collision_name = if legacy_collision_name.len() <= MAX_FILENAME_BYTES {
+                            legacy_collision_name
+                        } else {
+                            let suffix = tagger::track_filename_suffix(meta.explicit, &stream.codec);
+                            let prefix = final_name.strip_suffix(&suffix).unwrap_or(stem);
+                            let suffix_stem = suffix.strip_suffix(".m4a").unwrap_or(&suffix);
+                            let collision_suffix = format!("{suffix_stem}_{collision_id}.m4a");
+                            let name = format!("{prefix}{collision_suffix}");
+                            bound_filename_with_suffix(
+                                &name,
+                                &collision_suffix,
+                                MAX_FILENAME_BYTES,
+                            )
+                        };
+                        final_path = target_dir.join(bound_filename_with_suffix(
+                            &collision_name,
+                            ".m4a",
+                            MAX_FILENAME_BYTES,
+                        ));
                     }
                     Err(error) => return Err(error.into()),
                 }

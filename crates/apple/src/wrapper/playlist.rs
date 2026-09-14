@@ -318,15 +318,18 @@ fn group_rank(
     }
 }
 
-/// Trailing integer of `prefix + number` in a group id, e.g.
-/// `audio-atmos-2768` -> 2768.
+/// Numeric bitrate prefix of `prefix + number` in a group id, e.g.
+/// `audio-atmos-2768` -> 2768 and `audio-stereo-256-binaural` -> 256.
 fn group_bitrate(group_id: &str, prefix: &str) -> Result<i64, WrapperError> {
     let rest = group_id.strip_prefix(prefix).ok_or_else(|| {
         WrapperError::Message(format!(
             "Master playlist has invalid audio group: {group_id}"
         ))
     })?;
-    let bitrate = parse_positive_u64(rest, "audio group bitrate")?;
+    // Apple appends provider metadata such as `-binaural` to some group ids;
+    // only the numeric bitrate component participates in variant ranking.
+    let bitrate_token = rest.split_once('-').map_or(rest, |(bitrate, _)| bitrate);
+    let bitrate = parse_positive_u64(bitrate_token, "audio group bitrate")?;
     i64::try_from(bitrate).map_err(|_| {
         WrapperError::Message(format!(
             "Master playlist has invalid audio group: {group_id}"
@@ -668,6 +671,27 @@ A_track_gr64.m3u8"#
     }
 
     #[test]
+    fn atmos_selection_ignores_binaural_stereo_group_suffix() {
+        let master = r#"#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio-stereo-256-binaural",AUTOSELECT=YES,CHANNELS="2",NAME="songEnhanced"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio-atmos-2768",AUTOSELECT=YES,CHANNELS="16/JOC",NAME="songEnhanced"
+#EXT-X-STREAM-INF:BANDWIDTH=270020,CODECS="mp4a.40.2",AUDIO="audio-stereo-256-binaural"
+A_track_gr256.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=771138,CODECS="ec-3",AUDIO="audio-atmos-2768"
+A_track_atmos_2768.m3u8"#;
+
+        let info = parse_master_playlist(
+            master,
+            "https://aod.itunes.apple.com/assets/master.m3u8",
+            CodecPreference::Atmos,
+        )
+        .expect("binaural suffix is valid provider metadata");
+        assert_eq!(info.codec, "ec-3");
+        assert!(info.stream_url.ends_with("A_track_atmos_2768.m3u8"));
+    }
+
+    #[test]
     fn aac_falls_back_when_no_alac() {
         let master = r#"#EXTM3U
 #EXT-X-VERSION:7
@@ -740,6 +764,7 @@ audio.m3u8"#,
             "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=not-a-number,CODECS=\"mp4a.40.2\",AUDIO=\"audio-stereo-128\"\naudio.m3u8",
             "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio-stereo-128\",SAMPLE-RATE=not-a-number\n#EXT-X-STREAM-INF:BANDWIDTH=128000,CODECS=\"mp4a.40.2\",AUDIO=\"audio-stereo-128\"\naudio.m3u8",
             "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=128000,CODECS=\"ec-3\",AUDIO=\"audio-atmos-invalid\"\naudio.m3u8",
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=128000,CODECS=\"mp4a.40.2\",AUDIO=\"audio-stereo-not-a-number-binaural\"\naudio.m3u8",
         ];
 
         for content in cases {

@@ -12,6 +12,9 @@ Built in Rust: [ferogram](https://github.com/ankit-chaubey/ferogram) (Telegram M
 
 - **True Lossless Audio**: Streams native Apple Lossless Audio Codec (ALAC 16-bit / 24-bit up to 192kHz) directly from
   decryption mirrors.
+- **Automatic Primary + Atmos Delivery**: `/get` delivers the highest available primary rendition (ALAC, with AAC
+  fallback) plus optional Dolby Atmos (EC-3). Missing Atmos is silent; multi-track albums are delivered as ZIPs and
+  Atmos ZIPs include available tracks only.
 - **Automatic Fallback Engine**: If the primary mirror encounters downtime or timeouts, the bot automatically fails over
   to a secondary wrapper or custom mirror without interrupting downloads.
 - **Instant Dump Channel Caching**: Every ripped track is indexed with full metadata and stored in a private Telegram
@@ -25,9 +28,8 @@ Built in Rust: [ferogram](https://github.com/ankit-chaubey/ferogram) (Telegram M
 - **Group Chat Friendly**: When triggered in a group chat, audio files are delivered directly to the user's private chat
   (DM) to eliminate spam, keeping only a live progress card in the group.
 - **Interactive Task Cancellation**:
-    - Live `[Cancel Download]` inline button attached to the progress card.
-    - `/cancel` command to abort the user's current running task.
-    - Permission-controlled: only the requester or a bot admin can cancel.
+     - Live `[Cancel Download]` inline button attached to the progress card.
+     - Permission-controlled: only the requester or a bot admin can cancel.
 - **Synced Lyrics Embedding**: Automatically prefetches and embeds word-by-word synced lyrics (TTML -> Enhanced LRC) or
   line-synced LRC from Apple Music and LRCLIB.
 - **High-Res Metadata & Artwork**: Tags every track with the native Rust media pipeline, embedding high-resolution
@@ -176,42 +178,38 @@ ALAC_WRAPPER_API_KEY=your_secret_api_key
 
 ### General Commands
 
-| Command                              | Description                                                                                     |
-|:-------------------------------------|:------------------------------------------------------------------------------------------------|
-| `/alac <Apple Music/iTunes URL> [-f]` | Download Apple Music track, album, or playlist in lossless ALAC (`-f` forces re-rip for admins) |
-| `/rip`, `/batch`, `/dl`, `/download` | Aliases for `/alac`                                                                             |
-| `/search <query>`                    | Search the cached library and Apple Music catalog with text-labelled buttons                    |
-| `/info <Apple Music/iTunes URL>`      | Show track metadata and cache availability                                                      |
-| `/cancel`                            | Cancel your current active download                                                             |
-| `/help`                              | Display usage instructions and available commands                                               |
+| Command | Description |
+|:--|:--|
+| `/get <Apple Music link> [-f]` | Download a track or collection; multi-track albums are delivered as primary and optional sparse Atmos ZIPs (`-f` forces re-rip for admins) |
+| `/search <query>` | Search the cached library and Apple Music catalog with text-labelled buttons |
+| `/info <Apple Music link>` | Show track metadata and cache availability |
+| `/status` | Show active downloads and cancellation controls |
+| `/spec` | Generate a spectrogram from replied audio |
+| `/report` | Report a problem with a track |
+| `/help` | Display usage instructions and available commands |
 
-> **Batch Tip**: You can upload a `.txt` document containing one Apple Music link per line with `/alac` or `/batch` as
-> the caption to rip entire batches automatically.
+> **Batch Tip**: You can upload a `.txt` document containing one Apple Music link per line with `/get` as the caption to
+> rip an entire batch automatically.
 
 ---
 
 ### Admin Management Commands
 
-| Command                         | Description                                                                                          |
-|:--------------------------------|:-----------------------------------------------------------------------------------------------------|
-| `/auth [id\|username]`          | Authorize a user or group to use the bot                                                             |
-| `/revoke [id\|username]`        | Revoke access from a user or group                                                                   |
-| `/authlist`                     | Show paginated list of authorized users and groups                                                   |
-| `/health`, `/ping`              | Check live latency and mirror wrapper instance health                                                |
-| `/stats`                        | View bot performance, queue metrics, and top requested tracks                                        |
-| `/queue`                        | View active and pending download tasks in the sequential queue                                       |
-| `/status`                       | Live download status & queue dashboard                                                               |
-| `/clean`                        | Clean up leftover temporary files in download scratch directory                                      |
-| `/delete <Apple Music/iTunes URL>` | Remove a track from cache and the dump channel                                                       |
-| `/index`                        | Re-index and synchronize existing tracks in the dump channel                                         |
-| `/spec`                         | Reply to audio to generate a frequency spectrogram (aliases: `/spectogram`, `/spectrogram`, `/spek`) |
-| `/report`, `/issue`             | Report a corrupt track to the admin for a re-rip                                                     |
-| `/settings`                     | Bot operational settings & ripping toggles                                                           |
-| `/dumpnew <days>` / `/autodump` | Auto-dump new releases from Apple Music (also runs daily on a 24h scheduler)                         |
-| `/cache <link>` / `/dump`       | Seed tracks directly into the dump channel without delivering a copy                                 |
-| `/random`                       | Interactive random album discovery & dump                                                            |
-| `/export`                       | Export a compressed PostgreSQL database archive (`.json.gz`) via DM                                  |
-| `/import`                       | Restore database by replying to a `.json.gz` archive file                                            |
+| Command | Description |
+|:--|:--|
+| `/settings` | Bot operational settings and ripping toggles |
+| `/dump` | Seed new Apple Music releases into the dump channel |
+| `/random` | Discover and seed a random album |
+| `/delete <Apple Music link>` | Remove a track from cache and the dump channel |
+| `/auth <user_id\|reply>` | Authorize a user or group |
+| `/revoke <user_id\|reply>` | Revoke authorization |
+| `/authlist` | List authorized users and groups |
+| `/stats` | View download and cache statistics |
+| `/clean` | Remove leftover temporary files |
+| `/ping` | Check Telegram, database, and mirror health |
+| `/index` | Reconcile the dump channel with the database |
+| `/export` | Export a compressed PostgreSQL database archive |
+| `/import` | Restore a database archive |
 
 ---
 
