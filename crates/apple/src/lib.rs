@@ -14,7 +14,7 @@ pub mod wrapper;
 
 pub use acquisition::{
     AppleAcquisitionConfig, ApplePresentation, AppleProduction, AppleProductionConfig,
-    AppleRipperDeps, AppleStreamAcquisition,
+    AppleRipperDeps, AppleStreamAcquisition, WrapperKind,
 };
 pub use catalog::{
     AlbumSearchResult, Catalog, CatalogError, ChartAlbum, ReqwestTransport, SharedCatalog,

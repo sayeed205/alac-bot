@@ -59,7 +59,7 @@ enum RipScript {
     OkWithCodec(Vec<u8>, &'static str),
     /// Primary succeeds, while the optional Atmos request has no variant.
     AtmosUnavailable(Vec<u8>),
-    Fail(&'static str),
+    Fail(RipError),
 }
 
 #[derive(Default)]
@@ -580,13 +580,13 @@ impl TrackAcquisition for FakeDeps {
             gate.cancelled().await;
         }
         match script {
-            Some(RipScript::Fail(msg)) => Err(RipError::Message(msg.to_string())),
+            Some(RipScript::Fail(error)) => Err(error.clone()),
             Some(RipScript::AtmosUnavailable(_))
                 if options.codec_preference == music::CodecPreference::Atmos =>
             {
-                Err(RipError::Unavailable(
-                    "No Dolby Atmos stream variant found".into(),
-                ))
+                Err(RipError::RenditionUnavailable {
+                    reason: "No Dolby Atmos stream variant found".into(),
+                })
             }
             Some(RipScript::OkWithCodec(bytes, codec)) => {
                 let dir = output_dir
@@ -1518,10 +1518,10 @@ async fn playlist_resolution_uses_seam() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rip_failure_logs_and_continues() {
     let (orch, deps, state, _) = setup();
-    deps.rip_scripts
-        .lock()
-        .unwrap()
-        .insert("bad".into(), RipScript::Fail("CDN error"));
+    deps.rip_scripts.lock().unwrap().insert(
+        "bad".into(),
+        RipScript::Fail(RipError::Message("CDN error".into())),
+    );
     deps.rip_scripts
         .lock()
         .unwrap()
@@ -1551,13 +1551,15 @@ async fn rip_failure_logs_and_continues() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn circuit_breaker_stops_remaining_batch() {
+async fn source_offline_skips_track_and_continues_batch() {
     let (orch, deps, state, events) = setup();
     for id in ["t1", "t2", "t3"] {
-        deps.rip_scripts
-            .lock()
-            .unwrap()
-            .insert(id.into(), RipScript::Fail("Mirror /status check timed out"));
+        deps.rip_scripts.lock().unwrap().insert(
+            id.into(),
+            RipScript::Fail(RipError::SourceOffline {
+                source: engine::streaming::SourceId::PrimaryMirror,
+            }),
+        );
     }
 
     let summary = run_async(
@@ -1569,19 +1571,19 @@ async fn circuit_breaker_stops_remaining_batch() {
         ),
     )
     .await
-    .expect("job completes (deviation: producer settles instead of hanging)");
+    .expect("job completes with per-track failures");
 
-    // t1 fails → breaker row; t2/t3 are never ripped.
+    // SourceOffline marks each track failed and the batch continues.
     let st = state.lock().unwrap();
-    assert_eq!(st.rip_calls, vec!["t1".to_string()]);
-    drop(st);
-    assert_eq!(summary.failed_tracks.len(), 2);
-    assert_eq!(summary.failed_tracks[0].id, "t1");
-    assert_eq!(summary.failed_tracks[1].id, "Remaining tracks");
     assert_eq!(
-        summary.failed_tracks[1].error,
-        "Mirror service offline / unreachable (stopped remaining batch)"
+        st.rip_calls,
+        vec!["t1".to_string(), "t2".to_string(), "t3".to_string()]
     );
+    drop(st);
+    assert_eq!(summary.failed_tracks.len(), 3);
+    assert_eq!(summary.failed_tracks[0].id, "t1");
+    assert_eq!(summary.failed_tracks[1].id, "t2");
+    assert_eq!(summary.failed_tracks[2].id, "t3");
     let _ = events;
 }
 
@@ -1591,7 +1593,7 @@ async fn generic_timeout_and_status_errors_do_not_break_batch() {
     for id in ["t1", "t2", "t3"] {
         deps.rip_scripts.lock().unwrap().insert(
             id.into(),
-            RipScript::Fail("request timed out with HTTP 503"),
+            RipScript::Fail(RipError::Message("request timed out with HTTP 503".into())),
         );
     }
 
@@ -3130,10 +3132,10 @@ async fn zip_partial_delivery_marks_zip_delivery_partial() {
         .lock()
         .unwrap()
         .insert("t1".into(), RipScript::OkWithFile(vec![1, 2, 3]));
-    deps.rip_scripts
-        .lock()
-        .unwrap()
-        .insert("t2".into(), RipScript::Fail("mirror exploded"));
+    deps.rip_scripts.lock().unwrap().insert(
+        "t2".into(),
+        RipScript::Fail(RipError::Message("mirror exploded".into())),
+    );
     {
         let mut st = state.lock().unwrap();
         st.send_audio_results.push_back(FakeDeps::upload_ok());

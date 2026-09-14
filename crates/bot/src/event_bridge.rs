@@ -296,25 +296,20 @@ async fn refresh_dashboard_for_job(state: &BotState, job: &ActiveRipJob) {
     }
 }
 
-fn failed_track_reason(error: &str) -> Option<&'static str> {
-    let lower = error.to_ascii_lowercase();
-    if lower.contains("404")
-        || lower.contains("failed to get m3u8")
-        || lower.contains("unavailable")
-        || lower.contains("unstreamable")
-        || lower.contains("not streamable")
-        || lower.contains("not available")
-        || lower.contains("not found")
-    {
-        Some("Unavailable on Apple Music")
-    } else if lower.contains("cancelled") {
-        Some("Cancelled")
-    } else if lower.contains("timed out") || lower.contains("timeout") {
-        Some("Timed out")
-    } else if lower.contains("401") || lower.contains("403") || lower.contains("unauthorized") {
-        Some("Authentication error")
-    } else {
-        None
+fn failed_track_reason(
+    kind: Option<engine::orchestrator::types::FailedTrackKind>,
+) -> Option<&'static str> {
+    use engine::orchestrator::types::FailedTrackKind;
+    match kind {
+        Some(FailedTrackKind::TrackUnavailable) | Some(FailedTrackKind::RenditionUnavailable) => {
+            Some("Unavailable on Apple Music")
+        }
+        Some(FailedTrackKind::SourceOffline) => Some("Service temporarily offline"),
+        Some(FailedTrackKind::Cancelled) => Some("Cancelled"),
+        Some(FailedTrackKind::Timeout) => Some("Timed out"),
+        Some(FailedTrackKind::Authentication) => Some("Authentication error"),
+        Some(FailedTrackKind::LocalIo) => Some("Local file error"),
+        None => None,
     }
 }
 
@@ -349,7 +344,7 @@ fn format_failed_track(failed: &FailedTrack) -> String {
         label
     };
 
-    if let Some(reason) = failed_track_reason(&failed.error) {
+    if let Some(reason) = failed_track_reason(failed.kind) {
         format!("{link} <i>({reason})</i>")
     } else {
         link
@@ -638,9 +633,11 @@ mod tests {
     }
     #[test]
     fn format_failed_track_rendering() {
+        use engine::orchestrator::types::FailedTrackKind;
         let ft1 = FailedTrack {
             id: "6804576275".into(),
-            error: "failed to get m3u8".into(),
+            error: "track unavailable: failed to get m3u8".into(),
+            kind: Some(FailedTrackKind::TrackUnavailable),
             title: Some("Bhaber deshe thako konya".into()),
             artist: Some("Fakira".into()),
             storefront: Some("in".into()),
@@ -652,7 +649,8 @@ mod tests {
 
         let ft2 = FailedTrack {
             id: "6804576275".into(),
-            error: "failed to get m3u8".into(),
+            error: "track unavailable: failed to get m3u8".into(),
+            kind: Some(FailedTrackKind::TrackUnavailable),
             title: Some("Bhaber deshe thako konya".into()),
             artist: Some("Fakira".into()),
             storefront: None,
@@ -664,7 +662,8 @@ mod tests {
 
         let ft3 = FailedTrack {
             id: "12345".into(),
-            error: "404".into(),
+            error: "track unavailable: 404".into(),
+            kind: Some(FailedTrackKind::TrackUnavailable),
             title: None,
             artist: None,
             storefront: None,
@@ -677,6 +676,7 @@ mod tests {
         let ft4 = FailedTrack {
             id: "Remaining tracks".into(),
             error: "offline".into(),
+            kind: None,
             title: None,
             artist: None,
             storefront: None,
@@ -686,6 +686,7 @@ mod tests {
         let ft5 = FailedTrack {
             id: "999".into(),
             error: "err".into(),
+            kind: None,
             title: Some("Tom & Jerry <Special>".into()),
             artist: Some("AC/DC & Friends".into()),
             storefront: None,
@@ -693,6 +694,45 @@ mod tests {
         assert_eq!(
             format_failed_track(&ft5),
             r#"<a href="https://music.apple.com/song/999">Tom &amp; Jerry &lt;Special&gt; - AC/DC &amp; Friends</a>"#
+        );
+
+        let ft6 = FailedTrack {
+            id: "777".into(),
+            error: "operation timed out".into(),
+            kind: Some(FailedTrackKind::Timeout),
+            title: None,
+            artist: None,
+            storefront: None,
+        };
+        assert_eq!(
+            format_failed_track(&ft6),
+            r#"<a href="https://music.apple.com/song/777">Track 777</a> <i>(Timed out)</i>"#
+        );
+
+        let ft7 = FailedTrack {
+            id: "888".into(),
+            error: "cancelled".into(),
+            kind: Some(FailedTrackKind::Cancelled),
+            title: None,
+            artist: None,
+            storefront: None,
+        };
+        assert_eq!(
+            format_failed_track(&ft7),
+            r#"<a href="https://music.apple.com/song/888">Track 888</a> <i>(Cancelled)</i>"#
+        );
+
+        let ft8 = FailedTrack {
+            id: "999".into(),
+            error: "wrapper service offline".into(),
+            kind: Some(FailedTrackKind::SourceOffline),
+            title: None,
+            artist: None,
+            storefront: None,
+        };
+        assert_eq!(
+            format_failed_track(&ft8),
+            r#"<a href="https://music.apple.com/song/999">Track 999</a> <i>(Service temporarily offline)</i>"#
         );
     }
 

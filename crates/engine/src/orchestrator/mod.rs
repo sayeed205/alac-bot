@@ -43,14 +43,14 @@ use crate::{
             TrackAcquisition, UploadProgressCallback,
         },
         types::{
-            ActiveRipJob, EventCallback, FailedTrack, JobPhase, OrchestratorEvent,
+            ActiveRipJob, EventCallback, FailedTrack, FailedTrackKind, JobPhase, OrchestratorEvent,
             ResolutionFailure, RipJobOptions, RipJobProgress, RipJobSummary, TerminalJobState,
             ZipDeliveryInfo,
         },
     },
     progress::format_byte_progress,
     queue::{EnqueueOptions, SequentialRipQueue},
-    ripper::{RipOptions, RipProgressCallback},
+    ripper::{RipError, RipOptions, RipProgressCallback},
     settings::BotSettings,
     tagger::{bound_filename_with_suffix, MAX_FILENAME_BYTES},
     types::{AlbumTracks, ArtistTracks, Codec, Provider, TargetKind, TrackKey, TrackRipResult},
@@ -306,6 +306,7 @@ fn record_lane_task_panic(
         failures.push(FailedTrack {
             id: item_id.to_owned(),
             error,
+            kind: None,
             title: None,
             artist: None,
             storefront: None,
@@ -1922,6 +1923,7 @@ async fn rip_fresh_item<D: OrchestratorDeps>(input: RipFreshInput<'_, D>) -> Rip
             failures.push(FailedTrack {
                 id: item.track_id.clone(),
                 error: err_msg.clone(),
+                kind: Some(FailedTrackKind::TrackUnavailable),
                 title: item.meta_title.clone(),
                 artist: item.meta_artist.clone(),
                 storefront: item.storefront.clone(),
@@ -2036,7 +2038,7 @@ async fn rip_fresh_item<D: OrchestratorDeps>(input: RipFreshInput<'_, D>) -> Rip
                 return RipLaneOutcome::Cancelled;
             }
             if item.rendition == Rendition::Atmos
-                && matches!(&error, crate::ripper::RipError::Unavailable(_))
+                && matches!(&error, RipError::RenditionUnavailable { .. })
             {
                 tracing::debug!(track_id = %item.track_id, "Atmos rendition unavailable");
                 return RipLaneOutcome::Finished;
@@ -2049,6 +2051,7 @@ async fn rip_fresh_item<D: OrchestratorDeps>(input: RipFreshInput<'_, D>) -> Rip
                 failures.push(FailedTrack {
                     id: item.track_id.clone(),
                     error: err_msg.clone(),
+                    kind: FailedTrackKind::of(&error),
                     title: item.meta_title.clone(),
                     artist: item.meta_artist.clone(),
                     storefront: item.storefront.clone(),
@@ -2085,33 +2088,16 @@ async fn rip_fresh_item<D: OrchestratorDeps>(input: RipFreshInput<'_, D>) -> Rip
                 download_text.as_deref(),
                 upload_text.as_deref(),
             );
-            let mirror_down = [
-                "Mirror /status check timed out",
-                "Mirror health check failed",
-                "Lossless wrapper is currently offline",
-                "Mirror manifest lookup timed out",
-                "Mirror service is currently offline",
-                "Failed to connect to mirror stream",
-            ]
-            .iter()
-            .any(|phrase| err_msg.contains(phrase));
-            if mirror_down && item.rendition == Rendition::Primary {
-                let mut failures = ctx.failed_tracks.lock().expect("failures poisoned");
-                failures.push(FailedTrack {
-                    id: "Remaining tracks".to_owned(),
-                    error: "Mirror service offline / unreachable (stopped remaining batch)"
-                        .to_owned(),
-                    title: None,
-                    artist: None,
-                    storefront: None,
-                });
-                shared.lock().expect("job poisoned").job.failed_count = failures.len();
+            // Source-offline failures skip this track but no longer stop the
+            // batch: the wrapper fallback covers the remaining tracks.
+            if matches!(error, RipError::SourceOffline { .. })
+                && item.rendition == Rendition::Primary
+            {
                 tracing::error!(
                     track_id = %item.track_id,
                     error = %err_msg,
-                    "Lossless mirror appears to be down, aborting remaining batch to prevent repeated timeouts"
+                    "Mirror source offline; skipping track and continuing batch"
                 );
-                return RipLaneOutcome::Stop;
             }
             return RipLaneOutcome::Finished;
         }
@@ -4053,6 +4039,7 @@ async fn upload_one<D: OrchestratorDeps>(
                         failures.push(FailedTrack {
                             id: track_id.clone(),
                             error: upload_err.to_string(),
+                            kind: None,
                             title: Some(rip_result.title.clone()),
                             artist: Some(rip_result.artist.clone()),
                             storefront: None,
@@ -4100,6 +4087,7 @@ async fn upload_one<D: OrchestratorDeps>(
                     failures.push(FailedTrack {
                         id: track_id.clone(),
                         error: err_msg.to_string(),
+                        kind: None,
                         title: Some(rip_result.title.clone()),
                         artist: Some(rip_result.artist.clone()),
                         storefront: None,
@@ -4297,6 +4285,7 @@ async fn record_failure<D: OrchestratorDeps>(
         failures.push(FailedTrack {
             id: details.track_id.to_string(),
             error: details.err_msg.clone(),
+            kind: None,
             title: details.title,
             artist: details.artist,
             storefront: None,

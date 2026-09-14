@@ -2,7 +2,7 @@ use std::{sync::Mutex, time::Duration};
 
 use bytes::Bytes;
 use engine::streaming::{
-    ByteStream, FetchEndpointOptions, StreamHttp, StreamHttpError, StreamHttpResponse,
+    ByteStream, FetchEndpointOptions, SourceId, StreamHttp, StreamHttpError, StreamHttpResponse,
     StreamTransport,
 };
 use futures_util::stream;
@@ -52,7 +52,9 @@ async fn fetch_endpoint_validates_and_preserves_stream_metadata() {
         .fetch_endpoint(FetchEndpointOptions {
             stream_url: "https://example.test/audio".into(),
             api_key: None,
-            source_name: "test source".into(),
+            source: SourceId::WrapperLite {
+                url: "http://127.0.0.1:12340".into(),
+            },
             signal: None,
             timeout: Duration::from_secs(1),
         })
@@ -62,6 +64,12 @@ async fn fetch_endpoint_validates_and_preserves_stream_metadata() {
     assert_eq!(source.bit_depth, 24);
     assert_eq!(source.sample_rate, 96_000);
     assert_eq!(source.content_length, Some(5));
+    assert_eq!(
+        source.source,
+        SourceId::WrapperLite {
+            url: "http://127.0.0.1:12340".into()
+        }
+    );
 }
 
 #[tokio::test]
@@ -75,11 +83,11 @@ async fn fetch_endpoint_rejects_cancelled_requests() {
         .fetch_endpoint(FetchEndpointOptions {
             stream_url: "https://example.test/audio".into(),
             api_key: None,
-            source_name: "test source".into(),
+            source: SourceId::PrimaryMirror,
             signal: Some(signal),
             timeout: Duration::from_secs(1),
         })
         .await
         .unwrap_err();
-    assert_eq!(error.to_string(), "Download was cancelled");
+    assert!(matches!(error, engine::streaming::StreamError::Cancelled));
 }

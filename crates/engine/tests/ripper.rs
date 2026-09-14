@@ -58,7 +58,7 @@ fn fake_stream_with_length(chunks: Vec<Bytes>, content_length: Option<u64>) -> A
                 .into_iter()
                 .map(Ok::<_, engine::streaming::StreamBodyError>),
         )) as ByteStream,
-        source_name: "primary mirror (test)".into(),
+        source: engine::streaming::SourceId::PrimaryMirror,
         codec: "alac".into(),
         bit_depth: 24,
         sample_rate: 96_000,
@@ -74,7 +74,7 @@ struct FakeDeps {
     stream_chunks: Vec<Bytes>,
     stream_content_length: Option<u64>,
     connect_fails: u32, // first N connect calls fail with a stall message
-    connect_error: Option<String>,
+    connect_error: Option<RipError>,
     connect_permanent: Option<String>,
     connect_unavailable: bool,
     connect_calls: AtomicU32,
@@ -127,13 +127,15 @@ impl RipperDeps for FakeDeps {
         let _ = (track_id, signal, on_progress, codec_preference);
         let n = self.connect_calls.fetch_add(1, Ordering::SeqCst);
         if self.connect_unavailable {
-            return Err(RipError::Unavailable("Dolby Atmos is unavailable".into()));
+            return Err(RipError::RenditionUnavailable {
+                reason: "Dolby Atmos is unavailable".into(),
+            });
         }
-        if let Some(ref error) = self.connect_permanent {
-            return Err(RipError::Permanent(error.clone()));
+        if let Some(reason) = self.connect_permanent.clone() {
+            return Err(RipError::TrackUnavailable { reason });
         }
-        if let Some(ref err) = self.connect_error {
-            return Err(RipError::Message(err.clone()));
+        if let Some(err) = self.connect_error.clone() {
+            return Err(err);
         }
         if n < self.connect_fails {
             return Err(RipError::Message(
@@ -278,7 +280,7 @@ async fn metadata_error_cleans_staging_lane() {
         .await
         .unwrap_err();
 
-    assert_eq!(error.to_string(), "catalog down");
+    assert!(matches!(error, RipError::Message(message) if message == "catalog down"));
     assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
 }
 
@@ -326,10 +328,10 @@ async fn exhaustion_rethrows_last_error() {
         .rip(&deps, "42", RipOptions::new(Provider::Apple, "us"))
         .await
         .unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "Audio stream stalled on test: no data received for 45s"
-    );
+    assert!(matches!(
+        error,
+        RipError::Message(message) if message == "Audio stream stalled on test: no data received for 45s"
+    ));
     assert_eq!(
         deps.connect_calls.load(Ordering::SeqCst),
         3,
@@ -367,7 +369,7 @@ async fn cancelled_message_bypasses_retries() {
                 .0
                 .connect_stream(track_id, signal, on_progress, codec_preference)
                 .await?;
-            Err(RipError::Message("Download was cancelled".into()))
+            Err(RipError::Cancelled)
         }
         async fn fetch_lyrics(&self, lookup: &engine::lyrics::LyricsLookup) -> Option<String> {
             self.0.fetch_lyrics(lookup).await
@@ -396,7 +398,7 @@ async fn cancelled_message_bypasses_retries() {
         )
         .await
         .unwrap_err();
-    assert_eq!(error.to_string(), "Download was cancelled");
+    assert!(matches!(error, RipError::Cancelled));
     // No retry progress messages.
     assert!(log
         .lock()
@@ -420,7 +422,7 @@ async fn cancellation_mid_rip_no_retry() {
         )
         .await
         .unwrap_err();
-    assert_eq!(error.to_string(), "Download was cancelled");
+    assert!(matches!(error, RipError::Cancelled));
     assert_eq!(deps.meta_calls.load(Ordering::SeqCst), 0);
 }
 
@@ -460,7 +462,7 @@ async fn stalled_stream_is_retryable() {
             let pending: ByteStream = Box::pin(stream::pending());
             Ok(AudioStreamSource {
                 stream: pending,
-                source_name: "primary mirror (test)".into(),
+                source: engine::streaming::SourceId::PrimaryMirror,
                 codec: "alac".into(),
                 bit_depth: 24,
                 sample_rate: 96_000,
@@ -495,10 +497,13 @@ async fn stalled_stream_is_retryable() {
         .rip(&deps, "42", RipOptions::new(Provider::Apple, "us"))
         .await
         .unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("Audio stream stalled on primary mirror (test)"));
-    assert!(error.to_string().contains("no data received for 45s"));
+    assert!(matches!(
+        error,
+        RipError::StreamStalled {
+            source: engine::streaming::SourceId::PrimaryMirror,
+            secs: 45
+        }
+    ));
     assert_eq!(
         deps.0.connect_calls.load(Ordering::SeqCst),
         2,
@@ -547,7 +552,14 @@ async fn short_body_is_rejected_before_tagging() {
         .await
         .unwrap_err();
 
-    assert!(error.to_string().contains("Incomplete audio body"));
+    assert!(matches!(
+        error,
+        RipError::IncompleteBody {
+            source: engine::streaming::SourceId::PrimaryMirror,
+            expected: 20,
+            received: 15
+        }
+    ));
     assert!(deps.tag_calls.lock().unwrap().is_empty());
     assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
 }
@@ -604,7 +616,9 @@ async fn tag_failure_is_retryable_and_exhausts() {
         .rip(&deps, "42", RipOptions::new(Provider::Apple, "us"))
         .await
         .unwrap_err();
-    assert_eq!(error.to_string(), "native media finalization failed: boom");
+    assert!(
+        matches!(error, RipError::Message(message) if message == "native media finalization failed: boom")
+    );
     assert_eq!(deps.tag_calls.lock().unwrap().len(), 3);
     // Temp raw cleaned even after failures.
     let raw_left: Vec<_> = std::fs::read_dir(dir.path())
@@ -619,7 +633,9 @@ async fn tag_failure_is_retryable_and_exhausts() {
 async fn local_filename_error_is_non_retryable() {
     let dir = tempfile::tempdir().unwrap();
     let mut deps = FakeDeps::ok();
-    deps.connect_error = Some("local path error: ENAMETOOLONG (File name too long)".into());
+    deps.connect_error = Some(RipError::LocalIo {
+        message: "local path error: ENAMETOOLONG (File name too long)".into(),
+    });
     let ripper = AlacTrackRipper::new(config(dir.path(), 4, 1));
     let (cb, log) = record();
 
@@ -632,7 +648,10 @@ async fn local_filename_error_is_non_retryable() {
         .await
         .expect_err("a local filename error should fail without retries");
 
-    assert!(error.to_string().contains("ENAMETOOLONG"));
+    assert!(matches!(
+        error,
+        RipError::LocalIo { message } if message.contains("ENAMETOOLONG")
+    ));
     assert_eq!(deps.connect_calls.load(Ordering::SeqCst), 1);
     assert!(log
         .lock()
@@ -684,9 +703,10 @@ async fn not_found_404_skips_retries_completely() {
         .rip(&deps, "6804576275", RipOptions::new(Provider::Apple, "in"))
         .await
         .unwrap_err();
-    assert!(
-        matches!(error, RipError::Permanent(message) if message.contains("/m3u8") && message.contains("404"))
-    );
+    assert!(matches!(
+        error,
+        RipError::TrackUnavailable { reason } if reason == "Wrapper /m3u8 returned HTTP 404"
+    ));
     assert_eq!(
         deps.connect_calls.load(Ordering::SeqCst),
         1,
@@ -710,6 +730,9 @@ async fn typed_unavailable_outcome_bypasses_retries() {
         .await
         .unwrap_err();
 
-    assert!(matches!(error, RipError::Unavailable(_)));
+    assert!(matches!(
+        error,
+        RipError::RenditionUnavailable { reason } if reason == "Dolby Atmos is unavailable"
+    ));
     assert_eq!(deps.connect_calls.load(Ordering::SeqCst), 1);
 }

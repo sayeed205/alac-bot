@@ -146,9 +146,42 @@ pub struct RipJobProgress {
 pub struct FailedTrack {
     pub id: String,
     pub error: String,
+    /// Disposition of the failure, from the typed rip error. `None` for
+    /// upload-lane failures that never had a rip error.
+    pub kind: Option<FailedTrackKind>,
     pub title: Option<String>,
     pub artist: Option<String>,
     pub storefront: Option<String>,
+}
+
+/// What a consumer does with a failed track: render text or a label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailedTrackKind {
+    TrackUnavailable,
+    RenditionUnavailable,
+    SourceOffline,
+    Cancelled,
+    Timeout,
+    Authentication,
+    LocalIo,
+}
+
+impl FailedTrackKind {
+    /// Disposition of a typed rip error; `None` for technical failures that
+    /// carry no user-facing label.
+    pub fn of(error: &crate::ripper::RipError) -> Option<Self> {
+        use crate::ripper::RipError;
+        match error {
+            RipError::TrackUnavailable { .. } => Some(Self::TrackUnavailable),
+            RipError::RenditionUnavailable { .. } => Some(Self::RenditionUnavailable),
+            RipError::SourceOffline { .. } => Some(Self::SourceOffline),
+            RipError::Cancelled => Some(Self::Cancelled),
+            RipError::Timeout { .. } => Some(Self::Timeout),
+            RipError::Authentication { .. } => Some(Self::Authentication),
+            RipError::LocalIo { .. } => Some(Self::LocalIo),
+            _ => None,
+        }
+    }
 }
 
 impl FailedTrack {
@@ -156,6 +189,7 @@ impl FailedTrack {
         Self {
             id: id.into(),
             error: error.into(),
+            kind: None,
             title: None,
             artist: None,
             storefront: None,
@@ -171,6 +205,11 @@ impl FailedTrack {
         self.title = title;
         self.artist = artist;
         self.storefront = storefront;
+        self
+    }
+
+    pub fn with_kind(mut self, kind: Option<FailedTrackKind>) -> Self {
+        self.kind = kind;
         self
     }
 }

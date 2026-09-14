@@ -137,6 +137,7 @@ Telegram session + download scratch in the `/app/bot-data` volume.
 | `ALAC_MIRROR_URL`      | Optional static mirror URL override                               | Dynamic manifest         |
 | `ALAC_API_KEY`         | Optional static mirror API key override                           | Dynamic manifest         |
 | `ALAC_WRAPPER_URL`     | Secondary decryption wrapper / mirror URL fallback                | `http://127.0.0.1:12340` |
+| `ALAC_WRAPPER_KIND`    | Wrapper deployment flavor: `native` (wrapper-lite relay) or `endpoints` (candidate URLs) | `native` |
 | `ALAC_WRAPPER_API_KEY` | Optional API key for wrapper URL                                  | None                     |
 | `ALAC_MAX_RETRIES`     | Max retries per rip/upload attempt                                | `3`                      |
 | `ALAC_RETRY_BASE_MS`   | Exponential backoff base delay (ms)                               | `2000`                   |

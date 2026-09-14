@@ -139,9 +139,9 @@ impl TrackAcquisition for RaceDeps {
         while *self.rip_hold.lock().await && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        Err(engine::ripper::RipError::Message(
-            "Mirror service is currently offline".to_owned(),
-        ))
+        Err(engine::ripper::RipError::SourceOffline {
+            source: engine::streaming::SourceId::PrimaryMirror,
+        })
     }
 }
 
@@ -293,15 +293,16 @@ async fn settled_failed_job_is_no_longer_cancellable() {
     let task = tokio::spawn(async move { run_orch.start_job(run_deps, &options).await });
     let result = task.await.unwrap();
 
-    // The fake rip fails with a mirror-offline error, but this port
-    // records it as a failed track and completes the job with a summary —
-    // exactly one terminal event, and it is Completed (not Failed).
+    // The fake rip fails with a mirror-offline error, which this port records
+    // as a failed track and completes the job with a summary — exactly one
+    // terminal event, and it is Completed (not Failed). The batch no longer
+    // stops on mirror-down, so no synthetic "Remaining tracks" row appears.
     let terminals = terminals.lock().unwrap();
     assert_eq!(terminals.len(), 1);
     assert_eq!(terminals[0].0, "completed");
     assert!(result.is_ok(), "recorded failure + continue settles Ok");
-    // The failed track + the breaker's synthetic "Remaining tracks" row.
-    assert_eq!(result.as_ref().unwrap().failed_count, 2);
+    // Only the single failed track is recorded.
+    assert_eq!(result.as_ref().unwrap().failed_count, 1);
     // Late cancel is a no-op on a settled job.
     assert!(!orch.cancel_job(&terminals[0].1, Some("late")));
 }

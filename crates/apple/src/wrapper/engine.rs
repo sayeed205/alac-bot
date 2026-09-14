@@ -11,7 +11,7 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use bytes::Bytes;
-use engine::streaming::{AudioStreamSource, ProgressCallback, StreamError};
+use engine::streaming::{AudioStreamSource, ProgressCallback, SourceId, StreamError};
 use music::CodecPreference;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -25,6 +25,7 @@ use super::{
 pub struct WrapperEngine {
     client: WrapperLiteClient,
     http_client: reqwest::Client,
+    source: SourceId,
 }
 
 /// Result of wrapper acquisition while retaining the only provenance that can
@@ -42,9 +43,13 @@ impl WrapperEngine {
             .timeout(Duration::from_secs(60))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
+        let source = SourceId::WrapperLite {
+            url: client.base_url().to_owned(),
+        };
         Self {
             client,
             http_client,
+            source,
         }
     }
 
@@ -83,7 +88,7 @@ impl WrapperEngine {
         preference: CodecPreference,
     ) -> Result<WrapperTrackOutcome, StreamError> {
         if signal.as_ref().is_some_and(|s| s.is_cancelled()) {
-            return Err(StreamError::Message("Download was cancelled".into()));
+            return Err(StreamError::Cancelled);
         }
 
         if let Some(cb) = &on_progress {
@@ -92,15 +97,10 @@ impl WrapperEngine {
 
         let master_url = match self.client.fetch_m3u8_url(track_id).await {
             Ok(url) => url,
-            Err(WrapperError::Unavailable(reason)) if preference == CodecPreference::Atmos => {
+            Err(WrapperError::Unavailable(reason)) => {
                 return Ok(WrapperTrackOutcome::Unavailable(reason));
             }
-            Err(WrapperError::Unavailable(WrapperUnavailableReason::M3u8NotFound)) => {
-                return Err(StreamError::Permanent(
-                    WrapperUnavailableReason::M3u8NotFound.to_string(),
-                ));
-            }
-            Err(error) => return Err(StreamError::Message(format!("Fetch m3u8 URL: {error}"))),
+            Err(error) => return Err(self.map_client_error("fetch m3u8 url", error)),
         };
 
         debug!(track_id = %track_id, master_url = %master_url, "Fetched master m3u8 URL");
@@ -110,11 +110,11 @@ impl WrapperEngine {
             .get(&master_url)
             .send()
             .await
-            .map_err(|e| StreamError::Message(format!("Fetch master playlist: {e}")))?;
+            .map_err(|e| self.map_reqwest_error("Fetch master playlist", e))?;
         let master_text = master_resp
             .text()
             .await
-            .map_err(|e| StreamError::Message(format!("Read master playlist: {e}")))?;
+            .map_err(|e| self.map_reqwest_error("Read master playlist", e))?;
 
         // 3. Parse and select the stream variant per preference. A store
         // with no lossless HLS hands out a direct file URL instead of a
@@ -129,9 +129,10 @@ impl WrapperEngine {
                     self.webplayback_fallback(track_id, signal.as_ref(), on_progress.as_ref())
                         .await?
                 } else {
-                    return Err(StreamError::Message(format!(
-                        "Parse master playlist: {error}"
-                    )));
+                    return Err(StreamError::PlaylistParse {
+                        which: "master",
+                        detail: error.to_string(),
+                    });
                 }
             }
         };
@@ -154,22 +155,30 @@ impl WrapperEngine {
             .get(&alac_info.stream_url)
             .send()
             .await
-            .map_err(|e| StreamError::Message(format!("Fetch media playlist: {e}")))?;
+            .map_err(|e| self.map_reqwest_error("Fetch media playlist", e))?;
         let media_text = media_resp
             .text()
             .await
-            .map_err(|e| StreamError::Message(format!("Read media playlist: {e}")))?;
+            .map_err(|e| self.map_reqwest_error("Read media playlist", e))?;
 
-        let media_info = parse_media_playlist(&media_text, &alac_info.stream_url)
-            .map_err(|e| StreamError::Message(format!("Parse media playlist: {e}")))?;
+        let media_info = parse_media_playlist(&media_text, &alac_info.stream_url).map_err(|e| {
+            StreamError::PlaylistParse {
+                which: "media",
+                detail: e.to_string(),
+            }
+        })?;
 
         // 5b. CENC (Widevine) playlists — the webplayback AAC path — take a
         // different decryption route than the FairPlay master variants.
         if media_info.key_method.as_deref() == Some("ISO-23001-7") {
-            let kid_b64 = media_info
-                .cenc_kid_b64
-                .clone()
-                .ok_or_else(|| StreamError::Message("CENC playlist has no key id".into()))?;
+            let kid_b64 =
+                media_info
+                    .cenc_kid_b64
+                    .clone()
+                    .ok_or_else(|| StreamError::PlaylistParse {
+                        which: "media",
+                        detail: "CENC playlist has no key id".to_owned(),
+                    })?;
             return self
                 .rip_cenc_stream(
                     track_id,
@@ -196,8 +205,8 @@ impl WrapperEngine {
                         .client
                         .fetch_template(adam_for_key, key_uri)
                         .await
-                        .map_err(|e| {
-                            StreamError::Message(format!("Fetch template for {key_uri}: {e}"))
+                        .map_err(|e| StreamError::Decrypt {
+                            detail: format!("fetch template for {key_uri}: {e}"),
                         })?;
                     key_templates.insert(key_uri.clone(), Arc::new(tmpl));
                 }
@@ -215,11 +224,11 @@ impl WrapperEngine {
                 .get(single_url)
                 .send()
                 .await
-                .map_err(|e| StreamError::Message(format!("Download audio stream: {e}")))?;
+                .map_err(|e| self.map_reqwest_error("Download audio stream", e))?;
             let raw_data = resp
                 .bytes()
                 .await
-                .map_err(|e| StreamError::Message(format!("Read audio stream bytes: {e}")))?;
+                .map_err(|e| self.map_reqwest_error("Read audio stream bytes", e))?;
 
             if let Some(cb) = &on_progress {
                 cb("Decrypting FairPlay audio samples with Temari...");
@@ -244,12 +253,61 @@ impl WrapperEngine {
 
         Ok(WrapperTrackOutcome::Source(AudioStreamSource {
             stream,
-            source_name: format!("wrapper ({})", self.client.base_url()),
+            source: self.source.clone(),
             codec: alac_info.codec,
             bit_depth: alac_info.bit_depth,
             sample_rate: alac_info.sample_rate,
             content_length: Some(total_size),
         }))
+    }
+
+    fn map_client_error(&self, what: &str, error: WrapperError) -> StreamError {
+        match error {
+            WrapperError::Http(error) => {
+                if error.is_timeout() {
+                    return StreamError::Timeout {
+                        source: self.source.clone(),
+                        secs: 30,
+                    };
+                }
+                if error.is_connect() {
+                    // The wrapper-lite relay itself is unreachable: the
+                    // service is offline, not flaky.
+                    return StreamError::SourceOffline {
+                        source: self.source.clone(),
+                    };
+                }
+                StreamError::Message(format!("{what}: {error}"))
+            }
+            WrapperError::Auth { .. } => StreamError::Authentication {
+                source: self.source.clone(),
+            },
+            WrapperError::Api { code, message } => StreamError::Message(format!(
+                "{what}: wrapper API error (code {code}): {message}"
+            )),
+            other => StreamError::Message(format!("{what}: {other}")),
+        }
+    }
+
+    fn map_reqwest_error(&self, what: &str, error: reqwest::Error) -> StreamError {
+        if error.is_timeout() {
+            return StreamError::Timeout {
+                source: self.source.clone(),
+                secs: 60,
+            };
+        }
+        if error.is_connect() {
+            return StreamError::Message(format!("{what}: {error}"));
+        }
+        if let Some(status) = error.status() {
+            let code = status.as_u16();
+            if code == 401 || code == 403 {
+                return StreamError::Authentication {
+                    source: self.source.clone(),
+                };
+            }
+        }
+        StreamError::Message(format!("{what}: {error}"))
     }
 
     /// Handles stores with no lossless HLS: `/m3u8` hands out a direct
@@ -262,7 +320,7 @@ impl WrapperEngine {
         on_progress: Option<&ProgressCallback>,
     ) -> Result<AlacStreamInfo, StreamError> {
         if signal.is_some_and(|t| t.is_cancelled()) {
-            return Err(StreamError::Message("Download was cancelled".into()));
+            return Err(StreamError::Cancelled);
         }
         if let Some(cb) = on_progress {
             cb("No lossless stream; using web playback...");
@@ -271,7 +329,7 @@ impl WrapperEngine {
             .client
             .fetch_webplayback(track_id)
             .await
-            .map_err(|e| StreamError::Message(format!("Fetch web playback: {e}")))?;
+            .map_err(|e| self.map_client_error("fetch web playback", e))?;
         debug!(track_id = %track_id, media_url = %media_url, "Using web playback fallback");
         Ok(AlacStreamInfo {
             stream_url: media_url,
@@ -295,20 +353,21 @@ impl WrapperEngine {
         use base64::{engine::general_purpose::STANDARD as B64, Engine};
 
         if signal.is_some_and(|t| t.is_cancelled()) {
-            return Err(StreamError::Message("Download was cancelled".into()));
+            return Err(StreamError::Cancelled);
         }
         if let Some(cb) = on_progress {
             cb("Fetching Widevine license for encrypted AAC...");
         }
 
-        let kid = B64
-            .decode(kid_b64)
-            .map_err(|e| StreamError::Message(format!("Decode CENC key id: {e}")))?;
-        let mut cdm = super::widevine::Cdm::new(&kid)
-            .map_err(|e| StreamError::Message(format!("Init Widevine CDM: {e}")))?;
-        let challenge = cdm
-            .license_request()
-            .map_err(|e| StreamError::Message(format!("Build license request: {e}")))?;
+        let kid = B64.decode(kid_b64).map_err(|e| StreamError::Decrypt {
+            detail: format!("decode CENC key id: {e}"),
+        })?;
+        let mut cdm = super::widevine::Cdm::new(&kid).map_err(|e| StreamError::Decrypt {
+            detail: format!("init Widevine CDM: {e}"),
+        })?;
+        let challenge = cdm.license_request().map_err(|e| StreamError::Decrypt {
+            detail: format!("build license request: {e}"),
+        })?;
 
         // wrapper-lite forwards the playlist's original EXT-X-KEY URI
         // ("data:;base64,<kid>") verbatim to Apple; the PSSH built above
@@ -323,20 +382,24 @@ impl WrapperEngine {
             .client
             .fetch_license(track_id, &challenge, &key_uri)
             .await
-            .map_err(|e| StreamError::Message(format!("Fetch license: {e}")))?;
+            .map_err(|e| self.map_license_error(e))?;
 
         let content_keys = cdm
             .content_keys(&license_b64)
-            .map_err(|e| StreamError::Message(format!("Unwrap license keys: {e}")))?;
+            .map_err(|e| StreamError::License {
+                detail: format!("unwrap license keys: {e}"),
+            })?;
         let content_key = content_keys
             .iter()
             .find(|k| k.key_id == kid)
             .map(|k| k.value)
             .or_else(|| content_keys.first().map(|k| k.value))
-            .ok_or_else(|| StreamError::Message("License contained no content key".into()))?;
+            .ok_or_else(|| StreamError::License {
+                detail: "license contained no content key".to_owned(),
+            })?;
 
         if signal.is_some_and(|t| t.is_cancelled()) {
-            return Err(StreamError::Message("Download was cancelled".into()));
+            return Err(StreamError::Cancelled);
         }
         if let Some(cb) = on_progress {
             cb("Downloading encrypted AAC stream...");
@@ -348,17 +411,20 @@ impl WrapperEngine {
             .single_file_url
             .as_deref()
             .or(media_info.segments.first().map(|s| s.uri.as_str()))
-            .ok_or_else(|| StreamError::Message("CENC playlist has no segments".into()))?;
+            .ok_or_else(|| StreamError::PlaylistParse {
+                which: "media",
+                detail: "CENC playlist has no segments".to_owned(),
+            })?;
         let resp = self
             .http_client
             .get(single_url)
             .send()
             .await
-            .map_err(|e| StreamError::Message(format!("Download audio stream: {e}")))?;
+            .map_err(|e| self.map_reqwest_error("Download audio stream", e))?;
         let raw_data = resp
             .bytes()
             .await
-            .map_err(|e| StreamError::Message(format!("Read audio stream bytes: {e}")))?;
+            .map_err(|e| self.map_reqwest_error("Read audio stream bytes", e))?;
 
         if let Some(cb) = on_progress {
             cb("Decrypting CENC audio samples...");
@@ -366,37 +432,46 @@ impl WrapperEngine {
 
         let (init_offset, init_len) = media_info.init_byte_range.unwrap_or((0, 1037));
         if raw_data.len() < (init_offset + init_len) as usize {
-            return Err(StreamError::Message(
-                "Raw stream shorter than init segment".into(),
-            ));
+            return Err(StreamError::Decrypt {
+                detail: "raw stream shorter than init segment".to_owned(),
+            });
         }
         let init_raw = &raw_data[init_offset as usize..(init_offset + init_len) as usize];
-        let transformed_init = super::decryptor::transform_init_segment(init_raw)
-            .map_err(|e| StreamError::Message(format!("Transform init segment: {e}")))?;
+        let transformed_init = super::decryptor::transform_init_segment(init_raw).map_err(|e| {
+            StreamError::Decrypt {
+                detail: format!("transform init segment: {e}"),
+            }
+        })?;
 
         let mut output = Vec::with_capacity(raw_data.len());
         output.extend_from_slice(&transformed_init);
 
         for (i, seg) in media_info.segments.iter().enumerate() {
             if signal.is_some_and(|t| t.is_cancelled()) {
-                return Err(StreamError::Message("Download was cancelled".into()));
+                return Err(StreamError::Cancelled);
             }
-            let (off, len) = seg
-                .byte_range
-                .ok_or_else(|| StreamError::Message(format!("Segment {i} missing byte range")))?;
+            let (off, len) = seg.byte_range.ok_or_else(|| StreamError::Decrypt {
+                detail: format!("segment {i} missing byte range"),
+            })?;
             let start = off as usize;
             let end = (off + len) as usize;
             if end > raw_data.len() {
-                return Err(StreamError::Message(format!(
-                    "Segment {i} range {start}..{end} out of bounds ({})",
-                    raw_data.len()
-                )));
+                return Err(StreamError::Decrypt {
+                    detail: format!(
+                        "segment {i} range {start}..{end} out of bounds ({})",
+                        raw_data.len()
+                    ),
+                });
             }
             let mut frag = raw_data[start..end].to_vec();
-            super::cenc::decrypt_cenc_fragment(&mut frag, &content_key)
-                .map_err(|e| StreamError::Message(format!("Decrypt segment {i}: {e}")))?;
-            super::cenc::strip_encryption_boxes(&mut frag)
-                .map_err(|e| StreamError::Message(format!("Strip segment {i} boxes: {e}")))?;
+            super::cenc::decrypt_cenc_fragment(&mut frag, &content_key).map_err(|e| {
+                StreamError::Decrypt {
+                    detail: format!("decrypt segment {i}: {e}"),
+                }
+            })?;
+            super::cenc::strip_encryption_boxes(&mut frag).map_err(|e| StreamError::Decrypt {
+                detail: format!("strip segment {i} boxes: {e}"),
+            })?;
             output.extend_from_slice(&frag);
         }
 
@@ -408,12 +483,37 @@ impl WrapperEngine {
 
         Ok(AudioStreamSource {
             stream,
-            source_name: format!("wrapper ({})", self.client.base_url()),
+            source: self.source.clone(),
             codec: "mp4a.40.2".to_owned(),
             bit_depth: 16,
             sample_rate: 44_100,
             content_length: Some(total_size),
         })
+    }
+
+    fn map_license_error(&self, error: WrapperError) -> StreamError {
+        match error {
+            WrapperError::Http(error) => {
+                if error.is_timeout() {
+                    return StreamError::Timeout {
+                        source: self.source.clone(),
+                        secs: 30,
+                    };
+                }
+                StreamError::License {
+                    detail: format!("fetch license: {error}"),
+                }
+            }
+            WrapperError::Auth { status } => StreamError::License {
+                detail: format!("license rejected (HTTP {status})"),
+            },
+            WrapperError::Api { code, message } => StreamError::License {
+                detail: format!("license error (code {code}): {message}"),
+            },
+            other => StreamError::License {
+                detail: other.to_string(),
+            },
+        }
     }
 
     fn decrypt_single_file_stream(
@@ -426,13 +526,15 @@ impl WrapperEngine {
         // Extract and transform init segment
         let (init_offset, init_len) = media_info.init_byte_range.unwrap_or((0, 1037));
         if raw_data.len() < (init_offset + init_len) as usize {
-            return Err(StreamError::Message(
-                "Raw stream shorter than init segment".into(),
-            ));
+            return Err(StreamError::Decrypt {
+                detail: "raw stream shorter than init segment".to_owned(),
+            });
         }
         let init_raw = &raw_data[init_offset as usize..(init_offset + init_len) as usize];
-        let transformed_init = transform_init_segment(init_raw)
-            .map_err(|e| StreamError::Message(format!("Transform init segment: {e}")))?;
+        let transformed_init =
+            transform_init_segment(init_raw).map_err(|e| StreamError::Decrypt {
+                detail: format!("transform init segment: {e}"),
+            })?;
 
         let mut output = Vec::with_capacity(raw_data.len());
         output.extend_from_slice(&transformed_init);
@@ -443,24 +545,24 @@ impl WrapperEngine {
             .find(|(k, _)| !k.contains("P000000000"))
             .map(|(_, v)| v.clone())
             .or_else(|| key_templates.values().next().cloned())
-            .ok_or_else(|| {
-                StreamError::Message("No FairPlay decryption template available".into())
+            .ok_or_else(|| StreamError::Decrypt {
+                detail: "no FairPlay decryption template available".to_owned(),
             })?;
 
         // Process each media fragment
         for (i, seg) in media_info.segments.iter().enumerate() {
-            let (off, len) = seg
-                .byte_range
-                .ok_or_else(|| StreamError::Message(format!("Segment {i} missing byte range")))?;
+            let (off, len) = seg.byte_range.ok_or_else(|| StreamError::Decrypt {
+                detail: format!("segment {i} missing byte range"),
+            })?;
             let start = off as usize;
             let end = (off + len) as usize;
             if end > raw_data.len() {
-                return Err(StreamError::Message(format!(
-                    "Segment {i} range {}..{} out of bounds ({})",
-                    start,
-                    end,
-                    raw_data.len()
-                )));
+                return Err(StreamError::Decrypt {
+                    detail: format!(
+                        "segment {i} range {start}..{end} out of bounds ({})",
+                        raw_data.len()
+                    ),
+                });
             }
             let frag_raw = &raw_data[start..end];
 
@@ -470,8 +572,10 @@ impl WrapperEngine {
                 .and_then(|uri| key_templates.get(uri))
                 .unwrap_or(&default_template);
 
-            let decrypted_frag = decrypt_fragment(frag_raw, tmpl)
-                .map_err(|e| StreamError::Message(format!("Decrypt fragment {i}: {e}")))?;
+            let decrypted_frag =
+                decrypt_fragment(frag_raw, tmpl).map_err(|e| StreamError::Decrypt {
+                    detail: format!("decrypt fragment {i}: {e}"),
+                })?;
 
             output.extend_from_slice(&decrypted_frag);
         }
@@ -493,13 +597,15 @@ impl WrapperEngine {
             .get(&media_info.init_uri)
             .send()
             .await
-            .map_err(|e| StreamError::Message(format!("Fetch init segment: {e}")))?;
+            .map_err(|e| self.map_reqwest_error("Fetch init segment", e))?;
         let init_bytes = init_resp
             .bytes()
             .await
-            .map_err(|e| StreamError::Message(format!("Read init bytes: {e}")))?;
-        let transformed_init = transform_init_segment(&init_bytes)
-            .map_err(|e| StreamError::Message(format!("Transform init segment: {e}")))?;
+            .map_err(|e| self.map_reqwest_error("Read init bytes", e))?;
+        let transformed_init =
+            transform_init_segment(&init_bytes).map_err(|e| StreamError::Decrypt {
+                detail: format!("transform init segment: {e}"),
+            })?;
 
         let mut output = Vec::new();
         output.extend_from_slice(&transformed_init);
@@ -509,7 +615,9 @@ impl WrapperEngine {
             .find(|(k, _)| !k.contains("P000000000"))
             .map(|(_, v)| v.clone())
             .or_else(|| key_templates.values().next().cloned())
-            .ok_or_else(|| StreamError::Message("No FairPlay template available".into()))?;
+            .ok_or_else(|| StreamError::Decrypt {
+                detail: "no FairPlay template available".to_owned(),
+            })?;
 
         for (i, seg) in media_info.segments.iter().enumerate() {
             let seg_resp = self
@@ -517,11 +625,11 @@ impl WrapperEngine {
                 .get(&seg.uri)
                 .send()
                 .await
-                .map_err(|e| StreamError::Message(format!("Fetch segment {i}: {e}")))?;
+                .map_err(|e| self.map_reqwest_error("Fetch segment", e))?;
             let seg_bytes = seg_resp
                 .bytes()
                 .await
-                .map_err(|e| StreamError::Message(format!("Read segment {i}: {e}")))?;
+                .map_err(|e| self.map_reqwest_error("Read segment bytes", e))?;
 
             let tmpl = seg
                 .key_uri
@@ -529,8 +637,9 @@ impl WrapperEngine {
                 .and_then(|uri| key_templates.get(uri))
                 .unwrap_or(&default_template);
 
-            let dec = decrypt_fragment(&seg_bytes, tmpl)
-                .map_err(|e| StreamError::Message(format!("Decrypt segment {i}: {e}")))?;
+            let dec = decrypt_fragment(&seg_bytes, tmpl).map_err(|e| StreamError::Decrypt {
+                detail: format!("decrypt segment {i}: {e}"),
+            })?;
             output.extend_from_slice(&dec);
         }
 

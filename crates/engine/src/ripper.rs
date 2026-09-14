@@ -1,4 +1,5 @@
 //! Single-track ripper: metadata → stream → raw file → tagged M4A, with
+//! retries, cancellation, and source-failure circuit reporting.
 
 use std::{
     collections::BTreeMap,
@@ -17,29 +18,108 @@ use tracing::{debug, warn};
 use crate::{
     limits::MAX_AUDIO_BYTES,
     lyrics::LyricsLookup,
-    streaming::{AudioStreamSource, ProgressCallback, StreamError},
+    streaming::{AudioStreamSource, ProgressCallback, SourceId, StreamError},
     tagger::{self, bound_filename_with_suffix, MAX_FILENAME_BYTES},
     types::{TrackMeta, TrackRipResult},
 };
 
-/// All rip failures reduce to plain user-facing messages.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone)]
 pub enum RipError {
-    #[error("{0}")]
-    Message(String),
-    #[error("{0}")]
-    Permanent(String),
-    #[error("{0}")]
-    Unavailable(String),
-    /// A provider identified a failure in the already-selected source. The
-    /// ripper adds source context and reports it through `RipperDeps` before
-    /// returning the ordinary user-facing error.
-    #[error("{message}")]
-    SourceFailure {
-        kind: SourceFailureKind,
+    Cancelled,
+    TrackUnavailable {
+        reason: String,
+    },
+    RenditionUnavailable {
+        reason: String,
+    },
+    LocalIo {
         message: String,
     },
+    SourceOffline {
+        source: SourceId,
+    },
+    StreamCorrupt {
+        source: SourceId,
+        detail: String,
+    },
+    IncompleteBody {
+        source: SourceId,
+        expected: u64,
+        received: u64,
+    },
+    StreamStalled {
+        source: SourceId,
+        secs: u64,
+    },
+    Timeout {
+        source: Option<SourceId>,
+        detail: String,
+    },
+    Authentication {
+        source: SourceId,
+    },
+    PlaylistParse {
+        which: &'static str,
+        detail: String,
+    },
+    License {
+        detail: String,
+    },
+    Decrypt {
+        detail: String,
+    },
+    Decode {
+        source: Option<SourceId>,
+        detail: String,
+    },
+    LimitExceeded {
+        limit_mib: u64,
+    },
+    Message(String),
 }
+
+impl std::fmt::Display for RipError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => formatter.write_str("Download was cancelled"),
+            Self::TrackUnavailable { reason } => write!(formatter, "track unavailable: {reason}"),
+            Self::RenditionUnavailable { reason } => {
+                write!(formatter, "rendition unavailable: {reason}")
+            }
+            Self::LocalIo { message } => write!(formatter, "local file error: {message}"),
+            Self::SourceOffline { source } => write!(formatter, "{source} is offline"),
+            Self::StreamCorrupt { source, detail } => {
+                write!(formatter, "stream corrupt on {source}: {detail}")
+            }
+            Self::IncompleteBody {
+                source,
+                expected,
+                received,
+            } => write!(
+                formatter,
+                "incomplete audio body from {source}: expected {expected} bytes, received {received}"
+            ),
+            Self::StreamStalled { source, secs } => write!(
+                formatter,
+                "audio stream stalled on {source}: no data received for {secs}s"
+            ),
+            Self::Timeout { detail, .. } => write!(formatter, "operation timed out: {detail}"),
+            Self::Authentication { source } => write!(formatter, "authentication failed on {source}"),
+            Self::PlaylistParse { which, detail } => {
+                write!(formatter, "{which} playlist parse failed: {detail}")
+            }
+            Self::License { detail } => write!(formatter, "license error: {detail}"),
+            Self::Decrypt { detail } => write!(formatter, "decrypt failed: {detail}"),
+            Self::Decode { detail, .. } => write!(formatter, "audio decode failed: {detail}"),
+            Self::LimitExceeded { limit_mib } => {
+                write!(formatter, "audio stream exceeds the {limit_mib} MiB limit")
+            }
+            Self::Message(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for RipError {}
 
 /// Failure classes that can be attributed to an acquired stream source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,16 +133,39 @@ impl From<StreamError> for RipError {
     fn from(error: StreamError) -> Self {
         match error {
             StreamError::Message(message) => RipError::Message(message),
-            StreamError::Permanent(message) => RipError::Permanent(message),
-            StreamError::Unavailable(message) => RipError::Unavailable(message),
-            other => RipError::Message(other.to_string()),
+            StreamError::Permanent(reason) => RipError::TrackUnavailable { reason },
+            StreamError::Unavailable(reason) => RipError::RenditionUnavailable { reason },
+            StreamError::Timeout { source, secs } => RipError::Timeout {
+                source: Some(source),
+                detail: format!("stream handshake timed out after {secs}s"),
+            },
+            StreamError::Authentication { source } => RipError::Authentication { source },
+            StreamError::SourceOffline { source } => RipError::SourceOffline { source },
+            StreamError::PlaylistParse { which, detail } => {
+                RipError::PlaylistParse { which, detail }
+            }
+            StreamError::License { detail } => RipError::License { detail },
+            StreamError::Decrypt { detail } => RipError::Decrypt { detail },
+            StreamError::IncompleteBody {
+                source,
+                expected,
+                received,
+            } => RipError::IncompleteBody {
+                source,
+                expected,
+                received,
+            },
+            StreamError::LimitExceeded { limit_mib } => RipError::LimitExceeded { limit_mib },
+            StreamError::Cancelled => RipError::Cancelled,
         }
     }
 }
 
 impl From<std::io::Error> for RipError {
     fn from(error: std::io::Error) -> Self {
-        RipError::Message(error.to_string())
+        RipError::LocalIo {
+            message: error.to_string(),
+        }
     }
 }
 
@@ -93,16 +196,11 @@ impl Default for RipperConfig {
 
 /// Everything a rip needs, behind one seam so tests can fake each step.
 pub trait RipperDeps: Send + Sync {
-    /// Provider-specific permanent failures may opt out of retries.
-    fn is_non_retryable_error(&self, message: &str) -> bool {
-        is_non_retryable_local_error(message)
-    }
-
     /// Report a corruption/validation failure from the selected source.
     /// Providers may use the source identity to invalidate that source;
     /// fakes and providers without source health tracking need no override.
-    fn report_source_failure(&self, source_name: &str, kind: SourceFailureKind, error: &str) {
-        let _ = (source_name, kind, error);
+    fn report_source_failure(&self, source: &SourceId, kind: SourceFailureKind, error: &str) {
+        let _ = (source, kind, error);
     }
 
     fn track_meta(
@@ -157,14 +255,6 @@ impl std::fmt::Debug for RipOptions<'_> {
     }
 }
 
-/// Local filesystem failures cannot be repaired by retrying the same rip.
-pub fn is_non_retryable_local_error(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    lower.contains("file name too long")
-        || lower.contains("enametoolong")
-        || lower.contains("os error 36")
-}
-
 impl<'a> RipOptions<'a> {
     pub fn new(provider: Provider, storefront: &'a str) -> Self {
         Self {
@@ -216,28 +306,24 @@ impl AlacTrackRipper {
 
         loop {
             if options.signal.as_ref().is_some_and(|t| t.is_cancelled()) {
-                return Err(cancelled());
+                return Err(RipError::Cancelled);
             }
 
             match self.rip_once(deps, track_id, &options).await {
                 Ok(result) => return Ok(result),
                 Err(err) => {
-                    if matches!(err, RipError::Permanent(_) | RipError::Unavailable(_)) {
+                    if matches!(
+                        err,
+                        RipError::Cancelled
+                            | RipError::TrackUnavailable { .. }
+                            | RipError::RenditionUnavailable { .. }
+                            | RipError::LocalIo { .. }
+                            | RipError::SourceOffline { .. }
+                    ) {
                         return Err(err);
                     }
-                    let message = err.to_string();
-                    if options.signal.as_ref().is_some_and(|t| t.is_cancelled())
-                        || message == "Download was cancelled"
-                    {
-                        return Err(err);
-                    }
-                    if deps.is_non_retryable_error(&message) {
-                        warn!(
-                            track_id,
-                            error = %message,
-                            "Track rip failed permanently/unavailable, skipping retries"
-                        );
-                        return Err(err);
+                    if options.signal.as_ref().is_some_and(|t| t.is_cancelled()) {
+                        return Err(RipError::Cancelled);
                     }
                     if attempt >= self.config.max_retries {
                         return Err(err);
@@ -252,7 +338,7 @@ impl AlacTrackRipper {
                     emit_progress(
                         options.on_progress,
                         &format!(
-                            "⚠️ Rip failed, retrying (attempt {attempt}/{}) in {wait_sec:.1}s: {message}",
+                            "⚠️ Rip failed, retrying (attempt {attempt}/{}) in {wait_sec:.1}s: {err}",
                             self.config.max_retries
                         ),
                         None,
@@ -263,7 +349,7 @@ impl AlacTrackRipper {
                         attempt,
                         max_retries = self.config.max_retries,
                         delay_ms,
-                        error = %message,
+                        error = %err,
                         "Track rip failed, retrying"
                     );
 
@@ -271,7 +357,7 @@ impl AlacTrackRipper {
                     if let Some(token) = &options.signal {
                         tokio::select! {
                             _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
-                            _ = token.cancelled() => return Err(cancelled()),
+                            _ = token.cancelled() => return Err(RipError::Cancelled),
                         }
                     } else {
                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -302,7 +388,7 @@ impl AlacTrackRipper {
         let rip_start = std::time::Instant::now();
 
         if signal.is_some_and(|t| t.is_cancelled()) {
-            return Err(cancelled());
+            return Err(RipError::Cancelled);
         }
 
         let target_dir: &Path = output_dir.unwrap_or(&self.config.default_output_dir);
@@ -324,7 +410,7 @@ impl AlacTrackRipper {
             let meta = deps.track_meta(track_id, storefront).await?;
 
             if signal.is_some_and(|t| t.is_cancelled()) {
-                return Err(cancelled());
+                return Err(RipError::Cancelled);
             }
 
             emit_progress(
@@ -334,16 +420,13 @@ impl AlacTrackRipper {
                 None,
             );
 
-        // Concurrent prefetch: lyrics + artwork run while the audio streams.
+            // Concurrent prefetch: lyrics + artwork run while the audio streams.
             let lyrics_lookup = LyricsLookup {
                 title: meta.title.clone(),
                 artists: vec![meta.artist.clone()],
                 album: Some(meta.album.clone()).filter(|a| !a.is_empty()),
                 duration: Some(meta.duration_secs).filter(|d| *d != 0),
-                provider_ids: BTreeMap::from([(
-                    provider.as_str().to_owned(),
-                    track_id.to_owned(),
-                )]),
+                provider_ids: BTreeMap::from([(provider.as_str().to_owned(), track_id.to_owned())]),
             };
             let lyrics_task = {
                 let lookup = lyrics_lookup.clone();
@@ -378,23 +461,18 @@ impl AlacTrackRipper {
                 }
             };
 
-        // Connect the audio stream.
+            // Connect the audio stream.
             let stream_start = std::time::Instant::now();
             let stream_progress: Option<ProgressCallback> = on_progress
                 .cloned()
                 .map(|cb| Arc::new(move |status: &str| cb(status, None, None)) as Arc<_>);
             let mut stream = deps
-                .connect_stream(
-                    track_id,
-                    signal.cloned(),
-                    stream_progress,
-                    codec_preference,
-                )
+                .connect_stream(track_id, signal.cloned(), stream_progress, codec_preference)
                 .await?;
 
             debug!(
                 track_id,
-                source = %stream.source_name,
+                source = %stream.source,
                 codec = %stream.codec,
                 bit_depth = stream.bit_depth,
                 sample_rate = stream.sample_rate,
@@ -422,11 +500,8 @@ impl AlacTrackRipper {
                 "stream_{safe_track_id}_{unix_ms}_{}.raw",
                 unique_temp_suffix()
             );
-            let temp_raw_name = bound_filename_with_suffix(
-                &temp_raw_name,
-                ".raw",
-                MAX_FILENAME_BYTES,
-            );
+            let temp_raw_name =
+                bound_filename_with_suffix(&temp_raw_name, ".raw", MAX_FILENAME_BYTES);
             let temp_raw_path = track_dir.join(temp_raw_name);
             // The raw stream is staged in the private lane, but the completed
             // file must live outside it: callers consume this path after `rip`
@@ -450,16 +525,13 @@ impl AlacTrackRipper {
                         let collision_name = if legacy_collision_name.len() <= MAX_FILENAME_BYTES {
                             legacy_collision_name
                         } else {
-                            let suffix = tagger::track_filename_suffix(meta.explicit, &stream.codec);
+                            let suffix =
+                                tagger::track_filename_suffix(meta.explicit, &stream.codec);
                             let prefix = final_name.strip_suffix(&suffix).unwrap_or(stem);
                             let suffix_stem = suffix.strip_suffix(".m4a").unwrap_or(&suffix);
                             let collision_suffix = format!("{suffix_stem}_{collision_id}.m4a");
                             let name = format!("{prefix}{collision_suffix}");
-                            bound_filename_with_suffix(
-                                &name,
-                                &collision_suffix,
-                                MAX_FILENAME_BYTES,
-                            )
+                            bound_filename_with_suffix(&name, &collision_suffix, MAX_FILENAME_BYTES)
                         };
                         final_path = target_dir.join(bound_filename_with_suffix(
                             &collision_name,
@@ -471,211 +543,223 @@ impl AlacTrackRipper {
                 }
             }
 
-        // Detached-into-the-loop prefetch: lyrics + artwork download while
-        // the audio streams (polled in the same select! as the stream so
-        // failures never wait on them).
-        let lyrics_fut = std::pin::pin!(lyrics_task);
-        let artwork_fut = std::pin::pin!(artwork_task);
-        let mut lyrics_result: Option<Option<String>> = None;
-        let mut artwork_result: Option<Option<Vec<u8>>> = None;
-        let mut lyrics_fut = lyrics_fut.fuse();
-        let mut artwork_fut = artwork_fut.fuse();
+            // Detached-into-the-loop prefetch: lyrics + artwork download while
+            // the audio streams (polled in the same select! as the stream so
+            // failures never wait on them).
+            let lyrics_fut = std::pin::pin!(lyrics_task);
+            let artwork_fut = std::pin::pin!(artwork_task);
+            let mut lyrics_result: Option<Option<String>> = None;
+            let mut artwork_result: Option<Option<Vec<u8>>> = None;
+            let mut lyrics_fut = lyrics_fut.fuse();
+            let mut artwork_fut = artwork_fut.fuse();
 
-        const CHUNK_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(45);
+            const CHUNK_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(45);
 
             let result: Result<TrackRipResult, RipError> = async {
-            let total = stream.content_length.filter(|len| *len > 0);
-            if total.is_some_and(|length| length > MAX_AUDIO_BYTES) {
-                return Err(RipError::Message(format!(
-                    "Audio stream exceeds the {} MiB limit",
-                    MAX_AUDIO_BYTES / (1024 * 1024)
-                )));
-            }
-            let mut downloaded_bytes = 0u64;
-            // Starting at 0 makes the first chunk always emit a progress event.
-            let mut last_progress_update = std::time::Instant::now()
-                .checked_sub(Duration::from_secs(10))
-                .unwrap_or_else(std::time::Instant::now);
-            let mut file = tokio::fs::File::create(&temp_raw_path).await?;
-
-            loop {
-                if signal.is_some_and(|t| t.is_cancelled()) {
-                    return Err(cancelled());
+                let total = stream.content_length.filter(|len| *len > 0);
+                if total.is_some_and(|length| length > MAX_AUDIO_BYTES) {
+                    return Err(RipError::LimitExceeded {
+                        limit_mib: MAX_AUDIO_BYTES / (1024 * 1024),
+                    });
                 }
+                let mut downloaded_bytes = 0u64;
+                // Starting at 0 makes the first chunk always emit a progress event.
+                let mut last_progress_update = std::time::Instant::now()
+                    .checked_sub(Duration::from_secs(10))
+                    .unwrap_or_else(std::time::Instant::now);
+                let mut file = tokio::fs::File::create(&temp_raw_path).await?;
+
+                loop {
+                    if signal.is_some_and(|t| t.is_cancelled()) {
+                        return Err(RipError::Cancelled);
+                    }
 
                     let chunk: bytes::Bytes = tokio::select! {
-                        lyrics = &mut lyrics_fut => {
-                            lyrics_result = Some(lyrics);
+                            lyrics = &mut lyrics_fut => {
+                                lyrics_result = Some(lyrics);
+                                continue;
+                        }
+                        artwork = &mut artwork_fut => {
+                            artwork_result = Some(artwork);
                             continue;
-                    }
-                    artwork = &mut artwork_fut => {
-                        artwork_result = Some(artwork);
-                        continue;
-                    }
-                    _ = tokio::time::sleep(CHUNK_INACTIVITY_TIMEOUT) => {
-                        if signal.is_some_and(|token| token.is_cancelled()) {
-                            return Err(cancelled());
                         }
-                        let message = format!(
-                            "Audio stream stalled on {}: no data received for {}s",
-                            stream.source_name,
-                            CHUNK_INACTIVITY_TIMEOUT.as_secs()
-                        );
-                        deps.report_source_failure(
-                            &stream.source_name,
-                            SourceFailureKind::Stream,
-                            &message,
-                        );
-                        return Err(RipError::Message(message));
-                    }
-                    chunk = stream.stream.next() => match chunk {
-                        Some(Ok(bytes)) => bytes,
-                        Some(Err(error)) => {
+                        _ = tokio::time::sleep(CHUNK_INACTIVITY_TIMEOUT) => {
                             if signal.is_some_and(|token| token.is_cancelled()) {
-                                return Err(cancelled());
+                                return Err(RipError::Cancelled);
                             }
-                            let message = format!(
-                                "Audio stream body failed on {}: {error}",
-                                stream.source_name
-                            );
+                            let error = RipError::StreamStalled {
+                                source: stream.source.clone(),
+                                secs: CHUNK_INACTIVITY_TIMEOUT.as_secs(),
+                            };
                             deps.report_source_failure(
-                                &stream.source_name,
+                                &stream.source,
                                 SourceFailureKind::Stream,
-                                &message,
+                                &error.to_string(),
                             );
-                            return Err(RipError::Message(message));
+                            return Err(error);
                         }
-                        None => break,
-                    },
-                };
+                        chunk = stream.stream.next() => match chunk {
+                            Some(Ok(bytes)) => bytes,
+                            Some(Err(error)) => {
+                                if signal.is_some_and(|token| token.is_cancelled()) {
+                                    return Err(RipError::Cancelled);
+                                }
+                                let error = RipError::StreamCorrupt {
+                                    source: stream.source.clone(),
+                                    detail: error.to_string(),
+                                };
+                                deps.report_source_failure(
+                                    &stream.source,
+                                    SourceFailureKind::Stream,
+                                    &error.to_string(),
+                                );
+                                return Err(error);
+                            }
+                            None => break,
+                        },
+                    };
 
-                if downloaded_bytes.saturating_add(chunk.len() as u64) > MAX_AUDIO_BYTES {
-                    return Err(RipError::Message(format!(
-                        "Audio stream exceeds the {} MiB limit",
-                        MAX_AUDIO_BYTES / (1024 * 1024)
-                    )));
-                }
-
-                file.write_all(&chunk).await?;
-                downloaded_bytes += chunk.len() as u64;
-
-                if last_progress_update.elapsed() > Duration::from_secs(1) {
-                    last_progress_update = std::time::Instant::now();
-                    let total_for_bar = total.unwrap_or(0);
-                    let progress_str =
-                        crate::progress::format_byte_progress(downloaded_bytes, total_for_bar, 12);
-                    emit_progress(
-                        on_progress,
-                        &format!("Downloading lossless audio: {progress_str}"),
-                        Some(downloaded_bytes),
-                        total,
-                    );
-                }
-            }
-
-            if let Some(expected) = total {
-                if downloaded_bytes != expected {
-                    if signal.is_some_and(|token| token.is_cancelled()) {
-                        return Err(cancelled());
+                    if downloaded_bytes.saturating_add(chunk.len() as u64) > MAX_AUDIO_BYTES {
+                        return Err(RipError::LimitExceeded {
+                            limit_mib: MAX_AUDIO_BYTES / (1024 * 1024),
+                        });
                     }
-                    let message = format!(
-                        "Incomplete audio body from {}: expected {expected} bytes, received {downloaded_bytes}",
-                        stream.source_name
-                    );
-                    deps.report_source_failure(
-                        &stream.source_name,
-                        SourceFailureKind::IncompleteBody,
-                        &message,
-                    );
-                    return Err(RipError::Message(message));
-                }
-            }
 
-            file.flush().await?;
+                    file.write_all(&chunk).await?;
+                    downloaded_bytes += chunk.len() as u64;
 
-            if signal.is_some_and(|t| t.is_cancelled()) {
-                return Err(cancelled());
-            }
-
-            debug!(
-                track_id,
-                source = %stream.source_name,
-                downloaded_bytes,
-                stream_duration_ms = stream_start.elapsed().as_millis() as u64,
-                "Stream download completed"
-            );
-
-            emit_progress(
-                on_progress,
-                "Tagging and embedding lossless artwork...",
-                None,
-                None,
-            );
-            let tag_start = std::time::Instant::now();
-
-            // Reap any prefetches that outlived the stream.
-            if lyrics_result.is_none() {
-                lyrics_result = Some((&mut lyrics_fut).await);
-            }
-            if artwork_result.is_none() {
-                artwork_result = Some((&mut artwork_fut).await);
-            }
-            let lyrics = lyrics_result.flatten();
-            let cover = artwork_result.flatten();
-
-            if signal.is_some_and(|t| t.is_cancelled()) {
-                return Err(cancelled());
-            }
-
-            match deps
-                .tag_m4a(
-                &temp_raw_path,
-                &final_path,
-                &meta,
-                cover.as_deref(),
-                lyrics.as_deref(),
-            )
-            .await
-            {
-                Ok(()) => {}
-                Err(RipError::SourceFailure { kind, message }) => {
-                    if signal.is_some_and(|token| token.is_cancelled()) {
-                        return Err(cancelled());
+                    if last_progress_update.elapsed() > Duration::from_secs(1) {
+                        last_progress_update = std::time::Instant::now();
+                        let total_for_bar = total.unwrap_or(0);
+                        let progress_str = crate::progress::format_byte_progress(
+                            downloaded_bytes,
+                            total_for_bar,
+                            12,
+                        );
+                        emit_progress(
+                            on_progress,
+                            &format!("Downloading lossless audio: {progress_str}"),
+                            Some(downloaded_bytes),
+                            total,
+                        );
                     }
-                    let message = format!("{message} (source: {})", stream.source_name);
-                    deps.report_source_failure(&stream.source_name, kind, &message);
-                    return Err(RipError::Message(message));
                 }
-                Err(error) => return Err(error),
-            }
 
-            debug!(
-                track_id,
-                has_lyrics = lyrics.is_some(),
-                has_cover = cover.is_some(),
-                tag_duration_ms = tag_start.elapsed().as_millis() as u64,
-                total_duration_ms = rip_start.elapsed().as_millis() as u64,
-                "Tagging finished"
-            );
+                if let Some(expected) = total {
+                    if downloaded_bytes != expected {
+                        if signal.is_some_and(|token| token.is_cancelled()) {
+                            return Err(RipError::Cancelled);
+                        }
+                        let error = RipError::IncompleteBody {
+                            source: stream.source.clone(),
+                            expected,
+                            received: downloaded_bytes,
+                        };
+                        deps.report_source_failure(
+                            &stream.source,
+                            SourceFailureKind::IncompleteBody,
+                            &error.to_string(),
+                        );
+                        return Err(error);
+                    }
+                }
 
-            Ok(TrackRipResult {
-                file_path: final_path.to_string_lossy().into_owned(),
-                title: meta.title.clone(),
-                artist: meta.artist.clone(),
-                album: meta.album.clone(),
-                duration: meta.duration_secs,
-                bit_depth: stream.bit_depth,
-                sample_rate: stream.sample_rate,
-                codec: stream.codec.clone(),
-                genre: meta
-                    .genre
-                    .clone()
-                    .filter(|g| !g.is_empty())
-                    .unwrap_or_else(|| "Unknown".to_owned()),
-                release_date: meta.release_date.clone(),
-                track_number: meta.track_number.unwrap_or(1),
-                track_count: meta.track_count.unwrap_or(1),
-            })
+                file.flush().await?;
+
+                if signal.is_some_and(|t| t.is_cancelled()) {
+                    return Err(RipError::Cancelled);
+                }
+
+                debug!(
+                    track_id,
+                    source = %stream.source,
+                    downloaded_bytes,
+                    stream_duration_ms = stream_start.elapsed().as_millis() as u64,
+                    "Stream download completed"
+                );
+
+                emit_progress(
+                    on_progress,
+                    "Tagging and embedding lossless artwork...",
+                    None,
+                    None,
+                );
+                let tag_start = std::time::Instant::now();
+
+                // Reap any prefetches that outlived the stream.
+                if lyrics_result.is_none() {
+                    lyrics_result = Some((&mut lyrics_fut).await);
+                }
+                if artwork_result.is_none() {
+                    artwork_result = Some((&mut artwork_fut).await);
+                }
+                let lyrics = lyrics_result.flatten();
+                let cover = artwork_result.flatten();
+
+                if signal.is_some_and(|t| t.is_cancelled()) {
+                    return Err(RipError::Cancelled);
+                }
+
+                // `tag_m4a` only produces `Decode` for pre-tag source
+                // validation: the provider cannot know the stream source, so
+                // the ripper attaches it here. Post-tag failures arrive as
+                // `Message`/`LocalIo` and never trip the circuit.
+                match deps
+                    .tag_m4a(
+                        &temp_raw_path,
+                        &final_path,
+                        &meta,
+                        cover.as_deref(),
+                        lyrics.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(RipError::Decode { source, detail }) => {
+                        if signal.is_some_and(|token| token.is_cancelled()) {
+                            return Err(RipError::Cancelled);
+                        }
+                        let error = RipError::Decode {
+                            source: source.or_else(|| Some(stream.source.clone())),
+                            detail,
+                        };
+                        deps.report_source_failure(
+                            &stream.source,
+                            SourceFailureKind::MediaValidation,
+                            &error.to_string(),
+                        );
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
+                }
+
+                debug!(
+                    track_id,
+                    has_lyrics = lyrics.is_some(),
+                    has_cover = cover.is_some(),
+                    tag_duration_ms = tag_start.elapsed().as_millis() as u64,
+                    total_duration_ms = rip_start.elapsed().as_millis() as u64,
+                    "Tagging finished"
+                );
+
+                Ok(TrackRipResult {
+                    file_path: final_path.to_string_lossy().into_owned(),
+                    title: meta.title.clone(),
+                    artist: meta.artist.clone(),
+                    album: meta.album.clone(),
+                    duration: meta.duration_secs,
+                    bit_depth: stream.bit_depth,
+                    sample_rate: stream.sample_rate,
+                    codec: stream.codec.clone(),
+                    genre: meta
+                        .genre
+                        .clone()
+                        .filter(|g| !g.is_empty())
+                        .unwrap_or_else(|| "Unknown".to_owned()),
+                    release_date: meta.release_date.clone(),
+                    track_number: meta.track_number.unwrap_or(1),
+                    track_count: meta.track_count.unwrap_or(1),
+                })
             }
             .await;
 
@@ -695,10 +779,6 @@ impl AlacTrackRipper {
         let _ = tokio::fs::remove_dir_all(&track_dir).await;
         result
     }
-}
-
-fn cancelled() -> RipError {
-    RipError::Message("Download was cancelled".to_owned())
 }
 
 fn emit_progress(

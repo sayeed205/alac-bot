@@ -49,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         source.sample_rate,
         source.bit_depth,
         collected.len(),
-        source.source_name
+        source.source
     );
     if collected.len() < 8 {
         eprintln!("ERROR: empty stream");

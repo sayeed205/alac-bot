@@ -9,14 +9,14 @@ use std::{
 
 use apple::{
     AppleAcquisitionConfig, AppleStreamAcquisition, MirrorHttp, MirrorHttpError,
-    MirrorPolicyManager, MANIFEST_URL,
+    MirrorPolicyManager, WrapperKind, MANIFEST_URL,
 };
 use bytes::Bytes;
 use engine::{
     ripper::{AlacTrackRipper, RipError, RipOptions, RipperConfig, RipperDeps, SourceFailureKind},
     streaming::{
-        AudioStreamSource, ByteStream, ProgressCallback, StreamError, StreamHttp, StreamHttpError,
-        StreamHttpResponse, StreamTransport,
+        AudioStreamSource, ByteStream, ProgressCallback, SourceId, StreamError, StreamHttp,
+        StreamHttpError, StreamHttpResponse, StreamTransport,
     },
     types::TrackMeta,
 };
@@ -287,18 +287,20 @@ fn acquisition(
     failures: &[&str],
     mirror: FakeMirror,
     wrapper_url: Option<&str>,
+    kind: WrapperKind,
     rounds: u32,
 ) -> (
     AppleStreamAcquisition<FakeStream, FakeMirror>,
     Arc<Mutex<Vec<String>>>,
 ) {
-    acquisition_with_retry_config(failures, mirror, wrapper_url, rounds, 0)
+    acquisition_with_retry_config(failures, mirror, wrapper_url, kind, rounds, 0)
 }
 
 fn acquisition_with_retry_config(
     failures: &[&str],
     mirror: FakeMirror,
     wrapper_url: Option<&str>,
+    kind: WrapperKind,
     rounds: u32,
     retry_base_delay_ms: u64,
 ) -> (
@@ -314,6 +316,7 @@ fn acquisition_with_retry_config(
             policy,
             wrapper_url.map(str::to_owned),
             None,
+            kind,
             AppleAcquisitionConfig {
                 retry_rounds: rounds,
                 retry_base_delay_ms,
@@ -355,7 +358,7 @@ struct FallbackRipperDeps {
     acquisition: AppleStreamAcquisition<CorruptMirrorStream, FakeMirror>,
     tag_failures: AtomicUsize,
     source_validation_failure: bool,
-    reports: Mutex<Vec<(String, SourceFailureKind, String)>>,
+    reports: Mutex<Vec<(SourceId, SourceFailureKind, String)>>,
 }
 
 impl RipperDeps for FallbackRipperDeps {
@@ -400,9 +403,9 @@ impl RipperDeps for FallbackRipperDeps {
         if remaining != 0 {
             self.tag_failures.fetch_sub(1, Ordering::SeqCst);
             if self.source_validation_failure {
-                return Err(RipError::SourceFailure {
-                    kind: SourceFailureKind::MediaValidation,
-                    message: "audio decode failed: unexpected end of bitstream".to_owned(),
+                return Err(RipError::Decode {
+                    source: None,
+                    detail: "unexpected end of bitstream".to_owned(),
                 });
             }
             return Err(RipError::Message(
@@ -412,12 +415,12 @@ impl RipperDeps for FallbackRipperDeps {
         Ok(())
     }
 
-    fn report_source_failure(&self, source_name: &str, kind: SourceFailureKind, error: &str) {
+    fn report_source_failure(&self, source: &SourceId, kind: SourceFailureKind, error: &str) {
         self.reports
             .lock()
             .unwrap()
-            .push((source_name.to_owned(), kind, error.to_owned()));
-        if source_name.starts_with("primary mirror (") {
+            .push((source.clone(), kind, error.to_owned()));
+        if matches!(source, SourceId::PrimaryMirror) {
             self.acquisition.mirror_policy().record_failure(error);
         }
     }
@@ -441,6 +444,7 @@ fn fallback_ripper_deps(
         policy,
         Some("https://wrapper".to_owned()),
         None,
+        WrapperKind::Endpoints,
         AppleAcquisitionConfig {
             retry_rounds: 1,
             retry_base_delay_ms: 0,
@@ -460,13 +464,14 @@ async fn transient_mirror_failure_reuses_resolved_endpoint_on_retry_round() {
         &["mirror/api/stream/42"],
         FakeMirror { available: true },
         None,
+        WrapperKind::Native,
         2,
     );
     let source = acquisition
         .connect_stream("42", None, None, apple::CodecPreference::HighestQuality)
         .await
         .unwrap();
-    assert_eq!(source.source_name, "primary mirror (mirror)");
+    assert_eq!(source.source, SourceId::PrimaryMirror);
     assert_eq!(calls.lock().unwrap().len(), 2);
 }
 
@@ -476,6 +481,7 @@ async fn wrapper_candidates_are_tried_in_order_after_mirror_failure() {
         &["/api/stream/42"],
         FakeMirror { available: false },
         Some("https://wrapper///"),
+        WrapperKind::Endpoints,
         1,
     );
     acquisition
@@ -497,6 +503,7 @@ async fn wrapper_failures_are_aggregated_in_candidate_order() {
         &["/api/stream/42", "/stream/42"],
         FakeMirror { available: false },
         Some("https://wrapper"),
+        WrapperKind::Endpoints,
         1,
     );
     let error = acquisition
@@ -525,6 +532,7 @@ async fn cancellation_does_not_retry_or_open_primary_circuit() {
         policy,
         None,
         None,
+        WrapperKind::Native,
         AppleAcquisitionConfig {
             retry_rounds: 4,
             retry_base_delay_ms: 0,
@@ -559,6 +567,7 @@ async fn primary_failure_opens_circuit_and_primary_success_clears_it() {
         &["mirror/api/stream/42"],
         FakeMirror { available: true },
         None,
+        WrapperKind::Native,
         1,
     );
     failed_acquisition
@@ -578,6 +587,7 @@ async fn primary_failure_opens_circuit_and_primary_success_clears_it() {
         policy,
         None,
         None,
+        WrapperKind::Native,
         AppleAcquisitionConfig {
             retry_rounds: 1,
             retry_base_delay_ms: 0,
@@ -596,6 +606,7 @@ async fn fallback_reports_progress_when_primary_is_unavailable() {
         &[],
         FakeMirror { available: false },
         Some("https://wrapper"),
+        WrapperKind::Endpoints,
         1,
     );
     let (callback, messages) = progress_log();
@@ -642,9 +653,8 @@ async fn corrupt_primary_body_marks_mirror_and_retries_with_wrapper() {
     assert!(deps.acquisition.mirror_policy().is_circuit_open());
     let reports = deps.reports.lock().unwrap();
     assert_eq!(reports.len(), 1);
-    assert_eq!(reports[0].0, "primary mirror (mirror)");
+    assert_eq!(reports[0].0, SourceId::PrimaryMirror);
     assert_eq!(reports[0].1, SourceFailureKind::MediaValidation);
-    assert!(reports[0].2.contains("primary mirror (mirror)"));
     assert!(reports[0].2.contains("unexpected end of bitstream"));
 }
 
@@ -669,7 +679,13 @@ async fn wrapper_corruption_does_not_fallback_or_poison_mirror() {
         .await
         .expect_err("wrapper corruption should remain a failed rip");
 
-    assert!(error.to_string().contains("wrapper (https://wrapper)"));
+    assert!(matches!(
+        error,
+        RipError::Decode {
+            source: Some(SourceId::WrapperCandidate { endpoint }),
+            detail,
+        } if endpoint == "https://wrapper/api/stream/42" && detail.contains("unexpected end of bitstream")
+    ));
     assert!(!deps.acquisition.mirror_policy().is_circuit_open());
     assert!(calls
         .lock()
@@ -681,7 +697,7 @@ async fn wrapper_corruption_does_not_fallback_or_poison_mirror() {
         .lock()
         .unwrap()
         .iter()
-        .all(|(source, _, _)| { source == "wrapper (https://wrapper)" }));
+        .all(|(source, _, _)| { matches!(source, SourceId::WrapperCandidate { .. }) }));
 }
 
 #[tokio::test]
@@ -700,7 +716,10 @@ async fn ordinary_tag_failure_does_not_poison_mirror() {
         .await
         .expect_err("ordinary tagging errors should remain failures");
 
-    assert_eq!(error.to_string(), "native media finalization failed: boom");
+    assert!(matches!(
+        error,
+        RipError::Message(message) if message == "native media finalization failed: boom"
+    ));
     assert!(!deps.acquisition.mirror_policy().is_circuit_open());
     assert_eq!(
         deps.reports.lock().unwrap().len(),
@@ -713,8 +732,13 @@ async fn ordinary_tag_failure_does_not_poison_mirror() {
 #[tokio::test]
 async fn atmos_wrapper_m3u8_404_is_typed_unavailable_without_retry() {
     let (wrapper_url, requests, server) = wrapper_m3u8_404_server().await;
-    let (acquisition, stream_calls) =
-        acquisition(&[], FakeMirror { available: false }, Some(&wrapper_url), 3);
+    let (acquisition, stream_calls) = acquisition(
+        &[],
+        FakeMirror { available: false },
+        Some(&wrapper_url),
+        WrapperKind::Native,
+        3,
+    );
     let (callback, messages) = progress_log();
     let error = acquisition
         .connect_stream("42", None, Some(callback), apple::CodecPreference::Atmos)
@@ -738,8 +762,13 @@ async fn atmos_wrapper_m3u8_404_is_typed_unavailable_without_retry() {
 #[tokio::test]
 async fn primary_wrapper_m3u8_404_is_permanent_without_retry() {
     let (wrapper_url, requests, server) = wrapper_m3u8_404_server().await;
-    let (acquisition, stream_calls) =
-        acquisition(&[], FakeMirror { available: false }, Some(&wrapper_url), 3);
+    let (acquisition, stream_calls) = acquisition(
+        &[],
+        FakeMirror { available: false },
+        Some(&wrapper_url),
+        WrapperKind::Native,
+        3,
+    );
     let error = acquisition
         .connect_stream("42", None, None, apple::CodecPreference::HighestQuality)
         .await
@@ -757,7 +786,13 @@ async fn primary_wrapper_m3u8_404_is_permanent_without_retry() {
 #[tokio::test]
 async fn wrapper_license_404_remains_retryable_technical_failure() {
     let (wrapper_url, license_requests, server) = wrapper_license_404_server().await;
-    let (acquisition, _) = acquisition(&[], FakeMirror { available: false }, Some(&wrapper_url), 3);
+    let (acquisition, _) = acquisition(
+        &[],
+        FakeMirror { available: false },
+        Some(&wrapper_url),
+        WrapperKind::Native,
+        3,
+    );
     let error = acquisition
         .connect_stream("42", None, None, apple::CodecPreference::HighestQuality)
         .await
@@ -772,11 +807,157 @@ async fn wrapper_license_404_remains_retryable_technical_failure() {
 }
 
 #[tokio::test]
+async fn wrapper_service_offline_is_typed_without_retry() {
+    // Bind an ephemeral port then drop the listener: nothing is listening,
+    // so the wrapper-lite connection is refused.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let wrapper_url = format!("http://{address}/wrapper-lite");
+    let (acquisition, _) = acquisition(
+        &[],
+        FakeMirror { available: false },
+        Some(&wrapper_url),
+        WrapperKind::Native,
+        3,
+    );
+    let error = acquisition
+        .connect_stream("42", None, None, apple::CodecPreference::HighestQuality)
+        .await
+        .expect_err("an unreachable wrapper service is a typed offline failure");
+
+    assert!(
+        matches!(error, StreamError::SourceOffline { source } if matches!(
+            source,
+            SourceId::WrapperLite { .. }
+        ))
+    );
+}
+
+#[tokio::test]
+async fn wrapper_authentication_rejection_is_typed() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while let Ok(read) = socket.read(&mut buffer).await {
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .ok();
+        }
+    });
+    let wrapper_url = format!("http://{address}/wrapper-lite");
+    let (acquisition, _) = acquisition(
+        &[],
+        FakeMirror { available: false },
+        Some(&wrapper_url),
+        WrapperKind::Native,
+        3,
+    );
+    let error = acquisition
+        .connect_stream("42", None, None, apple::CodecPreference::HighestQuality)
+        .await
+        .expect_err("a 401 from the wrapper is a typed authentication failure");
+
+    eprintln!("ACTUAL_ERROR={error:?}");
+    assert!(
+        matches!(error, StreamError::Authentication { source } if matches!(
+            source,
+            SourceId::WrapperLite { .. }
+        ))
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn primary_wrapper_m3u8_404_maps_to_track_unavailable_in_rip_error() {
+    let (wrapper_url, requests, server) = wrapper_m3u8_404_server().await;
+    let (acquisition, _) = acquisition(
+        &[],
+        FakeMirror { available: false },
+        Some(&wrapper_url),
+        WrapperKind::Native,
+        3,
+    );
+    let error = acquisition
+        .connect_stream("42", None, None, apple::CodecPreference::HighestQuality)
+        .await
+        .expect_err("a primary wrapper 404 is typed track absence");
+
+    let rip_error = RipError::from(error);
+    assert!(matches!(
+        rip_error,
+        RipError::TrackUnavailable { reason } if reason.contains("/m3u8") && reason.contains("404")
+    ));
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn atmos_wrapper_m3u8_404_maps_to_rendition_unavailable_in_rip_error() {
+    let (wrapper_url, requests, server) = wrapper_m3u8_404_server().await;
+    let (acquisition, _) = acquisition(
+        &[],
+        FakeMirror { available: false },
+        Some(&wrapper_url),
+        WrapperKind::Native,
+        3,
+    );
+    let error = acquisition
+        .connect_stream("42", None, None, apple::CodecPreference::Atmos)
+        .await
+        .expect_err("an Atmos wrapper 404 is typed rendition absence");
+
+    let rip_error = RipError::from(error);
+    assert!(matches!(
+        rip_error,
+        RipError::RenditionUnavailable { reason } if reason.contains("404")
+    ));
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn wrapper_source_id_carries_url_in_display() {
+    let source = SourceId::WrapperLite {
+        url: "http://127.0.0.1:12340".to_owned(),
+    };
+    assert_eq!(source.to_string(), "wrapper-lite (http://127.0.0.1:12340)");
+    assert_eq!(
+        SourceId::WrapperCandidate {
+            endpoint: "https://wrapper/api/stream/42".to_owned()
+        }
+        .to_string(),
+        "wrapper candidate (https://wrapper/api/stream/42)"
+    );
+    assert_eq!(SourceId::PrimaryMirror.to_string(), "primary mirror");
+}
+
+#[tokio::test]
 async fn atmos_all_non_ec3_wrapper_candidates_are_unavailable_without_retry() {
     let (acquisition, calls) = acquisition(
         &[],
         FakeMirror { available: false },
         Some("https://wrapper"),
+        WrapperKind::Endpoints,
         3,
     );
     let error = acquisition
@@ -794,6 +975,7 @@ async fn atmos_non_ec3_candidate_does_not_hide_technical_wrapper_failure() {
         &["/api/stream/42"],
         FakeMirror { available: false },
         Some("https://wrapper"),
+        WrapperKind::Endpoints,
         2,
     );
     let error = acquisition
@@ -821,6 +1003,7 @@ async fn cancellation_after_non_ec3_candidate_is_not_typed_unavailable() {
         policy,
         Some("https://wrapper".to_owned()),
         None,
+        WrapperKind::Endpoints,
         AppleAcquisitionConfig {
             retry_rounds: 3,
             retry_base_delay_ms: 0,
@@ -832,9 +1015,7 @@ async fn cancellation_after_non_ec3_candidate_is_not_typed_unavailable() {
         .await
         .expect_err("cancellation must not become optional absence");
 
-    assert!(
-        matches!(error, StreamError::Message(message) if message.contains("Download was cancelled"))
-    );
+    assert!(matches!(error, StreamError::Cancelled));
     assert_eq!(calls.lock().unwrap().len(), 2);
 }
 
@@ -848,6 +1029,7 @@ async fn atmos_non_ec3_wrapper_candidate_falls_back_to_ec3_candidate() {
         policy,
         Some("https://wrapper".to_owned()),
         None,
+        WrapperKind::Endpoints,
         AppleAcquisitionConfig {
             retry_rounds: 1,
             retry_base_delay_ms: 0,
@@ -869,6 +1051,7 @@ async fn injected_retry_config_controls_exponential_backoff_and_rounds() {
         &["mirror/api/stream/42", "mirror/api/stream/42"],
         FakeMirror { available: true },
         None,
+        WrapperKind::Native,
         3,
         100,
     );

@@ -5,40 +5,99 @@ use std::{fmt, sync::Arc, time::Duration};
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-use super::http::{ByteStream, StreamHttp, StreamHttpError};
+use super::{
+    http::{ByteStream, StreamHttp, StreamHttpError},
+    source_id::SourceId,
+};
 use crate::limits::{MAX_AUDIO_BYTES, MAX_ERROR_BODY_BYTES};
 
 pub struct FetchEndpointOptions {
     pub stream_url: String,
     pub api_key: Option<String>,
-    pub source_name: String,
+    pub source: SourceId,
     pub signal: Option<CancellationToken>,
     pub timeout: Duration,
 }
 
-#[derive(Debug, thiserror::Error)]
+// Field names follow the approved design; `source` collides with thiserror's
+// reserved error-source field, so Display is implemented by hand.
+#[derive(Debug, Clone)]
 pub enum StreamError {
-    #[error("{0}")]
     Message(String),
     /// A provider has confirmed that the requested stream cannot be
     /// acquired.  Unlike an ordinary technical failure, this must not consume
     /// retry budget.
-    #[error("{0}")]
     Permanent(String),
     /// The requested optional rendition is known not to exist. This is
     /// distinct from a transport or provider failure so callers can skip
     /// the rendition without consuming retry budget.
-    #[error("{0}")]
     Unavailable(String),
-    #[error(
-        "incomplete audio body from {source_name}: expected {expected} bytes, received {received}"
-    )]
+    Timeout {
+        source: SourceId,
+        secs: u64,
+    },
+    Authentication {
+        source: SourceId,
+    },
+    SourceOffline {
+        source: SourceId,
+    },
+    PlaylistParse {
+        which: &'static str,
+        detail: String,
+    },
+    License {
+        detail: String,
+    },
+    Decrypt {
+        detail: String,
+    },
     IncompleteBody {
-        source_name: String,
+        source: SourceId,
         expected: u64,
         received: u64,
     },
+    LimitExceeded {
+        limit_mib: u64,
+    },
+    Cancelled,
 }
+
+impl std::fmt::Display for StreamError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Message(message) => formatter.write_str(message),
+            Self::Permanent(message) => formatter.write_str(message),
+            Self::Unavailable(reason) => formatter.write_str(reason),
+            Self::Timeout { source, secs } => {
+                write!(formatter, "stream handshake timed out after {secs}s on {source}")
+            }
+            Self::Authentication { source } => {
+                write!(formatter, "authentication failed on {source}")
+            }
+            Self::SourceOffline { source } => write!(formatter, "{source} is offline"),
+            Self::PlaylistParse { which, detail } => {
+                write!(formatter, "{which} playlist parse failed: {detail}")
+            }
+            Self::License { detail } => write!(formatter, "license error: {detail}"),
+            Self::Decrypt { detail } => write!(formatter, "decrypt failed: {detail}"),
+            Self::IncompleteBody {
+                source,
+                expected,
+                received,
+            } => write!(
+                formatter,
+                "incomplete audio body from {source}: expected {expected} bytes, received {received}"
+            ),
+            Self::LimitExceeded { limit_mib } => {
+                write!(formatter, "audio stream exceeds the {limit_mib} MiB limit")
+            }
+            Self::Cancelled => formatter.write_str("Download was cancelled"),
+        }
+    }
+}
+
+impl std::error::Error for StreamError {}
 
 impl StreamError {
     fn message(message: impl Into<String>) -> Self {
@@ -48,7 +107,7 @@ impl StreamError {
 
 pub struct AudioStreamSource {
     pub stream: ByteStream,
-    pub source_name: String,
+    pub source: SourceId,
     pub codec: String,
     pub bit_depth: u32,
     pub sample_rate: u32,
@@ -61,7 +120,7 @@ impl fmt::Debug for AudioStreamSource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("AudioStreamSource")
-            .field("source_name", &self.source_name)
+            .field("source", &self.source)
             .field("codec", &self.codec)
             .field("bit_depth", &self.bit_depth)
             .field("sample_rate", &self.sample_rate)
@@ -93,18 +152,18 @@ impl<H: StreamHttp> StreamTransport<H> {
         let FetchEndpointOptions {
             stream_url,
             api_key,
-            source_name,
+            source,
             signal,
             timeout,
         } = options;
         if signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
-            return Err(StreamError::message("Download was cancelled"));
+            return Err(StreamError::Cancelled);
         }
         let response = self
             .http
             .fetch(&stream_url, api_key.as_deref(), timeout, signal.as_ref())
             .await
-            .map_err(|error| self.map_http_error(error, timeout, &source_name))?;
+            .map_err(|error| self.map_http_error(error, timeout, &source))?;
 
         if !(200..300).contains(&response.status) {
             let text = if let Some(mut body) = response.body {
@@ -113,24 +172,22 @@ impl<H: StreamHttp> StreamTransport<H> {
                 String::new()
             };
             return Err(StreamError::message(format!(
-                "HTTP {} on {}: {}",
+                "HTTP {} on {source}: {}",
                 response.status,
-                source_name,
                 text.chars().take(120).collect::<String>()
             )));
         }
 
-        let body = response.body.ok_or_else(|| {
-            StreamError::message(format!("Empty body returned from {source_name}"))
-        })?;
+        let body = response
+            .body
+            .ok_or_else(|| StreamError::message(format!("Empty body from {source}")))?;
         if response
             .content_length
             .is_some_and(|length| length > MAX_AUDIO_BYTES)
         {
-            return Err(StreamError::message(format!(
-                "Audio stream exceeds the {} MiB limit",
-                MAX_AUDIO_BYTES / (1024 * 1024)
-            )));
+            return Err(StreamError::LimitExceeded {
+                limit_mib: MAX_AUDIO_BYTES / (1024 * 1024),
+            });
         }
         // Malformed values parse as documented defaults instead of
         // failing, which only ever happens with misbehaving mirrors.
@@ -146,7 +203,7 @@ impl<H: StreamHttp> StreamTransport<H> {
             .unwrap_or(96_000);
         Ok(AudioStreamSource {
             stream: body,
-            source_name,
+            source,
             codec: response.codec.unwrap_or_else(|| "alac".to_owned()),
             bit_depth,
             sample_rate,
@@ -158,14 +215,14 @@ impl<H: StreamHttp> StreamTransport<H> {
         &self,
         error: StreamHttpError,
         timeout: Duration,
-        source_name: &str,
+        source: &SourceId,
     ) -> StreamError {
         match error {
-            StreamHttpError::Timeout { .. } => StreamError::message(format!(
-                "Stream handshake timed out after {}s on {source_name}",
-                timeout.as_millis() / 1000
-            )),
-            StreamHttpError::Cancelled => StreamError::message("Download was cancelled"),
+            StreamHttpError::Timeout { .. } => StreamError::Timeout {
+                source: source.clone(),
+                secs: u64::try_from(timeout.as_millis() / 1000).unwrap_or(u64::MAX),
+            },
+            StreamHttpError::Cancelled => StreamError::Cancelled,
             StreamHttpError::Network(message) => StreamError::message(message),
         }
     }

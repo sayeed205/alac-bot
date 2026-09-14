@@ -5,7 +5,7 @@
 //! - `/m3u8?adamId={id}` -> master playlist URL
 //! - `/key?adamId={id}&uri={uri}` -> FairPlay key templates for Temari
 
-use std::{fmt, fmt::Display, time::Duration};
+use std::time::Duration;
 
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
@@ -27,8 +27,8 @@ pub enum WrapperUnavailableReason {
     NonEc3StreamForAtmos,
 }
 
-impl Display for WrapperUnavailableReason {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Display for WrapperUnavailableReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoAtmosVariantInValidMaster => {
                 formatter.write_str("No Dolby Atmos stream variant found in master playlist")
@@ -49,6 +49,8 @@ pub enum WrapperError {
     Json(#[from] serde_json::Error),
     #[error("Wrapper API error (code {code}): {message}")]
     Api { code: i64, message: String },
+    #[error("wrapper authentication rejected (HTTP {status})")]
+    Auth { status: u16 },
     #[error("Temari template error: {0}")]
     Template(String),
     /// The requested rendition is not present in the provider playlist.
@@ -140,19 +142,14 @@ impl WrapperLiteClient {
         let url = format!("{}/status", self.base_url);
         debug!(url = %url, "Checking wrapper-lite status");
         let resp = self.client.get(&url).send().await?;
-        if !resp.status().is_success() {
-            return Err(WrapperError::Message(format!(
-                "Wrapper /status HTTP {}",
-                resp.status()
-            )));
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(auth_or_http("Wrapper /status", status));
         }
         let text = resp.text().await?;
         let env: ApiResponse<StatusData> = serde_json::from_str(&text)?;
         if env.code != 0 {
-            return Err(WrapperError::Api {
-                code: env.code,
-                message: env.msg,
-            });
+            return Err(api_or_auth(env.code, env.msg));
         }
         Ok(env.data.map(|d| d.regions).unwrap_or_default())
     }
@@ -162,16 +159,14 @@ impl WrapperLiteClient {
         let url = format!("{}/m3u8?adamId={}", self.base_url, adam_id);
         debug!(adam_id = %adam_id, url = %url, "Fetching m3u8 URL from wrapper");
         let resp = self.client.get(&url).send().await?;
-        if !resp.status().is_success() {
-            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        let status = resp.status();
+        if !status.is_success() {
+            if status == reqwest::StatusCode::NOT_FOUND {
                 return Err(WrapperError::Unavailable(
                     WrapperUnavailableReason::M3u8NotFound,
                 ));
             }
-            return Err(WrapperError::Message(format!(
-                "Wrapper /m3u8 HTTP {}",
-                resp.status()
-            )));
+            return Err(auth_or_http("Wrapper /m3u8", status));
         }
         let text = resp.text().await?;
         let env: ApiResponse<M3u8Data> = serde_json::from_str(&text)?;
@@ -181,10 +176,7 @@ impl WrapperLiteClient {
                     WrapperUnavailableReason::M3u8NotFound,
                 ));
             }
-            return Err(WrapperError::Api {
-                code: env.code,
-                message: env.msg,
-            });
+            return Err(api_or_auth(env.code, env.msg));
         }
         let m3u8 = env
             .data
@@ -200,19 +192,14 @@ impl WrapperLiteClient {
         let url = format!("{}/webplayback?adamId={}", self.base_url, adam_id);
         debug!(adam_id = %adam_id, url = %url, "Fetching web playback URL from wrapper");
         let resp = self.client.get(&url).send().await?;
-        if !resp.status().is_success() {
-            return Err(WrapperError::Message(format!(
-                "Wrapper /webplayback HTTP {}",
-                resp.status()
-            )));
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(auth_or_http("Wrapper /webplayback", status));
         }
         let text = resp.text().await?;
         let env: ApiResponse<M3u8Data> = serde_json::from_str(&text)?;
         if env.code != 0 {
-            return Err(WrapperError::Api {
-                code: env.code,
-                message: env.msg,
-            });
+            return Err(api_or_auth(env.code, env.msg));
         }
         let m3u8 = env
             .data
@@ -257,10 +244,15 @@ impl WrapperLiteClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
+            let truncated = truncate_error_body(&text);
+            if status.as_u16() == 401 || status.as_u16() == 403 {
+                return Err(WrapperError::Auth {
+                    status: status.as_u16(),
+                });
+            }
             return Err(WrapperError::Message(format!(
                 "Wrapper /license HTTP {}: {}",
-                status,
-                truncate_error_body(&text)
+                status, truncated
             )));
         }
         let text = resp.text().await?;
@@ -271,10 +263,7 @@ impl WrapperLiteClient {
         }
         let env: ApiResponse<LicenseData> = serde_json::from_str(&text)?;
         if env.code != 0 {
-            return Err(WrapperError::Api {
-                code: env.code,
-                message: env.msg,
-            });
+            return Err(api_or_auth(env.code, env.msg));
         }
         let license = env
             .data
@@ -388,4 +377,23 @@ fn truncate_error_body(text: &str) -> String {
         out.push('…');
     }
     out
+}
+
+/// 401/403 are authentication failures, not transport noise.
+fn auth_or_http(what: &str, status: reqwest::StatusCode) -> WrapperError {
+    let code = status.as_u16();
+    if code == 401 || code == 403 {
+        return WrapperError::Auth { status: code };
+    }
+    WrapperError::Message(format!("{what} HTTP {status}"))
+}
+
+/// API body codes share HTTP's authentication semantics.
+fn api_or_auth(code: i64, message: String) -> WrapperError {
+    if code == 401 || code == 403 {
+        return WrapperError::Auth {
+            status: u16::try_from(code).unwrap_or_default(),
+        };
+    }
+    WrapperError::Api { code, message }
 }
