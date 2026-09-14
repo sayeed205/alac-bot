@@ -170,7 +170,6 @@ impl<H: PlaylistHttp> PlaylistClient<H> {
             Ok(token) => {
                 let mut cache = self.token_cache.lock().expect("token cache poisoned");
                 cache.token = Some(token.clone());
-                // Cache for 24 hours.
                 cache.expires_at_ms = now + 24 * 60 * 60 * 1000;
                 tracing::debug!("Extracted live Apple Music developer token");
                 Ok(token)
@@ -199,7 +198,6 @@ impl<H: PlaylistHttp> PlaylistClient<H> {
             .await
             .map_err(|e| e.to_string())?;
 
-        // Match /assets/index~[a-zA-Z0-9]+.js asset.
         let asset = find_asset_path(&browse).ok_or("no index asset in browse page")?;
         let js = self
             .http
@@ -211,14 +209,12 @@ impl<H: PlaylistHttp> PlaylistClient<H> {
             .await
             .map_err(|e| e.to_string())?;
 
-        // developerToken:($varName) -> varName = "value".
         if let Some(var_name) = find_developer_token_var(&js) {
             if let Some(value) = find_var_assignment(&js, &var_name) {
                 return Ok(value);
             }
         }
 
-        // Direct JWT fallback.
         if let Some(jwt) = find_direct_jwt(&js) {
             return Ok(jwt);
         }
@@ -232,7 +228,6 @@ impl<H: PlaylistHttp> PlaylistClient<H> {
         playlist_id: &str,
         storefront: &str,
     ) -> Result<PlaylistData, PlaylistError> {
-        // Empty storefront falls back to 'us'; no trim.
         let sf_raw = storefront.to_ascii_lowercase();
         let sf = if sf_raw.is_empty() {
             "us".to_string()
@@ -356,7 +351,6 @@ impl<H: PlaylistHttp> PlaylistClient<H> {
             .map(|d| d.as_slice())
             .unwrap_or_default();
         for t in initial_tracks {
-            // Falsy ids (missing or empty) are skipped.
             if t.id.as_deref().is_some_and(|id| !id.is_empty()) {
                 tracks.push(map_track(t));
             }
@@ -383,7 +377,6 @@ impl<H: PlaylistHttp> PlaylistClient<H> {
                 Ok(body) => match serde_json::from_str::<RawTracksPageResponse>(&body) {
                     Ok(page) => {
                         for t in page.data.unwrap_or_default() {
-                            // Falsy ids are skipped.
                             if t.id.as_deref().is_some_and(|id| !id.is_empty()) {
                                 tracks.push(map_track(&t));
                             }
@@ -455,7 +448,6 @@ fn url_encode(segment: &str) -> String {
     out
 }
 
-// regex-free scanners for the token scrape
 /// `/\/assets\/index~[a-zA-Z0-9]+\.js/` — leftmost match, path + ".js".
 fn find_asset_path(html: &str) -> Option<String> {
     let pat = "/assets/index~";
@@ -540,7 +532,6 @@ fn find_direct_jwt(js: &str) -> Option<String> {
     }
 }
 
-// raw AMP response shapes
 #[derive(Debug, Deserialize)]
 struct RawPlaylistResponse {
     #[serde(default)]

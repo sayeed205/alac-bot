@@ -193,15 +193,17 @@ impl MediaProcessor {
         source: &Path,
         cancellation: &CancellationToken,
     ) -> Result<AudioInfo, MediaError> {
-        let _permit = media_slot()
+        let permit = media_slot()
             .acquire_owned()
             .await
             .map_err(|_| MediaError::Decode("media worker unavailable".into()))?;
         let source = source.to_owned();
         let cancellation = cancellation.clone();
-        spawn_blocking(move || inspect_sync(&source, &cancellation))
+        let result = spawn_blocking(move || inspect_sync(&source, &cancellation))
             .await
-            .map_err(|error| MediaError::Decode(error.to_string()))?
+            .map_err(|error| MediaError::Decode(error.to_string()))?;
+        drop(permit);
+        result
     }
 
     pub async fn render_spectrogram(
@@ -211,7 +213,7 @@ impl MediaProcessor {
         options: &SpectrogramOptions,
         cancellation: &CancellationToken,
     ) -> Result<SpectrogramReport, MediaError> {
-        let _permit = media_slot()
+        let permit = media_slot()
             .acquire_owned()
             .await
             .map_err(|_| MediaError::Render("media worker unavailable".into()))?;
@@ -219,11 +221,13 @@ impl MediaProcessor {
         let destination = destination.to_owned();
         let options = options.clone();
         let cancellation = cancellation.clone();
-        spawn_blocking(move || {
+        let result = spawn_blocking(move || {
             render_spectrogram_sync(&source, &destination, &options, &cancellation)
         })
         .await
-        .map_err(|error| MediaError::Render(error.to_string()))?
+        .map_err(|error| MediaError::Render(error.to_string()))?;
+        drop(permit);
+        result
     }
 
     /// Validate, tag, and commit an audio rip. The pipeline selects the
@@ -238,7 +242,7 @@ impl MediaProcessor {
         tags: &TrackTags,
         cancellation: &CancellationToken,
     ) -> Result<ValidatedM4a, MediaError> {
-        let _permit = media_slot()
+        let permit = media_slot()
             .acquire_owned()
             .await
             .map_err(|_| MediaError::Metadata("media worker unavailable".into()))?;
@@ -246,9 +250,12 @@ impl MediaProcessor {
         let destination = destination.to_owned();
         let tags = tags.clone();
         let cancellation = cancellation.clone();
-        spawn_blocking(move || finalize_m4a_sync(&source, &destination, &tags, &cancellation))
-            .await
-            .map_err(|error| MediaError::Metadata(error.to_string()))?
+        let result =
+            spawn_blocking(move || finalize_m4a_sync(&source, &destination, &tags, &cancellation))
+                .await
+                .map_err(|error| MediaError::Metadata(error.to_string()))?;
+        drop(permit);
+        result
     }
 }
 
@@ -388,19 +395,19 @@ fn decode_sync(
             // structure end to end.
             continue;
         };
-        let decoded = decoder.decode(&packet).map_err(|error| match error {
+        let audio_buf = decoder.decode(&packet).map_err(|error| match error {
             SymphoniaError::DecodeError(message) => MediaError::Decode(message.to_string()),
             other => MediaError::Decode(other.to_string()),
         })?;
         if collect_samples {
-            let count = decoded.frames();
+            let count = audio_buf.frames();
             if samples.len().saturating_add(count) > MAX_DECODED_FRAMES {
                 return Err(MediaError::Invalid(
                     "decoded audio exceeds frame limit".into(),
                 ));
             }
-            let mut interleaved = vec![f32::MID; decoded.samples_interleaved()];
-            decoded.copy_to_slice_interleaved(&mut interleaved);
+            let mut interleaved = vec![f32::MID; audio_buf.samples_interleaved()];
+            audio_buf.copy_to_slice_interleaved(&mut interleaved);
             let channel_count = channels as usize;
             for (channel, sample) in interleaved.into_iter().enumerate() {
                 samples[channel % channel_count].push(sample);
@@ -1193,7 +1200,6 @@ mod tests {
             ..TrackTags::default()
         };
 
-        // Core fields are written by the same path as finalization.
         if let Some(value) = tags.title.as_deref() {
             tag.set_title(value);
         }

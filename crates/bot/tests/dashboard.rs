@@ -32,7 +32,7 @@ fn empty_dashboard_is_exact_and_pages_are_mobile_friendly() {
         current_upload: None,
         jobs: vec![],
     };
-    assert_eq!(render(&empty, 1, false).0, "<b>No active downloads.</b>");
+    assert_eq!(render(&empty, 1).0, "<b>No active downloads.</b>");
     let jobs = (0..6).map(|n| job(n, n == 0)).collect();
     let snapshot = DashboardSnapshot {
         ripping_mode: "sequential".into(),
@@ -41,7 +41,7 @@ fn empty_dashboard_is_exact_and_pages_are_mobile_friendly() {
         current_upload: None,
         jobs,
     };
-    let (text, keyboard) = render(&snapshot, 1, false);
+    let (text, keyboard) = render(&snapshot, 1);
     assert!(
         text.contains("Requester 0") && !text.contains("Status: Processing") && text.contains("1.")
     );
@@ -57,7 +57,7 @@ fn cancel_controls_are_only_rendered_for_allowed_rows() {
         current_upload: None,
         jobs: vec![job(0, true), job(1, false)],
     };
-    let (text, keyboard) = render(&snapshot, 1, false);
+    let (text, keyboard) = render(&snapshot, 1);
     assert!(keyboard.is_some());
     assert!(text.contains("/cancel_j0"));
     assert!(text.contains("/cancel_j1"));
@@ -74,7 +74,7 @@ fn header_renders_both_lane_lines_independently() {
         current_upload: Some("<b>Album.zip</b>".into()),
         jobs: vec![job(0, true)],
     };
-    let (text, _) = render(&both, 1, false);
+    let (text, _) = render(&both, 1);
     assert!(text.contains("<b>⬇️ Downloading:</b> <b>Song</b> <code>1 MB</code>"));
     assert!(text.contains("<b>⬆️ Uploading:</b> <b>Album.zip</b>"));
 
@@ -83,7 +83,7 @@ fn header_renders_both_lane_lines_independently() {
         current_upload: None,
         ..both.clone()
     };
-    let (text, _) = render(&download_only, 1, false);
+    let (text, _) = render(&download_only, 1);
     assert!(text.contains("<b>⬇️ Downloading:</b> <b>Song</b>"));
     assert!(!text.contains("⬆️"));
 
@@ -93,7 +93,7 @@ fn header_renders_both_lane_lines_independently() {
         jobs: vec![job(0, true)],
         ..both
     };
-    let (text, _) = render(&idle, 1, false);
+    let (text, _) = render(&idle, 1);
     assert!(!text.contains("⬇️"));
     assert!(!text.contains("⬆️"));
 }
@@ -107,7 +107,7 @@ fn upload_only_header_does_not_render_a_downloading_lane() {
         ..DashboardSnapshot::default()
     };
 
-    let (text, _) = render(&snapshot, 1, false);
+    let (text, _) = render(&snapshot, 1);
     assert!(!text.contains("⬇️"));
     assert!(text.contains("<b>⬆️ Uploading:</b> <b>Song</b> <code>4 MB</code>"));
 }

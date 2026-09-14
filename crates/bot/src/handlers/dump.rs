@@ -260,7 +260,6 @@ pub async fn run_auto_dump_pipeline(
         );
         return false;
     }
-    // Release the re-entry guard on every exit path .
     let result = run_auto_dump_pipeline_inner(
         Arc::clone(&state),
         days,
@@ -342,7 +341,6 @@ async fn run_auto_dump_pipeline_inner(
 
     match job {
         Ok(_) => {
-            // Final admin DM summary card .
             // The iterates `Object.entries(storefrontCounts)`, which
             // preserves the configured storefront order (every storefront is
             // seeded with 0 before discovery).
@@ -585,7 +583,6 @@ mod tests {
     fn discovery_dedupes_and_counts_per_storefront() {
         let mut map = HashMap::new();
         let mut counts = HashMap::new();
-        // Same id from two storefronts: first insert wins .
         let mut first = HashMap::new();
         let mut first_counts = HashMap::new();
         discover_from_playlist_insert(&mut first, &mut first_counts, "1", "us");
@@ -594,14 +591,12 @@ mod tests {
         discover_from_playlist_insert(&mut second, &mut second_counts, "1", "gb");
         map.extend(first);
         counts.extend(first_counts);
-        // Simulate a later duplicate arriving.
         for (id, sf) in second {
             map.entry(id).or_insert(sf);
         }
         assert_eq!(map.get("1"), Some(&"us".to_owned()));
     }
 
-    // Test-only helper mirroring the insert semantics of the discovery loops.
     fn discover_from_playlist_insert(
         map: &mut HashMap<String, String>,
         counts: &mut HashMap<String, usize>,

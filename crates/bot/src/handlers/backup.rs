@@ -146,7 +146,7 @@ async fn export(state: Arc<BotState>, msg: ferogram::update::IncomingMessage) {
 
     let dump = db::DbDumpService::new(state.db_client.clone());
     let result = dump.export_dump_for_channel(state.dump_channel_id).await;
-    let (buffer, stats, _filename) = match result {
+    let (buffer, stats, _) = match result {
         Ok(ok) => ok,
         Err(error) => {
             let text = format!(

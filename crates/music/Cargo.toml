@@ -12,3 +12,6 @@ diesel = ["dep:diesel"]
 [dependencies]
 diesel = { workspace = true, optional = true }
 serde.workspace = true
+
+[lints]
+workspace = true

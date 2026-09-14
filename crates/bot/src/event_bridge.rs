@@ -420,7 +420,6 @@ async fn notify_job_completed(state: &BotState, job: &ActiveRipJob, summary: &Ri
         None => None,
     };
 
-    // Format user mention for origin chat
     let name = job
         .user_name
         .as_deref()
@@ -639,7 +638,6 @@ mod tests {
     }
     #[test]
     fn format_failed_track_rendering() {
-        // 1. With title, artist, storefront
         let ft1 = FailedTrack {
             id: "6804576275".into(),
             error: "failed to get m3u8".into(),
@@ -652,7 +650,6 @@ mod tests {
             r#"<a href="https://music.apple.com/in/song/6804576275">Bhaber deshe thako konya - Fakira</a> <i>(Unavailable on Apple Music)</i>"#
         );
 
-        // 2. Without storefront
         let ft2 = FailedTrack {
             id: "6804576275".into(),
             error: "failed to get m3u8".into(),
@@ -665,7 +662,6 @@ mod tests {
             r#"<a href="https://music.apple.com/song/6804576275">Bhaber deshe thako konya - Fakira</a> <i>(Unavailable on Apple Music)</i>"#
         );
 
-        // 3. Only numeric ID
         let ft3 = FailedTrack {
             id: "12345".into(),
             error: "404".into(),
@@ -678,7 +674,6 @@ mod tests {
             r#"<a href="https://music.apple.com/song/12345">Track 12345</a> <i>(Unavailable on Apple Music)</i>"#
         );
 
-        // 4. Non-numeric ID (circuit breaker)
         let ft4 = FailedTrack {
             id: "Remaining tracks".into(),
             error: "offline".into(),
@@ -688,7 +683,6 @@ mod tests {
         };
         assert_eq!(format_failed_track(&ft4), "Remaining tracks");
 
-        // 5. Special chars escaped
         let ft5 = FailedTrack {
             id: "999".into(),
             error: "err".into(),

@@ -68,7 +68,6 @@ pub struct DashboardSnapshot {
 pub fn render(
     snapshot: &DashboardSnapshot,
     page: usize,
-    _viewer_is_admin: bool,
 ) -> (String, Option<ferogram::tl::enums::ReplyMarkup>) {
     if snapshot.jobs.is_empty() {
         return ("<b>No active downloads.</b>".into(), None);
@@ -191,7 +190,7 @@ pub fn format_lane_header(activity: &str, default_verb: &str, default_emoji: &st
         return String::new();
     }
 
-    let stages: [(&str, &str, &[&str]); 8] = [
+    let stages: [(&str, &str, &[&str]); 9] = [
         (
             "🏷️",
             "Tagging",
@@ -247,8 +246,21 @@ pub fn format_lane_header(activity: &str, default_verb: &str, default_emoji: &st
         ),
         (
             "⬆️",
+            "Uploading ZIP",
+            &[
+                "<b>⬆️ Uploading ZIP:</b>",
+                "⬆️ Uploading ZIP:",
+                "⬆️ Uploading ZIP",
+                "<b>Uploading ZIP:</b>",
+                "Uploading ZIP:",
+                "Uploading ZIP",
+            ],
+        ),
+        (
+            "⬆️",
             "Uploading",
             &[
+                "<b>⬆️ Uploading:</b>",
                 "⬆️ Uploading:",
                 "⬆️ Uploading",
                 "<b>Uploading:</b>",
@@ -260,6 +272,7 @@ pub fn format_lane_header(activity: &str, default_verb: &str, default_emoji: &st
             "⬇️",
             "Downloading",
             &[
+                "<b>⬇️ Downloading:</b>",
                 "⬇️ Downloading from TG:",
                 "⬇️ Downloading:",
                 "⬇️ Downloading",
@@ -287,7 +300,10 @@ pub fn format_lane_header(activity: &str, default_verb: &str, default_emoji: &st
     }
 
     let lower = trimmed.to_lowercase();
-    if lower.contains("tagging") {
+    if lower.contains("uploading zip") {
+        let body = strip_activity_decorations(trimmed);
+        return format!("<b>⬆️ Uploading ZIP:</b> {body}\n");
+    } else if lower.contains("tagging") {
         let body = strip_activity_decorations(trimmed);
         return format!("<b>🏷️ Tagging:</b> {body}\n");
     } else if lower.contains("decrypt") {
@@ -314,12 +330,14 @@ fn strip_activity_decorations(text: &str) -> &str {
         s = rest.trim();
     }
     for prefix in [
+        "<b>Uploading ZIP:</b>",
         "<b>Uploading:</b>",
         "<b>Downloading:</b>",
         "<b>Tagging:</b>",
         "<b>Decrypting:</b>",
         "<b>Zipping:</b>",
         "<b>Checking:</b>",
+        "Uploading ZIP:",
         "Uploading:",
         "Downloading:",
         "Tagging:",
@@ -419,7 +437,7 @@ impl DashboardManager {
     ) -> Result<i32, EditError> {
         let mut snapshot = snapshot;
         apply_viewer(&mut snapshot, viewer_id, viewer_is_admin);
-        let (text, keyboard) = render(&snapshot, 1, viewer_is_admin);
+        let (text, keyboard) = render(&snapshot, 1);
         let new_id = sink.send(&text, keyboard).await?;
         let empty = snapshot.jobs.is_empty();
         let old = self.entries.lock().await.insert(
@@ -486,7 +504,7 @@ impl DashboardManager {
                     return None;
                 }
                 entry.next_refresh_at = None;
-                let (text, keyboard) = render(&entry.snapshot, entry.page, entry.viewer_is_admin);
+                let (text, keyboard) = render(&entry.snapshot, entry.page);
                 Some((Arc::clone(&entry.sink), entry.id, text, keyboard))
             })
         };
@@ -555,8 +573,7 @@ impl DashboardManager {
                         entry.empty_rendered = false;
                     }
                     entry.next_refresh_at = Some(tokio::time::Instant::now() + REFRESH_INTERVAL);
-                    let (text, keyboard) =
-                        render(&entry.snapshot, entry.page, entry.viewer_is_admin);
+                    let (text, keyboard) = render(&entry.snapshot, entry.page);
                     Some((*chat, Arc::clone(&entry.sink), entry.id, text, keyboard))
                 })
                 .collect::<Vec<_>>()
@@ -604,7 +621,7 @@ impl DashboardManager {
                 let pages = entry.snapshot.jobs.len().div_ceil(5).max(1);
                 let page = page.clamp(1, pages);
                 entry.page = page;
-                let (text, keyboard) = render(&entry.snapshot, page, entry.viewer_is_admin);
+                let (text, keyboard) = render(&entry.snapshot, page);
                 Some((Arc::clone(&entry.sink), entry.id, text, keyboard))
             })
         };
@@ -657,7 +674,7 @@ mod tests {
             ..DashboardSnapshot::default()
         };
 
-        let (text, markup) = render(&snapshot, 1, false);
+        let (text, markup) = render(&snapshot, 1);
         assert!(text.contains("<i>1.</i> Album: <b>3 Originals</b> by <b>Rick Astley</b>"));
         assert!(text.contains("Album: <b>3 Originals</b> by <b>Rick Astley</b>"));
         assert!(text.contains("/cancel_job-1"));
@@ -686,7 +703,7 @@ mod tests {
             }],
             ..DashboardSnapshot::default()
         };
-        let (text, _) = render(&snapshot, 1, false);
+        let (text, _) = render(&snapshot, 1);
         assert!(text.contains("<i>1.</i> Track: <b>Song</b>"));
         assert!(text.contains("Queued · position #2"));
         assert!(!text.contains("<i>#2</i>"));
@@ -717,7 +734,7 @@ mod tests {
             ..DashboardSnapshot::default()
         };
 
-        let (text, _) = render(&snapshot, 2, false);
+        let (text, _) = render(&snapshot, 2);
         assert!(text.contains("<i>6.</i> Track 6"));
         assert!(!text.contains("<i>1. Track 1</i>"));
     }
@@ -746,7 +763,7 @@ mod tests {
             ..DashboardSnapshot::default()
         };
 
-        let (text, _) = render(&snapshot, 1, false);
+        let (text, _) = render(&snapshot, 1);
         assert!(text.contains("<b>⬇️ Downloading:</b> <b>Song</b>"));
         assert!(text.contains("<b>⬆️ Uploading:</b> <b>Album.zip</b>"));
         assert!(text.contains("/cancel_job-activity"));
@@ -755,7 +772,7 @@ mod tests {
     #[test]
     fn idle_lanes_hide_both_header_lines() {
         let snapshot = DashboardSnapshot::default();
-        let (text, _) = render(&snapshot, 1, false);
+        let (text, _) = render(&snapshot, 1);
         assert!(text.contains("No active downloads."));
         assert!(!text.contains("⬇️"));
         assert!(!text.contains("⬆️"));
@@ -783,7 +800,7 @@ mod tests {
             current_download: Some("<b>Song</b>".into()),
             ..DashboardSnapshot::default()
         };
-        let (text, _) = render(&snapshot, 1, false);
+        let (text, _) = render(&snapshot, 1);
         assert!(text.contains("<b>⬇️ Downloading:</b> <b>Song</b>"));
         assert!(!text.contains("⬆️"));
     }
@@ -807,58 +824,74 @@ mod tests {
             is_cancel_allowed_for_viewer: true,
         };
 
-        // Checking cache
         let s_checking = DashboardSnapshot {
             current_download: Some("🔍 Checking cache: <b>Album</b>".into()),
             jobs: vec![base_job.clone()],
             ..DashboardSnapshot::default()
         };
-        let (text, _) = render(&s_checking, 1, false);
+        let (text, _) = render(&s_checking, 1);
         assert!(text.contains("<b>🔍 Checking cache:</b> <b>Album</b>"));
 
-        // Checking cache without suffix
         let s_checking_plain = DashboardSnapshot {
             current_download: Some("🔍 Checking cache...".into()),
             jobs: vec![base_job.clone()],
             ..DashboardSnapshot::default()
         };
-        let (text, _) = render(&s_checking_plain, 1, false);
+        let (text, _) = render(&s_checking_plain, 1);
         assert!(text.contains("<b>🔍 Checking cache...</b>"));
 
-        // Decrypting
         let s_decrypt = DashboardSnapshot {
             current_download: Some("🔓 Decrypting: <b>Track 1</b>".into()),
             jobs: vec![base_job.clone()],
             ..DashboardSnapshot::default()
         };
-        let (text, _) = render(&s_decrypt, 1, false);
+        let (text, _) = render(&s_decrypt, 1);
         assert!(text.contains("<b>🔓 Decrypting:</b> <b>Track 1</b>"));
 
-        // Tagging
         let s_tag = DashboardSnapshot {
             current_download: Some("🏷️ Tagging: <b>Track 1</b>".into()),
             jobs: vec![base_job.clone()],
             ..DashboardSnapshot::default()
         };
-        let (text, _) = render(&s_tag, 1, false);
+        let (text, _) = render(&s_tag, 1);
         assert!(text.contains("<b>🏷️ Tagging:</b> <b>Track 1</b>"));
 
-        // Zipping
         let s_zip = DashboardSnapshot {
             current_upload: Some("📦 Zipping: <b>Album.zip</b> <code>[===]</code>".into()),
             jobs: vec![base_job.clone()],
             ..DashboardSnapshot::default()
         };
-        let (text, _) = render(&s_zip, 1, false);
+        let (text, _) = render(&s_zip, 1);
         assert!(text.contains("<b>📦 Zipping:</b> <b>Album.zip</b> <code>[===]</code>"));
 
-        // Uploading
+        let s_upload_zip = DashboardSnapshot {
+            current_upload: Some(
+                "⬆️ Uploading ZIP: <b>Bharat</b> <code>[===] 32% (81.0/251.7 MB)</code>".into(),
+            ),
+            jobs: vec![base_job.clone()],
+            ..DashboardSnapshot::default()
+        };
+        let (text, _) = render(&s_upload_zip, 1);
+        assert!(text.contains(
+            "<b>⬆️ Uploading ZIP:</b> <b>Bharat</b> <code>[===] 32% (81.0/251.7 MB)</code>"
+        ));
+        assert!(!text.contains("Uploading: Uploading ZIP:"));
+
+        let s_upload_zip_cleaned = DashboardSnapshot {
+            current_upload: Some("Uploading ZIP: <b>Bharat</b> <code>[===]</code>".into()),
+            jobs: vec![base_job.clone()],
+            ..DashboardSnapshot::default()
+        };
+        let (text, _) = render(&s_upload_zip_cleaned, 1);
+        assert!(text.contains("<b>⬆️ Uploading ZIP:</b> <b>Bharat</b> <code>[===]</code>"));
+        assert!(!text.contains("Uploading: Uploading ZIP:"));
+
         let s_upload = DashboardSnapshot {
             current_upload: Some("⬆️ Uploading: <b>Track 1</b> <code>[===]</code>".into()),
             jobs: vec![base_job],
             ..DashboardSnapshot::default()
         };
-        let (text, _) = render(&s_upload, 1, false);
+        let (text, _) = render(&s_upload, 1);
         assert!(text.contains("<b>⬆️ Uploading:</b> <b>Track 1</b> <code>[===]</code>"));
     }
 }

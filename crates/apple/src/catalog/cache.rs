@@ -34,7 +34,6 @@ impl<T: Clone> Cache<T> {
             return None; // expired (already removed)
         }
         let Entry { value, expires_at } = entry;
-        // Refresh recency: reinsert at the back.
         self.map.insert(
             key.to_owned(),
             Entry {
@@ -81,7 +80,6 @@ mod tests {
         let now = Instant::now();
         cache.set("a", 1, now);
         cache.set("b", 2, now);
-        // Touch "a" so "b" becomes the least-recent.
         assert_eq!(cache.get("a", now), Some(1));
         cache.set("c", 3, now);
         assert_eq!(cache.get("b", now), None, "b evicted as LRU");
@@ -100,7 +98,6 @@ mod tests {
 
     #[test]
     fn update_at_capacity_still_evicts_front() {
-        // Setting an existing key while full evicts the front entry.
         let mut cache: Cache<u32> = Cache::new(2, Duration::from_secs(60));
         let now = Instant::now();
         cache.set("a", 1, now);
@@ -118,7 +115,6 @@ mod tests {
 
     #[test]
     fn zero_capacity_degenerates_to_one() {
-        // maxCacheSize=0 → every set evicts the only entry.
         let mut cache: Cache<u32> = Cache::new(0, Duration::from_secs(60));
         let now = Instant::now();
         cache.set("a", 1, now);

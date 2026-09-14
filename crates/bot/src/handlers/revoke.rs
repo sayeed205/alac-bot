@@ -14,8 +14,8 @@ pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
         async move {
                 let sender = match msg.sender_user_id() { Some(id) => id, None => return };
                 if !state.auth.is_admin(sender) { return; }
-                let (id, name, _is_user) = match resolve_target(&msg, &state).await {
-                    TargetResult::Ok { id, name, is_user } => (id, name, is_user),
+                let (id, name) = match resolve_target(&msg, &state).await {
+                    TargetResult::Ok { id, name, .. } => (id, name),
                     TargetResult::UnresolvedReply => {
                         let text = "⚠️ <b>Could not resolve replied-to user.</b> Telegram did not provide sender information.<br/><br/>Please revoke explicitly by ID or username:<br/>• <code>/revoke &lt;id | @username&gt;</code>";
                         let _ = msg.reply(InputMessage::html(parse_dynamic_html(text))).await;

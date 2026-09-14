@@ -46,6 +46,16 @@ mp4ameta = "0.13"
 font8x8 = "0.3"
 temari = { git = "https://github.com/WorldObservationLog/Temari" }
 
+
+[workspace.lints.rust]
+dead_code = "deny"
+unused_variables = "deny"
+unused_imports = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+used_underscore_binding = "deny"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

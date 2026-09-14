@@ -121,7 +121,10 @@ fn clean_activity(text: &str) -> String {
 fn is_upload_activity(text: &str) -> bool {
     let trimmed = text.trim();
     let stripped = trimmed.strip_prefix("⬆️ ").unwrap_or(trimmed);
-    stripped.starts_with("Uploading:") || stripped.starts_with("<b>Uploading:")
+    stripped.starts_with("Uploading:")
+        || stripped.starts_with("Uploading ZIP:")
+        || stripped.starts_with("<b>Uploading:")
+        || stripped.starts_with("<b>Uploading ZIP:")
 }
 
 /// Map an engine job snapshot into a dashboard row for a specific viewer.
@@ -343,11 +346,8 @@ mod tests {
             uploading: None,
         };
         let job = engine_job(EnginePhase::Processing, None, 42, Some("Bob"));
-        // Requester
         assert!(job_to_dashboard(&job, &ctx, 42, false).is_cancel_allowed_for_viewer);
-        // Admin stranger
         assert!(job_to_dashboard(&job, &ctx, 99, true).is_cancel_allowed_for_viewer);
-        // Unauthorized stranger
         assert!(!job_to_dashboard(&job, &ctx, 99, false).is_cancel_allowed_for_viewer);
     }
 
@@ -460,6 +460,41 @@ mod tests {
             snapshot.jobs[0].uploading.as_deref(),
             Some("<b>Song - Artist</b> <code>4 MB</code>")
         );
+    }
+
+    #[test]
+    fn zip_upload_progress_stays_in_the_upload_lane() {
+        let mut job = engine_job(EnginePhase::Processing, Some(0), 7, Some("Alice"));
+        job.active_action_text =
+            Some("⬆️ Uploading ZIP: <b>Bharat</b> <code>32% (81.0/251.7 MB)</code>".into());
+        let mut contexts = JobContexts::new();
+        contexts.remember(&job);
+        contexts.remember_progress(&RipJobProgress {
+            job_id: job.id.clone(),
+            total_tracks: 1,
+            completed_tracks: 0,
+            cached_count: 0,
+            ripped_count: 0,
+            failed_count: 0,
+            skipped_count: 0,
+            percent: 0,
+            active_download_text: None,
+            active_upload_text: Some(
+                "⬆️ Uploading ZIP: <b>Bharat</b> <code>32% (81.0/251.7 MB)</code>".into(),
+            ),
+            activity_override: None,
+        });
+
+        let snapshot = snapshot_from(&[job], &contexts, 7, false, "live", None);
+        assert_eq!(snapshot.current_download, None);
+        assert_eq!(
+            snapshot.current_upload.as_deref(),
+            Some("Uploading ZIP: <b>Bharat</b> <code>32% (81.0/251.7 MB)</code>")
+        );
+        let (rendered, _) = crate::dashboard::render(&snapshot, 1);
+        assert!(rendered
+            .contains("<b>⬆️ Uploading ZIP:</b> <b>Bharat</b> <code>32% (81.0/251.7 MB)</code>"));
+        assert!(!rendered.contains("Uploading: Uploading ZIP:"));
     }
 
     #[test]

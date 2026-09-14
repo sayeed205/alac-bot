@@ -122,7 +122,6 @@ fn storefronts_keyboard(
         .map(|sf| sf.to_lowercase())
         .collect();
     let mut kb = InlineKeyboard::new();
-    // 4 buttons per row.
     for chunk in POPULAR_STOREFRONTS.chunks(4) {
         let row = chunk
             .iter()
@@ -231,7 +230,6 @@ pub(crate) async fn render_settings_message(
     let input = InputMessage::html(parse_dynamic_html(&render_settings_text(&settings)))
         .reply_markup(settings_keyboard(&settings));
     if let Some(message_id) = message_id {
-        // NOT_MODIFIED is swallowed.
         let _ = state
             .client
             .edit_message(peer.clone(), message_id, input)
@@ -251,7 +249,6 @@ pub(crate) async fn render_storefronts_message(state: &BotState, peer: &PeerRef,
     let settings = state.rip_deps.settings_snapshot();
     let input = InputMessage::html(parse_dynamic_html(&render_storefronts_text(&settings)))
         .reply_markup(storefronts_keyboard(&settings));
-    // swallows all edit errors here.
     let _ = state
         .client
         .edit_message(peer.clone(), message_id, input)
@@ -274,7 +271,6 @@ pub async fn command(state: Arc<BotState>, msg: ferogram::update::IncomingMessag
     let text = msg.text().unwrap_or_default();
     let parts: Vec<&str> = text.split_whitespace().collect();
 
-    // Subcommands need >= 3 parts ("/settings mode live").
     if parts.len() >= 3 {
         let sub = parts[1].to_lowercase();
         let raw_value = parts[2].to_lowercase();
@@ -386,7 +382,6 @@ async fn subcommand_reply(
             }
         }
         "limit" => {
-            // Parse failure also answers with the usage string.
             let num: i64 = match raw_value.parse() {
                 Ok(num) => num,
                 Err(_) => {
@@ -426,7 +421,6 @@ fn upper_join(list: &[String]) -> String {
 
 /// `settings:*` callback handler.
 pub async fn callback(state: Arc<BotState>, query: CallbackQuery, action: SettingsAction) {
-    // Admin re-check on every callback (owner only).
     if !state.auth.is_admin(query.user_id) {
         let _ = query
             .answer()

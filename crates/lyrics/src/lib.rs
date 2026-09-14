@@ -60,9 +60,6 @@ impl LyricsLookup {
     }
 }
 
-/// Compatibility alias for callers that used the old engine name.
-pub type LyricsMeta = LyricsLookup;
-
 /// The quality class inferred from a lyrics document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum LyricsTier {

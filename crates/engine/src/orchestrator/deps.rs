@@ -189,10 +189,10 @@ pub trait TelegramSink: Send + Sync {
     /// default unsupported result (useful for narrow test adapters).
     fn send_document_to_dump<'a>(
         &'a self,
-        _file_path: &'a str,
-        _thumb_path: Option<&'a str>,
-        _caption_html: &'a str,
-        _on_upload_progress: Option<&'a UploadProgressCallback>,
+        _: &'a str,
+        _: Option<&'a str>,
+        _: &'a str,
+        _: Option<&'a UploadProgressCallback>,
     ) -> BoxFuture<'a, Result<Option<DumpUpload>, SinkError>> {
         Box::pin(async { Err(SinkError("ZIP document upload is unavailable".into())) })
     }
@@ -201,11 +201,11 @@ pub trait TelegramSink: Send + Sync {
     /// `thumb_path` attaches a Telegram document thumbnail when present.
     fn send_document_to_chat<'a>(
         &'a self,
-        _chat_id: i64,
-        _file_path: &'a str,
-        _thumb_path: Option<&'a str>,
-        _caption_html: &'a str,
-        _on_upload_progress: Option<&'a UploadProgressCallback>,
+        _: i64,
+        _: &'a str,
+        _: Option<&'a str>,
+        _: &'a str,
+        _: Option<&'a UploadProgressCallback>,
     ) -> BoxFuture<'a, Result<i32, SinkError>> {
         Box::pin(async { Err(SinkError("direct ZIP upload is unavailable".into())) })
     }
@@ -214,9 +214,9 @@ pub trait TelegramSink: Send + Sync {
     /// caller treats failures as non-fatal.
     fn send_photo_to_chat<'a>(
         &'a self,
-        _chat_id: i64,
-        _image_bytes: &'a [u8],
-        _caption_html: &'a str,
+        _: i64,
+        _: &'a [u8],
+        _: &'a str,
     ) -> BoxFuture<'a, Result<(), SinkError>> {
         Box::pin(async { Err(SinkError("photo send is unavailable".into())) })
     }
@@ -224,9 +224,9 @@ pub trait TelegramSink: Send + Sync {
     /// Materializes a cached dump document for archive creation.
     fn download_dump_file<'a>(
         &'a self,
-        _message_id: i64,
-        _destination: &'a Path,
-        _on_download_progress: Option<&'a UploadProgressCallback>,
+        _: i64,
+        _: &'a Path,
+        _: Option<&'a UploadProgressCallback>,
     ) -> BoxFuture<'a, Result<(), SinkError>> {
         Box::pin(async { Err(SinkError("cached file download is unavailable".into())) })
     }
@@ -335,7 +335,7 @@ pub trait OrchestratorDeps: Send + Sync + 'static {
 
     /// Persists a completed ZIP part. Partial archives intentionally never
     /// call this method.
-    fn save_album<'a>(&'a self, _upload: AlbumUpload) -> BoxFuture<'a, Result<(), String>> {
+    fn save_album<'a>(&'a self, _: AlbumUpload) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async { Ok(()) })
     }
 
@@ -356,9 +356,9 @@ pub trait OrchestratorDeps: Send + Sync + 'static {
     /// Lists cached ZIP parts for an album, ordered by part_index ascending.
     fn find_albums<'a>(
         &'a self,
-        _provider: Provider,
-        _album_id: &'a str,
-        _codec: Option<Codec>,
+        _: Provider,
+        _: &'a str,
+        _: Option<Codec>,
     ) -> BoxFuture<'a, Result<Vec<CachedAlbum>, String>> {
         Box::pin(async { Ok(Vec::new()) })
     }
@@ -367,9 +367,9 @@ pub trait OrchestratorDeps: Send + Sync + 'static {
     /// a possibly different part count.
     fn delete_albums<'a>(
         &'a self,
-        _provider: Provider,
-        _album_id: &'a str,
-        _codec: Option<Codec>,
+        _: Provider,
+        _: &'a str,
+        _: Option<Codec>,
     ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async { Ok(()) })
     }

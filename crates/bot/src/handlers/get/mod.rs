@@ -58,7 +58,6 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
     // suppresses all user-facing media for cache-only jobs.
     let is_cache_only = admin;
 
-    // Preflight gates .
     if let Some(text) = gates::cache_gate(is_cache_only, admin) {
         reply(&msg, text).await;
         return;
@@ -78,7 +77,6 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
         return;
     }
 
-    // Requester display name .
     let user = msg.sender_user().await.ok().flatten();
     let display_name = user
         .as_ref()

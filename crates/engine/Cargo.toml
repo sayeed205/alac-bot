@@ -27,3 +27,6 @@ sha2.workspace = true
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time", "test-util"] }
 futures-util.workspace = true
 tempfile = "3"
+
+[lints]
+workspace = true

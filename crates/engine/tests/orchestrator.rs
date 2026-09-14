@@ -758,7 +758,7 @@ impl OrchestratorDeps for FakeDeps {
 
     fn replace_albums<'a>(
         &'a self,
-        _provider: engine::types::Provider,
+        _: engine::types::Provider,
         album_id: &'a str,
         codec: engine::Codec,
         expected: AlbumReplacementExpectation,

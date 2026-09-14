@@ -871,7 +871,6 @@ impl RipOrchestrator {
         let settings = deps.get_settings().await;
 
         let job_controller = CancellationToken::new();
-        // Initial job header from the parsed targets.
         let mut job_header = deps
             .providers()
             .presentation()
@@ -1023,7 +1022,6 @@ impl RipOrchestrator {
             None,
         );
 
-        // Resolve every parsed item.
         let mut resolved_tracks: Vec<ResolvedTrackItem> = Vec::new();
         let mut album_name: Option<String> = None;
         let mut album_artist: Option<String> = None;
@@ -1168,14 +1166,12 @@ impl RipOrchestrator {
             });
         }
 
-        // Dedup preserving order.
         let mut seen_ids: HashSet<String> = HashSet::new();
         let unique_tracks: Vec<ResolvedTrackItem> = resolved_tracks
             .into_iter()
             .filter(|t| seen_ids.insert(t.id.clone()))
             .collect();
 
-        // Cap collections for non-admins.
         let mut capped_count = 0usize;
         let max_collection_limit = settings.max_collection_tracks;
         let mut tracks_to_process = unique_tracks;
@@ -1194,7 +1190,6 @@ impl RipOrchestrator {
             );
         }
 
-        // Job header refinement + total. Empty strings count as absent.
         fn non_empty(s: &Option<String>) -> Option<&str> {
             s.as_deref().filter(|s| !s.is_empty())
         }
@@ -1297,7 +1292,6 @@ impl RipOrchestrator {
             }
         }
 
-        // Cache lookup; a DB failure fails the whole job.
         self.set_phase(&shared, JobPhase::CheckingCache);
         let check_label = {
             let header = shared.lock().expect("job poisoned").job.job_header.clone();
@@ -1333,7 +1327,6 @@ impl RipOrchestrator {
 
         shared.lock().expect("job poisoned").job.active_action_text = None;
 
-        // Force + admin purge.
         if options.is_force && options.is_admin {
             let mut old_message_ids: Vec<i64> = Vec::new();
             for item in &tracks_to_process {
@@ -1353,7 +1346,6 @@ impl RipOrchestrator {
                     count = old_message_ids.len(),
                     "Deleting old dump messages on force re-rip prior to queue"
                 );
-                // Bulk delete; errors are swallowed.
                 let _ = deps.sink().delete_dump_messages(&old_message_ids).await;
             }
         }
@@ -1596,7 +1588,6 @@ impl RipOrchestrator {
             uncached_items.retain(|item| item.cached.is_some());
         }
 
-        // Live rip through the queue.
         self.set_phase(&shared, JobPhase::Queued);
         self.bus
             .emit_progress(&shared, Some("Queued for ripping..."), None, None);
@@ -1684,7 +1675,6 @@ impl RipOrchestrator {
         let (summary_tx, summary_rx) = tokio::sync::oneshot::channel::<FinalizeResult>();
         let summary_tx = Arc::new(Mutex::new(Some(summary_tx)));
 
-        // The queue task must be 'static — move everything it needs.
         let task_deps = Arc::clone(&deps);
         let task_shared = Arc::clone(&shared);
         let task_items = uncached_items;
@@ -4026,7 +4016,6 @@ async fn upload_one<D: OrchestratorDeps>(
             }
             Err(upload_err) => {
                 if is_cancelled() {
-                    // Stop retrying without recording a failure.
                     break 'upload;
                 }
                 if upload_err.to_string().contains("ENTITY_BOUNDS_INVALID") && !used_plain_caption {
@@ -4046,7 +4035,6 @@ async fn upload_one<D: OrchestratorDeps>(
                         error = %upload_err,
                         "Track upload to dump failed, retrying"
                     );
-                    // abortableSleep — cancellation cuts the delay short.
                     tokio::select! {
                         _ = tokio::time::sleep(Duration::from_millis(delay as u64)) => {}
                         _ = job_controller.cancelled() => {}

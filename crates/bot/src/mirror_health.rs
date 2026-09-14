@@ -74,7 +74,7 @@ impl<H: MirrorHttp> MirrorHealthProbe for PolicyProbe<H> {
                 self.policy.get_endpoint(false, None).await;
             let resolve_ms = started.elapsed().as_millis() as u64;
             match endpoint {
-                Ok(_endpoint) => {
+                Ok(_) => {
                     // The policy manager already verified manifest + /status
                     // + wrapper availability; a successful resolution IS the
                     // health signal (equivalent to the HEAD probe).
