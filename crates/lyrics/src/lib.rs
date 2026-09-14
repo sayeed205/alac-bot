@@ -435,7 +435,7 @@ fn push_candidate(
     }
 }
 
-#[cfg(any(feature = "lrclib", feature = "betterlyrics", feature = "paxsenix"))]
+#[cfg(any(feature = "betterlyrics", feature = "paxsenix"))]
 fn encode_uri_component(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {

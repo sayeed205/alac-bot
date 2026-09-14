@@ -34,6 +34,7 @@ pub struct AppleStreamAcquisition<S: StreamHttp, M: MirrorHttp> {
 /// endpoint from being mistaken for a provider-confirmed missing rendition.
 enum AcquisitionAttempt {
     Source(AudioStreamSource),
+    Permanent(String),
     OptionalUnavailable(WrapperUnavailableReason),
     NoSource,
 }
@@ -171,6 +172,9 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
             }
             match attempt {
                 AcquisitionAttempt::Source(stream) => return Ok(stream),
+                AcquisitionAttempt::Permanent(message) => {
+                    return Err(StreamError::Permanent(message));
+                }
                 AcquisitionAttempt::OptionalUnavailable(reason) => {
                     // A typed absence is conclusive only when no earlier
                     // candidate failed technically.  Otherwise preserve the
@@ -189,23 +193,6 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
                 }
             }
             if signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
-                break;
-            }
-
-            let wrapper_configured = self
-                .wrapper_url
-                .as_deref()
-                .is_some_and(|url| !url.trim().trim_end_matches('/').is_empty());
-            let permanent_failure = if wrapper_configured {
-                all_errors.iter().any(|error| {
-                    (error.contains("wrapper") || error.contains("Wrapper"))
-                        && is_non_retryable_error(error)
-                })
-            } else {
-                !all_errors.is_empty()
-                    && all_errors.iter().all(|error| is_non_retryable_error(error))
-            };
-            if permanent_failure {
                 break;
             }
         }
@@ -256,7 +243,7 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
                 match result {
                     Ok(stream) => {
                         self.mirror_policy.record_success();
-                        return Self::accept_stream(stream, codec_preference);
+                        return Self::accepted_attempt(stream, codec_preference);
                     }
                     Err(error) => {
                         let message = error.to_string();
@@ -297,11 +284,12 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
                 .await
             {
                 Ok(WrapperTrackOutcome::Source(source)) => {
-                    Self::accept_stream(source, codec_preference)
+                    Self::accepted_attempt(source, codec_preference)
                 }
                 Ok(WrapperTrackOutcome::Unavailable(reason)) => {
                     AcquisitionAttempt::OptionalUnavailable(reason)
                 }
+                Err(StreamError::Permanent(message)) => AcquisitionAttempt::Permanent(message),
                 Err(error) => {
                     errors.push(format!("Native wrapper engine failed: {error}"));
                     AcquisitionAttempt::NoSource
@@ -339,13 +327,8 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
                             return AcquisitionAttempt::NoSource;
                         }
                         match Self::accept_stream(stream, codec_preference) {
-                            AcquisitionAttempt::Source(source) => {
-                                return AcquisitionAttempt::Source(source)
-                            }
-                            AcquisitionAttempt::OptionalUnavailable(reason) => {
-                                unavailable_reason = Some(reason);
-                            }
-                            AcquisitionAttempt::NoSource => only_unavailable = false,
+                            Ok(source) => return AcquisitionAttempt::Source(source),
+                            Err(reason) => unavailable_reason = Some(reason),
                         }
                     }
                     Err(error) => {
@@ -369,15 +352,25 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
         }
     }
 
-    fn accept_stream(
+    fn accepted_attempt(
         stream: AudioStreamSource,
         codec_preference: CodecPreference,
     ) -> AcquisitionAttempt {
+        match Self::accept_stream(stream, codec_preference) {
+            Ok(stream) => AcquisitionAttempt::Source(stream),
+            Err(reason) => AcquisitionAttempt::OptionalUnavailable(reason),
+        }
+    }
+
+    fn accept_stream(
+        stream: AudioStreamSource,
+        codec_preference: CodecPreference,
+    ) -> Result<AudioStreamSource, WrapperUnavailableReason> {
         if codec_preference == CodecPreference::Atmos && !stream.codec.eq_ignore_ascii_case("ec-3")
         {
-            AcquisitionAttempt::OptionalUnavailable(WrapperUnavailableReason::NonEc3StreamForAtmos)
+            Err(WrapperUnavailableReason::NonEc3StreamForAtmos)
         } else {
-            AcquisitionAttempt::Source(stream)
+            Ok(stream)
         }
     }
 }
@@ -395,19 +388,30 @@ fn hostname(url: &str) -> String {
 pub fn is_non_retryable_error(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     engine::ripper::is_non_retryable_local_error(message)
-        || lower.contains("code 404")
-        || lower.contains("code: 404")
-        || lower.contains("http 404")
-        || lower.contains("status 404")
-        || lower.contains("status: 404")
-        || lower.contains("404 not found")
-        || lower.contains("failed to get m3u8")
         || lower.contains("song is currently unavailable")
         || lower.contains("track is currently unavailable")
         || lower.contains("track not found in itunes")
         || lower.contains("not available in your region")
         || lower.contains("not available in this country")
         || lower.contains("not available in the current storefront")
+}
+
+fn map_media_finalize_error(error: media::MediaError) -> engine::ripper::RipError {
+    match error {
+        media::MediaError::SourceValidation(media::SourceValidationError::Decode(message)) => {
+            engine::ripper::RipError::SourceFailure {
+                kind: engine::ripper::SourceFailureKind::MediaValidation,
+                message: format!("audio decode failed: {message}"),
+            }
+        }
+        media::MediaError::SourceValidation(media::SourceValidationError::Invalid(message)) => {
+            engine::ripper::RipError::SourceFailure {
+                kind: engine::ripper::SourceFailureKind::MediaValidation,
+                message: format!("invalid media: {message}"),
+            }
+        }
+        error => engine::ripper::RipError::Message(error.to_string()),
+    }
 }
 
 /// Production dependencies for the generic engine ripper.
@@ -605,6 +609,25 @@ impl engine::ripper::RipperDeps for AppleRipperDeps {
         is_non_retryable_error(message)
     }
 
+    fn report_source_failure(
+        &self,
+        source_name: &str,
+        kind: engine::ripper::SourceFailureKind,
+        error: &str,
+    ) {
+        if !source_name.starts_with("primary mirror (") {
+            return;
+        }
+        if matches!(
+            kind,
+            engine::ripper::SourceFailureKind::Stream
+                | engine::ripper::SourceFailureKind::IncompleteBody
+                | engine::ripper::SourceFailureKind::MediaValidation
+        ) {
+            self.acquisition.mirror_policy().record_failure(error);
+        }
+    }
+
     async fn track_meta(
         &self,
         track_id: &str,
@@ -733,13 +756,21 @@ impl engine::ripper::RipperDeps for AppleRipperDeps {
             .finalize_m4a(raw_path, output_path, &tags, &cancellation)
             .await
             .map(|_| ())
-            .map_err(|error| engine::ripper::RipError::Message(error.to_string()))
+            .map_err(map_media_finalize_error)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_non_retryable_error;
+    use engine::{
+        ripper::{RipperDeps, SourceFailureKind},
+        streaming::{ReqwestHttp, StreamTransport},
+    };
+
+    use super::{
+        is_non_retryable_error, map_media_finalize_error, AppleRipperDeps, AppleStreamAcquisition,
+    };
+    use crate::{Catalog, MirrorPolicyManager, ReqwestMirrorHttp};
 
     #[test]
     fn master_playlist_parse_errors_remain_retryable_without_matching_transient_wrapper_errors() {
@@ -751,6 +782,71 @@ mod tests {
         ));
         assert!(!is_non_retryable_error(
             "Wrapper candidate (https://wrapper/stream/42) failed: transient"
+        ));
+        assert!(!is_non_retryable_error(
+            "Native wrapper engine failed: Fetch license: Wrapper /license HTTP 404"
+        ));
+    }
+
+    #[test]
+    fn source_failure_reporting_only_marks_primary_mirror() {
+        let acquisition = AppleStreamAcquisition::with_config(
+            StreamTransport::new(ReqwestHttp::new()),
+            MirrorPolicyManager::new(ReqwestMirrorHttp::new(), None),
+            None,
+            None,
+            super::AppleAcquisitionConfig {
+                retry_rounds: 1,
+                retry_base_delay_ms: 0,
+            },
+        );
+        let deps = AppleRipperDeps::new(
+            Catalog::new(crate::catalog::ReqwestTransport::new()),
+            acquisition,
+        );
+
+        deps.report_source_failure(
+            "wrapper (https://wrapper)",
+            SourceFailureKind::MediaValidation,
+            "audio decode failed: corrupt wrapper",
+        );
+        assert!(!deps.mirror_policy().is_circuit_open());
+
+        deps.report_source_failure(
+            "primary mirror (mirror)",
+            SourceFailureKind::MediaValidation,
+            "audio decode failed: corrupt mirror",
+        );
+        assert!(deps.mirror_policy().is_circuit_open());
+    }
+
+    #[test]
+    fn only_original_source_validation_maps_to_source_failure() {
+        let source_error = map_media_finalize_error(media::MediaError::SourceValidation(
+            media::SourceValidationError::Decode("unexpected end of bitstream".to_owned()),
+        ));
+        assert!(matches!(
+            source_error,
+            engine::ripper::RipError::SourceFailure { kind: SourceFailureKind::MediaValidation, message }
+                if message == "audio decode failed: unexpected end of bitstream"
+        ));
+
+        let post_tag_decode = map_media_finalize_error(media::MediaError::Decode(
+            "post-tag decode failed".to_owned(),
+        ));
+        assert!(matches!(
+            post_tag_decode,
+            engine::ripper::RipError::Message(message)
+                if message == "audio decode failed: post-tag decode failed"
+        ));
+
+        let post_tag_invalid = map_media_finalize_error(media::MediaError::Invalid(
+            "finalized file has no duration".to_owned(),
+        ));
+        assert!(matches!(
+            post_tag_invalid,
+            engine::ripper::RipError::Message(message)
+                if message == "invalid media: finalized file has no duration"
         ));
     }
 }

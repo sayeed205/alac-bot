@@ -20,6 +20,11 @@ pub struct FetchEndpointOptions {
 pub enum StreamError {
     #[error("{0}")]
     Message(String),
+    /// A provider has confirmed that the requested stream cannot be
+    /// acquired.  Unlike an ordinary technical failure, this must not consume
+    /// retry budget.
+    #[error("{0}")]
+    Permanent(String),
     /// The requested optional rendition is known not to exist. This is
     /// distinct from a transport or provider failure so callers can skip
     /// the rendition without consuming retry budget.

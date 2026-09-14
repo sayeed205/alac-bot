@@ -48,10 +48,24 @@ pub enum MediaError {
     Render(String),
     #[error("invalid media: {0}")]
     Invalid(String),
+    /// Decode/structure failure while validating the original downloaded
+    /// source, before any metadata is written. This provenance lets callers
+    /// distinguish source corruption from a later finalization failure.
+    #[error(transparent)]
+    SourceValidation(SourceValidationError),
     #[error("metadata update failed: {0}")]
     Metadata(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+/// Failures that prove the original downloaded media is corrupt.
+#[derive(Debug, thiserror::Error)]
+pub enum SourceValidationError {
+    #[error("audio decode failed: {0}")]
+    Decode(String),
+    #[error("invalid media: {0}")]
+    Invalid(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -849,7 +863,7 @@ fn finalize_m4a_sync(
     // (ALAC, ec-3, AAC) and finalize must not reject a valid rip. Codecs
     // without a symphonia decoder (ec-3) are validated by container
     // structure instead of sample decoding.
-    let info = inspect_sync(source, cancellation)?;
+    let info = inspect_sync(source, cancellation).map_err(mark_source_validation)?;
 
     let part = destination.with_extension("m4a.part");
     if part.exists() {
@@ -944,6 +958,18 @@ fn finalize_m4a_sync(
         let _ = std::fs::remove_file(&part);
     }
     result
+}
+
+fn mark_source_validation(error: MediaError) -> MediaError {
+    match error {
+        MediaError::Decode(message) => {
+            MediaError::SourceValidation(SourceValidationError::Decode(message))
+        }
+        MediaError::Invalid(message) => {
+            MediaError::SourceValidation(SourceValidationError::Invalid(message))
+        }
+        other => other,
+    }
 }
 
 fn non_empty(value: Option<&str>) -> Option<&str> {
@@ -1158,6 +1184,31 @@ mod tests {
 
         assert_eq!(codec_name(CODEC_ID_ALAC), "alac");
         assert_eq!(codec_name(CODEC_ID_AAC), "aac");
+    }
+
+    #[test]
+    fn source_validation_provenance_is_distinct_from_post_tag_failures() {
+        let source_decode =
+            mark_source_validation(MediaError::Decode("unexpected end of bitstream".to_owned()));
+        assert!(matches!(
+            source_decode,
+            MediaError::SourceValidation(SourceValidationError::Decode(message))
+                if message == "unexpected end of bitstream"
+        ));
+
+        let source_invalid = mark_source_validation(MediaError::Invalid("no audio track".into()));
+        assert!(matches!(
+            source_invalid,
+            MediaError::SourceValidation(SourceValidationError::Invalid(message))
+                if message == "no audio track"
+        ));
+
+        // Post-tag validation returns the ordinary error directly; only the
+        // pre-tag inspection above passes through the source marker.
+        let post_tag_decode = MediaError::Decode("finalized file could not be decoded".into());
+        let post_tag_invalid = MediaError::Invalid("finalized file has no duration".into());
+        assert!(!matches!(post_tag_decode, MediaError::SourceValidation(_)));
+        assert!(!matches!(post_tag_invalid, MediaError::SourceValidation(_)));
     }
 
     #[test]

@@ -11,14 +11,17 @@ use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-/// A typed absence that is safe to propagate to an optional rendition.
+/// A typed wrapper outcome that can be propagated to an optional rendition.
 ///
 /// The valid-master variant retains provider-playlist provenance; the
 /// non-EC-3 variant is only produced after a wrapper candidate has resolved a
-/// successful stream response that cannot satisfy an Atmos request.
+/// successful stream response that cannot satisfy an Atmos request. A missing
+/// `/m3u8` is converted to a permanent primary failure by the wrapper engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WrapperUnavailableReason {
     NoAtmosVariantInValidMaster,
+    /// The wrapper cannot resolve a master playlist for this track.
+    M3u8NotFound,
     /// A wrapper endpoint resolved successfully, but only returned a stream
     /// that cannot satisfy an Atmos request.
     NonEc3StreamForAtmos,
@@ -30,6 +33,7 @@ impl Display for WrapperUnavailableReason {
             Self::NoAtmosVariantInValidMaster => {
                 formatter.write_str("No Dolby Atmos stream variant found in master playlist")
             }
+            Self::M3u8NotFound => formatter.write_str("Wrapper /m3u8 returned HTTP 404"),
             Self::NonEc3StreamForAtmos => {
                 formatter.write_str("Wrapper returned a non-EC-3 stream for Atmos request")
             }
@@ -159,6 +163,11 @@ impl WrapperLiteClient {
         debug!(adam_id = %adam_id, url = %url, "Fetching m3u8 URL from wrapper");
         let resp = self.client.get(&url).send().await?;
         if !resp.status().is_success() {
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                return Err(WrapperError::Unavailable(
+                    WrapperUnavailableReason::M3u8NotFound,
+                ));
+            }
             return Err(WrapperError::Message(format!(
                 "Wrapper /m3u8 HTTP {}",
                 resp.status()
@@ -167,6 +176,11 @@ impl WrapperLiteClient {
         let text = resp.text().await?;
         let env: ApiResponse<M3u8Data> = serde_json::from_str(&text)?;
         if env.code != 0 {
+            if env.code == 404 {
+                return Err(WrapperError::Unavailable(
+                    WrapperUnavailableReason::M3u8NotFound,
+                ));
+            }
             return Err(WrapperError::Api {
                 code: env.code,
                 message: env.msg,

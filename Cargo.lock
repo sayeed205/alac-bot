@@ -80,6 +80,7 @@ dependencies = [
  "serde_json",
  "sha1 0.10.7",
  "temari",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-util",

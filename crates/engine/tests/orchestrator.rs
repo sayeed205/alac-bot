@@ -1111,6 +1111,10 @@ async fn missing_atmos_is_silent_and_primary_still_delivers() {
     assert_eq!(st.sent_audio.len(), 1, "unavailable Atmos is not uploaded");
     assert_eq!(st.saved_tracks.len(), 1, "unavailable Atmos is not cached");
     assert_eq!(st.copies.len(), 1, "the primary copy is retained");
+    assert!(
+        st.request_logs.iter().all(|log| log.status != "failed"),
+        "unavailable Atmos must not create a failed request log"
+    );
     assert!(!events
         .snapshot()
         .iter()

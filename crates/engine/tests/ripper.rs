@@ -75,6 +75,7 @@ struct FakeDeps {
     stream_content_length: Option<u64>,
     connect_fails: u32, // first N connect calls fail with a stall message
     connect_error: Option<String>,
+    connect_permanent: Option<String>,
     connect_unavailable: bool,
     connect_calls: AtomicU32,
     lyrics: Option<String>,
@@ -94,6 +95,7 @@ impl FakeDeps {
             stream_content_length: None,
             connect_fails: 0,
             connect_error: None,
+            connect_permanent: None,
             connect_unavailable: false,
             connect_calls: AtomicU32::new(0),
             lyrics: Some("la\nla".into()),
@@ -126,6 +128,9 @@ impl RipperDeps for FakeDeps {
         let n = self.connect_calls.fetch_add(1, Ordering::SeqCst);
         if self.connect_unavailable {
             return Err(RipError::Unavailable("Dolby Atmos is unavailable".into()));
+        }
+        if let Some(ref error) = self.connect_permanent {
+            return Err(RipError::Permanent(error.clone()));
         }
         if let Some(ref err) = self.connect_error {
             return Err(RipError::Message(err.clone()));
@@ -673,13 +678,15 @@ async fn progress_throttles_to_one_per_second() {
 async fn not_found_404_skips_retries_completely() {
     let dir = tempfile::tempdir().unwrap();
     let mut deps = FakeDeps::ok();
-    deps.connect_error = Some("Failed to stream audio from all sources. All streaming endpoints failed for track 6804576275. Errors: Native wrapper engine failed: Fetch m3u8 URL: Wrapper API error (code 404): failed to get m3u8".into());
+    deps.connect_permanent = Some("Wrapper /m3u8 returned HTTP 404".into());
     let ripper = AlacTrackRipper::new(config(dir.path(), 4, 1000));
     let error = ripper
         .rip(&deps, "6804576275", RipOptions::new(Provider::Apple, "in"))
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("code 404"));
+    assert!(
+        matches!(error, RipError::Permanent(message) if message.contains("/m3u8") && message.contains("404"))
+    );
     assert_eq!(
         deps.connect_calls.load(Ordering::SeqCst),
         1,

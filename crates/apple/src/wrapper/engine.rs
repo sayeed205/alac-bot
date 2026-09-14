@@ -90,11 +90,18 @@ impl WrapperEngine {
             cb("Connecting to wrapper-lite engine...");
         }
 
-        let master_url = self
-            .client
-            .fetch_m3u8_url(track_id)
-            .await
-            .map_err(|e| StreamError::Message(format!("Fetch m3u8 URL: {e}")))?;
+        let master_url = match self.client.fetch_m3u8_url(track_id).await {
+            Ok(url) => url,
+            Err(WrapperError::Unavailable(reason)) if preference == CodecPreference::Atmos => {
+                return Ok(WrapperTrackOutcome::Unavailable(reason));
+            }
+            Err(WrapperError::Unavailable(WrapperUnavailableReason::M3u8NotFound)) => {
+                return Err(StreamError::Permanent(
+                    WrapperUnavailableReason::M3u8NotFound.to_string(),
+                ));
+            }
+            Err(error) => return Err(StreamError::Message(format!("Fetch m3u8 URL: {error}"))),
+        };
 
         debug!(track_id = %track_id, master_url = %master_url, "Fetched master m3u8 URL");
 

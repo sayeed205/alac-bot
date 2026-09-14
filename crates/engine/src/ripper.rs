@@ -28,13 +28,32 @@ pub enum RipError {
     #[error("{0}")]
     Message(String),
     #[error("{0}")]
+    Permanent(String),
+    #[error("{0}")]
     Unavailable(String),
+    /// A provider identified a failure in the already-selected source. The
+    /// ripper adds source context and reports it through `RipperDeps` before
+    /// returning the ordinary user-facing error.
+    #[error("{message}")]
+    SourceFailure {
+        kind: SourceFailureKind,
+        message: String,
+    },
+}
+
+/// Failure classes that can be attributed to an acquired stream source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceFailureKind {
+    Stream,
+    IncompleteBody,
+    MediaValidation,
 }
 
 impl From<StreamError> for RipError {
     fn from(error: StreamError) -> Self {
         match error {
             StreamError::Message(message) => RipError::Message(message),
+            StreamError::Permanent(message) => RipError::Permanent(message),
             StreamError::Unavailable(message) => RipError::Unavailable(message),
             other => RipError::Message(other.to_string()),
         }
@@ -76,14 +95,14 @@ impl Default for RipperConfig {
 pub trait RipperDeps: Send + Sync {
     /// Provider-specific permanent failures may opt out of retries.
     fn is_non_retryable_error(&self, message: &str) -> bool {
-        let lower = message.to_ascii_lowercase();
         is_non_retryable_local_error(message)
-            || lower.contains("code 404")
-            || lower.contains("code: 404")
-            || lower.contains("http 404")
-            || lower.contains("status 404")
-            || lower.contains("status: 404")
-            || lower.contains("404 not found")
+    }
+
+    /// Report a corruption/validation failure from the selected source.
+    /// Providers may use the source identity to invalidate that source;
+    /// fakes and providers without source health tracking need no override.
+    fn report_source_failure(&self, source_name: &str, kind: SourceFailureKind, error: &str) {
+        let _ = (source_name, kind, error);
     }
 
     fn track_meta(
@@ -203,7 +222,7 @@ impl AlacTrackRipper {
             match self.rip_once(deps, track_id, &options).await {
                 Ok(result) => return Ok(result),
                 Err(err) => {
-                    if matches!(err, RipError::Unavailable(_)) {
+                    if matches!(err, RipError::Permanent(_) | RipError::Unavailable(_)) {
                         return Err(err);
                     }
                     let message = err.to_string();
@@ -216,7 +235,7 @@ impl AlacTrackRipper {
                         warn!(
                             track_id,
                             error = %message,
-                            "Track rip failed permanently (404/unavailable), skipping retries"
+                            "Track rip failed permanently/unavailable, skipping retries"
                         );
                         return Err(err);
                     }
@@ -484,26 +503,47 @@ impl AlacTrackRipper {
                     return Err(cancelled());
                 }
 
-                let chunk: bytes::Bytes = tokio::select! {
-                    lyrics = &mut lyrics_fut => {
-                        lyrics_result = Some(lyrics);
-                        continue;
+                    let chunk: bytes::Bytes = tokio::select! {
+                        lyrics = &mut lyrics_fut => {
+                            lyrics_result = Some(lyrics);
+                            continue;
                     }
                     artwork = &mut artwork_fut => {
                         artwork_result = Some(artwork);
                         continue;
                     }
                     _ = tokio::time::sleep(CHUNK_INACTIVITY_TIMEOUT) => {
-                        return Err(RipError::Message(format!(
+                        if signal.is_some_and(|token| token.is_cancelled()) {
+                            return Err(cancelled());
+                        }
+                        let message = format!(
                             "Audio stream stalled on {}: no data received for {}s",
                             stream.source_name,
                             CHUNK_INACTIVITY_TIMEOUT.as_secs()
-                        )));
+                        );
+                        deps.report_source_failure(
+                            &stream.source_name,
+                            SourceFailureKind::Stream,
+                            &message,
+                        );
+                        return Err(RipError::Message(message));
                     }
                     chunk = stream.stream.next() => match chunk {
                         Some(Ok(bytes)) => bytes,
                         Some(Err(error)) => {
-                            return Err(RipError::Message(error.to_string()));
+                            if signal.is_some_and(|token| token.is_cancelled()) {
+                                return Err(cancelled());
+                            }
+                            let message = format!(
+                                "Audio stream body failed on {}: {error}",
+                                stream.source_name
+                            );
+                            deps.report_source_failure(
+                                &stream.source_name,
+                                SourceFailureKind::Stream,
+                                &message,
+                            );
+                            return Err(RipError::Message(message));
                         }
                         None => break,
                     },
@@ -535,10 +575,19 @@ impl AlacTrackRipper {
 
             if let Some(expected) = total {
                 if downloaded_bytes != expected {
-                    return Err(RipError::Message(format!(
+                    if signal.is_some_and(|token| token.is_cancelled()) {
+                        return Err(cancelled());
+                    }
+                    let message = format!(
                         "Incomplete audio body from {}: expected {expected} bytes, received {downloaded_bytes}",
                         stream.source_name
-                    )));
+                    );
+                    deps.report_source_failure(
+                        &stream.source_name,
+                        SourceFailureKind::IncompleteBody,
+                        &message,
+                    );
+                    return Err(RipError::Message(message));
                 }
             }
 
@@ -578,14 +627,27 @@ impl AlacTrackRipper {
                 return Err(cancelled());
             }
 
-            deps.tag_m4a(
+            match deps
+                .tag_m4a(
                 &temp_raw_path,
                 &final_path,
                 &meta,
                 cover.as_deref(),
                 lyrics.as_deref(),
             )
-            .await?;
+            .await
+            {
+                Ok(()) => {}
+                Err(RipError::SourceFailure { kind, message }) => {
+                    if signal.is_some_and(|token| token.is_cancelled()) {
+                        return Err(cancelled());
+                    }
+                    let message = format!("{message} (source: {})", stream.source_name);
+                    deps.report_source_failure(&stream.source_name, kind, &message);
+                    return Err(RipError::Message(message));
+                }
+                Err(error) => return Err(error),
+            }
 
             debug!(
                 track_id,

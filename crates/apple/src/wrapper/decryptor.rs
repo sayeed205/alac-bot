@@ -836,6 +836,35 @@ pub fn normalize_fragment(fragment: &mut Vec<u8>) {
             .map(|(off, _, _)| read_u32_be(&fragment[*off..*off + 4]) as i64)
             .sum::<i64>();
 
+    // Sibling truns keep their original boxes, but their samples live in
+    // the same mdat, which moved by the total growth. A fragment mixing a
+    // leading size-less trun with size-full siblings (96 kHz ALAC ships
+    // this layout) would otherwise read every sibling sample
+    // `total_delta` bytes early. Patch siblings before splicing, while
+    // their box offsets are still the collection-time ones.
+    {
+        let mut cur = traf_off + 8;
+        while cur + 8 <= traf_end {
+            let Some((b_len, b_type, _)) = read_box_header(fragment, cur) else {
+                break;
+            };
+            if b_len < 8 || cur + b_len > traf_end {
+                break;
+            }
+            if &b_type == b"trun" && !rebuilds.iter().any(|(off, _, _)| *off == cur) {
+                let flags = read_u24_be(&fragment[cur + 9..cur + 12]);
+                if flags & 0x1 != 0 && cur + 20 <= traf_end {
+                    let doff_pos = cur + 16;
+                    let doff =
+                        i32::from_be_bytes(fragment[doff_pos..doff_pos + 4].try_into().unwrap());
+                    let new_doff = doff + total_delta as i32;
+                    fragment[doff_pos..doff_pos + 4].copy_from_slice(&new_doff.to_be_bytes());
+                }
+            }
+            cur += b_len;
+        }
+    }
+
     let mut delta: i64 = 0;
     for (off, old_data_offset, mut new_trun) in rebuilds {
         let old_len = read_u32_be(&fragment[off..off + 4]) as usize;
@@ -1063,5 +1092,72 @@ mod tests {
         // (moof size after shrink) + 8 within the fragment.
         let moof_size = read_u32_be(&frag[0..4]) as usize;
         assert_eq!(frag[moof_size + 4..moof_size + 8], *b"mdat");
+    }
+
+    /// A leading size-less trun followed by size-full sibling truns (the
+    /// 96 kHz ALAC segment layout): rebuilding the leading trun grows
+    /// moof and shifts mdat, so every sibling's `data_offset` must shift
+    /// by the same total delta. Unpatched siblings read their samples
+    /// from the wrong mdat position and decode as garbage.
+    #[test]
+    fn normalize_fragment_patches_sibling_trun_offsets() {
+        let mut tfhd_body = Vec::new();
+        tfhd_body.extend_from_slice(&1u32.to_be_bytes()); // track_id
+        tfhd_body.extend_from_slice(&4096u32.to_be_bytes()); // duration
+        tfhd_body.extend_from_slice(&8224u32.to_be_bytes()); // size
+        let tfhd_box = tfhd(0x020018, &tfhd_body);
+        // Layout: moof { mfhd, traf { tfhd, trun(0x1, 2), trun(0x201, 1) } },
+        // mdat payload of 3 * 8224 bytes starting at moof-relative 108.
+        let sizeless = trun(0x1, 2, 108, &[]);
+        let sibling = trun(0x201, 1, 108 + 2 * 8224, &[8224]);
+        let (traf, _) = wrap_traf(&[tfhd_box, sizeless.clone(), sibling.clone()]);
+        let mut mfhd = Vec::new();
+        mfhd.extend_from_slice(&16u32.to_be_bytes());
+        mfhd.extend_from_slice(b"mfhd");
+        mfhd.extend_from_slice(&0u32.to_be_bytes());
+        mfhd.extend_from_slice(&1u32.to_be_bytes());
+        let mut moof = Vec::new();
+        moof.extend_from_slice(&((8 + mfhd.len() + traf.len()) as u32).to_be_bytes());
+        moof.extend_from_slice(b"moof");
+        moof.extend_from_slice(&mfhd);
+        moof.extend_from_slice(&traf);
+        let payload = vec![0xCDu8; 3 * 8224];
+        let mut mdat = Vec::new();
+        mdat.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
+        mdat.extend_from_slice(b"mdat");
+        mdat.extend_from_slice(&payload);
+        let mut frag = moof;
+        frag.extend_from_slice(&mdat);
+
+        normalize_fragment(&mut frag);
+
+        let (moof_off, moof_size) = find_child_box(&frag, 0, frag.len(), b"moof").expect("moof");
+        let (traf_off, traf_len) =
+            find_child_box(&frag, moof_off + 8, moof_off + moof_size, b"traf").expect("traf");
+        let trun_boxes = find_all_child_boxes(&frag, traf_off + 8, traf_off + traf_len, b"trun");
+        assert_eq!(trun_boxes.len(), 2, "both truns survive the rebuild");
+        let (rebuilt_off, rebuilt_len) = trun_boxes[0];
+        let (sibling_off, _) = trun_boxes[1];
+
+        // Rebuilt leading trun: flags 0x301, 2 samples, doff shifted by
+        // the rebuild growth (36 - 20 = 16 bytes).
+        assert_eq!(read_u24_be(&frag[rebuilt_off + 9..rebuilt_off + 12]), 0x301);
+        assert_eq!(read_u32_be(&frag[rebuilt_off + 12..rebuilt_off + 16]), 2);
+        assert_eq!(
+            rebuilt_len, 36,
+            "leading trun rebuilt with per-sample sizes"
+        );
+        let rebuilt_doff = read_i32_be(&frag[rebuilt_off + 16..rebuilt_off + 20]);
+        assert_eq!(rebuilt_doff, 108 + 16);
+
+        // Sibling keeps its shape, but its data_offset must follow mdat.
+        assert_eq!(read_u24_be(&frag[sibling_off + 9..sibling_off + 12]), 0x201);
+        let sibling_doff = read_i32_be(&frag[sibling_off + 16..sibling_off + 20]);
+        assert_eq!(sibling_doff, 108 + 2 * 8224 + 16, "sibling tracks mdat");
+
+        // Both offsets land on sample boundaries inside the shifted mdat.
+        let mdat_payload = moof_off + moof_size + 8;
+        assert_eq!(rebuilt_doff as usize, mdat_payload);
+        assert_eq!(sibling_doff as usize, mdat_payload + 2 * 8224);
     }
 }
