@@ -3,18 +3,20 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    future::Future,
-    pin::Pin,
     sync::{Arc, Mutex},
 };
 
 use engine::{
     orchestrator::{
         deps::{
-            AlbumReplacementExpectation, AlbumReplacementResult, AlbumUpload, ArtworkProvider,
-            CachedAlbum, CachedTrack, CollectionResolver, DumpUpload, OrchestratorDeps,
-            ProviderComposition, ProviderPresentation, RequestLog, SaveTrackInput, SinkError,
-            TelegramSink, TrackAcquisition, UploadProgressCallback,
+            AlbumCache, AlbumCacheError, AlbumCacheOperation, AlbumReplacementExpectation,
+            AlbumReplacementResult, AlbumUpload, ArtworkProvider, CachedAlbum, CachedTrack,
+            ChatDelivery, ChatMessageRef, CollectionResolver, Delivery, DeliveryError,
+            DeliveryReceipt, DumpMessageRef, DumpPublication, DumpPublish, JobBookkeeping,
+            JobBookkeepingError, JobBookkeepingOperation, OrchestratorConfig, ProviderAccess,
+            ProviderComposition, ProviderPresentation, RequestLog, SaveTrackInput,
+            StorageRetryPolicy, TrackAcquisition, TrackCache, TrackCacheError, TrackCacheOperation,
+            UploadProgressCallback,
         },
         types::{JobPhase, OrchestratorEvent, RipJobOptions, RipJobSummary},
         OrchestratorError, RipOrchestrator,
@@ -67,11 +69,14 @@ struct DepsState {
     saved_tracks: Vec<SaveTrackInput>,
     /// When set, `save_track` fails with this message.
     save_track_error: Option<String>,
+    save_track_unavailable_attempts: usize,
+    cache_unavailable_attempts: usize,
+    request_log_error: Option<String>,
     request_logs: Vec<RequestLog>,
     deleted_tracks: Vec<String>,
     deleted_message_batches: Vec<Vec<i64>>,
     /// Send-audio results, one per call.
-    send_audio_results: VecDeque<Result<Option<DumpUpload>, SinkError>>,
+    send_audio_results: VecDeque<Result<DumpPublication, DeliveryError>>,
     sent_audio: Vec<(String, String, String)>, // (file, title, performer)
     copies: Vec<(i64, i64, Option<i64>, bool)>, // (to, msg, replyTo, silent)
     /// Message ids whose dump copy fails (once).
@@ -81,12 +86,13 @@ struct DepsState {
     rip_calls: Vec<String>,
     // album ZIP
     saved_albums: Vec<AlbumUpload>,
-    zip_dump_results: VecDeque<Result<Option<DumpUpload>, SinkError>>,
+    zip_dump_results: VecDeque<Result<DumpPublication, DeliveryError>>,
     zip_dump_panics: bool,
     zip_dump_calls: usize,
     zip_dump_panic_on_call: Option<usize>,
-    zip_chat_results: VecDeque<Result<i32, SinkError>>,
+    zip_chat_results: VecDeque<Result<DeliveryReceipt, DeliveryError>>,
     save_album_error: Option<String>,
+    replace_conflict: bool,
     deleted_album_zip_ids: Vec<String>,
     found_albums: HashMap<String, Vec<CachedAlbum>>,
     sent_documents: Vec<String>, // dump + direct document upload paths
@@ -130,8 +136,6 @@ struct FakeDeps {
     albums: Mutex<HashMap<String, AlbumTracks>>,
     artists: Mutex<HashMap<String, ArtistTracks>>,
     playlists: Mutex<HashMap<String, PlaylistData>>,
-    upload_retry_base_ms: u64,
-    upload_max_retries: Mutex<u32>,
     rip_delay_ms: Mutex<u64>,
     cache_delay_ms: Mutex<u64>,
     rip_notify: Arc<tokio::sync::Notify>,
@@ -154,8 +158,6 @@ impl FakeDeps {
             albums: Mutex::new(HashMap::new()),
             artists: Mutex::new(HashMap::new()),
             playlists: Mutex::new(HashMap::new()),
-            upload_retry_base_ms: 1,
-            upload_max_retries: Mutex::new(3),
             rip_delay_ms: Mutex::new(0),
             cache_delay_ms: Mutex::new(0),
             rip_notify,
@@ -254,12 +256,12 @@ impl FakeDeps {
         }
     }
 
-    fn upload_ok() -> Result<Option<DumpUpload>, SinkError> {
-        Ok(Some(DumpUpload {
-            message_id: 777,
+    fn upload_ok() -> Result<DumpPublication, DeliveryError> {
+        Ok(DumpPublication {
+            message: DumpMessageRef::new(777),
             file_id: "dump_file".into(),
             file_unique_id: "dump_uniq".into(),
-        }))
+        })
     }
 }
 
@@ -277,216 +279,200 @@ fn archive_codec_replaced(replacement: engine::Codec, existing: engine::Codec) -
     }
 }
 
-impl TelegramSink for FakeSink {
-    fn send_audio_to_dump<'a>(
+impl Delivery for FakeSink {
+    fn publish_to_dump<'a>(
         &'a self,
-        file_path: &'a str,
-        title: &'a str,
-        performer: &'a str,
-        duration: i64,
-        caption_html: &'a str,
-        on_upload_progress: Option<&'a UploadProgressCallback>,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<DumpUpload>, SinkError>> + Send + 'a>> {
-        let _ = (duration, caption_html, on_upload_progress);
+        publication: DumpPublish,
+    ) -> engine::orchestrator::deps::BoxFuture<'a, Result<DumpPublication, DeliveryError>> {
         let state = Arc::clone(&self.state);
         Box::pin(async move {
-            let gate = {
-                let st = state.lock().unwrap();
-                st.gate_uploads.clone()
-            };
-            if let Some(gate) = gate {
-                gate.cancelled().await;
-            }
-            let mut st = state.lock().unwrap();
-            st.sent_audio.push((
-                file_path.to_string(),
-                title.to_string(),
-                performer.to_string(),
-            ));
-            if st.send_audio_panics {
-                drop(st);
-                panic!("track sink panic");
-            }
-            match st.send_audio_results.pop_front() {
-                Some(r) => r,
-                None => Self::default_upload(),
+            match publication {
+                DumpPublish::TrackAudio {
+                    file_path,
+                    title,
+                    performer,
+                    ..
+                } => {
+                    let gate = state.lock().unwrap().gate_uploads.clone();
+                    if let Some(gate) = gate {
+                        gate.cancelled().await;
+                    }
+                    let mut st = state.lock().unwrap();
+                    st.sent_audio.push((file_path, title, performer));
+                    if st.send_audio_panics {
+                        drop(st);
+                        panic!("track sink panic");
+                    }
+                    match st.send_audio_results.pop_front() {
+                        Some(result) => result,
+                        None => FakeDeps::upload_ok(),
+                    }
+                }
+                DumpPublish::ZipDocument {
+                    file_path,
+                    thumb_path,
+                    caption_html,
+                    on_upload_progress,
+                } => {
+                    let bytes = std::fs::read(&file_path).unwrap_or_default();
+                    if let Some(callback) = on_upload_progress {
+                        callback(0, bytes.len() as u64);
+                        callback(bytes.len() as u64, bytes.len() as u64);
+                    }
+                    let mut st = state.lock().unwrap();
+                    st.sent_documents.push(file_path);
+                    st.sent_document_captions.push(caption_html);
+                    st.uploaded_document_bytes = bytes;
+                    if let Some(thumb_path) = thumb_path {
+                        st.sent_thumbs.push(thumb_path);
+                    }
+                    st.zip_dump_calls += 1;
+                    let should_panic =
+                        st.zip_dump_panics || st.zip_dump_panic_on_call == Some(st.zip_dump_calls);
+                    drop(st);
+                    if should_panic {
+                        panic!("ZIP sink panic");
+                    }
+                    let mut st = state.lock().unwrap();
+                    match st.zip_dump_results.pop_front() {
+                        Some(result) => result,
+                        None => Ok(DumpPublication {
+                            message: DumpMessageRef::new(900),
+                            file_id: "zip_file".into(),
+                            file_unique_id: "zip_uniq".into(),
+                        }),
+                    }
+                }
             }
         })
     }
 
-    fn send_dump_copy<'a>(
+    fn deliver_to_chat<'a>(
         &'a self,
-        to_chat_id: i64,
-        message_id: i64,
-        reply_to: Option<i64>,
-        silent: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<i32, SinkError>> + Send + 'a>> {
+        delivery: ChatDelivery,
+    ) -> engine::orchestrator::deps::BoxFuture<'a, Result<DeliveryReceipt, DeliveryError>> {
         let state = Arc::clone(&self.state);
         let copy_notify = Arc::clone(&self.copy_notify);
         Box::pin(async move {
-            let cached_gate = {
-                let st = state.lock().unwrap();
-                if message_id == 4242 {
-                    st.cache_copy_gate
-                        .clone()
-                        .or_else(|| st.gate_uploads.clone())
-                } else {
-                    None
+            match delivery {
+                ChatDelivery::DumpCopy {
+                    destination,
+                    source,
+                    reply_to,
+                    silent,
+                } => {
+                    let message_id = source.id();
+                    let cached_gate = {
+                        let st = state.lock().unwrap();
+                        if message_id == 4242 {
+                            st.cache_copy_gate
+                                .clone()
+                                .or_else(|| st.gate_uploads.clone())
+                        } else {
+                            None
+                        }
+                    };
+                    if message_id == 4242 {
+                        state.lock().unwrap().cached_copy_started = true;
+                        copy_notify.notify_waiters();
+                    }
+                    if let Some(gate) = cached_gate {
+                        gate.cancelled().await;
+                    }
+                    let mut st = state.lock().unwrap();
+                    st.copies.push((
+                        destination.id(),
+                        message_id,
+                        reply_to.map(ChatMessageRef::id),
+                        silent,
+                    ));
+                    drop(st);
+                    copy_notify.notify_waiters();
+                    let mut st = state.lock().unwrap();
+                    if st.copies_fail_ids.contains(&message_id) {
+                        st.copies_fail_ids.retain(|id| *id != message_id);
+                        return Err(DeliveryError::Unavailable("copy failed".into()));
+                    }
+                    Ok(DeliveryReceipt::Message(ChatMessageRef::new(message_id)))
                 }
-            };
-            if message_id == 4242 {
-                state.lock().unwrap().cached_copy_started = true;
-                copy_notify.notify_waiters();
+                ChatDelivery::ZipDocument {
+                    destination,
+                    file_path,
+                    caption_html,
+                    on_upload_progress,
+                    ..
+                } => {
+                    let bytes = std::fs::read(&file_path).unwrap_or_default();
+                    if let Some(callback) = on_upload_progress {
+                        callback(0, bytes.len() as u64);
+                        callback(bytes.len() as u64, bytes.len() as u64);
+                    }
+                    let mut st = state.lock().unwrap();
+                    st.sent_documents.push(file_path);
+                    st.sent_document_captions.push(caption_html);
+                    st.uploaded_document_bytes = bytes;
+                    let result = st
+                        .zip_chat_results
+                        .pop_front()
+                        .unwrap_or_else(|| Ok(DeliveryReceipt::Message(ChatMessageRef::new(200))));
+                    let _ = destination;
+                    result
+                }
+                ChatDelivery::Photo {
+                    destination,
+                    image_bytes,
+                    caption_html,
+                } => {
+                    state.lock().unwrap().sent_photos.push((
+                        destination.id(),
+                        image_bytes.len(),
+                        caption_html,
+                    ));
+                    Ok(DeliveryReceipt::PreviewDelivered)
+                }
             }
-            if let Some(gate) = cached_gate {
-                gate.cancelled().await;
-            }
-            let mut st = state.lock().unwrap();
-            st.copies.push((to_chat_id, message_id, reply_to, silent));
-            drop(st);
-            copy_notify.notify_waiters();
-            let mut st = state.lock().unwrap();
-            if st.copies_fail_ids.contains(&message_id) {
-                st.copies_fail_ids.retain(|id| *id != message_id);
-                return Err(SinkError("copy failed".into()));
-            }
-            Ok(message_id as i32)
         })
     }
 
-    fn delete_dump_messages<'a>(
+    fn materialize_cached<'a>(
         &'a self,
-        message_ids: &'a [i64],
-    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        source: DumpMessageRef,
+        destination: &'a std::path::Path,
+        progress: Option<&'a UploadProgressCallback>,
+    ) -> engine::orchestrator::deps::BoxFuture<'a, Result<(), DeliveryError>> {
+        let state = Arc::clone(&self.state);
+        let should_fail = state
+            .lock()
+            .unwrap()
+            .download_fail_ids
+            .contains(&source.id());
+        Box::pin(async move {
+            if should_fail {
+                return Err(DeliveryError::Unavailable("download failed".into()));
+            }
+            let bytes = b"cached-audio-bytes";
+            std::fs::write(destination, bytes)
+                .map_err(|error| DeliveryError::LocalIo(error.to_string()))?;
+            if let Some(callback) = progress {
+                callback(bytes.len() as u64, bytes.len() as u64);
+            }
+            Ok(())
+        })
+    }
+
+    fn retract_dump<'a>(
+        &'a self,
+        messages: &'a [DumpMessageRef],
+    ) -> engine::orchestrator::deps::BoxFuture<'a, Result<(), DeliveryError>> {
         let state = Arc::clone(&self.state);
         Box::pin(async move {
             state
                 .lock()
                 .unwrap()
                 .deleted_message_batches
-                .push(message_ids.to_vec());
+                .push(messages.iter().map(|message| message.id()).collect());
             Ok(())
         })
-    }
-
-    fn send_document_to_dump<'a>(
-        &'a self,
-        file_path: &'a str,
-        thumb_path: Option<&'a str>,
-        caption_html: &'a str,
-        on_upload_progress: Option<&'a UploadProgressCallback>,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<DumpUpload>, SinkError>> + Send + 'a>> {
-        let _ = caption_html;
-        let state = Arc::clone(&self.state);
-        let path = file_path.to_owned();
-        let thumb = thumb_path.map(str::to_owned);
-        Box::pin(async move {
-            // Read the bytes now: the orchestrator deletes the workspace
-            // right after the upload returns.
-            let bytes = std::fs::read(&path).unwrap_or_default();
-            if let Some(callback) = on_upload_progress {
-                callback(0, bytes.len() as u64);
-                callback(bytes.len() as u64, bytes.len() as u64);
-            }
-            let mut st = state.lock().unwrap();
-            st.sent_documents.push(path);
-            st.sent_document_captions.push(caption_html.to_string());
-            st.uploaded_document_bytes = bytes;
-            st.sent_thumbs.extend(thumb);
-            st.zip_dump_calls += 1;
-            let should_panic =
-                st.zip_dump_panics || st.zip_dump_panic_on_call == Some(st.zip_dump_calls);
-            drop(st);
-            if should_panic {
-                panic!("ZIP sink panic");
-            }
-            let mut st = state.lock().unwrap();
-            match st.zip_dump_results.pop_front() {
-                Some(result) => result,
-                None => Ok(Some(DumpUpload {
-                    message_id: 900,
-                    file_id: "zip_file".into(),
-                    file_unique_id: "zip_uniq".into(),
-                })),
-            }
-        })
-    }
-
-    fn send_document_to_chat<'a>(
-        &'a self,
-        chat_id: i64,
-        file_path: &'a str,
-        thumb_path: Option<&'a str>,
-        caption_html: &'a str,
-        on_upload_progress: Option<&'a UploadProgressCallback>,
-    ) -> Pin<Box<dyn Future<Output = Result<i32, SinkError>> + Send + 'a>> {
-        let _ = (chat_id, caption_html);
-        let state = Arc::clone(&self.state);
-        let path = file_path.to_owned();
-        let thumb = thumb_path.map(str::to_owned);
-        Box::pin(async move {
-            let bytes = std::fs::read(&path).unwrap_or_default();
-            if let Some(callback) = on_upload_progress {
-                callback(0, bytes.len() as u64);
-                callback(bytes.len() as u64, bytes.len() as u64);
-            }
-            let mut st = state.lock().unwrap();
-            st.sent_documents.push(path);
-            st.sent_document_captions.push(caption_html.to_string());
-            st.uploaded_document_bytes = bytes;
-            st.sent_thumbs.extend(thumb);
-            st.zip_chat_results.pop_front().unwrap_or(Ok(200))
-        })
-    }
-
-    fn send_photo_to_chat<'a>(
-        &'a self,
-        chat_id: i64,
-        image_bytes: &'a [u8],
-        caption_html: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        let state = Arc::clone(&self.state);
-        Box::pin(async move {
-            state.lock().unwrap().sent_photos.push((
-                chat_id,
-                image_bytes.len(),
-                caption_html.to_string(),
-            ));
-            Ok(())
-        })
-    }
-
-    fn download_dump_file<'a>(
-        &'a self,
-        message_id: i64,
-        destination: &'a std::path::Path,
-        on_download_progress: Option<&'a UploadProgressCallback>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        let state = Arc::clone(&self.state);
-        let should_fail = state
-            .lock()
-            .unwrap()
-            .download_fail_ids
-            .contains(&message_id);
-        Box::pin(async move {
-            if should_fail {
-                return Err(SinkError("download failed".into()));
-            }
-            // Materialize a deterministic fake audio file so ZIP staging has
-            // real bytes to archive.
-            let bytes = b"cached-audio-bytes";
-            std::fs::write(destination, bytes).map_err(|error| SinkError(error.to_string()))?;
-            if let Some(callback) = on_download_progress {
-                callback(bytes.len() as u64, bytes.len() as u64);
-            }
-            Ok(())
-        })
-    }
-}
-
-impl FakeSink {
-    fn default_upload() -> Result<Option<DumpUpload>, SinkError> {
-        FakeDeps::upload_ok()
     }
 }
 
@@ -683,77 +669,136 @@ impl ProviderComposition for FakeDeps {
     }
 }
 
-impl OrchestratorDeps for FakeDeps {
+impl ProviderAccess for FakeDeps {
     type Providers = Self;
 
     fn providers(&self) -> &Self::Providers {
         self
     }
+}
 
-    fn get_settings(&self) -> impl Future<Output = BotSettings> + Send {
-        let settings = self.settings.lock().unwrap().clone();
-        async move { settings }
-    }
-
-    fn find_cached_tracks(
-        &self,
-        keys: &[TrackKey],
-    ) -> impl Future<Output = Result<HashMap<TrackKey, CachedTrack>, String>> + Send {
+impl TrackCache for FakeDeps {
+    fn find_cached_tracks<'a>(
+        &'a self,
+        keys: &'a [TrackKey],
+    ) -> engine::orchestrator::deps::BoxFuture<
+        'a,
+        Result<HashMap<TrackKey, CachedTrack>, TrackCacheError>,
+    > {
         let cache: HashMap<TrackKey, CachedTrack> = self
             .cache
             .lock()
             .unwrap()
             .iter()
             .filter(|(key, _)| keys.contains(key))
-            .map(|(id, t)| (id.clone(), t.clone()))
+            .map(|(id, track)| (id.clone(), track.clone()))
             .collect();
         let delay_ms = *self.cache_delay_ms.lock().unwrap();
-        async move {
+        let unavailable = {
+            let mut state = self.state.lock().unwrap();
+            if state.cache_unavailable_attempts > 0 {
+                state.cache_unavailable_attempts -= 1;
+                true
+            } else {
+                false
+            }
+        };
+        Box::pin(async move {
             if delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
-            Ok(cache)
-        }
-    }
-
-    fn save_track(&self, input: SaveTrackInput) -> impl Future<Output = Result<(), String>> + Send {
-        let err = self.state.lock().unwrap().save_track_error.clone();
-        self.state.lock().unwrap().saved_tracks.push(input);
-        async move {
-            if let Some(err) = err {
-                Err(err)
+            if unavailable {
+                Err(TrackCacheError::unavailable(
+                    TrackCacheOperation::Find,
+                    "cache unavailable",
+                ))
             } else {
-                Ok(())
+                Ok(cache)
             }
-        }
+        })
     }
 
-    fn delete_track(
-        &self,
-        track_key: &TrackKey,
-    ) -> impl Future<Output = Result<bool, String>> + Send {
+    fn save_track<'a>(
+        &'a self,
+        input: SaveTrackInput,
+    ) -> engine::orchestrator::deps::BoxFuture<'a, Result<(), TrackCacheError>> {
+        let (error, unavailable) = {
+            let mut state = self.state.lock().unwrap();
+            let unavailable = if state.save_track_unavailable_attempts > 0 {
+                state.save_track_unavailable_attempts -= 1;
+                true
+            } else {
+                false
+            };
+            (state.save_track_error.clone(), unavailable)
+        };
+        self.state.lock().unwrap().saved_tracks.push(input);
+        Box::pin(async move {
+            if unavailable {
+                Err(TrackCacheError::unavailable(
+                    TrackCacheOperation::Save,
+                    "cache unavailable",
+                ))
+            } else {
+                error.map_or(Ok(()), |detail| {
+                    Err(TrackCacheError::failed(TrackCacheOperation::Save, detail))
+                })
+            }
+        })
+    }
+
+    fn delete_track<'a>(
+        &'a self,
+        track_key: &'a TrackKey,
+    ) -> engine::orchestrator::deps::BoxFuture<'a, Result<bool, TrackCacheError>> {
         self.state
             .lock()
             .unwrap()
             .deleted_tracks
             .push(track_key.track_id.clone());
         self.cache.lock().unwrap().remove(track_key);
-        async move { Ok(true) }
+        Box::pin(async { Ok(true) })
+    }
+}
+
+impl JobBookkeeping for FakeDeps {
+    fn settings_snapshot(&self) -> BotSettings {
+        self.settings.lock().unwrap().clone()
     }
 
-    fn log_request(&self, log: RequestLog) -> impl Future<Output = Result<(), String>> + Send {
-        self.state.lock().unwrap().request_logs.push(log);
-        async move { Ok(()) }
+    fn log_request<'a>(
+        &'a self,
+        log: RequestLog,
+    ) -> engine::orchestrator::deps::BoxFuture<'a, Result<(), JobBookkeepingError>> {
+        let error = {
+            let mut state = self.state.lock().unwrap();
+            state.request_logs.push(log);
+            state.request_log_error.clone()
+        };
+        Box::pin(async move {
+            error.map_or(Ok(()), |detail| {
+                Err(JobBookkeepingError::failed(
+                    JobBookkeepingOperation::LogRequest,
+                    detail,
+                ))
+            })
+        })
     }
+}
 
+impl AlbumCache for FakeDeps {
     fn save_album<'a>(
         &'a self,
         upload: AlbumUpload,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+    ) -> engine::orchestrator::deps::BoxFuture<'a, Result<(), AlbumCacheError>> {
         let mut state = self.state.lock().unwrap();
         state.saved_albums.push(upload);
-        let result = state.save_album_error.clone();
-        Box::pin(async move { result.map_or(Ok(()), Err) })
+        let error = state.save_album_error.clone();
+        Box::pin(async move {
+            error.map_or(Ok(()), |detail| {
+                Err(AlbumCacheError::failed(AlbumCacheOperation::Save, detail))
+            })
+        })
     }
 
     fn replace_albums<'a>(
@@ -763,11 +808,20 @@ impl OrchestratorDeps for FakeDeps {
         codec: engine::Codec,
         expected: AlbumReplacementExpectation,
         uploads: Vec<AlbumUpload>,
-    ) -> Pin<Box<dyn Future<Output = Result<AlbumReplacementResult, String>> + Send + 'a>> {
+    ) -> engine::orchestrator::deps::BoxFuture<'a, Result<AlbumReplacementResult, AlbumCacheError>>
+    {
         let mut state = self.state.lock().unwrap();
-        let result = state.save_album_error.clone();
-        let replacement = if result.is_some() {
-            Err(result.clone().expect("replacement error present"))
+        let error = state.save_album_error.clone();
+        let replacement = if state.replace_conflict {
+            Err(AlbumCacheError::conflict(
+                AlbumCacheOperation::Replace,
+                "replacement conflict",
+            ))
+        } else if let Some(detail) = error {
+            Err(AlbumCacheError::failed(
+                AlbumCacheOperation::Replace,
+                detail,
+            ))
         } else {
             let rows = state.found_albums.entry(album_id.to_owned()).or_default();
             let matches_expected = match &expected {
@@ -826,7 +880,7 @@ impl OrchestratorDeps for FakeDeps {
         provider: engine::types::Provider,
         album_id: &'a str,
         codec: Option<engine::Codec>,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<CachedAlbum>, String>> + Send + 'a>> {
+    ) -> engine::orchestrator::deps::BoxFuture<'a, Result<Vec<CachedAlbum>, AlbumCacheError>> {
         let _ = provider;
         let rows = self
             .state
@@ -848,26 +902,46 @@ impl OrchestratorDeps for FakeDeps {
         provider: engine::types::Provider,
         album_id: &'a str,
         codec: Option<engine::Codec>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+    ) -> engine::orchestrator::deps::BoxFuture<'a, Result<(), AlbumCacheError>> {
         let _ = (provider, codec);
         self.state
             .lock()
             .unwrap()
             .deleted_album_zip_ids
-            .push(album_id.to_string());
+            .push(album_id.to_owned());
         Box::pin(async { Ok(()) })
     }
+}
 
-    fn sink(&self) -> &dyn TelegramSink {
-        &self.sink
+impl Delivery for FakeDeps {
+    fn publish_to_dump<'a>(
+        &'a self,
+        publication: DumpPublish,
+    ) -> engine::orchestrator::deps::BoxFuture<'a, Result<DumpPublication, DeliveryError>> {
+        self.sink.publish_to_dump(publication)
     }
 
-    fn upload_retry_base_ms(&self) -> u64 {
-        self.upload_retry_base_ms
+    fn deliver_to_chat<'a>(
+        &'a self,
+        delivery: ChatDelivery,
+    ) -> engine::orchestrator::deps::BoxFuture<'a, Result<DeliveryReceipt, DeliveryError>> {
+        self.sink.deliver_to_chat(delivery)
     }
 
-    fn upload_max_retries(&self) -> u32 {
-        *self.upload_max_retries.lock().unwrap()
+    fn materialize_cached<'a>(
+        &'a self,
+        source: DumpMessageRef,
+        destination: &'a std::path::Path,
+        progress: Option<&'a UploadProgressCallback>,
+    ) -> engine::orchestrator::deps::BoxFuture<'a, Result<(), DeliveryError>> {
+        self.sink.materialize_cached(source, destination, progress)
+    }
+
+    fn retract_dump<'a>(
+        &'a self,
+        messages: &'a [DumpMessageRef],
+    ) -> engine::orchestrator::deps::BoxFuture<'a, Result<(), DeliveryError>> {
+        self.sink.retract_dump(messages)
     }
 }
 
@@ -964,16 +1038,31 @@ fn playlist_item(id: &str) -> ParsedTargetItem {
     }
 }
 
-fn setup() -> (
+fn setup_with_upload_retries(
+    upload_max_retries: u32,
+) -> (
     RipOrchestrator,
     Arc<FakeDeps>,
     Arc<Mutex<DepsState>>,
     EventLog,
 ) {
     let (deps, state) = FakeDeps::new();
-    let orch = RipOrchestrator::new();
+    let orch = RipOrchestrator::new(OrchestratorConfig {
+        storage_retry: StorageRetryPolicy::test(),
+        upload_retry_base_ms: 0,
+        upload_max_retries,
+    });
     let events = EventLog::attach(&orch);
     (orch, deps, state, events)
+}
+
+fn setup() -> (
+    RipOrchestrator,
+    Arc<FakeDeps>,
+    Arc<Mutex<DepsState>>,
+    EventLog,
+) {
+    setup_with_upload_retries(3)
 }
 
 async fn run_async(
@@ -1204,6 +1293,54 @@ async fn all_cached_uses_ordered_pipeline_once() {
         ev.contains(&"started".to_string()),
         "cache hits use the ordered pipeline"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cache_lookup_unavailability_retries_before_serving_hit() {
+    let (orch, deps, state, _) = setup();
+    deps.cache_track("cache-retry", 4242);
+    state.lock().unwrap().cache_unavailable_attempts = 2;
+
+    let summary = run_async(
+        &orch,
+        &deps,
+        &options(vec![track_item("cache-retry")], false),
+    )
+    .await
+    .expect("cache lookup retries then succeeds");
+
+    assert_eq!(summary.cached_count, 1);
+    let st = state.lock().unwrap();
+    assert!(
+        st.rip_calls.is_empty(),
+        "a recovered cache lookup avoids ripping"
+    );
+    assert_eq!(st.copies, vec![(100, 4242, Some(555), false)]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cache_lookup_failure_stops_before_media_work() {
+    let (orch, deps, state, events) = setup();
+    state.lock().unwrap().cache_unavailable_attempts = 3;
+
+    let error = run_async(&orch, &deps, &options(vec![track_item("cache-down")], true))
+        .await
+        .expect_err("cache failure must refuse to start media work");
+
+    assert_eq!(
+        error.to_string(),
+        "find track unavailable: cache unavailable"
+    );
+    let st = state.lock().unwrap();
+    assert!(st.rip_calls.is_empty());
+    assert!(st.sent_audio.is_empty());
+    assert!(st.copies.is_empty());
+    assert!(st.request_logs.is_empty());
+    drop(st);
+    assert!(events
+        .snapshot()
+        .iter()
+        .any(|event| event == "failed:find track unavailable: cache unavailable"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1618,7 +1755,7 @@ async fn upload_retry_then_success() {
         let mut st = state.lock().unwrap();
         st.clear_sink_results();
         st.send_audio_results
-            .push_back(Err(SinkError("flood".into())));
+            .push_back(Err(DeliveryError::Transient("flood".into())));
         st.send_audio_results.push_back(FakeDeps::upload_ok());
     }
 
@@ -1634,16 +1771,49 @@ async fn upload_retry_then_success() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn configured_upload_retry_count_controls_calls() {
-    let (orch, deps, state, _) = setup();
-    *deps.upload_max_retries.lock().unwrap() = 1;
+async fn unavailable_delivery_is_not_retried() {
+    let (orch, deps, state, _) = setup_with_upload_retries(3);
     {
         let mut st = state.lock().unwrap();
         st.clear_sink_results();
         st.send_audio_results
-            .push_back(Err(SinkError("flood".into())));
+            .push_back(Err(DeliveryError::Unavailable("dump offline".into())));
+        st.send_audio_results.push_back(FakeDeps::upload_ok());
+    }
+
+    let summary = run_async(
+        &orch,
+        &deps,
+        &options(vec![track_item("delivery-down")], true),
+    )
+    .await
+    .expect("non-transient delivery failure is recorded");
+
+    assert_eq!(summary.failed_tracks.len(), 1);
+    assert_eq!(
+        summary.failed_tracks[0].error,
+        "delivery unavailable: dump offline"
+    );
+    let st = state.lock().unwrap();
+    assert_eq!(
+        st.sent_audio.len(),
+        1,
+        "unavailable delivery is not retried"
+    );
+    assert!(st.saved_tracks.is_empty());
+    assert!(st.copies.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configured_upload_retry_count_controls_calls() {
+    let (orch, deps, state, _) = setup_with_upload_retries(1);
+    {
+        let mut st = state.lock().unwrap();
+        st.clear_sink_results();
         st.send_audio_results
-            .push_back(Err(SinkError("flood".into())));
+            .push_back(Err(DeliveryError::Transient("flood".into())));
+        st.send_audio_results
+            .push_back(Err(DeliveryError::Transient("flood".into())));
     }
 
     let summary = run_async(&orch, &deps, &options(vec![track_item("t1")], true))
@@ -1655,13 +1825,12 @@ async fn configured_upload_retry_count_controls_calls() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exhausted_upload_continues_next_track() {
-    let (orch, deps, state, _) = setup();
-    *deps.upload_max_retries.lock().unwrap() = 0;
+    let (orch, deps, state, _) = setup_with_upload_retries(0);
     {
         let mut st = state.lock().unwrap();
         st.clear_sink_results();
         st.send_audio_results
-            .push_back(Err(SinkError("first failed".into())));
+            .push_back(Err(DeliveryError::Unavailable("first failed".into())));
         st.send_audio_results.push_back(FakeDeps::upload_ok());
     }
 
@@ -1685,7 +1854,7 @@ async fn upload_retries_exhausted_records_failure() {
         st.clear_sink_results();
         for _ in 0..4 {
             st.send_audio_results
-                .push_back(Err(SinkError("flood".into())));
+                .push_back(Err(DeliveryError::Transient("flood".into())));
         }
     }
 
@@ -1696,7 +1865,10 @@ async fn upload_retries_exhausted_records_failure() {
     assert_eq!(summary.ripped_count, 0);
     assert_eq!(summary.failed_tracks.len(), 1);
     assert_eq!(summary.failed_tracks[0].id, "t1");
-    assert_eq!(summary.failed_tracks[0].error, "flood");
+    assert_eq!(
+        summary.failed_tracks[0].error,
+        "transient delivery failure: flood"
+    );
     let st = state.lock().unwrap();
     assert_eq!(st.sent_audio.len(), 4, "max_retries=4 attempts");
     // No request log is written for an upload-exhausted track.
@@ -1755,7 +1927,8 @@ async fn non_audio_media_records_no_log() {
     {
         let mut st = state.lock().unwrap();
         st.clear_sink_results();
-        st.send_audio_results.push_back(Ok(None)); // not audio
+        st.send_audio_results
+            .push_back(Err(DeliveryError::UnexpectedMedia)); // not audio
     }
 
     let summary = run_async(&orch, &deps, &options(vec![track_item("t1")], true))
@@ -1765,7 +1938,7 @@ async fn non_audio_media_records_no_log() {
     assert_eq!(summary.failed_tracks.len(), 1);
     assert_eq!(
         summary.failed_tracks[0].error,
-        "Upload failed: no audio media returned"
+        "delivery returned unexpected media"
     );
     let st = state.lock().unwrap();
     assert!(st.request_logs.is_empty(), "no request log for non-audio");
@@ -1784,14 +1957,70 @@ async fn post_upload_save_failure_records_and_logs() {
     assert_eq!(summary.ripped_count, 0);
     assert_eq!(summary.failed_tracks.len(), 1);
     assert_eq!(summary.failed_tracks[0].id, "t1");
-    assert_eq!(summary.failed_tracks[0].error, "db down");
+    assert_eq!(
+        summary.failed_tracks[0].error,
+        "track cache persistence failed: save track failed: db down"
+    );
     let st = state.lock().unwrap();
     // The post-upload catch logs a failed request (save → copy → log share
     // the try/catch: the copy never happens because save failed first).
     assert_eq!(st.request_logs.len(), 1);
     assert_eq!(st.request_logs[0].status, "failed");
-    assert_eq!(st.request_logs[0].error_reason.as_deref(), Some("db down"));
+    assert_eq!(
+        st.request_logs[0].error_reason.as_deref(),
+        Some("track cache persistence failed: save track failed: db down")
+    );
     assert!(st.copies.is_empty(), "copy skipped after save failure");
+    assert_eq!(
+        st.deleted_message_batches,
+        vec![vec![777]],
+        "a failed cache write retracts only the new dump publication"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unavailable_cache_write_retries_before_non_transient_failure() {
+    let (orch, deps, state, _) = setup();
+    {
+        let mut st = state.lock().unwrap();
+        st.save_track_unavailable_attempts = 2;
+        st.save_track_error = Some("db row rejected".into());
+    }
+
+    let summary = run_async(&orch, &deps, &options(vec![track_item("save-retry")], true))
+        .await
+        .expect("cache-write failure is recorded without failing the job");
+
+    assert_eq!(summary.failed_tracks.len(), 1);
+    assert_eq!(
+        summary.failed_tracks[0].error,
+        "track cache persistence failed: save track failed: db row rejected"
+    );
+    let st = state.lock().unwrap();
+    assert_eq!(
+        st.saved_tracks.len(),
+        3,
+        "two unavailable attempts plus one final failure"
+    );
+    assert_eq!(st.deleted_message_batches, vec![vec![777]]);
+    assert!(st.copies.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_log_failure_is_best_effort() {
+    let (orch, deps, state, _) = setup();
+    state.lock().unwrap().request_log_error = Some("audit store unavailable".into());
+
+    let summary = run_async(&orch, &deps, &options(vec![track_item("log-down")], true))
+        .await
+        .expect("request-log failure must not fail a delivered track");
+
+    assert_eq!(summary.ripped_count, 1);
+    assert!(summary.failed_tracks.is_empty());
+    let st = state.lock().unwrap();
+    assert_eq!(st.copies, vec![(100, 777, Some(555), false)]);
+    assert_eq!(st.request_logs.len(), 1);
+    assert_eq!(st.request_logs[0].status, "completed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1846,11 +2075,11 @@ async fn failed_first_cache_slot_preserves_order_while_other_job_uploads() {
         st.cache_copy_gate = Some(cache_copy_gate.clone());
         st.clear_sink_results();
         for message_id in [880, 881, 882] {
-            st.send_audio_results.push_back(Ok(Some(DumpUpload {
-                message_id,
+            st.send_audio_results.push_back(Ok(DumpPublication {
+                message: DumpMessageRef::new(message_id),
                 file_id: format!("file-{message_id}"),
                 file_unique_id: format!("unique-{message_id}"),
-            })));
+            }));
         }
     }
 
@@ -2086,11 +2315,11 @@ async fn early_cached_rerip_drains_seventeen_later_items_in_order() {
         st.fallback_rip_track = Some(cached_id.to_owned());
         st.fallback_rip_gate = Some(fallback_gate.clone());
         for message_id in 1000..1018 {
-            st.send_audio_results.push_back(Ok(Some(DumpUpload {
-                message_id,
+            st.send_audio_results.push_back(Ok(DumpPublication {
+                message: DumpMessageRef::new(message_id),
                 file_id: format!("file-{message_id}"),
                 file_unique_id: format!("unique-{message_id}"),
-            })));
+            }));
         }
     }
 
@@ -2284,7 +2513,7 @@ async fn queue_position_field_defaults_none() {
 async fn queued_position_and_pending_cancel_are_terminally_safe() {
     let (deps, _) = FakeDeps::new();
     *deps.rip_delay_ms.lock().unwrap() = 100;
-    let orch = Arc::new(RipOrchestrator::new());
+    let orch = Arc::new(RipOrchestrator::new(OrchestratorConfig::test()));
     let terminal_events = Arc::new(Mutex::new(Vec::<(String, &'static str)>::new()));
     let phase_snapshots = Arc::new(Mutex::new(Vec::<(JobPhase, Option<u64>)>::new()));
     let terminals = Arc::clone(&terminal_events);
@@ -2565,7 +2794,7 @@ async fn primary_zip_upload_failure_fails_after_marker_cleanup() {
         st.send_audio_results.push_back(FakeDeps::upload_ok());
         st.send_audio_results.push_back(FakeDeps::upload_ok());
         st.zip_dump_results
-            .push_back(Err(SinkError("ZIP service down".into())));
+            .push_back(Err(DeliveryError::Unavailable("ZIP service down".into())));
     }
 
     let error = run_async(
@@ -2577,7 +2806,7 @@ async fn primary_zip_upload_failure_fails_after_marker_cleanup() {
     .expect_err("a required primary ZIP upload must fail the job");
     assert_eq!(
         error.to_string(),
-        "primary ZIP upload failed: ZIP service down"
+        "primary ZIP upload failed: delivery unavailable: ZIP service down"
     );
     let st = state.lock().unwrap();
     let uploaded_path = st
@@ -2595,9 +2824,9 @@ async fn primary_zip_upload_failure_fails_after_marker_cleanup() {
             .count(),
         1
     );
-    assert!(records
-        .iter()
-        .any(|event| event == "failed:primary ZIP upload failed: ZIP service down"));
+    assert!(records.iter().any(|event| {
+        event == "failed:primary ZIP upload failed: delivery unavailable: ZIP service down"
+    }));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2676,12 +2905,12 @@ async fn primary_zip_delivery_failure_is_not_reported_completed() {
     .expect_err("a required primary ZIP copy must fail the job");
     assert_eq!(
         error.to_string(),
-        "primary ZIP delivery failed: copy failed"
+        "primary ZIP delivery failed: delivery unavailable: copy failed"
     );
     let records = events.snapshot();
-    assert!(records
-        .iter()
-        .any(|event| event == "failed:primary ZIP delivery failed: copy failed"));
+    assert!(records.iter().any(|event| {
+        event == "failed:primary ZIP delivery failed: delivery unavailable: copy failed"
+    }));
     assert!(!records.iter().any(|event| event == "completed"));
     assert_eq!(
         state.lock().unwrap().deleted_message_batches,
@@ -3207,6 +3436,51 @@ async fn zip_reuse_delivers_cached_parts_without_rebuild() {
     assert_eq!(delivery.total_parts, 2);
     assert!(!delivery.is_partial);
     assert_eq!(delivery.size_bytes, 2 * 512);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zip_replacement_conflict_retracts_loser_and_reuses_winner() {
+    let (orch, deps, state, _) = setup();
+    let album_id = "alb.zip.conflict";
+    let meta = |id: &str| FakeDeps::track_meta(id, "Track", "Artist");
+    deps.albums.lock().unwrap().insert(
+        album_id.into(),
+        FakeDeps::album(vec![meta("conflict-1"), meta("conflict-2")]),
+    );
+    for id in ["conflict-1", "conflict-2"] {
+        deps.rip_scripts
+            .lock()
+            .unwrap()
+            .insert(id.into(), RipScript::OkWithFile(vec![1, 2, 3]));
+    }
+    let mut winner = cached_zip_row(album_id, 1, 1, "committed-winner");
+    winner.message_id = 7001;
+    {
+        let mut st = state.lock().unwrap();
+        st.replace_conflict = true;
+        st.found_albums.insert(album_id.into(), vec![winner]);
+    }
+
+    let summary = run_async(&orch, &deps, &album_options(album_id, false, true))
+        .await
+        .expect("a cache replacement conflict reuses the committed winner");
+
+    assert_eq!(summary.failed_count, 0);
+    let st = state.lock().unwrap();
+    assert!(
+        st.saved_albums.is_empty(),
+        "the losing generation is not cached"
+    );
+    assert_eq!(
+        st.deleted_message_batches,
+        vec![vec![900]],
+        "only the losing publication is retracted"
+    );
+    assert_eq!(
+        st.copies.last().map(|copy| copy.1),
+        Some(7001),
+        "the committed winner is delivered after the conflict"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

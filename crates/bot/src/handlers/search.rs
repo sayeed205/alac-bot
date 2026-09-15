@@ -4,7 +4,10 @@
 use std::sync::Arc;
 
 use engine::{
-    orchestrator::deps::OrchestratorDeps,
+    orchestrator::deps::{
+        ChatDelivery, ChatRef, Delivery, DeliveryReceipt, DumpMessageRef, JobBookkeeping,
+        TrackCache,
+    },
     types::{ParsedTargetItem, Provider, TargetKind, TrackKey, TrackMeta},
 };
 use ferogram::{
@@ -294,15 +297,21 @@ async fn deliver_cached(state: Arc<BotState>, query: CallbackQuery, track_id: St
             .await;
         return;
     };
-    if let Err(error) = state
+    let delivery = state
         .rip_deps
-        .sink()
-        // Search results can be selected from a group. Deliver cached audio
-        // to the requester’s private chat, never back into the group.
-        .send_dump_copy(query.user_id, cached.message_id, None, false)
-        .await
-    {
-        tracing::warn!(track_id, %error, "failed to deliver cached track");
+        .deliver_to_chat(ChatDelivery::DumpCopy {
+            destination: ChatRef::new(query.user_id),
+            source: DumpMessageRef::new(cached.message_id),
+            reply_to: None,
+            silent: false,
+        })
+        .await;
+    if !matches!(delivery, Ok(DeliveryReceipt::Message(_))) {
+        if let Err(error) = delivery {
+            tracing::warn!(track_id, %error, "failed to deliver cached track");
+        } else {
+            tracing::warn!(track_id, "cached track delivery returned unexpected media");
+        }
         let _ = query
             .answer()
             .alert("Failed to retrieve audio from dump channel.")
@@ -374,10 +383,12 @@ async fn get(state: Arc<BotState>, query: CallbackQuery, track_id: String) {
             .await;
         let _ = state
             .rip_deps
-            .sink()
-            // Cached selections from a group follow the same DM delivery
-            // rule as live rips.
-            .send_dump_copy(query.user_id, cached.message_id, None, false)
+            .deliver_to_chat(ChatDelivery::DumpCopy {
+                destination: ChatRef::new(query.user_id),
+                source: DumpMessageRef::new(cached.message_id),
+                reply_to: None,
+                silent: false,
+            })
             .await;
         delete_query_message(&state, &query).await;
         return;

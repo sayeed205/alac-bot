@@ -1,25 +1,70 @@
-//! Production Telegram sink used by the orchestration engine.
+//! Production Telegram delivery adapter used by the orchestration engine.
 
 use std::{path::Path, sync::Arc, time::Duration};
 
 use engine::orchestrator::deps::{
-    BoxFuture, DumpUpload, SinkError, TelegramSink, UploadProgressCallback,
+    BoxFuture, ChatDelivery, ChatMessageRef, Delivery, DeliveryError, DeliveryReceipt,
+    DeliveryRejection, DumpMessageRef, DumpPublication, DumpPublish, UploadProgressCallback,
 };
-use ferogram::{InputMessage, PeerRef, TransferHandle};
+use ferogram::{
+    ErrorKind, InputMessage, InvocationError, InvocationErrorExt, PeerRef, TransferHandle,
+};
 
-/// Ferogram-backed implementation of the engine's Telegram port.
+/// Ferogram-backed implementation of the engine's delivery port.
 pub struct FerogramTelegramSink {
     client: Arc<ferogram::Client>,
     dump_peer: PeerRef,
     dump_peer_native_id: i64,
 }
 
+fn map_invocation(error: InvocationError) -> DeliveryError {
+    let detail = error.to_string();
+    match error.kind() {
+        ErrorKind::FloodWait(_)
+        | ErrorKind::Network
+        | ErrorKind::Migration(_)
+        | ErrorKind::Transfer => DeliveryError::Transient(detail),
+        ErrorKind::Rpc { code, .. } if code >= 500 => DeliveryError::Transient(detail),
+        ErrorKind::Rpc { name, .. } if name == "ENTITY_BOUNDS_INVALID" => {
+            DeliveryError::Rejected(DeliveryRejection::EntityBoundsInvalid)
+        }
+        ErrorKind::Rpc { .. } => DeliveryError::Rejected(DeliveryRejection::Other(detail)),
+        ErrorKind::Auth | ErrorKind::Cancelled | ErrorKind::Other => {
+            DeliveryError::Unavailable(detail)
+        }
+        _ => DeliveryError::Unavailable(detail),
+    }
+}
+
+fn progress_task(
+    handle: &TransferHandle,
+    callback: Option<&UploadProgressCallback>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    callback.map(|callback| {
+        let callback = Arc::clone(callback);
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            loop {
+                let progress = handle.progress();
+                callback(progress.done, progress.total);
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        })
+    })
+}
+
+fn stop_progress(task: Option<tokio::task::JoinHandle<()>>) {
+    if let Some(task) = task {
+        task.abort();
+    }
+}
+
 impl FerogramTelegramSink {
-    pub async fn new(client: Arc<ferogram::Client>, dump_peer: PeerRef) -> Result<Self, SinkError> {
-        let dump_peer = dump_peer
-            .resolve(&client)
-            .await
-            .map_err(|error| SinkError(error.to_string()))?;
+    pub async fn new(
+        client: Arc<ferogram::Client>,
+        dump_peer: PeerRef,
+    ) -> Result<Self, DeliveryError> {
+        let dump_peer = dump_peer.resolve(&client).await.map_err(map_invocation)?;
         let dump_peer_native_id = ferogram::PeerExt::bare_id(&dump_peer);
         Ok(Self {
             client,
@@ -43,380 +88,306 @@ impl FerogramTelegramSink {
     async fn upload_thumbnail(
         &self,
         thumb_path: &str,
-    ) -> Result<ferogram::tl::enums::InputFile, SinkError> {
+    ) -> Result<ferogram::tl::enums::InputFile, DeliveryError> {
         let uploaded = self
             .client
             .upload_file(thumb_path)
             .await
-            .map_err(|error| SinkError(format!("thumbnail upload failed: {error}")))?;
+            .map_err(map_invocation)?;
         let ferogram::tl::enums::InputMedia::UploadedPhoto(photo) = uploaded.as_photo_media()
         else {
-            return Err(SinkError("uploaded thumb did not yield photo media".into()));
+            return Err(DeliveryError::UnexpectedMedia);
         };
         Ok(photo.file)
     }
+
+    async fn upload_zip_media(
+        &self,
+        file_path: &str,
+        thumb_path: Option<&str>,
+        on_upload_progress: Option<&UploadProgressCallback>,
+    ) -> Result<ferogram::tl::enums::InputMedia, DeliveryError> {
+        let handle = TransferHandle::new();
+        let progress = progress_task(&handle, on_upload_progress);
+        let upload_result = self.client.upload_file(file_path).handle(&handle).await;
+        stop_progress(progress);
+        let uploaded = upload_result.map_err(map_invocation)?;
+        let mut media = uploaded.as_document_media();
+        if let Some(thumb_path) = thumb_path {
+            match self.upload_thumbnail(thumb_path).await {
+                Ok(thumb) => {
+                    if let ferogram::tl::enums::InputMedia::UploadedDocument(document) = &mut media
+                    {
+                        document.thumb = Some(thumb);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "ZIP thumbnail upload failed; sending without");
+                }
+            }
+        }
+        Ok(media)
+    }
 }
 
-impl TelegramSink for FerogramTelegramSink {
-    fn send_audio_to_dump<'a>(
+impl Delivery for FerogramTelegramSink {
+    fn publish_to_dump<'a>(
         &'a self,
-        file_path: &'a str,
-        title: &'a str,
-        performer: &'a str,
-        duration: i64,
-        caption_html: &'a str,
-        on_upload_progress: Option<&'a UploadProgressCallback>,
-    ) -> BoxFuture<'a, Result<Option<DumpUpload>, SinkError>> {
+        publication: DumpPublish,
+    ) -> BoxFuture<'a, Result<DumpPublication, DeliveryError>> {
         Box::pin(async move {
-            let handle = TransferHandle::new();
-            let progress_task = on_upload_progress.map(|callback| {
-                let callback = Arc::clone(callback);
-                let handle = handle.clone();
-                tokio::spawn(async move {
-                    loop {
-                        let progress = handle.progress();
-                        callback(progress.done, progress.total);
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                    }
-                })
-            });
-
-            let upload_result = self.client.upload_file(file_path).handle(&handle).await;
-            if let Some(task) = progress_task {
-                task.abort();
-            }
-            let uploaded = upload_result.map_err(|error| SinkError(error.to_string()))?;
-
-            let duration = i32::try_from(duration)
-                .map_err(|error| SinkError(format!("duration out of range: {error}")))?;
-            // UploadedFile intentionally exposes only the automatic media
-            // builder; its InputFile is crate-private.  The returned media is
-            // public, so customize the generated audio attribute in place.
-            let mut media = uploaded.as_auto_media();
-            if let ferogram::tl::enums::InputMedia::UploadedDocument(document) = &mut media {
-                for attribute in &mut document.attributes {
-                    if let ferogram::tl::enums::DocumentAttribute::Audio(audio) = attribute {
-                        audio.voice = false;
-                        audio.duration = duration;
-                        audio.title = Some(title.to_owned());
-                        audio.performer = Some(performer.to_owned());
-                    }
-                }
-            }
-            let message = self
-                .client
-                .send_message(
-                    self.dump_peer.clone(),
-                    InputMessage::html(caption_html)
-                        .silent(true)
-                        .copy_media(media),
-                )
-                .await
-                .map_err(|error| SinkError(error.to_string()))?;
-
-            tracing::info!(
-                message_id = message.id(),
-                dump_peer_id = self.dump_peer_native_id,
-                "Audio uploaded to dump channel"
-            );
-
-            let actual_peer = message.peer_id().map(ferogram::PeerExt::bare_id);
-            if actual_peer != Some(self.dump_peer_native_id) {
-                return Err(SinkError(format!(
-                    "dump upload landed in unexpected peer (expected {}, got {:?})",
-                    self.dump_peer_native_id, actual_peer
-                )));
-            }
-
-            let Some(document) = message.document() else {
-                tracing::warn!(
-                    message_id = message.id(),
-                    "Dump upload returned no document"
-                );
-                return Ok(None);
-            };
-            let is_audio = document.raw.attributes.iter().any(|attribute| {
-                matches!(attribute, ferogram::tl::enums::DocumentAttribute::Audio(_))
-            });
-            if !is_audio {
-                return Ok(None);
-            }
-            let (file_id, file_unique_id) = Self::file_ids(&document);
-            Ok(Some(DumpUpload {
-                message_id: i64::from(message.id()),
-                file_id,
-                file_unique_id,
-            }))
-        })
-    }
-
-    fn send_document_to_dump<'a>(
-        &'a self,
-        file_path: &'a str,
-        thumb_path: Option<&'a str>,
-        caption_html: &'a str,
-        on_upload_progress: Option<&'a UploadProgressCallback>,
-    ) -> BoxFuture<'a, Result<Option<DumpUpload>, SinkError>> {
-        Box::pin(async move {
-            let handle = TransferHandle::new();
-            let progress_task = on_upload_progress.map(|callback| {
-                let callback = Arc::clone(callback);
-                let handle = handle.clone();
-                tokio::spawn(async move {
-                    loop {
-                        let progress = handle.progress();
-                        callback(progress.done, progress.total);
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                    }
-                })
-            });
-
-            let upload_result = self.client.upload_file(file_path).handle(&handle).await;
-            if let Some(task) = progress_task {
-                task.abort();
-            }
-            let uploaded = upload_result.map_err(|error| SinkError(error.to_string()))?;
-            let mut media = uploaded.as_document_media();
-            if let Some(thumb_path) = thumb_path {
-                match self.upload_thumbnail(thumb_path).await {
-                    Ok(thumb) => {
-                        if let ferogram::tl::enums::InputMedia::UploadedDocument(document) =
-                            &mut media
-                        {
-                            document.thumb = Some(thumb);
+            match publication {
+                DumpPublish::TrackAudio {
+                    file_path,
+                    title,
+                    performer,
+                    duration,
+                    caption_html,
+                    on_upload_progress,
+                } => {
+                    let handle = TransferHandle::new();
+                    let progress = progress_task(&handle, on_upload_progress.as_ref());
+                    let upload_result = self.client.upload_file(&file_path).handle(&handle).await;
+                    stop_progress(progress);
+                    let uploaded = upload_result.map_err(map_invocation)?;
+                    let duration = i32::try_from(duration).map_err(|error| {
+                        DeliveryError::LocalIo(format!("duration out of range: {error}"))
+                    })?;
+                    let mut media = uploaded.as_auto_media();
+                    if let ferogram::tl::enums::InputMedia::UploadedDocument(document) = &mut media
+                    {
+                        for attribute in &mut document.attributes {
+                            if let ferogram::tl::enums::DocumentAttribute::Audio(audio) = attribute
+                            {
+                                audio.voice = false;
+                                audio.duration = duration;
+                                audio.title = Some(title.clone());
+                                audio.performer = Some(performer.clone());
+                            }
                         }
                     }
-                    Err(error) => {
-                        tracing::warn!(%error, "ZIP thumbnail upload failed; sending without");
+                    let message = self
+                        .client
+                        .send_message(
+                            self.dump_peer.clone(),
+                            InputMessage::html(&caption_html)
+                                .silent(true)
+                                .copy_media(media),
+                        )
+                        .await
+                        .map_err(map_invocation)?;
+                    if message.peer_id().map(ferogram::PeerExt::bare_id)
+                        != Some(self.dump_peer_native_id)
+                    {
+                        return Err(DeliveryError::Unavailable(format!(
+                            "dump upload landed in unexpected peer (expected {}, got {:?})",
+                            self.dump_peer_native_id,
+                            message.peer_id().map(ferogram::PeerExt::bare_id)
+                        )));
                     }
+                    let Some(document) = message.document() else {
+                        return Err(DeliveryError::UnexpectedMedia);
+                    };
+                    let is_audio = document.raw.attributes.iter().any(|attribute| {
+                        matches!(attribute, ferogram::tl::enums::DocumentAttribute::Audio(_))
+                    });
+                    if !is_audio {
+                        return Err(DeliveryError::UnexpectedMedia);
+                    }
+                    let (file_id, file_unique_id) = Self::file_ids(&document);
+                    Ok(DumpPublication {
+                        message: DumpMessageRef::new(i64::from(message.id())),
+                        file_id,
+                        file_unique_id,
+                    })
+                }
+                DumpPublish::ZipDocument {
+                    file_path,
+                    thumb_path,
+                    caption_html,
+                    on_upload_progress,
+                } => {
+                    let media = self
+                        .upload_zip_media(
+                            &file_path,
+                            thumb_path.as_deref(),
+                            on_upload_progress.as_ref(),
+                        )
+                        .await?;
+                    let message = self
+                        .client
+                        .send_message(
+                            self.dump_peer.clone(),
+                            InputMessage::html(&caption_html)
+                                .silent(true)
+                                .copy_media(media),
+                        )
+                        .await
+                        .map_err(map_invocation)?;
+                    let Some(document) = message.document() else {
+                        return Err(DeliveryError::UnexpectedMedia);
+                    };
+                    let (file_id, file_unique_id) = Self::file_ids(&document);
+                    Ok(DumpPublication {
+                        message: DumpMessageRef::new(i64::from(message.id())),
+                        file_id,
+                        file_unique_id,
+                    })
                 }
             }
-
-            let message = self
-                .client
-                .send_message(
-                    self.dump_peer.clone(),
-                    InputMessage::html(caption_html)
-                        .silent(true)
-                        .copy_media(media),
-                )
-                .await
-                .map_err(|error| SinkError(error.to_string()))?;
-
-            let Some(document) = message.document() else {
-                tracing::warn!(
-                    message_id = message.id(),
-                    "Dump document upload returned no document"
-                );
-                return Ok(None);
-            };
-
-            let (file_id, file_unique_id) = Self::file_ids(&document);
-            Ok(Some(DumpUpload {
-                message_id: i64::from(message.id()),
-                file_id,
-                file_unique_id,
-            }))
         })
     }
 
-    fn send_document_to_chat<'a>(
+    fn deliver_to_chat<'a>(
         &'a self,
-        chat_id: i64,
-        file_path: &'a str,
-        thumb_path: Option<&'a str>,
-        caption_html: &'a str,
-        on_upload_progress: Option<&'a UploadProgressCallback>,
-    ) -> BoxFuture<'a, Result<i32, SinkError>> {
+        delivery: ChatDelivery,
+    ) -> BoxFuture<'a, Result<DeliveryReceipt, DeliveryError>> {
         Box::pin(async move {
-            let handle = TransferHandle::new();
-            let progress_task = on_upload_progress.map(|callback| {
-                let callback = Arc::clone(callback);
-                let handle = handle.clone();
-                tokio::spawn(async move {
-                    loop {
-                        let progress = handle.progress();
-                        callback(progress.done, progress.total);
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                    }
-                })
-            });
-
-            let upload_result = self.client.upload_file(file_path).handle(&handle).await;
-            if let Some(task) = progress_task {
-                task.abort();
-            }
-            let uploaded = upload_result.map_err(|error| SinkError(error.to_string()))?;
-            let mut media = uploaded.as_document_media();
-            if let Some(thumb_path) = thumb_path {
-                match self.upload_thumbnail(thumb_path).await {
-                    Ok(thumb) => {
-                        if let ferogram::tl::enums::InputMedia::UploadedDocument(document) =
-                            &mut media
-                        {
-                            document.thumb = Some(thumb);
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "ZIP thumbnail upload failed; sending without");
-                    }
+            match delivery {
+                ChatDelivery::DumpCopy {
+                    destination,
+                    source,
+                    reply_to,
+                    silent,
+                } => {
+                    let source_id = i32::try_from(source.id()).map_err(|error| {
+                        DeliveryError::LocalIo(format!("source message id out of range: {error}"))
+                    })?;
+                    let reply_to = reply_to
+                        .map(|message| i32::try_from(message.id()))
+                        .transpose()
+                        .map_err(|error| {
+                            DeliveryError::LocalIo(format!(
+                                "reply message id out of range: {error}"
+                            ))
+                        })?;
+                    let source = self
+                        .client
+                        .get_messages(self.dump_peer.clone(), &[source_id])
+                        .await
+                        .map_err(map_invocation)?
+                        .into_iter()
+                        .next()
+                        .ok_or(DeliveryError::UnexpectedMedia)?;
+                    let media: ferogram::tl::enums::InputMedia = if let Some(photo) = source.photo()
+                    {
+                        photo.to_input_media().into()
+                    } else if let Some(document) = source.document() {
+                        document.to_input_media().into()
+                    } else {
+                        return Err(DeliveryError::UnexpectedMedia);
+                    };
+                    let message = self
+                        .client
+                        .send_message(
+                            PeerRef::from(destination.id()),
+                            InputMessage::text("")
+                                .reply_to(reply_to)
+                                .silent(silent)
+                                .copy_media(media),
+                        )
+                        .await
+                        .map_err(map_invocation)?;
+                    Ok(DeliveryReceipt::Message(ChatMessageRef::new(i64::from(
+                        message.id(),
+                    ))))
+                }
+                ChatDelivery::ZipDocument {
+                    destination,
+                    file_path,
+                    thumb_path,
+                    caption_html,
+                    on_upload_progress,
+                } => {
+                    let media = self
+                        .upload_zip_media(
+                            &file_path,
+                            thumb_path.as_deref(),
+                            on_upload_progress.as_ref(),
+                        )
+                        .await?;
+                    let message = self
+                        .client
+                        .send_message(
+                            PeerRef::from(destination.id()),
+                            InputMessage::html(&caption_html).copy_media(media),
+                        )
+                        .await
+                        .map_err(map_invocation)?;
+                    Ok(DeliveryReceipt::Message(ChatMessageRef::new(i64::from(
+                        message.id(),
+                    ))))
+                }
+                ChatDelivery::Photo {
+                    destination,
+                    image_bytes,
+                    caption_html,
+                } => {
+                    let uploaded = self
+                        .client
+                        .upload(std::io::Cursor::new(image_bytes), "cover.jpg")
+                        .await
+                        .map_err(map_invocation)?;
+                    let media = uploaded.as_photo_media();
+                    self.client
+                        .send_message(
+                            PeerRef::from(destination.id()),
+                            InputMessage::html(&caption_html).copy_media(media),
+                        )
+                        .await
+                        .map_err(map_invocation)?;
+                    Ok(DeliveryReceipt::PreviewDelivered)
                 }
             }
-
-            self.client
-                .send_message(
-                    PeerRef::from(chat_id),
-                    InputMessage::html(caption_html).copy_media(media),
-                )
-                .await
-                .map(|msg| msg.id())
-                .map_err(|error| SinkError(error.to_string()))
         })
     }
 
-    fn send_photo_to_chat<'a>(
+    fn materialize_cached<'a>(
         &'a self,
-        chat_id: i64,
-        image_bytes: &'a [u8],
-        caption_html: &'a str,
-    ) -> BoxFuture<'a, Result<(), SinkError>> {
-        Box::pin(async move {
-            let uploaded = self
-                .client
-                .upload(std::io::Cursor::new(image_bytes), "cover.jpg")
-                .await
-                .map_err(|error| SinkError(error.to_string()))?;
-            let media = uploaded.as_photo_media();
-            self.client
-                .send_message(
-                    PeerRef::from(chat_id),
-                    InputMessage::html(caption_html).copy_media(media),
-                )
-                .await
-                .map(|_| ())
-                .map_err(|error| SinkError(error.to_string()))
-        })
-    }
-
-    fn download_dump_file<'a>(
-        &'a self,
-        message_id: i64,
+        source: DumpMessageRef,
         destination: &'a Path,
-        on_download_progress: Option<&'a UploadProgressCallback>,
-    ) -> BoxFuture<'a, Result<(), SinkError>> {
+        progress: Option<&'a UploadProgressCallback>,
+    ) -> BoxFuture<'a, Result<(), DeliveryError>> {
         Box::pin(async move {
-            let message_id = i32::try_from(message_id)
-                .map_err(|error| SinkError(format!("message_id out of range: {error}")))?;
-            let source = self
+            let source_id = i32::try_from(source.id()).map_err(|error| {
+                DeliveryError::LocalIo(format!("source message id out of range: {error}"))
+            })?;
+            let message = self
                 .client
-                .get_messages(self.dump_peer.clone(), &[message_id])
+                .get_messages(self.dump_peer.clone(), &[source_id])
                 .await
-                .map_err(|error| SinkError(error.to_string()))?
+                .map_err(map_invocation)?
                 .into_iter()
                 .next()
-                .ok_or_else(|| {
-                    SinkError("download_dump_file: source message not found or inaccessible".into())
-                })?;
-
-            let document = source.document().ok_or_else(|| {
-                SinkError("download_dump_file: source message has no document".into())
-            })?;
-
+                .ok_or(DeliveryError::UnexpectedMedia)?;
+            let document = message.document().ok_or(DeliveryError::UnexpectedMedia)?;
             let handle = TransferHandle::new();
-            let progress_task = on_download_progress.map(|callback| {
-                let callback = Arc::clone(callback);
-                let handle = handle.clone();
-                tokio::spawn(async move {
-                    loop {
-                        let progress = handle.progress();
-                        callback(progress.done, progress.total);
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                    }
-                })
-            });
-
+            let progress_task = progress_task(&handle, progress);
             let download_result = self
                 .client
                 .download_file(&document, destination)
                 .handle(&handle)
                 .await;
-
-            if let Some(task) = progress_task {
-                task.abort();
-            }
-
-            download_result.map_err(|error| SinkError(error.to_string()))?;
-            Ok(())
+            stop_progress(progress_task);
+            download_result.map(|_| ()).map_err(map_invocation)
         })
     }
 
-    fn send_dump_copy<'a>(
+    fn retract_dump<'a>(
         &'a self,
-        to_chat_id: i64,
-        message_id: i64,
-        reply_to: Option<i64>,
-        silent: bool,
-    ) -> BoxFuture<'a, Result<i32, SinkError>> {
+        messages: &'a [DumpMessageRef],
+    ) -> BoxFuture<'a, Result<(), DeliveryError>> {
         Box::pin(async move {
-            let message_id = i32::try_from(message_id)
-                .map_err(|error| SinkError(format!("message_id out of range: {error}")))?;
-            let reply_to = reply_to
-                .map(i32::try_from)
-                .transpose()
-                .map_err(|error| SinkError(format!("reply_to out of range: {error}")))?;
-            // sendDumpCopy = mtcute sendCopy with EMPTY_CAPTION: media
-            // re-attached by reference, no forward attribution, empty text.
-            //
-            // ferogram's `copy_message` caption-override path implements
-            // exactly this (fetch -> re-attach -> send as a fresh message),
-            // but instantiating it trips a rustc layout cycle (its body
-            // monomorphizes `copy_messages<T, T>`, whose body re-monomorphizes
-            // `copy_message<T, T>`), so we reproduce the fetch-and-resend
-            // path directly here.
-            let source = self
-                .client
-                .get_messages(self.dump_peer.clone(), &[message_id])
-                .await
-                .map_err(|error| SinkError(error.to_string()))?
-                .into_iter()
-                .next()
-                .ok_or_else(|| {
-                    SinkError("copy_message: source message not found or inaccessible".into())
-                })?;
-
-            let media: ferogram::tl::enums::InputMedia = if let Some(photo) = source.photo() {
-                photo.to_input_media().into()
-            } else if let Some(document) = source.document() {
-                document.to_input_media().into()
-            } else {
-                return Err(SinkError(
-                    "copy_message: source message has no copyable media".into(),
-                ));
-            };
-
-            let input = InputMessage::text("")
-                .reply_to(reply_to)
-                .silent(silent)
-                .copy_media(media);
-            self.client
-                .send_message(PeerRef::from(to_chat_id), input)
-                .await
-                .map(|msg| msg.id())
-                .map_err(|error| SinkError(error.to_string()))
-        })
-    }
-
-    fn delete_dump_messages<'a>(
-        &'a self,
-        message_ids: &'a [i64],
-    ) -> BoxFuture<'a, Result<(), SinkError>> {
-        Box::pin(async move {
-            let ids: Vec<i32> = message_ids
+            let ids: Vec<i32> = messages
                 .iter()
-                .filter_map(|id| match i32::try_from(*id) {
+                .filter_map(|message| match i32::try_from(message.id()) {
                     Ok(id) => Some(id),
                     Err(error) => {
-                        tracing::warn!(message_id = *id, %error, "skipping out-of-range dump message id");
+                        tracing::warn!(
+                            message_id = message.id(),
+                            %error,
+                            "skipping out-of-range dump message id"
+                        );
                         None
                     }
                 })
@@ -428,13 +399,18 @@ impl TelegramSink for FerogramTelegramSink {
                 .client
                 .get_messages(self.dump_peer.clone(), &ids)
                 .await
-                .map_err(|error| SinkError(error.to_string()))?;
+                .map_err(map_invocation)?;
+            let mut first_error = None;
             for message in messages {
                 if let Err(error) = message.delete_with(&self.client).await {
-                    tracing::warn!(message_id = message.id(), %error, "failed to delete dump message");
+                    let error = map_invocation(error);
+                    tracing::warn!(%error, message_id = message.id(), "failed to delete dump message");
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
                 }
             }
-            Ok(())
+            first_error.map_or(Ok(()), Err)
         })
     }
 }
@@ -442,6 +418,29 @@ impl TelegramSink for FerogramTelegramSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_rpc_errors_are_transient() {
+        let error = InvocationError::Rpc(ferogram::RpcError {
+            code: 500,
+            name: "INTERNAL".into(),
+            value: None,
+        });
+        assert!(matches!(map_invocation(error), DeliveryError::Transient(_)));
+    }
+
+    #[test]
+    fn client_rpc_errors_are_rejected() {
+        let error = InvocationError::Rpc(ferogram::RpcError {
+            code: 400,
+            name: "CHAT_WRITE_FORBIDDEN".into(),
+            value: None,
+        });
+        assert!(matches!(
+            map_invocation(error),
+            DeliveryError::Rejected(DeliveryRejection::Other(_))
+        ));
+    }
 
     #[test]
     fn file_ids_match_mtproto_format() {

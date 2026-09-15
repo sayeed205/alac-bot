@@ -37,10 +37,13 @@ use crate::{
             html_escape, AlbumDetailsCaptionMetadata, DumpCaptionMetadata, DumpZipCaptionMetadata,
         },
         deps::{
-            AlbumReplacementExpectation, AlbumReplacementResult, AlbumUpload, ArtworkProvider,
-            CachedAlbum, CachedTrack, CollectionResolver, DumpUpload, OrchestratorDeps,
-            ProviderComposition, ProviderPresentation, RequestLog, SaveTrackInput,
-            TrackAcquisition, UploadProgressCallback,
+            AlbumCache, AlbumCacheError, AlbumReplacementExpectation, AlbumReplacementResult,
+            AlbumUpload, ArtworkProvider, CachedAlbum, CachedTrack, ChatDelivery, ChatMessageRef,
+            ChatRef, CollectionResolver, Delivery, DeliveryError, DeliveryReceipt,
+            DeliveryRejection, DumpMessageRef, DumpPublication, DumpPublish, JobBookkeeping,
+            JobDeps, OrchestratorConfig, ProviderAccess, ProviderComposition, ProviderPresentation,
+            RequestLog, SaveTrackInput, StorageRetryPolicy, TrackAcquisition, TrackCache,
+            UploadProgressCallback,
         },
         types::{
             ActiveRipJob, EventCallback, FailedTrack, FailedTrackKind, JobPhase, OrchestratorEvent,
@@ -116,6 +119,44 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+async fn find_cached_tracks_with_retry<D: TrackCache>(
+    cache: &D,
+    keys: &[TrackKey],
+    policy: &StorageRetryPolicy,
+) -> Result<HashMap<TrackKey, CachedTrack>, crate::orchestrator::deps::TrackCacheError> {
+    let attempts = policy.total_attempts.max(1);
+    let mut attempt = 0;
+    loop {
+        match cache.find_cached_tracks(keys).await {
+            Ok(value) => return Ok(value),
+            Err(error) if error.is_unavailable() && attempt + 1 < attempts => {
+                tokio::time::sleep(policy.delay_before_retry(attempt)).await;
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn save_track_with_retry<D: TrackCache>(
+    cache: &D,
+    input: SaveTrackInput,
+    policy: &StorageRetryPolicy,
+) -> Result<(), crate::orchestrator::deps::TrackCacheError> {
+    let attempts = policy.total_attempts.max(1);
+    let mut attempt = 0;
+    loop {
+        match cache.save_track(input.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(error) if error.is_unavailable() && attempt + 1 < attempts => {
+                tokio::time::sleep(policy.delay_before_retry(attempt)).await;
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// A resolved track to rip.
 #[derive(Debug, Clone)]
 struct ResolvedTrackItem {
@@ -167,6 +208,7 @@ struct ZipState {
 /// Everything the two lanes need about one job, shared by `Arc` into the
 /// lane-2 upload items and the finalize marker.
 struct JobContext {
+    config: OrchestratorConfig,
     options: RipJobOptions,
     zip_build: bool,
     zip_deliver: bool,
@@ -200,7 +242,7 @@ struct JobContext {
     /// partial job.
     fatal_error: Arc<Mutex<Option<String>>>,
     primary_zip_error: Arc<Mutex<Option<String>>>,
-    zip_new_dump_messages: Arc<Mutex<Vec<i64>>>,
+    zip_new_dump_messages: Arc<Mutex<Vec<DumpMessageRef>>>,
     is_multi_track: bool,
     max_collection_limit: u32,
     capped_count: usize,
@@ -208,7 +250,7 @@ struct JobContext {
     ripped_count: Arc<std::sync::atomic::AtomicUsize>,
     failed_tracks: Arc<Mutex<Vec<FailedTrack>>>,
     texts: Arc<PipelineTexts>,
-    first_delivered_msg_id: Arc<Mutex<Option<i32>>>,
+    first_delivered_msg_id: Arc<Mutex<Option<ChatMessageRef>>>,
     zip_delivery_infos: Arc<Mutex<Vec<ZipDeliveryInfo>>>,
 }
 
@@ -251,7 +293,7 @@ fn primary_zip_error(ctx: &JobContext) -> Option<String> {
         .clone()
 }
 
-fn remember_zip_dump_message(ctx: &JobContext, message_id: i64) {
+fn remember_zip_dump_message(ctx: &JobContext, message_id: DumpMessageRef) {
     ctx.zip_new_dump_messages
         .lock()
         .expect("ZIP messages poisoned")
@@ -263,7 +305,7 @@ fn remember_zip_dump_message(ctx: &JobContext, message_id: i64) {
 /// a retried fake transport) may expose the same numeric id more than once;
 /// one committed upload must not accidentally transfer a different pending
 /// upload with the same id.
-fn transfer_zip_dump_messages(ctx: &JobContext, committed: &[i64]) {
+fn transfer_zip_dump_messages(ctx: &JobContext, committed: &[DumpMessageRef]) {
     let mut pending = ctx
         .zip_new_dump_messages
         .lock()
@@ -278,7 +320,7 @@ fn transfer_zip_dump_messages(ctx: &JobContext, committed: &[i64]) {
     }
 }
 
-fn take_uncommitted_zip_dump_messages(ctx: &JobContext) -> Vec<i64> {
+fn take_uncommitted_zip_dump_messages(ctx: &JobContext) -> Vec<DumpMessageRef> {
     let mut pending = ctx
         .zip_new_dump_messages
         .lock()
@@ -443,6 +485,7 @@ impl EventBus {
 
 /// The orchestrator: subscriber registry + job table + the rip queue.
 pub struct RipOrchestrator {
+    config: OrchestratorConfig,
     bus: EventBus,
     jobs: Arc<Mutex<HashMap<String, Arc<Mutex<JobShared>>>>>,
     queue: SequentialRipQueue,
@@ -457,7 +500,7 @@ pub struct RipOrchestrator {
 
 impl Default for RipOrchestrator {
     fn default() -> Self {
-        Self::new()
+        Self::new(OrchestratorConfig::default())
     }
 }
 
@@ -701,8 +744,9 @@ async fn push_lane_task(
 }
 
 impl RipOrchestrator {
-    pub fn new() -> Self {
+    pub fn new(config: OrchestratorConfig) -> Self {
         Self {
+            config,
             bus: EventBus::new(),
             jobs: Arc::new(Mutex::new(HashMap::new())),
             queue: SequentialRipQueue::new(),
@@ -852,7 +896,7 @@ impl RipOrchestrator {
     }
 
     /// Run the whole rip flow for one request. Deps arrive per call.
-    pub async fn start_job<D: OrchestratorDeps>(
+    pub async fn start_job<D: JobDeps>(
         &self,
         deps: Arc<D>,
         options: &RipJobOptions,
@@ -869,7 +913,7 @@ impl RipOrchestrator {
 
         // Settings are a snapshot.  The live-availability decision is made
         // after resolution and cache delivery, not as an early gate.
-        let settings = deps.get_settings().await;
+        let settings = deps.settings_snapshot();
 
         let job_controller = CancellationToken::new();
         let mut job_header = deps
@@ -1005,7 +1049,7 @@ impl RipOrchestrator {
 
     /// The queue phase of the job flow: resolve → cap → cache lookup →
     /// admission of the two-lane pipeline.
-    async fn run_job<D: OrchestratorDeps>(
+    async fn run_job<D: JobDeps>(
         &self,
         deps: Arc<D>,
         options: &RipJobOptions,
@@ -1319,24 +1363,31 @@ impl RipOrchestrator {
                     })
             })
             .collect();
-        let mut existing_tracks_map = match deps.find_cached_tracks(&requested_ids).await {
+        let mut existing_tracks_map = match find_cached_tracks_with_retry(
+            deps.as_ref(),
+            &requested_ids,
+            &self.config.storage_retry,
+        )
+        .await
+        {
             Ok(existing) => existing,
             Err(error) => {
-                return Err(OrchestratorError::Message(error));
+                tracing::error!(%error, "track cache lookup failed; refusing to start media work");
+                return Err(OrchestratorError::Message(error.to_string()));
             }
         };
 
         shared.lock().expect("job poisoned").job.active_action_text = None;
 
         if options.is_force && options.is_admin {
-            let mut old_message_ids: Vec<i64> = Vec::new();
+            let mut old_message_ids: Vec<DumpMessageRef> = Vec::new();
             for item in &tracks_to_process {
                 for rendition in options.rendition_policy.renditions() {
                     for codec in rendition.accepted_cache_codecs() {
                         let lookup_key =
                             TrackKey::new(options.provider, item.id.clone()).with_codec(*codec);
                         if let Some(cached) = existing_tracks_map.remove(&lookup_key) {
-                            old_message_ids.push(cached.message_id);
+                            old_message_ids.push(DumpMessageRef::new(cached.message_id));
                             let _ = deps.delete_track(&lookup_key).await;
                         }
                     }
@@ -1347,7 +1398,7 @@ impl RipOrchestrator {
                     count = old_message_ids.len(),
                     "Deleting old dump messages on force re-rip prior to queue"
                 );
-                let _ = deps.sink().delete_dump_messages(&old_message_ids).await;
+                let _ = deps.retract_dump(&old_message_ids).await;
             }
         }
 
@@ -1357,7 +1408,7 @@ impl RipOrchestrator {
         let mut pipeline_items: Vec<PipelineItem> = Vec::new();
         let cached_count = 0usize;
         let is_multi_track = tracks_to_process.len() > 1;
-        let first_delivered_msg_id: Option<i32> = None;
+        let first_delivered_msg_id: Option<ChatMessageRef> = None;
 
         // Take one snapshot of all archive rows for the replacement groups.
         // Besides powering reuse, this is the compare-and-swap generation
@@ -1516,7 +1567,7 @@ impl RipOrchestrator {
                        skipped: Vec<String>,
                        elapsed: &str,
                        zip_delivery: Option<ZipDeliveryInfo>,
-                       first_msg_id: Option<i32>| {
+                       first_msg_id: Option<ChatMessageRef>| {
             let guard = shared.lock().expect("job poisoned");
             RipJobSummary {
                 job_id: guard.job.id.clone(),
@@ -1616,6 +1667,7 @@ impl RipOrchestrator {
         // The job context moves into both lanes: every lane-2 item holds a
         // clone, and the finalize marker holds the last one.
         let job_ctx = Arc::new(JobContext {
+            config: self.config.clone(),
             options: options.clone(),
             zip_build,
             zip_deliver,
@@ -1797,7 +1849,7 @@ impl RipOrchestrator {
 /// continuation behind the active queue item, and the sequential queue is
 /// free while cache I/O is pending.
 ///
-struct LaneOneContext<'a, D: OrchestratorDeps> {
+struct LaneOneContext<'a, D> {
     deps: Arc<D>,
     bus: EventBus,
     shared: Arc<Mutex<JobShared>>,
@@ -1884,7 +1936,7 @@ fn is_lane_cancelled(
         || queue_signal.is_cancelled()
 }
 
-struct RipFreshInput<'a, D: OrchestratorDeps> {
+struct RipFreshInput<'a, D> {
     deps: &'a Arc<D>,
     bus: &'a EventBus,
     shared: &'a Arc<Mutex<JobShared>>,
@@ -1897,7 +1949,10 @@ struct RipFreshInput<'a, D: OrchestratorDeps> {
 
 /// Rip one item on lane 1. There is deliberately no cache, Telegram, ZIP, or
 /// filesystem operation here; the result is handed to lane 2 by the caller.
-async fn rip_fresh_item<D: OrchestratorDeps>(input: RipFreshInput<'_, D>) -> RipLaneOutcome {
+async fn rip_fresh_item<D>(input: RipFreshInput<'_, D>) -> RipLaneOutcome
+where
+    D: ProviderAccess + JobBookkeeping + 'static,
+{
     let RipFreshInput {
         deps,
         bus,
@@ -1931,7 +1986,7 @@ async fn rip_fresh_item<D: OrchestratorDeps>(input: RipFreshInput<'_, D>) -> Rip
             shared.lock().expect("job poisoned").job.failed_count = failures.len();
         }
         tracing::warn!(track_id = %item.track_id, "{log_message}");
-        let _ = deps
+        let log_result = deps
             .log_request(RequestLog {
                 telegram_id: ctx.options.user_id,
                 chat_id: ctx.options.chat_id,
@@ -1942,6 +1997,9 @@ async fn rip_fresh_item<D: OrchestratorDeps>(input: RipFreshInput<'_, D>) -> Rip
                 error_reason: Some(err_msg),
             })
             .await;
+        if let Err(error) = log_result {
+            tracing::warn!(%error, track_id = %item.track_id, "request log failed for unavailable track");
+        }
         let (download_text, upload_text) = ctx.texts.snapshot();
         bus.emit_progress(
             shared,
@@ -2064,7 +2122,7 @@ async fn rip_fresh_item<D: OrchestratorDeps>(input: RipFreshInput<'_, D>) -> Rip
                 error = %err_msg,
                 "Rip job failed"
             );
-            let _ = deps
+            let log_result = deps
                 .log_request(RequestLog {
                     telegram_id: ctx.options.user_id,
                     chat_id: ctx.options.chat_id,
@@ -2080,6 +2138,13 @@ async fn rip_fresh_item<D: OrchestratorDeps>(input: RipFreshInput<'_, D>) -> Rip
                     error_reason: Some(err_msg.clone()),
                 })
                 .await;
+            if let Err(log_error) = log_result {
+                tracing::warn!(
+                    %log_error,
+                    track_id = %item.track_id,
+                    "request log failed after rip failure"
+                );
+            }
 
             let (download_text, upload_text) = ctx.texts.snapshot();
             bus.emit_progress(
@@ -2123,7 +2188,7 @@ async fn rip_fresh_item<D: OrchestratorDeps>(input: RipFreshInput<'_, D>) -> Rip
     }))
 }
 
-struct UploadLaneInput<D: OrchestratorDeps> {
+struct UploadLaneInput<D> {
     deps: Arc<D>,
     bus: EventBus,
     shared: Arc<Mutex<JobShared>>,
@@ -2134,7 +2199,10 @@ struct UploadLaneInput<D: OrchestratorDeps> {
     upload_item: PipelineRipResult,
 }
 
-async fn enqueue_upload_task<D: OrchestratorDeps>(input: UploadLaneInput<D>) -> bool {
+async fn enqueue_upload_task<D>(input: UploadLaneInput<D>) -> bool
+where
+    D: TrackCache + Delivery + JobBookkeeping + 'static,
+{
     let UploadLaneInput {
         deps,
         bus,
@@ -2181,7 +2249,7 @@ async fn enqueue_upload_task<D: OrchestratorDeps>(input: UploadLaneInput<D>) -> 
     pushed
 }
 
-struct CachedResolutionInput<'a, D: OrchestratorDeps> {
+struct CachedResolutionInput<'a, D> {
     deps: &'a Arc<D>,
     bus: &'a EventBus,
     shared: &'a Arc<Mutex<JobShared>>,
@@ -2192,9 +2260,10 @@ struct CachedResolutionInput<'a, D: OrchestratorDeps> {
     cached: &'a CachedTrack,
 }
 
-async fn resolve_cached_item<D: OrchestratorDeps>(
-    input: CachedResolutionInput<'_, D>,
-) -> CacheResolution {
+async fn resolve_cached_item<D>(input: CachedResolutionInput<'_, D>) -> CacheResolution
+where
+    D: TrackCache + Delivery + JobBookkeeping,
+{
     let CachedResolutionInput {
         deps,
         bus,
@@ -2229,17 +2298,22 @@ async fn resolve_cached_item<D: OrchestratorDeps>(
             .then_some(ctx.options.reply_to_message_id)
             .flatten();
         let copy_result = tokio::select! {
-            result = deps.sink().send_dump_copy(
-                ctx.options.delivery_chat_id,
-                cached.message_id,
-                reply_to,
-                ctx.is_multi_track,
-            ) => result,
+            result = deps.deliver_to_chat(ChatDelivery::DumpCopy {
+                destination: ChatRef::new(ctx.options.delivery_chat_id),
+                source: DumpMessageRef::new(cached.message_id),
+                reply_to: reply_to.map(ChatMessageRef::new),
+                silent: ctx.is_multi_track,
+            }) => result,
             _ = job_controller.cancelled() => return CacheResolution::Cancelled,
             _ = queue_signal.cancelled() => return CacheResolution::Cancelled,
         };
         let sent_id = match copy_result {
-            Ok(sent_id) => sent_id,
+            Ok(DeliveryReceipt::Message(sent_id)) => sent_id,
+            Ok(DeliveryReceipt::PreviewDelivered) => {
+                tracing::warn!(track_id = %item.track_id, "cached track delivery returned a preview receipt");
+                let _ = deps.delete_track(&cache_key).await;
+                return CacheResolution::Rerip;
+            }
             Err(_) => {
                 tracing::warn!(track_id = %item.track_id, "cached track delivery failed; reripping");
                 let _ = deps.delete_track(&cache_key).await;
@@ -2249,7 +2323,7 @@ async fn resolve_cached_item<D: OrchestratorDeps>(
         if is_cancelled() {
             return CacheResolution::Cancelled;
         }
-        let _ = tokio::select! {
+        let log_result = tokio::select! {
             result = deps.log_request(RequestLog {
                 telegram_id: ctx.options.user_id,
                 chat_id: ctx.options.chat_id,
@@ -2262,6 +2336,9 @@ async fn resolve_cached_item<D: OrchestratorDeps>(
             _ = job_controller.cancelled() => return CacheResolution::Cancelled,
             _ = queue_signal.cancelled() => return CacheResolution::Cancelled,
         };
+        if let Err(error) = log_result {
+            tracing::warn!(%error, track_id = %item.track_id, "request log failed for cached track");
+        }
         if is_cancelled() {
             return CacheResolution::Cancelled;
         }
@@ -2276,7 +2353,7 @@ async fn resolve_cached_item<D: OrchestratorDeps>(
                 .expect("first message poisoned") = Some(sent_id);
         }
     } else if !ctx.options.is_cache_only && ctx.zip_deliver {
-        let _ = tokio::select! {
+        let log_result = tokio::select! {
             result = deps.log_request(RequestLog {
                 telegram_id: ctx.options.user_id,
                 chat_id: ctx.options.chat_id,
@@ -2289,6 +2366,9 @@ async fn resolve_cached_item<D: OrchestratorDeps>(
             _ = job_controller.cancelled() => return CacheResolution::Cancelled,
             _ = queue_signal.cancelled() => return CacheResolution::Cancelled,
         };
+        if let Err(error) = log_result {
+            tracing::warn!(%error, track_id = %item.track_id, "request log failed for cached ZIP track");
+        }
         if is_cancelled() {
             return CacheResolution::Cancelled;
         }
@@ -2305,7 +2385,11 @@ async fn resolve_cached_item<D: OrchestratorDeps>(
             let filename = bound_filename_with_suffix(&name, &suffix, MAX_ZIP_ENTRY_FILENAME_BYTES);
             let destination = state.dir.join(&filename);
             let download_result = tokio::select! {
-                result = deps.sink().download_dump_file(cached.message_id, &destination, None) => result,
+                result = deps.materialize_cached(
+                    DumpMessageRef::new(cached.message_id),
+                    &destination,
+                    None,
+                ) => result,
                 _ = job_controller.cancelled() => {
                     let _ = tokio::fs::remove_file(&destination).await;
                     return CacheResolution::Cancelled;
@@ -2365,7 +2449,7 @@ async fn resolve_cached_item<D: OrchestratorDeps>(
     CacheResolution::Hit
 }
 
-struct CachedLaneInput<D: OrchestratorDeps> {
+struct CachedLaneInput<D> {
     deps: Arc<D>,
     bus: EventBus,
     shared: Arc<Mutex<JobShared>>,
@@ -2413,7 +2497,7 @@ enum CacheEnqueueResult {
 /// sequential rip queue and the global Telegram lane: it may wait for this
 /// job's cache result or fallback rerip while the global upload lane remains
 /// free to process other jobs.
-struct OrderedDispatchInput<D: OrchestratorDeps> {
+struct OrderedDispatchInput<D> {
     deps: Arc<D>,
     bus: EventBus,
     shared: Arc<Mutex<JobShared>>,
@@ -2436,9 +2520,10 @@ struct OrderedDispatchInput<D: OrchestratorDeps> {
 /// one-shot is the handoff: lane 2 reports the cache outcome and immediately
 /// becomes available for other jobs; a detached continuation later submits
 /// the fallback to lane 1.
-async fn enqueue_cached_lane_task<D: OrchestratorDeps>(
-    input: CachedLaneInput<D>,
-) -> CacheEnqueueResult {
+async fn enqueue_cached_lane_task<D>(input: CachedLaneInput<D>) -> CacheEnqueueResult
+where
+    D: TrackCache + Delivery + JobBookkeeping + 'static,
+{
     let CachedLaneInput {
         deps,
         bus,
@@ -2509,7 +2594,10 @@ async fn enqueue_cached_lane_task<D: OrchestratorDeps>(
 /// the remaining results.  Results are handed to a bounded, per-job ordered
 /// dispatcher; lane 1 never waits for a Telegram operation or a fallback
 /// rerip.
-async fn run_lane_one<D: OrchestratorDeps>(input: LaneOneContext<'_, D>) {
+async fn run_lane_one<D>(input: LaneOneContext<'_, D>)
+where
+    D: TrackCache + AlbumCache + ProviderAccess + Delivery + JobBookkeeping + 'static,
+{
     let LaneOneContext {
         deps,
         bus,
@@ -2604,7 +2692,7 @@ async fn run_lane_one<D: OrchestratorDeps>(input: LaneOneContext<'_, D>) {
     let _ = slot_tx.send(OrderedSlot::Finished).await;
 }
 
-async fn enqueue_finalize_marker<D: OrchestratorDeps>(
+async fn enqueue_finalize_marker<D>(
     deps: Arc<D>,
     bus: EventBus,
     shared: Arc<Mutex<JobShared>>,
@@ -2612,7 +2700,9 @@ async fn enqueue_finalize_marker<D: OrchestratorDeps>(
     job_controller: CancellationToken,
     upload_lane: Arc<Mutex<Option<tokio::sync::mpsc::Sender<LaneTask>>>>,
     finalization_guard: FinalizationGuard,
-) {
+) where
+    D: AlbumCache + Delivery + ProviderAccess + 'static,
+{
     let marker_panic_shared = Arc::clone(&shared);
     let marker_panic_ctx = Arc::clone(&ctx);
     let marker_controller = job_controller.clone();
@@ -2652,7 +2742,7 @@ async fn enqueue_finalize_marker<D: OrchestratorDeps>(
     }
 }
 
-struct OrderedReripInput<D: OrchestratorDeps> {
+struct OrderedReripInput<D> {
     deps: Arc<D>,
     bus: EventBus,
     shared: Arc<Mutex<JobShared>>,
@@ -2663,9 +2753,10 @@ struct OrderedReripInput<D: OrchestratorDeps> {
     rip_job_dir: PathBuf,
 }
 
-fn submit_ordered_rerip_item<D: OrchestratorDeps>(
-    input: OrderedReripInput<D>,
-) -> crate::queue::TaskReceiver {
+fn submit_ordered_rerip_item<D>(input: OrderedReripInput<D>) -> crate::queue::TaskReceiver
+where
+    D: ProviderAccess + JobBookkeeping + 'static,
+{
     let OrderedReripInput {
         deps,
         bus,
@@ -2855,7 +2946,10 @@ async fn wait_for_ordered_rerip(
 /// operation or for its own fallback to obtain the sequential rip queue, but
 /// it never runs in the global lane-2 worker.  Consequently another job's
 /// uploads remain dispatchable while this job's missing slot is settling.
-async fn run_ordered_dispatch<D: OrchestratorDeps>(input: OrderedDispatchInput<D>) {
+async fn run_ordered_dispatch<D>(input: OrderedDispatchInput<D>)
+where
+    D: TrackCache + AlbumCache + ProviderAccess + Delivery + JobBookkeeping + 'static,
+{
     let OrderedDispatchInput {
         deps,
         bus,
@@ -3104,14 +3198,16 @@ fn build_job_summary(
 /// copy (unless the archive replaces individual delivery), request log,
 /// file cleanup, and — for zip jobs — staging the audio into the zip
 /// workspace for the finalize marker to package.
-async fn run_upload_item<D: OrchestratorDeps>(
+async fn run_upload_item<D>(
     deps: Arc<D>,
     bus: EventBus,
     shared: Arc<Mutex<JobShared>>,
     ctx: Arc<JobContext>,
     job_controller: CancellationToken,
     upload_item: PipelineRipResult,
-) {
+) where
+    D: TrackCache + Delivery + JobBookkeeping,
+{
     let uploaded_ok = upload_one(&deps, &bus, &shared, &ctx, &job_controller, &upload_item).await;
 
     let cancelled =
@@ -3215,13 +3311,16 @@ async fn run_upload_item<D: OrchestratorDeps>(
 /// - Incomplete archive → never cached; delivered as `[Partial].zip`
 ///   straight to the delivery chat only for user-facing `zip_deliver` jobs;
 ///   otherwise skipped entirely.
-async fn finalize_job<D: OrchestratorDeps>(
+async fn finalize_job<D>(
     deps: Arc<D>,
     bus: EventBus,
     shared: Arc<Mutex<JobShared>>,
     ctx: Arc<JobContext>,
     job_controller: CancellationToken,
-) -> FinalizeResult {
+) -> FinalizeResult
+where
+    D: AlbumCache + Delivery + ProviderAccess,
+{
     if let Some(error) = fatal_error(&ctx) {
         return Err(error);
     }
@@ -3235,34 +3334,105 @@ async fn finalize_job<D: OrchestratorDeps>(
 /// The archive half of the finalize marker. A failed publication removes only
 /// messages uploaded by this attempt; old cached rows/messages are never
 /// deleted before the replacement transaction commits.
-async fn finalize_zip<D: OrchestratorDeps>(
+async fn finalize_zip<D>(
     deps: &Arc<D>,
     bus: &EventBus,
     shared: &Arc<Mutex<JobShared>>,
     ctx: &Arc<JobContext>,
     job_controller: &CancellationToken,
-) -> Result<Option<ZipDeliveryInfo>, String> {
+) -> Result<Option<ZipDeliveryInfo>, String>
+where
+    D: AlbumCache + Delivery + ProviderAccess,
+{
     let result = finalize_zip_inner(deps, bus, shared, ctx, job_controller).await;
     let cancelled =
         shared.lock().expect("job poisoned").job.is_cancelled || job_controller.is_cancelled();
     if result.is_err() || cancelled {
         let message_ids = take_uncommitted_zip_dump_messages(ctx);
         if !message_ids.is_empty() {
-            let _ = deps.sink().delete_dump_messages(&message_ids).await;
+            if let Err(error) = deps.retract_dump(&message_ids).await {
+                tracing::error!(%error, "failed to retract ZIP dump publication");
+            }
         }
     }
     result
 }
 
+async fn deliver_cached_zip_rows<D>(
+    deps: &Arc<D>,
+    shared: &Arc<Mutex<JobShared>>,
+    ctx: &Arc<JobContext>,
+    rendition: Rendition,
+    rows: &[CachedAlbum],
+    job_controller: &CancellationToken,
+) -> Result<(usize, i64), String>
+where
+    D: Delivery,
+{
+    let options = &ctx.options;
+    let reply_to = (options.delivery_chat_id == options.chat_id)
+        .then_some(options.reply_to_message_id)
+        .flatten();
+    let mut delivered = 0usize;
+    let mut size = 0i64;
+    for row in rows {
+        if shared.lock().expect("job poisoned").job.is_cancelled || job_controller.is_cancelled() {
+            return Ok((delivered, size));
+        }
+        let result = deps
+            .deliver_to_chat(ChatDelivery::DumpCopy {
+                destination: ChatRef::new(options.delivery_chat_id),
+                source: DumpMessageRef::new(row.message_id),
+                reply_to: reply_to.map(ChatMessageRef::new),
+                silent: rows.len() > 1,
+            })
+            .await;
+        match result {
+            Ok(DeliveryReceipt::Message(sent_id)) => {
+                if shared.lock().expect("job poisoned").job.is_cancelled
+                    || job_controller.is_cancelled()
+                {
+                    return Ok((delivered, size));
+                }
+                let mut first = ctx.first_delivered_msg_id.lock().unwrap();
+                if first.is_none() {
+                    *first = Some(sent_id);
+                }
+                delivered += 1;
+                size += row.file_size;
+            }
+            Ok(DeliveryReceipt::PreviewDelivered) if rendition == Rendition::Primary => {
+                return Err("primary ZIP delivery returned a preview receipt".to_owned());
+            }
+            Ok(DeliveryReceipt::PreviewDelivered) => {
+                tracing::warn!(
+                    rendition = ?rendition,
+                    "optional Atmos ZIP delivery returned a preview receipt"
+                );
+            }
+            Err(error) if rendition == Rendition::Primary => {
+                return Err(format!("primary ZIP delivery failed: {error}"));
+            }
+            Err(error) => {
+                tracing::warn!(%error, rendition = ?rendition, "optional Atmos ZIP delivery failed");
+            }
+        }
+    }
+    Ok((delivered, size))
+}
+
 /// Builds/delivers one archive rendition. Cache publication is staged in
 /// memory and replaced only after every required primary part succeeded.
-async fn finalize_zip_inner<D: OrchestratorDeps>(
+async fn finalize_zip_inner<D>(
     deps: &Arc<D>,
     bus: &EventBus,
     shared: &Arc<Mutex<JobShared>>,
     ctx: &Arc<JobContext>,
     job_controller: &CancellationToken,
-) -> Result<Option<ZipDeliveryInfo>, String> {
+) -> Result<Option<ZipDeliveryInfo>, String>
+where
+    D: AlbumCache + Delivery + ProviderAccess,
+{
     let options = &ctx.options;
     if !ctx.zip_build {
         return Ok(None);
@@ -3292,48 +3462,15 @@ async fn finalize_zip_inner<D: OrchestratorDeps>(
         }
         if let Some(rows) = ctx.zip_reuse.get(&state.rendition) {
             if ctx.zip_deliver && !options.is_cache_only {
-                let reply_to = (options.delivery_chat_id == options.chat_id)
-                    .then_some(options.reply_to_message_id)
-                    .flatten();
-                let mut delivered = 0usize;
-                let mut size = 0i64;
-                for row in rows {
-                    if is_cancelled() {
-                        return Ok(first_delivery);
-                    }
-                    match deps
-                        .sink()
-                        .send_dump_copy(
-                            options.delivery_chat_id,
-                            row.message_id,
-                            reply_to,
-                            rows.len() > 1,
-                        )
-                        .await
-                    {
-                        Ok(sent_id) => {
-                            if is_cancelled() {
-                                return Ok(first_delivery);
-                            }
-                            let mut first = ctx.first_delivered_msg_id.lock().unwrap();
-                            if first.is_none() {
-                                *first = Some(sent_id);
-                            }
-                            delivered += 1;
-                            size += row.file_size;
-                        }
-                        Err(error) if state.rendition == Rendition::Primary => {
-                            return Err(format!("primary ZIP delivery failed: {error}"));
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                %error,
-                                rendition = ?state.rendition,
-                                "optional Atmos ZIP delivery failed"
-                            );
-                        }
-                    }
-                }
+                let (delivered, size) = deliver_cached_zip_rows(
+                    deps,
+                    shared,
+                    ctx,
+                    state.rendition,
+                    rows,
+                    job_controller,
+                )
+                .await?;
                 if delivered > 0 {
                     let codec = rows[0].codec.as_str().to_owned();
                     let info = ZipDeliveryInfo {
@@ -3447,6 +3584,10 @@ async fn finalize_zip_inner<D: OrchestratorDeps>(
         let mut delivered_size = 0i64;
         let expected_parts = plans.len();
         let mut all_parts_uploaded = true;
+        enum ZipSendOutcome {
+            Published(DumpPublication),
+            Delivered,
+        }
         for original in plans {
             let mut plan = original;
             if !complete {
@@ -3604,14 +3745,14 @@ async fn finalize_zip_inner<D: OrchestratorDeps>(
                 download_text.as_deref(),
                 upload_text.as_deref(),
             );
-            let upload = if complete {
+            let upload: Result<ZipSendOutcome, DeliveryError> = if complete {
                 tokio::select! {
-                    result = deps.sink().send_document_to_dump(
-                        &path,
-                        thumb_path_str.as_deref(),
-                        &caption,
-                        Some(&on_upload),
-                    ) => result,
+                    result = deps.publish_to_dump(DumpPublish::ZipDocument {
+                        file_path: path.clone(),
+                        thumb_path: thumb_path_str.clone(),
+                        caption_html: caption.clone(),
+                        on_upload_progress: Some(Arc::clone(&on_upload)),
+                    }) => result.map(ZipSendOutcome::Published),
                     _ = job_controller.cancelled() => {
                         *ctx.texts.upload.lock().expect("texts poisoned") = None;
                         return Ok(first_delivery);
@@ -3619,31 +3760,32 @@ async fn finalize_zip_inner<D: OrchestratorDeps>(
                 }
             } else {
                 let chat_upload = tokio::select! {
-                    result = deps.sink().send_document_to_chat(
-                        options.delivery_chat_id,
-                        &path,
-                        thumb_path_str.as_deref(),
-                        &caption,
-                        Some(&on_upload),
-                    ) => result,
+                    result = deps.deliver_to_chat(ChatDelivery::ZipDocument {
+                        destination: ChatRef::new(options.delivery_chat_id),
+                        file_path: path.clone(),
+                        thumb_path: thumb_path_str.clone(),
+                        caption_html: caption.clone(),
+                        on_upload_progress: Some(Arc::clone(&on_upload)),
+                    }) => result,
                     _ = job_controller.cancelled() => return Ok(first_delivery),
                 };
                 match chat_upload {
-                    Ok(sent_id) => {
+                    Ok(DeliveryReceipt::Message(sent_id)) => {
                         let mut first = ctx.first_delivered_msg_id.lock().unwrap();
                         if first.is_none() {
                             *first = Some(sent_id);
                         }
-                        Ok(None)
+                        Ok(ZipSendOutcome::Delivered)
                     }
+                    Ok(DeliveryReceipt::PreviewDelivered) => Err(DeliveryError::UnexpectedMedia),
                     Err(error) => Err(error),
                 }
             };
             *ctx.texts.upload.lock().expect("texts poisoned") = None;
             match upload {
-                Ok(Some(upload)) if complete => {
-                    rendition_dump_messages.push(upload.message_id);
-                    remember_zip_dump_message(ctx, upload.message_id);
+                Ok(ZipSendOutcome::Published(upload)) if complete => {
+                    rendition_dump_messages.push(upload.message);
+                    remember_zip_dump_message(ctx, upload.message);
                     if is_cancelled() {
                         return Ok(first_delivery);
                     }
@@ -3655,16 +3797,16 @@ async fn finalize_zip_inner<D: OrchestratorDeps>(
                             .then_some(options.reply_to_message_id)
                             .flatten();
                         let copy_result = tokio::select! {
-                            result = deps.sink().send_dump_copy(
-                                options.delivery_chat_id,
-                                upload.message_id,
-                                reply_to,
-                                plan.total_parts > 1,
-                            ) => result,
+                            result = deps.deliver_to_chat(ChatDelivery::DumpCopy {
+                                destination: ChatRef::new(options.delivery_chat_id),
+                                source: upload.message,
+                                reply_to: reply_to.map(ChatMessageRef::new),
+                                silent: plan.total_parts > 1,
+                            }) => result,
                             _ = job_controller.cancelled() => return Ok(first_delivery),
                         };
                         match copy_result {
-                            Ok(sent_id) => {
+                            Ok(DeliveryReceipt::Message(sent_id)) => {
                                 if is_cancelled() {
                                     return Ok(first_delivery);
                                 }
@@ -3674,6 +3816,15 @@ async fn finalize_zip_inner<D: OrchestratorDeps>(
                                 }
                                 delivered_parts += 1;
                                 delivered_size += size as i64;
+                            }
+                            Ok(DeliveryReceipt::PreviewDelivered) => {
+                                if state.rendition == Rendition::Primary {
+                                    return Err("primary ZIP delivery returned a preview receipt"
+                                        .to_owned());
+                                }
+                                tracing::warn!(
+                                    "optional Atmos ZIP delivery returned a preview receipt"
+                                );
                             }
                             Err(error) if state.rendition == Rendition::Primary => {
                                 return Err(format!("primary ZIP delivery failed: {error}"));
@@ -3692,7 +3843,7 @@ async fn finalize_zip_inner<D: OrchestratorDeps>(
                         codec: album_codec,
                         part_index: plan.part_index as i32,
                         total_parts: plan.total_parts as i32,
-                        message_id: upload.message_id,
+                        message_id: upload.message.id(),
                         file_id: upload.file_id,
                         file_unique_id: upload.file_unique_id,
                         file_size: size as i64,
@@ -3700,16 +3851,9 @@ async fn finalize_zip_inner<D: OrchestratorDeps>(
                         generation_hash: state.generation_hash.clone().unwrap_or_default(),
                     });
                 }
-                Ok(_) if !complete && !options.is_cache_only => {
+                Ok(ZipSendOutcome::Delivered) if !complete && !options.is_cache_only => {
                     delivered_parts += 1;
                     delivered_size += size as i64;
-                }
-                Ok(None) if complete => {
-                    if state.rendition == Rendition::Primary {
-                        return Err("primary ZIP upload returned no document".to_owned());
-                    }
-                    all_parts_uploaded = false;
-                    tracing::warn!("optional Atmos ZIP upload returned no document");
                 }
                 Err(error) if state.rendition == Rendition::Primary => {
                     return Err(format!("primary ZIP upload failed: {error}"));
@@ -3718,13 +3862,17 @@ async fn finalize_zip_inner<D: OrchestratorDeps>(
                     all_parts_uploaded = false;
                     tracing::warn!(%error, "optional Atmos ZIP upload failed");
                 }
-                _ => {}
+                Ok(ZipSendOutcome::Delivered) => {}
+                Ok(ZipSendOutcome::Published(_)) => {
+                    all_parts_uploaded = false;
+                    tracing::warn!("ZIP publication was returned for a direct delivery");
+                }
             }
         }
         if complete && all_parts_uploaded && replacement_uploads.len() == expected_parts {
             let new_message_ids = replacement_uploads
                 .iter()
-                .map(|upload| upload.message_id)
+                .map(|upload| DumpMessageRef::new(upload.message_id))
                 .collect::<Vec<_>>();
             let expected = ctx
                 .zip_expectations
@@ -3741,25 +3889,75 @@ async fn finalize_zip_inner<D: OrchestratorDeps>(
                 )
                 .await;
             match replacement {
+                Err(AlbumCacheError::Conflict { .. }) => {
+                    if let Err(error) = deps.retract_dump(&rendition_dump_messages).await {
+                        tracing::error!(
+                            %error,
+                            rendition = ?state.rendition,
+                            "failed to retract ZIP uploads after cache conflict"
+                        );
+                    }
+                    transfer_zip_dump_messages(ctx, &rendition_dump_messages);
+                    let winner_rows = match deps
+                        .find_albums(options.provider, &ctx.zip_album_id, Some(album_codec))
+                        .await
+                    {
+                        Ok(rows) => rows,
+                        Err(error) if state.rendition == Rendition::Primary => {
+                            return Err(format!(
+                                "primary ZIP cache conflict winner lookup failed: {error}"
+                            ));
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                rendition = ?state.rendition,
+                                "optional Atmos cache conflict winner lookup failed"
+                            );
+                            Vec::new()
+                        }
+                    };
+                    if winner_rows.is_empty() {
+                        if state.rendition == Rendition::Primary {
+                            return Err(
+                                "primary ZIP cache conflict had no committed winner".to_owned()
+                            );
+                        }
+                        tracing::warn!(
+                            rendition = ?state.rendition,
+                            "optional Atmos cache conflict had no committed winner"
+                        );
+                    } else if ctx.zip_deliver && !options.is_cache_only {
+                        let (winner_parts, winner_size) = deliver_cached_zip_rows(
+                            deps,
+                            shared,
+                            ctx,
+                            state.rendition,
+                            &winner_rows,
+                            job_controller,
+                        )
+                        .await?;
+                        delivered_parts = winner_parts;
+                        delivered_size = winner_size;
+                    }
+                    tracing::info!(
+                        rendition = ?state.rendition,
+                        "discarded ZIP uploads and reused committed cache winner"
+                    );
+                }
                 Err(error) => {
                     if state.rendition == Rendition::Primary {
                         return Err(format!("primary ZIP cache replacement failed: {error}"));
                     }
                     tracing::warn!(%error, "optional Atmos ZIP cache replacement failed");
-                    let _ = deps
-                        .sink()
-                        .delete_dump_messages(&rendition_dump_messages)
-                        .await;
+                    let _ = deps.retract_dump(&rendition_dump_messages).await;
                     transfer_zip_dump_messages(ctx, &rendition_dump_messages);
                 }
                 Ok(AlbumReplacementResult::Stale) => {
                     // Another rebuild won after this job took its snapshot.
                     // Its rows/messages are not ours to remove; only the
                     // documents uploaded by this attempt are cleaned.
-                    let _ = deps
-                        .sink()
-                        .delete_dump_messages(&rendition_dump_messages)
-                        .await;
+                    let _ = deps.retract_dump(&rendition_dump_messages).await;
                     transfer_zip_dump_messages(ctx, &rendition_dump_messages);
                     tracing::info!(
                         rendition = ?state.rendition,
@@ -3777,18 +3975,16 @@ async fn finalize_zip_inner<D: OrchestratorDeps>(
                     transfer_zip_dump_messages(ctx, &new_message_ids);
                     let old_message_ids = displaced_message_ids
                         .into_iter()
+                        .map(DumpMessageRef::new)
                         .filter(|message_id| !new_message_ids.contains(message_id))
                         .collect::<Vec<_>>();
                     if !old_message_ids.is_empty() {
-                        let _ = deps.sink().delete_dump_messages(&old_message_ids).await;
+                        let _ = deps.retract_dump(&old_message_ids).await;
                     }
                 }
             }
         } else if complete && state.rendition == Rendition::Atmos {
-            let _ = deps
-                .sink()
-                .delete_dump_messages(&rendition_dump_messages)
-                .await;
+            let _ = deps.retract_dump(&rendition_dump_messages).await;
             transfer_zip_dump_messages(ctx, &rendition_dump_messages);
             tracing::warn!("optional Atmos ZIP publication was incomplete");
         } else if state.rendition == Rendition::Primary && complete {
@@ -3818,11 +4014,11 @@ async fn finalize_zip_inner<D: OrchestratorDeps>(
                     return Ok(first_delivery);
                 }
                 let delivered = tokio::select! {
-                    result = deps.sink().send_photo_to_chat(
-                        options.delivery_chat_id,
-                        bytes,
-                        &details,
-                    ) => result.is_ok(),
+                    result = deps.deliver_to_chat(ChatDelivery::Photo {
+                        destination: ChatRef::new(options.delivery_chat_id),
+                        image_bytes: bytes.clone(),
+                        caption_html: details.clone(),
+                    }) => matches!(result, Ok(DeliveryReceipt::PreviewDelivered)),
                     _ = job_controller.cancelled() => return Ok(first_delivery),
                 };
                 if is_cancelled() {
@@ -3861,19 +4057,17 @@ async fn finalize_zip_inner<D: OrchestratorDeps>(
 }
 
 /// Best-effort cleanup for a cancellation after an upload has completed.
-async fn rollback_cancelled<D: OrchestratorDeps>(
+async fn rollback_cancelled<D>(
     deps: &Arc<D>,
     provider: Provider,
     track_id: &str,
-    dump_message_id: i64,
+    dump_message_id: DumpMessageRef,
     delete_record: bool,
     codec: Option<Codec>,
-) {
-    let dump_removed = deps
-        .sink()
-        .delete_dump_messages(&[dump_message_id])
-        .await
-        .is_ok();
+) where
+    D: TrackCache + Delivery,
+{
+    let dump_removed = deps.retract_dump(&[dump_message_id]).await.is_ok();
     if dump_removed && delete_record {
         let mut key = TrackKey::new(provider, track_id);
         if let Some(c) = codec {
@@ -3890,14 +4084,17 @@ async fn rollback_cancelled<D: OrchestratorDeps>(
 ///
 /// Runs on lane 2, so it only checks the job's own cancellation token:
 /// rip-queue lifecycle tokens (position, queue abort) do not apply.
-async fn upload_one<D: OrchestratorDeps>(
+async fn upload_one<D>(
     deps: &Arc<D>,
     bus: &EventBus,
     shared: &Arc<Mutex<JobShared>>,
     ctx: &Arc<JobContext>,
     job_controller: &CancellationToken,
     upload_item: &PipelineRipResult,
-) -> bool {
+) -> bool
+where
+    D: TrackCache + Delivery + JobBookkeeping,
+{
     let options = &ctx.options;
     let texts = &ctx.texts;
     let track_id = upload_item.track_id.clone();
@@ -3940,11 +4137,9 @@ async fn upload_one<D: OrchestratorDeps>(
 
     // Send with configured retries.  The initial call is attempt zero, so
     // `max_retries + 1` calls are made in the ordinary case.
-    let max_retries = deps.upload_max_retries();
+    let max_retries = ctx.config.upload_max_retries;
     enum SendOutcome {
-        Audio(DumpUpload),
-        /// Send succeeded but the message carried no audio media.
-        NotAudio,
+        Audio(crate::orchestrator::deps::DumpPublication),
     }
     let mut outcome: Option<SendOutcome> = None;
     'upload: for attempt in 0..=max_retries {
@@ -3976,25 +4171,19 @@ async fn upload_one<D: OrchestratorDeps>(
         };
 
         let upload_result = tokio::select! {
-            result = deps.sink().send_audio_to_dump(
-                &rip_result.file_path,
-                &rip_result.title,
-                &rip_result.artist,
-                rip_result.duration,
-                &current_caption,
-                Some(&on_upload),
-            ) => result,
+            result = deps.publish_to_dump(DumpPublish::TrackAudio {
+                file_path: rip_result.file_path.clone(),
+                title: rip_result.title.clone(),
+                performer: rip_result.artist.clone(),
+                duration: rip_result.duration,
+                caption_html: current_caption.clone(),
+                on_upload_progress: Some(Arc::clone(&on_upload)),
+            }) => result,
             _ = job_controller.cancelled() => break 'upload,
         };
         match upload_result {
             Ok(upload) => {
-                outcome = Some(match upload {
-                    Some(dump) => SendOutcome::Audio(dump),
-                    // Send succeeded but the media was not audio — the TS
-                    // retry loop breaks here too (`dumpMsg` is set), and the
-                    // `media?.type === 'audio'` check below fails.
-                    None => SendOutcome::NotAudio,
-                });
+                outcome = Some(SendOutcome::Audio(upload));
                 // The post-upload transaction performs cancellation cleanup
                 // before saving or delivering anything derived from this
                 // message.  Do not start another awaited operation here.
@@ -4004,15 +4193,19 @@ async fn upload_one<D: OrchestratorDeps>(
                 if is_cancelled() {
                     break 'upload;
                 }
-                if upload_err.to_string().contains("ENTITY_BOUNDS_INVALID") && !used_plain_caption {
+                if matches!(
+                    upload_err,
+                    DeliveryError::Rejected(DeliveryRejection::EntityBoundsInvalid)
+                ) && !used_plain_caption
+                {
                     used_plain_caption = true;
                     current_caption = plain_caption.clone();
                     continue 'upload;
                 }
-                if attempt < max_retries {
+                if upload_err.is_transient() && attempt < max_retries {
                     let jitter = 0.8 + (now_ms() % 400) as f64 / 1000.0;
                     let delay =
-                        deps.upload_retry_base_ms() as f64 * 2f64.powi(attempt as i32) * jitter;
+                        ctx.config.upload_retry_base_ms as f64 * 2f64.powi(attempt as i32) * jitter;
                     tracing::warn!(
                         track_id = %track_id,
                         attempt,
@@ -4028,7 +4221,7 @@ async fn upload_one<D: OrchestratorDeps>(
                 } else {
                     tracing::error!(
                         track_id = %track_id,
-                        attempts = max_retries + 1,
+                        attempts = attempt + 1,
                         error = %upload_err,
                         "All upload retries exhausted for track"
                     );
@@ -4075,60 +4268,35 @@ async fn upload_one<D: OrchestratorDeps>(
         return false;
     };
 
-    // A successful send with no audio media records a track failure (no
-    // request log) unless the job was cancelled.
-    let dump_upload = match outcome {
-        SendOutcome::Audio(dump_upload) => dump_upload,
-        SendOutcome::NotAudio => {
-            if !is_cancelled() {
-                let err_msg = "Upload failed: no audio media returned";
-                if upload_item.rendition == Rendition::Primary {
-                    let mut failures = ctx.failed_tracks.lock().expect("failures poisoned");
-                    failures.push(FailedTrack {
-                        id: track_id.clone(),
-                        error: err_msg.to_string(),
-                        kind: None,
-                        title: Some(rip_result.title.clone()),
-                        artist: Some(rip_result.artist.clone()),
-                        storefront: None,
-                    });
-                    shared.lock().expect("job poisoned").job.failed_count = failures.len();
-                }
-                tracing::error!(track_id = %track_id, "Track upload failed: no audio media returned");
-            }
-            *texts.upload.lock().expect("texts poisoned") = None;
-            shared.lock().expect("job poisoned").job.active_action_text = None;
-            let (download_text, upload_text) = texts.snapshot();
-            bus.emit_progress(
-                shared,
-                None,
-                download_text.as_deref(),
-                upload_text.as_deref(),
-            );
-            return false;
-        }
-    };
+    let SendOutcome::Audio(dump_upload) = outcome;
 
     // Post-upload block: save + copy + log share one try/catch — any
     // failure records the track failure and continues.
     let post_upload: Result<i64, String> = async {
         if is_cancelled() {
-            let _ = deps
-                .sink()
-                .delete_dump_messages(&[dump_upload.message_id])
-                .await;
+            if let Err(error) = deps.retract_dump(&[dump_upload.message]).await {
+                tracing::error!(%error, "failed to retract cancelled track publication");
+            }
             return Err("cancelled".to_owned());
         }
-        deps.save_track(SaveTrackInput::from_rip_result(
+        let cache_input = SaveTrackInput::from_rip_result(
             options.provider,
             &track_id,
             rip_result,
-            dump_upload.message_id,
+            dump_upload.message.id(),
             &dump_upload.file_id,
             &dump_upload.file_unique_id,
-        ))
-        .await
-        .map_err(|e| e.to_string())?;
+        );
+        if let Err(error) = save_track_with_retry(deps.as_ref(), cache_input, &ctx.config.storage_retry).await {
+            if let Err(retract_error) = deps.retract_dump(&[dump_upload.message]).await {
+                tracing::error!(
+                    %retract_error,
+                    track_id = %track_id,
+                    "failed to retract track publication after cache persistence failure"
+                );
+            }
+            return Err(format!("track cache persistence failed: {error}"));
+        }
 
         if is_cancelled() {
             let rip_codec = rip_result.codec.parse::<Codec>().ok();
@@ -4136,7 +4304,7 @@ async fn upload_one<D: OrchestratorDeps>(
                 deps,
                 options.provider,
                 &track_id,
-                dump_upload.message_id,
+                dump_upload.message_id(),
                 true,
                 rip_codec,
             )
@@ -4151,15 +4319,17 @@ async fn upload_one<D: OrchestratorDeps>(
                 .then_some(options.reply_to_message_id)
                 .flatten();
             let sent_id = deps
-                .sink()
-                .send_dump_copy(
-                    options.delivery_chat_id,
-                    dump_upload.message_id,
-                    reply_to,
-                    ctx.is_multi_track,
-                )
+                .deliver_to_chat(ChatDelivery::DumpCopy {
+                    destination: ChatRef::new(options.delivery_chat_id),
+                    source: dump_upload.message,
+                    reply_to: reply_to.map(ChatMessageRef::new),
+                    silent: ctx.is_multi_track,
+                })
                 .await
                 .map_err(|e| e.to_string())?;
+            let DeliveryReceipt::Message(sent_id) = sent_id else {
+                return Err("track delivery returned a preview receipt".to_owned());
+            };
             let mut guard = ctx.first_delivered_msg_id.lock().unwrap();
             if guard.is_none() {
                 *guard = Some(sent_id);
@@ -4171,7 +4341,7 @@ async fn upload_one<D: OrchestratorDeps>(
                 deps,
                 options.provider,
                 &track_id,
-                dump_upload.message_id,
+                dump_upload.message_id(),
                 true,
                 rip_result.codec.parse::<Codec>().ok(),
             )
@@ -4180,7 +4350,7 @@ async fn upload_one<D: OrchestratorDeps>(
         }
 
         let total_duration_ms = (now_ms() - upload_item.start_time_ms) as i64;
-        deps.log_request(RequestLog {
+        if let Err(error) = deps.log_request(RequestLog {
             telegram_id: options.user_id,
             chat_id: options.chat_id,
             track_key: TrackKey::new(options.provider, track_id.clone()),
@@ -4188,9 +4358,9 @@ async fn upload_one<D: OrchestratorDeps>(
             duration_ms: Some(total_duration_ms),
             status: "completed".to_string(),
             error_reason: None,
-        })
-        .await
-        .map_err(|e| e.to_string())?;
+        }).await {
+            tracing::warn!(%error, track_id = %track_id, "request log failed after track completion");
+        }
 
         Ok(total_duration_ms)
     }
@@ -4274,12 +4444,14 @@ struct TrackFailureDetails<'a> {
 
 /// Record a track failure: push the row, update the counter, and log the
 /// request.
-async fn record_failure<D: OrchestratorDeps>(
+async fn record_failure<D>(
     shared: &Arc<Mutex<JobShared>>,
     ctx: &JobContext,
     deps: &Arc<D>,
     details: TrackFailureDetails<'_>,
-) {
+) where
+    D: JobBookkeeping,
+{
     {
         let mut failures = ctx.failed_tracks.lock().expect("failures poisoned");
         failures.push(FailedTrack {
@@ -4293,7 +4465,7 @@ async fn record_failure<D: OrchestratorDeps>(
         shared.lock().expect("job poisoned").job.failed_count = failures.len();
     }
     tracing::error!(track_id = %details.track_id, error = %details.err_msg, "Track upload failed");
-    let _ = deps
+    let log_result = deps
         .log_request(RequestLog {
             telegram_id: ctx.options.user_id,
             chat_id: ctx.options.chat_id,
@@ -4304,6 +4476,9 @@ async fn record_failure<D: OrchestratorDeps>(
             error_reason: Some(details.err_msg),
         })
         .await;
+    if let Err(error) = log_result {
+        tracing::warn!(%error, track_id = %details.track_id, "request log failed after track failure");
+    }
 }
 
 // helpers
@@ -4379,7 +4554,7 @@ mod hardening_tests {
 
     #[test]
     fn admission_limits_users_and_global_jobs() {
-        let orchestrator = RipOrchestrator::new();
+        let orchestrator = RipOrchestrator::new(OrchestratorConfig::test());
         // Per-user cap: 4 concurrent jobs for normal users.
         let user = options(1, false);
         for job in ["u1", "u2", "u3", "u4"] {

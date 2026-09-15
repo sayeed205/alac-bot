@@ -10,6 +10,7 @@ name = "bot"
 path = "src/main.rs"
 
 [dependencies]
+diesel.workspace = true
 db = { path = "../db" }
 engine = { path = "../engine" }
 apple = { path = "../apple" }

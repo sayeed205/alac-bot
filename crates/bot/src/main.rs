@@ -160,7 +160,9 @@ async fn main() -> Result<()> {
         .context("initialize rip dependencies")?,
     );
 
-    let orchestrator = Arc::new(engine::orchestrator::RipOrchestrator::new());
+    let orchestrator = Arc::new(engine::orchestrator::RipOrchestrator::new(
+        bot::rip_deps::orchestrator_config(),
+    ));
     let state = Arc::new(BotState {
         client: client.clone(),
         auth,

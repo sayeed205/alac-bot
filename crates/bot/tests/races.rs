@@ -3,7 +3,6 @@
 
 use std::{
     collections::HashMap,
-    future::Future,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -14,9 +13,13 @@ use std::{
 use engine::{
     orchestrator::{
         deps::{
-            AlbumReplacementExpectation, AlbumReplacementResult, ArtworkProvider, CachedTrack,
-            CollectionResolver, OrchestratorDeps, ProviderComposition, ProviderPresentation,
-            RequestLog, SaveTrackInput, TrackAcquisition,
+            AlbumCache, AlbumCacheError, AlbumReplacementExpectation, AlbumReplacementResult,
+            AlbumUpload, ArtworkProvider, BoxFuture, CachedAlbum, CachedTrack, ChatDelivery,
+            CollectionResolver, Delivery, DeliveryError, DeliveryReceipt, DumpMessageRef,
+            DumpPublication, DumpPublish, JobBookkeeping, JobBookkeepingError, OrchestratorConfig,
+            ProviderAccess, ProviderComposition, ProviderPresentation, RequestLog, SaveTrackInput,
+            StorageRetryPolicy, TrackAcquisition, TrackCache, TrackCacheError,
+            UploadProgressCallback,
         },
         types::{JobPhase, OrchestratorEvent, RipJobOptions},
         RipOrchestrator,
@@ -54,49 +57,126 @@ struct RaceDeps {
     rip_calls: Arc<AtomicUsize>,
 }
 
-impl OrchestratorDeps for RaceDeps {
+impl ProviderAccess for RaceDeps {
     type Providers = Self;
 
     fn providers(&self) -> &Self::Providers {
         self
     }
+}
 
-    fn get_settings(&self) -> impl Future<Output = BotSettings> + Send {
-        let settings = self.settings.clone();
-        async move { settings }
-    }
-    async fn find_cached_tracks(
-        &self,
-        keys: &[TrackKey],
-    ) -> Result<HashMap<TrackKey, CachedTrack>, String> {
+impl TrackCache for RaceDeps {
+    fn find_cached_tracks<'a>(
+        &'a self,
+        keys: &'a [TrackKey],
+    ) -> BoxFuture<'a, Result<HashMap<TrackKey, CachedTrack>, TrackCacheError>> {
         let _ = keys;
-        Ok(HashMap::new())
+        Box::pin(async { Ok(HashMap::new()) })
     }
-    async fn save_track(&self, input: SaveTrackInput) -> Result<(), String> {
+
+    fn save_track<'a>(
+        &'a self,
+        input: SaveTrackInput,
+    ) -> BoxFuture<'a, Result<(), TrackCacheError>> {
         let _ = input;
-        Ok(())
+        Box::pin(async { Ok(()) })
     }
-    async fn delete_track(&self, key: &TrackKey) -> Result<bool, String> {
+
+    fn delete_track<'a>(
+        &'a self,
+        key: &'a TrackKey,
+    ) -> BoxFuture<'a, Result<bool, TrackCacheError>> {
         let _ = key;
-        Ok(true)
+        Box::pin(async { Ok(true) })
     }
-    async fn log_request(&self, log: RequestLog) -> Result<(), String> {
+}
+
+impl JobBookkeeping for RaceDeps {
+    fn settings_snapshot(&self) -> BotSettings {
+        self.settings.clone()
+    }
+
+    fn log_request<'a>(
+        &'a self,
+        log: RequestLog,
+    ) -> BoxFuture<'a, Result<(), JobBookkeepingError>> {
         let _ = log;
-        Ok(())
+        Box::pin(async { Ok(()) })
     }
+}
+
+impl AlbumCache for RaceDeps {
+    fn save_album<'a>(&'a self, upload: AlbumUpload) -> BoxFuture<'a, Result<(), AlbumCacheError>> {
+        let _ = upload;
+        Box::pin(async { Ok(()) })
+    }
+
     fn replace_albums<'a>(
         &'a self,
         provider: Provider,
         album_id: &'a str,
         codec: engine::Codec,
         expected: AlbumReplacementExpectation,
-        uploads: Vec<engine::orchestrator::deps::AlbumUpload>,
-    ) -> engine::orchestrator::deps::BoxFuture<'a, Result<AlbumReplacementResult, String>> {
+        uploads: Vec<AlbumUpload>,
+    ) -> BoxFuture<'a, Result<AlbumReplacementResult, AlbumCacheError>> {
         let _ = (provider, album_id, codec, expected, uploads);
         Box::pin(async { Ok(AlbumReplacementResult::Stale) })
     }
-    fn sink(&self) -> &dyn engine::orchestrator::deps::TelegramSink {
-        unreachable!("sink not reached in race tests")
+
+    fn find_albums<'a>(
+        &'a self,
+        provider: Provider,
+        album_id: &'a str,
+        codec: Option<engine::Codec>,
+    ) -> BoxFuture<'a, Result<Vec<CachedAlbum>, AlbumCacheError>> {
+        let _ = (provider, album_id, codec);
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn delete_albums<'a>(
+        &'a self,
+        provider: Provider,
+        album_id: &'a str,
+        codec: Option<engine::Codec>,
+    ) -> BoxFuture<'a, Result<(), AlbumCacheError>> {
+        let _ = (provider, album_id, codec);
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl Delivery for RaceDeps {
+    fn publish_to_dump<'a>(
+        &'a self,
+        publication: DumpPublish,
+    ) -> BoxFuture<'a, Result<DumpPublication, DeliveryError>> {
+        let _ = publication;
+        Box::pin(async { Err(DeliveryError::Unavailable("delivery not reached".into())) })
+    }
+
+    fn deliver_to_chat<'a>(
+        &'a self,
+        delivery: ChatDelivery,
+    ) -> BoxFuture<'a, Result<DeliveryReceipt, DeliveryError>> {
+        let _ = delivery;
+        Box::pin(async { Err(DeliveryError::Unavailable("delivery not reached".into())) })
+    }
+
+    fn materialize_cached<'a>(
+        &'a self,
+        source: DumpMessageRef,
+        destination: &'a std::path::Path,
+        progress: Option<&'a UploadProgressCallback>,
+    ) -> BoxFuture<'a, Result<(), DeliveryError>> {
+        let _ = (source, destination, progress);
+        Box::pin(async { Err(DeliveryError::Unavailable("delivery not reached".into())) })
+    }
+
+    fn retract_dump<'a>(
+        &'a self,
+        messages: &'a [DumpMessageRef],
+    ) -> BoxFuture<'a, Result<(), DeliveryError>> {
+        let _ = messages;
+        Box::pin(async { Err(DeliveryError::Unavailable("delivery not reached".into())) })
     }
 }
 
@@ -248,7 +328,11 @@ async fn wait_for_phase(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_during_active_rip_emits_exactly_one_cancelled_terminal() {
-    let orch = Arc::new(RipOrchestrator::new());
+    let orch = Arc::new(RipOrchestrator::new(OrchestratorConfig {
+        storage_retry: StorageRetryPolicy::test(),
+        upload_retry_base_ms: 0,
+        upload_max_retries: 0,
+    }));
     let terminals = terminal_recorder(&orch);
     let deps = Arc::new(RaceDeps {
         settings: engine::settings::default_settings(),
@@ -279,7 +363,11 @@ async fn cancel_during_active_rip_emits_exactly_one_cancelled_terminal() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn settled_failed_job_is_no_longer_cancellable() {
-    let orch = Arc::new(RipOrchestrator::new());
+    let orch = Arc::new(RipOrchestrator::new(OrchestratorConfig {
+        storage_retry: StorageRetryPolicy::test(),
+        upload_retry_base_ms: 0,
+        upload_max_retries: 0,
+    }));
     let terminals = terminal_recorder(&orch);
     let deps = Arc::new(RaceDeps {
         settings: engine::settings::default_settings(),

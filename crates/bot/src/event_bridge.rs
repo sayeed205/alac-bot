@@ -9,9 +9,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use engine::orchestrator::{
-    deps::OrchestratorDeps,
-    types::{ActiveRipJob, FailedTrack, OrchestratorEvent, RipJobProgress, RipJobSummary},
+use engine::orchestrator::types::{
+    ActiveRipJob, FailedTrack, OrchestratorEvent, RipJobProgress, RipJobSummary,
 };
 use tokio::sync::mpsc;
 
@@ -187,7 +186,7 @@ pub fn start(state: Arc<BotState>) {
 /// Build a global dashboard snapshot from the engine's current jobs.
 pub async fn current_snapshot(state: &BotState) -> crate::dashboard::DashboardSnapshot {
     let active = state.rip_orchestrator.get_active_jobs();
-    let settings = state.rip_deps.get_settings().await;
+    let settings = state.rip_deps.settings_snapshot();
     let mode = settings.ripping_mode.as_str().to_owned();
     // Refresh mirror health opportunistically: the last-known value renders
     // immediately, and a fresh probe runs only when the cached one is stale.
@@ -476,7 +475,8 @@ async fn notify_job_completed(state: &BotState, job: &ActiveRipJob, summary: &Ri
             let url = if state.bot_id > 0 {
                 format!(
                     "tg://openmessage?user_id={}&message_id={msg_id}",
-                    state.bot_id
+                    state.bot_id,
+                    msg_id = msg_id.id()
                 )
             } else {
                 format!(
@@ -757,7 +757,7 @@ mod tests {
             warnings: Vec::new(),
             zip_delivery: Some(primary.clone()),
             zip_deliveries: vec![primary, atmos],
-            first_delivered_msg_id: Some(1),
+            first_delivered_msg_id: Some(engine::orchestrator::deps::ChatMessageRef::new(1)),
         };
 
         let entries = zip_delivery_entries(&summary);

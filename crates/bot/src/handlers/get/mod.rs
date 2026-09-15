@@ -11,7 +11,6 @@ pub mod input;
 
 use std::sync::Arc;
 
-use engine::orchestrator::deps::OrchestratorDeps;
 use ferogram::{
     filters::{self, Dispatcher},
     InputMessage,
@@ -71,7 +70,7 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
         reply(&msg, text).await;
         return;
     }
-    let settings = state.rip_deps.get_settings().await;
+    let settings = state.rip_deps.settings_snapshot();
     if let Some(text) = gates::feature_gate(&settings, &parsed.items, admin, parsed.document) {
         reply(&msg, text).await;
         return;

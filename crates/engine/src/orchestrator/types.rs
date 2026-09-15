@@ -5,6 +5,7 @@ use std::sync::Arc;
 pub use music::{Rendition, RenditionPolicy, RenditionWorkPlan, RenditionWorkUnit};
 use tokio_util::sync::CancellationToken;
 
+use super::deps::ChatMessageRef;
 use crate::types::{ParsedTargetItem, Provider, TargetKind};
 
 /// The non-terminal lifecycle phase of a job.  Terminality is represented by
@@ -241,7 +242,7 @@ pub struct RipJobSummary {
     /// retained as the primary/first entry compatibility view.
     pub zip_deliveries: Vec<ZipDeliveryInfo>,
     /// Telegram message ID of the first delivered track or ZIP in the delivery chat.
-    pub first_delivered_msg_id: Option<i32>,
+    pub first_delivered_msg_id: Option<ChatMessageRef>,
 }
 
 /// Album details for a delivered ZIP, powering the post-ZIP info message.
