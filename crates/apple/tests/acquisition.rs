@@ -7,8 +7,8 @@ use std::{
 };
 
 use apple::{
-    AppleAcquisitionConfig, AppleStreamAcquisition, MirrorHttp, MirrorHttpError,
-    MirrorPolicyManager, WrapperKind, MANIFEST_URL,
+    map_acquisition_outcome, AcquisitionOutcome, AppleAcquisitionConfig, AppleStreamAcquisition,
+    MirrorHttp, MirrorHttpError, MirrorPolicyManager, WrapperKind, MANIFEST_URL,
 };
 use bytes::Bytes;
 use engine::{
@@ -373,10 +373,11 @@ impl RipStage for FallbackRipStage {
         on_progress: Option<ProgressCallback>,
         codec_preference: apple::CodecPreference,
     ) -> Result<AudioStreamSource, RipError> {
-        self.acquisition
-            .connect_stream(track_id, signal, on_progress, codec_preference)
-            .await
-            .map_err(RipError::from)
+        map_acquisition_outcome(
+            self.acquisition
+                .connect_stream(track_id, signal, on_progress, codec_preference)
+                .await,
+        )
     }
 
     fn observe_stream_failure(&self, source: &SourceId, kind: SourceFailureKind, detail: &str) {
@@ -441,10 +442,14 @@ async fn transient_mirror_failure_reuses_resolved_endpoint_on_retry_round() {
         WrapperKind::Native,
         2,
     );
-    let source = acquisition
+    let source = match acquisition
         .connect_stream("42", None, None, apple::CodecPreference::HighestQuality)
         .await
-        .unwrap();
+        .unwrap()
+    {
+        AcquisitionOutcome::Stream(source) => source,
+        AcquisitionOutcome::RenditionAbsent => panic!("primary stream must be available"),
+    };
     assert_eq!(source.source, SourceId::PrimaryMirror);
     assert_eq!(calls.lock().unwrap().len(), 2);
 }
@@ -468,6 +473,47 @@ async fn wrapper_candidates_are_tried_in_order_after_mirror_failure() {
             "https://wrapper/api/stream/42".to_owned(),
             "https://wrapper/stream/42".to_owned(),
         ]
+    );
+}
+
+#[tokio::test]
+async fn highest_quality_endpoint_wrapper_returns_non_ec3_stream() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let policy = MirrorPolicyManager::new(FakeMirror { available: false }, None);
+    let stream = FakeStream::with_success_codecs(&["mp4a.40.2"], Arc::clone(&calls));
+    let acquisition = AppleStreamAcquisition::with_config(
+        StreamTransport::new(stream),
+        policy,
+        Some("https://wrapper".to_owned()),
+        None,
+        WrapperKind::Endpoints,
+        AppleAcquisitionConfig {
+            retry_rounds: 1,
+            retry_base_delay_ms: 0,
+        },
+    );
+
+    let outcome = acquisition
+        .connect_stream("42", None, None, apple::CodecPreference::HighestQuality)
+        .await
+        .expect("a non-EC-3 endpoint stream is valid for highest quality");
+
+    match outcome {
+        AcquisitionOutcome::Stream(source) => {
+            assert_eq!(source.codec, "mp4a.40.2");
+            assert!(matches!(
+                source.source,
+                SourceId::WrapperCandidate { endpoint }
+                    if endpoint == "https://wrapper/api/stream/42"
+            ));
+        }
+        AcquisitionOutcome::RenditionAbsent => {
+            panic!("a primary request must not report rendition absence")
+        }
+    }
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec!["https://wrapper/api/stream/42".to_owned()]
     );
 }
 
@@ -677,7 +723,7 @@ async fn wrapper_corruption_does_not_fallback_or_poison_mirror() {
 }
 
 #[tokio::test]
-async fn atmos_wrapper_m3u8_404_is_typed_unavailable_without_retry() {
+async fn atmos_wrapper_m3u8_404_returns_absence_without_retry() {
     let (wrapper_url, requests, server) = wrapper_m3u8_404_server().await;
     let (acquisition, stream_calls) = acquisition(
         &[],
@@ -687,15 +733,12 @@ async fn atmos_wrapper_m3u8_404_is_typed_unavailable_without_retry() {
         3,
     );
     let (callback, messages) = progress_log();
-    let error = acquisition
+    let outcome = acquisition
         .connect_stream("42", None, Some(callback), apple::CodecPreference::Atmos)
         .await
-        .expect_err("an Atmos wrapper 404 is optional absence");
+        .expect("an Atmos wrapper 404 is optional absence");
 
-    assert!(matches!(
-        error,
-        StreamError::Unavailable(message) if message.contains("404")
-    ));
+    assert!(matches!(outcome, AcquisitionOutcome::RenditionAbsent));
     assert_eq!(requests.load(Ordering::SeqCst), 1);
     assert!(stream_calls.lock().unwrap().is_empty());
     assert!(messages
@@ -859,7 +902,7 @@ async fn primary_wrapper_m3u8_404_maps_to_track_unavailable_in_rip_error() {
 }
 
 #[tokio::test]
-async fn atmos_wrapper_m3u8_404_maps_to_rendition_unavailable_in_rip_error() {
+async fn atmos_wrapper_m3u8_404_returns_public_absence() {
     let (wrapper_url, requests, server) = wrapper_m3u8_404_server().await;
     let (acquisition, _) = acquisition(
         &[],
@@ -868,18 +911,30 @@ async fn atmos_wrapper_m3u8_404_maps_to_rendition_unavailable_in_rip_error() {
         WrapperKind::Native,
         3,
     );
-    let error = acquisition
+    let outcome = acquisition
         .connect_stream("42", None, None, apple::CodecPreference::Atmos)
         .await
-        .expect_err("an Atmos wrapper 404 is typed rendition absence");
+        .expect("an Atmos wrapper 404 is optional absence");
 
-    let rip_error = RipError::from(error);
-    assert!(matches!(
-        rip_error,
-        RipError::RenditionUnavailable { reason } if reason.contains("404")
-    ));
+    assert!(matches!(outcome, AcquisitionOutcome::RenditionAbsent));
     assert_eq!(requests.load(Ordering::SeqCst), 1);
     server.abort();
+}
+
+#[tokio::test]
+async fn atmos_absence_maps_to_rendition_unavailable_in_rip_stage() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let stage = fallback_rip_stage(false, "mp4a.40.2", false, calls);
+    let error = stage
+        .connect_stream("42", None, None, apple::CodecPreference::Atmos)
+        .await
+        .expect_err("Atmos absence should map to a typed rip error");
+
+    assert!(matches!(
+        error,
+        RipError::RenditionUnavailable { reason }
+            if reason == "Dolby Atmos is unavailable"
+    ));
 }
 
 #[tokio::test]
@@ -907,19 +962,19 @@ async fn atmos_all_non_ec3_wrapper_candidates_are_unavailable_without_retry() {
         WrapperKind::Endpoints,
         3,
     );
-    let error = acquisition
+    let outcome = acquisition
         .connect_stream("42", None, None, apple::CodecPreference::Atmos)
         .await
-        .expect_err("all non-EC-3 candidates must be unavailable");
+        .expect("all non-EC-3 candidates must be unavailable");
 
-    assert!(matches!(error, StreamError::Unavailable(message) if message.contains("non-EC-3")));
+    assert!(matches!(outcome, AcquisitionOutcome::RenditionAbsent));
     assert_eq!(calls.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
 async fn atmos_non_ec3_candidate_does_not_hide_technical_wrapper_failure() {
     let (acquisition, calls) = acquisition(
-        &["/api/stream/42"],
+        &["/api/stream/42", "/api/stream/42"],
         FakeMirror { available: false },
         Some("https://wrapper"),
         WrapperKind::Endpoints,
@@ -983,10 +1038,14 @@ async fn atmos_non_ec3_wrapper_candidate_falls_back_to_ec3_candidate() {
         },
     );
 
-    let source = acquisition
+    let source = match acquisition
         .connect_stream("42", None, None, apple::CodecPreference::Atmos)
         .await
-        .expect("the second wrapper candidate is a valid Atmos stream");
+        .expect("the second wrapper candidate is a valid Atmos stream")
+    {
+        AcquisitionOutcome::Stream(source) => source,
+        AcquisitionOutcome::RenditionAbsent => panic!("the second candidate is EC-3"),
+    };
     assert_eq!(source.codec, "ec-3");
     assert_eq!(calls.lock().unwrap().len(), 2);
 }

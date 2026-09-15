@@ -52,8 +52,34 @@ impl WrapperKind {
 /// endpoint from being mistaken for a provider-confirmed missing rendition.
 enum AcquisitionAttempt {
     Source(AudioStreamSource),
+    RenditionAbsent,
     Typed(StreamError),
     NoSource,
+}
+
+/// Result of Apple source selection.
+#[derive(Debug)]
+pub enum AcquisitionOutcome {
+    /// A stream was successfully selected from an available source.
+    Stream(AudioStreamSource),
+    /// The optional Atmos rendition was confirmed absent; primary requests
+    /// return a stream or an error and never this variant.
+    RenditionAbsent,
+}
+
+/// Convert an acquisition result to the generic ripper's result type.
+pub fn map_acquisition_outcome(
+    result: Result<AcquisitionOutcome, StreamError>,
+) -> Result<AudioStreamSource, engine::ripper::RipError> {
+    match result {
+        Ok(AcquisitionOutcome::Stream(stream)) => Ok(stream),
+        Ok(AcquisitionOutcome::RenditionAbsent) => {
+            Err(engine::ripper::RipError::RenditionUnavailable {
+                reason: "Dolby Atmos is unavailable".to_owned(),
+            })
+        }
+        Err(error) => Err(engine::ripper::RipError::from(error)),
+    }
 }
 
 /// Retry settings for one Apple stream acquisition.
@@ -124,7 +150,7 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
         signal: Option<CancellationToken>,
         on_progress: Option<ProgressCallback>,
         codec_preference: CodecPreference,
-    ) -> Result<AudioStreamSource, StreamError> {
+    ) -> Result<AcquisitionOutcome, StreamError> {
         let rounds = self.retry_config.retry_rounds;
         let base_delay = self.retry_config.retry_base_delay_ms;
         let mut all_errors = Vec::new();
@@ -175,16 +201,13 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
                 return Err(StreamError::Cancelled);
             }
             match attempt {
-                AcquisitionAttempt::Source(stream) => return Ok(stream),
+                AcquisitionAttempt::Source(stream) => {
+                    return Ok(AcquisitionOutcome::Stream(stream));
+                }
+                AcquisitionAttempt::RenditionAbsent => {
+                    return Ok(AcquisitionOutcome::RenditionAbsent);
+                }
                 AcquisitionAttempt::Typed(error) => {
-                    // A typed absence is conclusive only when no earlier
-                    // candidate failed technically.  Otherwise preserve the
-                    // transport/parse/decrypt failure and its retry budget;
-                    // a later non-EC-3 response cannot prove absence after a
-                    // failed candidate was never resolved.
-                    if matches!(error, StreamError::Unavailable(_)) && !all_errors.is_empty() {
-                        continue;
-                    }
                     return Err(error);
                 }
                 AcquisitionAttempt::NoSource => {}
@@ -407,15 +430,15 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
         reason: WrapperUnavailableReason,
         codec_preference: CodecPreference,
     ) -> AcquisitionAttempt {
-        // A wrapper 404 on the master playlist is provider-confirmed track
-        // absence for a primary request, but only an optional rendition
-        // absence for an Atmos request.
-        if reason == WrapperUnavailableReason::M3u8NotFound
-            && codec_preference != CodecPreference::Atmos
-        {
-            return AcquisitionAttempt::Typed(StreamError::Permanent(reason.to_string()));
+        if codec_preference == CodecPreference::Atmos {
+            return AcquisitionAttempt::RenditionAbsent;
         }
-        AcquisitionAttempt::Typed(StreamError::Unavailable(reason.to_string()))
+        match reason {
+            WrapperUnavailableReason::M3u8NotFound => {
+                AcquisitionAttempt::Typed(StreamError::Permanent(reason.to_string()))
+            }
+            _ => AcquisitionAttempt::Typed(StreamError::Message(reason.to_string())),
+        }
     }
 
     fn accepted_attempt(
@@ -630,10 +653,11 @@ impl engine::ripper::RipStage for AppleRipperDeps {
         on_progress: Option<ProgressCallback>,
         codec_preference: CodecPreference,
     ) -> Result<AudioStreamSource, engine::ripper::RipError> {
-        self.acquisition
-            .connect_stream(track_id, signal, on_progress, codec_preference)
-            .await
-            .map_err(engine::ripper::RipError::from)
+        map_acquisition_outcome(
+            self.acquisition
+                .connect_stream(track_id, signal, on_progress, codec_preference)
+                .await,
+        )
     }
 
     fn track_tags(&self, meta: &music::TrackMeta) -> media::TrackTags {
