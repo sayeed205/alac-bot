@@ -10,7 +10,6 @@ use engine::streaming::{
     AudioStreamSource, FetchEndpointOptions, ProgressCallback, SourceId, StreamError, StreamHttp,
     StreamTransport,
 };
-use lyrics::{LyricsFuture, LyricsHttp, LyricsLookup, LyricsRegistry};
 use music::CodecPreference;
 use tokio_util::sync::CancellationToken;
 
@@ -442,35 +441,10 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
     }
 }
 
-fn map_media_finalize_error(error: media::MediaError) -> engine::ripper::RipError {
-    match error {
-        media::MediaError::SourceValidation(media::SourceValidationError::Decode(message)) => {
-            engine::ripper::RipError::Decode {
-                source: None,
-                detail: message,
-            }
-        }
-        media::MediaError::SourceValidation(media::SourceValidationError::Invalid(message)) => {
-            engine::ripper::RipError::Decode {
-                source: None,
-                detail: message,
-            }
-        }
-        media::MediaError::Io(error) => engine::ripper::RipError::LocalIo {
-            message: error.to_string(),
-        },
-        error => engine::ripper::RipError::Message(error.to_string()),
-    }
-}
-
 /// Production dependencies for the generic engine ripper.
 pub struct AppleRipperDeps {
     catalog: crate::catalog::Catalog<crate::catalog::ReqwestTransport>,
     acquisition: AppleStreamAcquisition<engine::streaming::ReqwestHttp, ReqwestMirrorHttp>,
-    artwork_client: reqwest::Client,
-    lyrics_client: reqwest::Client,
-    lyrics_registry: LyricsRegistry,
-    media: media::MediaProcessor,
 }
 
 impl AppleRipperDeps {
@@ -481,24 +455,11 @@ impl AppleRipperDeps {
         Self {
             catalog,
             acquisition,
-            artwork_client: reqwest::Client::new(),
-            lyrics_client: reqwest::Client::new(),
-            lyrics_registry: LyricsRegistry::default(),
-            media: media::MediaProcessor::new(),
         }
-    }
-
-    pub async fn fetch_artwork_bytes(&self, url: &str) -> Option<Vec<u8>> {
-        engine::ripper::RipperDeps::fetch_artwork(self, url).await
     }
 
     pub fn mirror_policy(&self) -> &MirrorPolicyManager<ReqwestMirrorHttp> {
         self.acquisition.mirror_policy()
-    }
-
-    pub fn with_lyrics_registry(mut self, registry: LyricsRegistry) -> Self {
-        self.lyrics_registry = registry;
-        self
     }
 
     pub fn catalog(&self) -> &crate::catalog::Catalog<crate::catalog::ReqwestTransport> {
@@ -603,11 +564,6 @@ impl AppleProduction {
         }
     }
 
-    pub fn with_lyrics_registry(mut self, registry: LyricsRegistry) -> Self {
-        self.ripper_deps = self.ripper_deps.with_lyrics_registry(registry);
-        self
-    }
-
     pub fn catalog(&self) -> &crate::catalog::Catalog<crate::catalog::ReqwestTransport> {
         self.ripper_deps.catalog()
     }
@@ -633,35 +589,12 @@ fn env_option(name: &str) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
-struct ReqwestLyricsHttp {
-    client: reqwest::Client,
-}
-
-impl LyricsHttp for ReqwestLyricsHttp {
-    fn get_json<'a>(&'a self, url: &'a str) -> LyricsFuture<'a, Option<String>> {
-        Box::pin(async move {
-            let response = self
-                .client
-                .get(url)
-                .header("User-Agent", "AlacBot/1.0")
-                .timeout(Duration::from_secs(5))
-                .send()
-                .await
-                .ok()?;
-            if !response.status().is_success() {
-                return None;
-            }
-            response.text().await.ok()
-        })
-    }
-}
-
-impl engine::ripper::RipperDeps for AppleRipperDeps {
-    fn report_source_failure(
+impl engine::ripper::RipStage for AppleRipperDeps {
+    fn observe_stream_failure(
         &self,
         source: &SourceId,
         kind: engine::ripper::SourceFailureKind,
-        error: &str,
+        detail: &str,
     ) {
         // Circuit rules: only source-attributed corruption from the primary
         // mirror trips the circuit. Wrapper-attributed failures and local or
@@ -675,7 +608,7 @@ impl engine::ripper::RipperDeps for AppleRipperDeps {
                 | engine::ripper::SourceFailureKind::IncompleteBody
                 | engine::ripper::SourceFailureKind::MediaValidation
         ) {
-            self.acquisition.mirror_policy().record_failure(error);
+            self.acquisition.mirror_policy().record_failure(detail);
         }
     }
 
@@ -703,37 +636,8 @@ impl engine::ripper::RipperDeps for AppleRipperDeps {
             .map_err(engine::ripper::RipError::from)
     }
 
-    async fn fetch_lyrics(&self, lookup: &LyricsLookup) -> Option<String> {
-        let http = ReqwestLyricsHttp {
-            client: self.lyrics_client.clone(),
-        };
-        lyrics::lookup(&http, &self.lyrics_registry, lookup).await
-    }
-
-    async fn fetch_artwork(&self, url: &str) -> Option<Vec<u8>> {
-        let response = self
-            .artwork_client
-            .get(url)
-            .header("User-Agent", "AlacBot/1.0")
-            .timeout(Duration::from_secs(15))
-            .send()
-            .await
-            .ok()?;
-        if !response.status().is_success() {
-            return None;
-        }
-        Some(response.bytes().await.ok()?.to_vec())
-    }
-
-    async fn tag_m4a(
-        &self,
-        raw_path: &std::path::Path,
-        output_path: &std::path::Path,
-        meta: &music::TrackMeta,
-        cover: Option<&[u8]>,
-        lyrics: Option<&str>,
-    ) -> Result<(), engine::ripper::RipError> {
-        let tags = media::TrackTags {
+    fn track_tags(&self, meta: &music::TrackMeta) -> media::TrackTags {
+        media::TrackTags {
             title: (!meta.title.is_empty()).then(|| meta.title.clone()),
             title_sort: (!meta.title.is_empty()).then(|| meta.title.clone()),
             artist: (!meta.artist.is_empty()).then(|| meta.artist.clone()),
@@ -762,8 +666,8 @@ impl engine::ripper::RipperDeps for AppleRipperDeps {
                 .disc_count
                 .filter(|value| *value != 0)
                 .and_then(|value| u16::try_from(value).ok()),
-            lyrics: lyrics.map(str::to_owned).filter(|value| !value.is_empty()),
-            artwork_jpeg: cover.filter(|value| !value.is_empty()).map(<[u8]>::to_vec),
+            lyrics: None,
+            artwork_jpeg: None,
             isrc: meta.isrc.clone().filter(|value| !value.is_empty()),
             label: meta.record_label.clone().filter(|value| !value.is_empty()),
             copyright: meta.copyright.clone().filter(|value| !value.is_empty()),
@@ -801,24 +705,18 @@ impl engine::ripper::RipperDeps for AppleRipperDeps {
             encoder: Some("alac-bot".to_owned()),
             comment: None,
             description: None,
-        };
-        let cancellation = CancellationToken::new();
-        self.media
-            .finalize_m4a(raw_path, output_path, &tags, &cancellation)
-            .await
-            .map(|_| ())
-            .map_err(map_media_finalize_error)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use engine::{
-        ripper::{RipperDeps, SourceFailureKind},
+        ripper::{RipStage, SourceFailureKind},
         streaming::{ReqwestHttp, SourceId, StreamTransport},
     };
 
-    use super::{map_media_finalize_error, AppleRipperDeps, AppleStreamAcquisition};
+    use super::{AppleRipperDeps, AppleStreamAcquisition};
     use crate::{Catalog, MirrorPolicyManager, ReqwestMirrorHttp};
 
     #[test]
@@ -839,7 +737,7 @@ mod tests {
             acquisition,
         );
 
-        deps.report_source_failure(
+        deps.observe_stream_failure(
             &SourceId::WrapperLite {
                 url: "http://wrapper".to_owned(),
             },
@@ -848,7 +746,7 @@ mod tests {
         );
         assert!(!deps.mirror_policy().is_circuit_open());
 
-        deps.report_source_failure(
+        deps.observe_stream_failure(
             &SourceId::WrapperCandidate {
                 endpoint: "http://wrapper/api/stream/42".to_owned(),
             },
@@ -857,49 +755,11 @@ mod tests {
         );
         assert!(!deps.mirror_policy().is_circuit_open());
 
-        deps.report_source_failure(
+        deps.observe_stream_failure(
             &SourceId::PrimaryMirror,
             SourceFailureKind::MediaValidation,
             "audio decode failed: corrupt mirror",
         );
         assert!(deps.mirror_policy().is_circuit_open());
-    }
-
-    #[test]
-    fn only_original_source_validation_maps_to_source_failure() {
-        let source_error = map_media_finalize_error(media::MediaError::SourceValidation(
-            media::SourceValidationError::Decode("unexpected end of bitstream".to_owned()),
-        ));
-        assert!(matches!(
-            source_error,
-            engine::ripper::RipError::Decode { source: None, detail }
-                if detail == "unexpected end of bitstream"
-        ));
-
-        let post_tag_decode = map_media_finalize_error(media::MediaError::Decode(
-            "post-tag decode failed".to_owned(),
-        ));
-        assert!(matches!(
-            post_tag_decode,
-            engine::ripper::RipError::Message(message)
-                if message == "audio decode failed: post-tag decode failed"
-        ));
-
-        let post_tag_invalid = map_media_finalize_error(media::MediaError::Invalid(
-            "finalized file has no duration".to_owned(),
-        ));
-        assert!(matches!(
-            post_tag_invalid,
-            engine::ripper::RipError::Message(message)
-                if message == "invalid media: finalized file has no duration"
-        ));
-
-        let local_io =
-            map_media_finalize_error(media::MediaError::Io(std::io::Error::other("disk full")));
-        assert!(matches!(
-            local_io,
-            engine::ripper::RipError::LocalIo { message }
-                if message == "disk full"
-        ));
     }
 }

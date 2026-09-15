@@ -3,7 +3,7 @@
 //! result mapping.
 
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc, Mutex,
@@ -13,7 +13,8 @@ use std::{
 use bytes::Bytes;
 use engine::{
     ripper::{
-        AlacTrackRipper, RipError, RipOptions, RipProgressCallback, RipperConfig, RipperDeps,
+        fetch_artwork_bytes, AlacTrackRipper, RipError, RipOptions, RipProgressCallback, RipStage,
+        RipperConfig, SourceFailureKind,
     },
     streaming::{AudioStreamSource, ByteStream, ProgressCallback},
     tagger::MAX_FILENAME_BYTES,
@@ -21,6 +22,7 @@ use engine::{
 };
 use futures_util::stream;
 use music::{CodecPreference, Provider};
+use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
 fn meta() -> TrackMeta {
@@ -66,8 +68,21 @@ fn fake_stream_with_length(chunks: Vec<Bytes>, content_length: Option<u64>) -> A
     }
 }
 
-/// Scriptable fake deps: every behavior is configurable per test.
-struct FakeDeps {
+fn valid_stream_chunks() -> Vec<Bytes> {
+    vec![Bytes::from_static(include_bytes!("fixtures/tone.m4a"))]
+}
+
+fn split_valid_stream_chunks(count: usize) -> Vec<Bytes> {
+    let bytes = include_bytes!("fixtures/tone.m4a");
+    let chunk_size = bytes.len().div_ceil(count);
+    bytes
+        .chunks(chunk_size)
+        .map(Bytes::copy_from_slice)
+        .collect()
+}
+
+/// Scriptable fake stage: acquisition behavior is configurable per test.
+struct FakeStage {
     meta: TrackMeta,
     meta_failures: u32, // first N track_meta calls fail
     meta_calls: AtomicU32,
@@ -78,36 +93,28 @@ struct FakeDeps {
     connect_permanent: Option<String>,
     connect_unavailable: bool,
     connect_calls: AtomicU32,
-    lyrics: Option<String>,
-    lyrics_lookups: Mutex<Vec<engine::lyrics::LyricsLookup>>,
-    artwork: Option<Vec<u8>>,
-    tag_calls: Mutex<Vec<(PathBuf, PathBuf)>>,
-    tag_should_fail: bool,
+    observations: Mutex<Vec<(engine::streaming::SourceId, SourceFailureKind, String)>>,
 }
 
-impl FakeDeps {
+impl FakeStage {
     fn ok() -> Self {
         Self {
             meta: meta(),
             meta_failures: 0,
             meta_calls: AtomicU32::new(0),
-            stream_chunks: vec![Bytes::from(vec![1u8; 10]), Bytes::from(vec![2u8; 5])],
+            stream_chunks: valid_stream_chunks(),
             stream_content_length: None,
             connect_fails: 0,
             connect_error: None,
             connect_permanent: None,
             connect_unavailable: false,
             connect_calls: AtomicU32::new(0),
-            lyrics: Some("la\nla".into()),
-            lyrics_lookups: Mutex::new(Vec::new()),
-            artwork: Some(vec![1, 2, 3]),
-            tag_calls: Mutex::new(Vec::new()),
-            tag_should_fail: false,
+            observations: Mutex::new(Vec::new()),
         }
     }
 }
 
-impl RipperDeps for FakeDeps {
+impl RipStage for FakeStage {
     async fn track_meta(&self, track_id: &str, storefront: &str) -> Result<TrackMeta, RipError> {
         let _ = (track_id, storefront);
         let n = self.meta_calls.fetch_add(1, Ordering::SeqCst);
@@ -148,35 +155,25 @@ impl RipperDeps for FakeDeps {
         ))
     }
 
-    async fn fetch_lyrics(&self, lookup: &engine::lyrics::LyricsLookup) -> Option<String> {
-        self.lyrics_lookups.lock().unwrap().push(lookup.clone());
-        self.lyrics.clone()
-    }
-
-    async fn fetch_artwork(&self, url: &str) -> Option<Vec<u8>> {
-        let _ = url;
-        self.artwork.clone()
-    }
-
-    async fn tag_m4a(
+    fn observe_stream_failure(
         &self,
-        raw_path: &Path,
-        output_path: &Path,
-        meta: &TrackMeta,
-        cover: Option<&[u8]>,
-        lyrics: Option<&str>,
-    ) -> Result<(), RipError> {
-        let _ = (meta, cover, lyrics);
-        self.tag_calls
+        source: &engine::streaming::SourceId,
+        kind: SourceFailureKind,
+        detail: &str,
+    ) {
+        self.observations
             .lock()
             .unwrap()
-            .push((raw_path.to_owned(), output_path.to_owned()));
-        if self.tag_should_fail {
-            return Err(RipError::Message(
-                "native media finalization failed: boom".into(),
-            ));
+            .push((source.clone(), kind, detail.to_owned()));
+    }
+
+    fn track_tags(&self, meta: &TrackMeta) -> media::TrackTags {
+        media::TrackTags {
+            title: Some(meta.title.clone()),
+            artist: Some(meta.artist.clone()),
+            album: Some(meta.album.clone()),
+            ..media::TrackTags::default()
         }
-        Ok(())
     }
 }
 
@@ -185,6 +182,7 @@ fn config(dir: &Path, retries: u32, base_ms: u64) -> RipperConfig {
         default_output_dir: dir.to_owned(),
         max_retries: retries,
         base_delay_ms: base_ms,
+        ..RipperConfig::default()
     }
 }
 
@@ -202,7 +200,7 @@ fn record() -> (RipProgressCallback, ProgressLog) {
 #[tokio::test]
 async fn happy_path_progress_and_result_mapping() {
     let dir = tempfile::tempdir().unwrap();
-    let deps = FakeDeps::ok();
+    let deps = FakeStage::ok();
     let ripper = AlacTrackRipper::new(config(dir.path(), 3, 1));
     let (cb, log) = record();
     let result = ripper
@@ -240,18 +238,8 @@ async fn happy_path_progress_and_result_mapping() {
     );
     assert!(statuses.contains(&"Tagging and embedding lossless artwork..."));
 
-    // Tagged with the right paths; temp raw cleaned up.
-    let tag_calls = deps.tag_calls.lock().unwrap();
-    assert_eq!(tag_calls.len(), 1);
-    assert!(tag_calls[0]
-        .0
-        .file_name()
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .starts_with("stream_42_"));
-    assert_eq!(tag_calls[0].1, PathBuf::from(&result.file_path));
-    drop(tag_calls);
+    // Finalized output exists; temp raw cleaned up.
+    assert!(Path::new(&result.file_path).is_file());
     let leftovers: Vec<_> = std::fs::read_dir(dir.path())
         .unwrap()
         .filter_map(|e| e.ok())
@@ -271,7 +259,7 @@ async fn happy_path_progress_and_result_mapping() {
 #[tokio::test]
 async fn metadata_error_cleans_staging_lane() {
     let dir = tempfile::tempdir().unwrap();
-    let mut deps = FakeDeps::ok();
+    let mut deps = FakeStage::ok();
     deps.meta_failures = 1;
     let ripper = AlacTrackRipper::new(config(dir.path(), 0, 1));
 
@@ -287,7 +275,7 @@ async fn metadata_error_cleans_staging_lane() {
 #[tokio::test]
 async fn retry_succeeds_after_two_failures() {
     let dir = tempfile::tempdir().unwrap();
-    let mut deps = FakeDeps::ok();
+    let mut deps = FakeStage::ok();
     deps.connect_fails = 2;
     let ripper = AlacTrackRipper::new(config(dir.path(), 3, 1));
     let (cb, log) = record();
@@ -321,7 +309,7 @@ async fn retry_succeeds_after_two_failures() {
 #[tokio::test]
 async fn exhaustion_rethrows_last_error() {
     let dir = tempfile::tempdir().unwrap();
-    let mut deps = FakeDeps::ok();
+    let mut deps = FakeStage::ok();
     deps.connect_fails = 10;
     let ripper = AlacTrackRipper::new(config(dir.path(), 2, 1));
     let error = ripper
@@ -340,17 +328,13 @@ async fn exhaustion_rethrows_last_error() {
 }
 
 #[tokio::test]
-async fn cancelled_message_bypasses_retries() {
+async fn cancelled_error_bypasses_retries() {
     let dir = tempfile::tempdir().unwrap();
-    let mut deps = FakeDeps::ok();
-    deps.connect_fails = 1;
-    // Make the failure message exactly 'Download was cancelled'.
     let ripper = AlacTrackRipper::new(config(dir.path(), 5, 1));
     let (cb, log) = record();
 
-    // Simulate: connect fails with the cancelled message.
-    struct CancelledDeps(FakeDeps);
-    impl RipperDeps for CancelledDeps {
+    struct CancelledStage(FakeStage);
+    impl RipStage for CancelledStage {
         async fn track_meta(
             &self,
             track_id: &str,
@@ -368,31 +352,27 @@ async fn cancelled_message_bypasses_retries() {
             let _ = self
                 .0
                 .connect_stream(track_id, signal, on_progress, codec_preference)
-                .await?;
+                .await;
             Err(RipError::Cancelled)
         }
-        async fn fetch_lyrics(&self, lookup: &engine::lyrics::LyricsLookup) -> Option<String> {
-            self.0.fetch_lyrics(lookup).await
-        }
-        async fn fetch_artwork(&self, u: &str) -> Option<Vec<u8>> {
-            self.0.fetch_artwork(u).await
-        }
-        async fn tag_m4a(
+        fn observe_stream_failure(
             &self,
-            r: &Path,
-            o: &Path,
-            m: &TrackMeta,
-            c: Option<&[u8]>,
-            l: Option<&str>,
-        ) -> Result<(), RipError> {
-            self.0.tag_m4a(r, o, m, c, l).await
+            source: &engine::streaming::SourceId,
+            kind: SourceFailureKind,
+            detail: &str,
+        ) {
+            self.0.observe_stream_failure(source, kind, detail);
+        }
+
+        fn track_tags(&self, meta: &TrackMeta) -> media::TrackTags {
+            self.0.track_tags(meta)
         }
     }
 
-    let deps = CancelledDeps(FakeDeps::ok());
+    let stage = CancelledStage(FakeStage::ok());
     let error = ripper
         .rip(
-            &deps,
+            &stage,
             "42",
             RipOptions::new(Provider::Apple, "us").with_progress(&cb),
         )
@@ -410,7 +390,7 @@ async fn cancelled_message_bypasses_retries() {
 #[tokio::test]
 async fn cancellation_mid_rip_no_retry() {
     let dir = tempfile::tempdir().unwrap();
-    let deps = FakeDeps::ok();
+    let deps = FakeStage::ok();
     let ripper = AlacTrackRipper::new(config(dir.path(), 3, 1));
     let token = CancellationToken::new();
     token.cancel();
@@ -428,16 +408,25 @@ async fn cancellation_mid_rip_no_retry() {
 
 #[tokio::test]
 async fn artwork_empty_vec_means_no_cover() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .ok();
+    });
     let dir = tempfile::tempdir().unwrap();
-    let mut deps = FakeDeps::ok();
-    deps.artwork = Some(Vec::new());
-    let ripper = AlacTrackRipper::new(config(dir.path(), 3, 1));
-    ripper
-        .rip(&deps, "42", RipOptions::new(Provider::Apple, "us"))
-        .await
-        .unwrap();
-    // Tagged once — cover emptiness is handled inside tag_m4a.
-    assert_eq!(deps.tag_calls.lock().unwrap().len(), 1);
+    let artwork = fetch_artwork_bytes(
+        &config(dir.path(), 0, 0),
+        &format!("http://{address}/cover"),
+    )
+    .await;
+    assert_eq!(artwork, Some(Vec::new()));
+    server.abort();
 }
 
 #[tokio::test]
@@ -445,8 +434,8 @@ async fn stalled_stream_is_retryable() {
     // A stream that NEVER yields (pending forever): rip_once returns the
     // 45s stall error, and the retry loop retries it.
     let dir = tempfile::tempdir().unwrap();
-    struct StalledDeps(FakeDeps);
-    impl RipperDeps for StalledDeps {
+    struct StalledStage(FakeStage);
+    impl RipStage for StalledStage {
         async fn track_meta(&self, t: &str, s: &str) -> Result<TrackMeta, RipError> {
             self.0.track_meta(t, s).await
         }
@@ -469,32 +458,28 @@ async fn stalled_stream_is_retryable() {
                 content_length: None,
             })
         }
-        async fn fetch_lyrics(&self, lookup: &engine::lyrics::LyricsLookup) -> Option<String> {
-            self.0.fetch_lyrics(lookup).await
-        }
-        async fn fetch_artwork(&self, u: &str) -> Option<Vec<u8>> {
-            self.0.fetch_artwork(u).await
-        }
-        async fn tag_m4a(
+        fn observe_stream_failure(
             &self,
-            r: &Path,
-            o: &Path,
-            m: &TrackMeta,
-            c: Option<&[u8]>,
-            l: Option<&str>,
-        ) -> Result<(), RipError> {
-            self.0.tag_m4a(r, o, m, c, l).await
+            source: &engine::streaming::SourceId,
+            kind: SourceFailureKind,
+            detail: &str,
+        ) {
+            self.0.observe_stream_failure(source, kind, detail);
+        }
+
+        fn track_tags(&self, meta: &TrackMeta) -> media::TrackTags {
+            self.0.track_tags(meta)
         }
     }
 
-    let inner = FakeDeps::ok();
+    let inner = FakeStage::ok();
     let connect_calls = Arc::new(AtomicU32::new(0));
-    // Track connect attempts via the shared counter inside FakeDeps.
-    let deps = StalledDeps(inner);
+    // Track connect attempts via the shared counter inside FakeStage.
+    let stage = StalledStage(inner);
     let ripper = AlacTrackRipper::new(config(dir.path(), 1, 1));
     tokio::time::pause();
     let error = ripper
-        .rip(&deps, "42", RipOptions::new(Provider::Apple, "us"))
+        .rip(&stage, "42", RipOptions::new(Provider::Apple, "us"))
         .await
         .unwrap_err();
     assert!(matches!(
@@ -505,9 +490,14 @@ async fn stalled_stream_is_retryable() {
         }
     ));
     assert_eq!(
-        deps.0.connect_calls.load(Ordering::SeqCst),
+        stage.0.connect_calls.load(Ordering::SeqCst),
         2,
         "retried once"
+    );
+    assert_eq!(
+        stage.0.observations.lock().unwrap().len(),
+        2,
+        "each stalled stream is observed"
     );
     drop(connect_calls);
 }
@@ -515,9 +505,10 @@ async fn stalled_stream_is_retryable() {
 #[tokio::test]
 async fn progress_totals_with_content_length() {
     let dir = tempfile::tempdir().unwrap();
-    let mut deps = FakeDeps::ok();
-    // 15 bytes across two chunks, content-length 15.
-    deps.stream_chunks = vec![Bytes::from(vec![0u8; 10]), Bytes::from(vec![0u8; 5])];
+    let mut deps = FakeStage::ok();
+    let stream_length = include_bytes!("fixtures/tone.m4a").len() as u64;
+    deps.stream_chunks = split_valid_stream_chunks(2);
+    deps.stream_content_length = Some(stream_length);
     let ripper = AlacTrackRipper::new(config(dir.path(), 3, 1));
     let (cb, log) = record();
     ripper
@@ -534,16 +525,15 @@ async fn progress_totals_with_content_length() {
         .filter(|(s, _, _)| s.starts_with("Downloading lossless audio"))
         .collect();
     assert!(!download_events.is_empty());
-    // Byte progress format (content_length None → MB only).
-    assert!(download_events[0]
-        .0
-        .starts_with("Downloading lossless audio: 0.0 MB"));
+    // Byte progress includes the known total when content length is present.
+    assert!(download_events[0].0.contains("(0.0/0.0 MB)"));
 }
 
 #[tokio::test]
 async fn short_body_is_rejected_before_tagging() {
     let dir = tempfile::tempdir().unwrap();
-    let mut deps = FakeDeps::ok();
+    let mut deps = FakeStage::ok();
+    deps.stream_chunks = vec![Bytes::from(vec![0u8; 10]), Bytes::from(vec![0u8; 5])];
     deps.stream_content_length = Some(20);
     let ripper = AlacTrackRipper::new(config(dir.path(), 0, 1));
 
@@ -560,7 +550,10 @@ async fn short_body_is_rejected_before_tagging() {
             received: 15
         }
     ));
-    assert!(deps.tag_calls.lock().unwrap().is_empty());
+    assert!(matches!(
+        deps.observations.lock().unwrap().as_slice(),
+        [(_, SourceFailureKind::IncompleteBody, _)]
+    ));
     assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
 }
 
@@ -568,7 +561,7 @@ async fn short_body_is_rejected_before_tagging() {
 async fn output_dir_override_used() {
     let base = tempfile::tempdir().unwrap();
     let other = tempfile::tempdir().unwrap();
-    let deps = FakeDeps::ok();
+    let deps = FakeStage::ok();
     let ripper = AlacTrackRipper::new(config(base.path(), 3, 1));
     let result = ripper
         .rip(
@@ -580,14 +573,13 @@ async fn output_dir_override_used() {
         .unwrap();
     assert!(result.file_path.starts_with(other.path().to_str().unwrap()));
     assert!(Path::new(&result.file_path).starts_with(other.path()));
-    let tag_calls = deps.tag_calls.lock().unwrap();
-    assert!(tag_calls[0].0.starts_with(other.path()));
+    assert!(Path::new(&result.file_path).is_file());
 }
 
 #[tokio::test]
 async fn long_metadata_filename_is_bounded_and_rip_succeeds() {
     let dir = tempfile::tempdir().unwrap();
-    let mut deps = FakeDeps::ok();
+    let mut deps = FakeStage::ok();
     deps.meta.title = "曲".repeat(150);
     let ripper = AlacTrackRipper::new(config(dir.path(), 0, 1));
 
@@ -607,32 +599,9 @@ async fn long_metadata_filename_is_bounded_and_rip_succeeds() {
 }
 
 #[tokio::test]
-async fn tag_failure_is_retryable_and_exhausts() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut deps = FakeDeps::ok();
-    deps.tag_should_fail = true;
-    let ripper = AlacTrackRipper::new(config(dir.path(), 2, 1));
-    let error = ripper
-        .rip(&deps, "42", RipOptions::new(Provider::Apple, "us"))
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(error, RipError::Message(message) if message == "native media finalization failed: boom")
-    );
-    assert_eq!(deps.tag_calls.lock().unwrap().len(), 3);
-    // Temp raw cleaned even after failures.
-    let raw_left: Vec<_> = std::fs::read_dir(dir.path())
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(".raw")))
-        .collect();
-    assert!(raw_left.is_empty());
-}
-
-#[tokio::test]
 async fn local_filename_error_is_non_retryable() {
     let dir = tempfile::tempdir().unwrap();
-    let mut deps = FakeDeps::ok();
+    let mut deps = FakeStage::ok();
     deps.connect_error = Some(RipError::LocalIo {
         message: "local path error: ENAMETOOLONG (File name too long)".into(),
     });
@@ -663,9 +632,9 @@ async fn local_filename_error_is_non_retryable() {
 #[tokio::test]
 async fn progress_throttles_to_one_per_second() {
     let dir = tempfile::tempdir().unwrap();
-    let mut deps = FakeDeps::ok();
+    let mut deps = FakeStage::ok();
     // Many chunks arriving quickly: progress updates throttle to 1/sec.
-    deps.stream_chunks = (0..50).map(|i| Bytes::from(vec![i as u8; 100])).collect();
+    deps.stream_chunks = split_valid_stream_chunks(50);
     let ripper = AlacTrackRipper::new(config(dir.path(), 3, 1));
     let (cb, log) = record();
     tokio::time::pause();
@@ -696,7 +665,7 @@ async fn progress_throttles_to_one_per_second() {
 #[tokio::test]
 async fn not_found_404_skips_retries_completely() {
     let dir = tempfile::tempdir().unwrap();
-    let mut deps = FakeDeps::ok();
+    let mut deps = FakeStage::ok();
     deps.connect_permanent = Some("Wrapper /m3u8 returned HTTP 404".into());
     let ripper = AlacTrackRipper::new(config(dir.path(), 4, 1000));
     let error = ripper
@@ -717,7 +686,7 @@ async fn not_found_404_skips_retries_completely() {
 #[tokio::test]
 async fn typed_unavailable_outcome_bypasses_retries() {
     let dir = tempfile::tempdir().unwrap();
-    let mut deps = FakeDeps::ok();
+    let mut deps = FakeStage::ok();
     deps.connect_unavailable = true;
     let ripper = AlacTrackRipper::new(config(dir.path(), 4, 1000));
 

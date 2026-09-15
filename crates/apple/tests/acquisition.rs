@@ -1,5 +1,4 @@
 use std::{
-    path::Path,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -13,7 +12,7 @@ use apple::{
 };
 use bytes::Bytes;
 use engine::{
-    ripper::{AlacTrackRipper, RipError, RipOptions, RipperConfig, RipperDeps, SourceFailureKind},
+    ripper::{AlacTrackRipper, RipError, RipOptions, RipStage, RipperConfig, SourceFailureKind},
     streaming::{
         AudioStreamSource, ByteStream, ProgressCallback, SourceId, StreamError, StreamHttp,
         StreamHttpError, StreamHttpResponse, StreamTransport,
@@ -59,13 +58,15 @@ struct FakeStream {
 struct CorruptMirrorStream {
     calls: Arc<Mutex<Vec<String>>>,
     wrapper_codec: String,
+    wrapper_corrupt: bool,
 }
 
 impl CorruptMirrorStream {
-    fn new(calls: Arc<Mutex<Vec<String>>>, wrapper_codec: &str) -> Self {
+    fn new(calls: Arc<Mutex<Vec<String>>>, wrapper_codec: &str, wrapper_corrupt: bool) -> Self {
         Self {
             calls,
             wrapper_codec: wrapper_codec.to_owned(),
+            wrapper_corrupt,
         }
     }
 }
@@ -159,10 +160,10 @@ impl StreamHttp for CorruptMirrorStream {
         let _ = (api_key, timeout, signal);
         self.calls.lock().unwrap().push(url.to_owned());
         let is_mirror = url.contains("https://mirror/");
-        let bytes = if is_mirror {
-            Bytes::from_static(b"corrupt mirror body")
+        let bytes = if is_mirror || self.wrapper_corrupt {
+            Bytes::copy_from_slice(&include_bytes!("../../engine/tests/fixtures/tone.m4a")[..1024])
         } else {
-            Bytes::from_static(b"valid wrapper body")
+            Bytes::from_static(include_bytes!("../../engine/tests/fixtures/tone.m4a"))
         };
         let codec = if is_mirror {
             "alac".to_owned()
@@ -354,14 +355,12 @@ fn test_track_meta() -> TrackMeta {
     }
 }
 
-struct FallbackRipperDeps {
+struct FallbackRipStage {
     acquisition: AppleStreamAcquisition<CorruptMirrorStream, FakeMirror>,
-    tag_failures: AtomicUsize,
-    source_validation_failure: bool,
     reports: Mutex<Vec<(SourceId, SourceFailureKind, String)>>,
 }
 
-impl RipperDeps for FallbackRipperDeps {
+impl RipStage for FallbackRipStage {
     async fn track_meta(&self, track_id: &str, storefront: &str) -> Result<TrackMeta, RipError> {
         let _ = (track_id, storefront);
         Ok(test_track_meta())
@@ -380,59 +379,32 @@ impl RipperDeps for FallbackRipperDeps {
             .map_err(RipError::from)
     }
 
-    async fn fetch_lyrics(&self, lookup: &engine::lyrics::LyricsLookup) -> Option<String> {
-        let _ = lookup;
-        None
-    }
-
-    async fn fetch_artwork(&self, url: &str) -> Option<Vec<u8>> {
-        let _ = url;
-        None
-    }
-
-    async fn tag_m4a(
-        &self,
-        raw_path: &Path,
-        output_path: &Path,
-        meta: &TrackMeta,
-        cover: Option<&[u8]>,
-        lyrics: Option<&str>,
-    ) -> Result<(), RipError> {
-        let _ = (raw_path, output_path, meta, cover, lyrics);
-        let remaining = self.tag_failures.load(Ordering::SeqCst);
-        if remaining != 0 {
-            self.tag_failures.fetch_sub(1, Ordering::SeqCst);
-            if self.source_validation_failure {
-                return Err(RipError::Decode {
-                    source: None,
-                    detail: "unexpected end of bitstream".to_owned(),
-                });
-            }
-            return Err(RipError::Message(
-                "native media finalization failed: boom".to_owned(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn report_source_failure(&self, source: &SourceId, kind: SourceFailureKind, error: &str) {
+    fn observe_stream_failure(&self, source: &SourceId, kind: SourceFailureKind, detail: &str) {
         self.reports
             .lock()
             .unwrap()
-            .push((source.clone(), kind, error.to_owned()));
+            .push((source.clone(), kind, detail.to_owned()));
         if matches!(source, SourceId::PrimaryMirror) {
-            self.acquisition.mirror_policy().record_failure(error);
+            self.acquisition.mirror_policy().record_failure(detail);
+        }
+    }
+
+    fn track_tags(&self, meta: &TrackMeta) -> media::TrackTags {
+        media::TrackTags {
+            title: Some(meta.title.clone()),
+            artist: Some(meta.artist.clone()),
+            album: Some(meta.album.clone()),
+            ..media::TrackTags::default()
         }
     }
 }
 
-fn fallback_ripper_deps(
+fn fallback_rip_stage(
     mirror_available: bool,
     wrapper_codec: &str,
-    tag_failures: usize,
-    source_validation_failure: bool,
+    wrapper_corrupt: bool,
     calls: Arc<Mutex<Vec<String>>>,
-) -> FallbackRipperDeps {
+) -> FallbackRipStage {
     let policy = MirrorPolicyManager::new(
         FakeMirror {
             available: mirror_available,
@@ -440,7 +412,11 @@ fn fallback_ripper_deps(
         None,
     );
     let acquisition = AppleStreamAcquisition::with_config(
-        StreamTransport::new(CorruptMirrorStream::new(calls, wrapper_codec)),
+        StreamTransport::new(CorruptMirrorStream::new(
+            calls,
+            wrapper_codec,
+            wrapper_corrupt,
+        )),
         policy,
         Some("https://wrapper".to_owned()),
         None,
@@ -450,10 +426,8 @@ fn fallback_ripper_deps(
             retry_base_delay_ms: 0,
         },
     );
-    FallbackRipperDeps {
+    FallbackRipStage {
         acquisition,
-        tag_failures: AtomicUsize::new(tag_failures),
-        source_validation_failure,
         reports: Mutex::new(Vec::new()),
     }
 }
@@ -629,16 +603,17 @@ async fn fallback_reports_progress_when_primary_is_unavailable() {
 #[tokio::test]
 async fn corrupt_primary_body_marks_mirror_and_retries_with_wrapper() {
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let deps = fallback_ripper_deps(true, "alac", 1, true, Arc::clone(&calls));
+    let stage = fallback_rip_stage(true, "alac", false, Arc::clone(&calls));
     let output_dir = tempfile::tempdir().unwrap();
     let ripper = AlacTrackRipper::new(RipperConfig {
         default_output_dir: output_dir.path().to_owned(),
         max_retries: 1,
         base_delay_ms: 0,
+        ..RipperConfig::default()
     });
 
     let result = ripper
-        .rip(&deps, "42", RipOptions::new(Provider::Apple, "us"))
+        .rip(&stage, "42", RipOptions::new(Provider::Apple, "us"))
         .await
         .expect("wrapper should succeed after corrupt mirror output");
 
@@ -650,28 +625,29 @@ async fn corrupt_primary_body_marks_mirror_and_retries_with_wrapper() {
             "https://wrapper/api/stream/42".to_owned(),
         ]
     );
-    assert!(deps.acquisition.mirror_policy().is_circuit_open());
-    let reports = deps.reports.lock().unwrap();
+    assert!(stage.acquisition.mirror_policy().is_circuit_open());
+    let reports = stage.reports.lock().unwrap();
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].0, SourceId::PrimaryMirror);
     assert_eq!(reports[0].1, SourceFailureKind::MediaValidation);
-    assert!(reports[0].2.contains("unexpected end of bitstream"));
+    assert!(!reports[0].2.is_empty());
 }
 
 #[tokio::test]
 async fn wrapper_corruption_does_not_fallback_or_poison_mirror() {
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let deps = fallback_ripper_deps(true, "ec-3", usize::MAX, true, Arc::clone(&calls));
+    let stage = fallback_rip_stage(true, "ec-3", true, Arc::clone(&calls));
     let output_dir = tempfile::tempdir().unwrap();
     let ripper = AlacTrackRipper::new(RipperConfig {
         default_output_dir: output_dir.path().to_owned(),
         max_retries: 1,
         base_delay_ms: 0,
+        ..RipperConfig::default()
     });
 
     let error = ripper
         .rip(
-            &deps,
+            &stage,
             "42",
             RipOptions::new(Provider::Apple, "us")
                 .with_codec_preference(apple::CodecPreference::Atmos),
@@ -684,49 +660,20 @@ async fn wrapper_corruption_does_not_fallback_or_poison_mirror() {
         RipError::Decode {
             source: Some(SourceId::WrapperCandidate { endpoint }),
             detail,
-        } if endpoint == "https://wrapper/api/stream/42" && detail.contains("unexpected end of bitstream")
+        } if endpoint == "https://wrapper/api/stream/42" && !detail.is_empty()
     ));
-    assert!(!deps.acquisition.mirror_policy().is_circuit_open());
+    assert!(!stage.acquisition.mirror_policy().is_circuit_open());
     assert!(calls
         .lock()
         .unwrap()
         .iter()
         .all(|url| url.starts_with("https://wrapper/")));
-    assert!(deps
+    assert!(stage
         .reports
         .lock()
         .unwrap()
         .iter()
         .all(|(source, _, _)| { matches!(source, SourceId::WrapperCandidate { .. }) }));
-}
-
-#[tokio::test]
-async fn ordinary_tag_failure_does_not_poison_mirror() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let deps = fallback_ripper_deps(true, "alac", usize::MAX, false, Arc::clone(&calls));
-    let output_dir = tempfile::tempdir().unwrap();
-    let ripper = AlacTrackRipper::new(RipperConfig {
-        default_output_dir: output_dir.path().to_owned(),
-        max_retries: 1,
-        base_delay_ms: 0,
-    });
-
-    let error = ripper
-        .rip(&deps, "42", RipOptions::new(Provider::Apple, "us"))
-        .await
-        .expect_err("ordinary tagging errors should remain failures");
-
-    assert!(matches!(
-        error,
-        RipError::Message(message) if message == "native media finalization failed: boom"
-    ));
-    assert!(!deps.acquisition.mirror_policy().is_circuit_open());
-    assert_eq!(
-        deps.reports.lock().unwrap().len(),
-        0,
-        "ordinary tag failures must not report a source failure"
-    );
-    assert_eq!(calls.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]

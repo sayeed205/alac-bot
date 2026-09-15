@@ -7,7 +7,6 @@ license.workspace = true
 
 [dependencies]
 engine = { path = "../engine" }
-lyrics = { path = "../lyrics" }
 music = { path = "../music" }
 media = { path = "../media" }
 bytes.workspace = true

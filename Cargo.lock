@@ -69,7 +69,6 @@ dependencies = [
  "engine",
  "futures-util",
  "indexmap",
- "lyrics",
  "media",
  "music",
  "rand 0.10.2",

@@ -866,6 +866,11 @@ fn finalize_m4a_sync(
     let info = inspect_sync(source, cancellation).map_err(mark_source_validation)?;
 
     let part = destination.with_extension("m4a.part");
+    // Keep the legacy part name unless it would exceed one component.
+    let part = match part.file_name().and_then(|value| value.to_str()) {
+        Some(name) if name.len() <= 255 => part,
+        _ => destination.with_extension("p"),
+    };
     if part.exists() {
         std::fs::remove_file(&part)?;
     }

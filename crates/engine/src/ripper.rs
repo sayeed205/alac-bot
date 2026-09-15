@@ -3,6 +3,7 @@
 
 use std::{
     collections::BTreeMap,
+    fmt,
     future::Future,
     path::{Path, PathBuf},
     sync::Arc,
@@ -10,6 +11,7 @@ use std::{
 };
 
 use futures_util::{FutureExt, StreamExt};
+use lyrics::{LyricsHttp, LyricsLookup, LyricsRegistry};
 use music::{CodecPreference, Provider};
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
@@ -17,7 +19,6 @@ use tracing::{debug, warn};
 
 use crate::{
     limits::MAX_AUDIO_BYTES,
-    lyrics::LyricsLookup,
     streaming::{AudioStreamSource, ProgressCallback, SourceId, StreamError},
     tagger::{self, bound_filename_with_suffix, MAX_FILENAME_BYTES},
     types::{TrackMeta, TrackRipResult},
@@ -174,11 +175,29 @@ impl From<std::io::Error> for RipError {
 pub type RipProgressCallback = Arc<dyn Fn(&str, Option<u64>, Option<u64>) + Send + Sync>;
 
 /// Configuration knobs (default retries 3, base delay 2s).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RipperConfig {
     pub default_output_dir: PathBuf,
     pub max_retries: u32,
     pub base_delay_ms: u64,
+    pub lyrics_registry: Arc<LyricsRegistry>,
+    pub lyrics_client: reqwest::Client,
+    pub lyrics_timeout: Duration,
+    pub artwork_client: reqwest::Client,
+    pub artwork_timeout: Duration,
+}
+
+impl fmt::Debug for RipperConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RipperConfig")
+            .field("default_output_dir", &self.default_output_dir)
+            .field("max_retries", &self.max_retries)
+            .field("base_delay_ms", &self.base_delay_ms)
+            .field("lyrics_timeout", &self.lyrics_timeout)
+            .field("artwork_timeout", &self.artwork_timeout)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for RipperConfig {
@@ -190,19 +209,17 @@ impl Default for RipperConfig {
                 .join("downloads"),
             max_retries: 3,
             base_delay_ms: 2000,
+            lyrics_registry: Arc::new(LyricsRegistry::default()),
+            lyrics_client: reqwest::Client::new(),
+            lyrics_timeout: Duration::from_secs(5),
+            artwork_client: reqwest::Client::new(),
+            artwork_timeout: Duration::from_secs(15),
         }
     }
 }
 
-/// Everything a rip needs, behind one seam so tests can fake each step.
-pub trait RipperDeps: Send + Sync {
-    /// Report a corruption/validation failure from the selected source.
-    /// Providers may use the source identity to invalidate that source;
-    /// fakes and providers without source health tracking need no override.
-    fn report_source_failure(&self, source: &SourceId, kind: SourceFailureKind, error: &str) {
-        let _ = (source, kind, error);
-    }
-
+/// Provider-owned acquisition and metadata stage used by the generic ripper.
+pub trait RipStage: Send + Sync {
     fn track_meta(
         &self,
         track_id: &str,
@@ -215,16 +232,111 @@ pub trait RipperDeps: Send + Sync {
         on_progress: Option<ProgressCallback>,
         codec_preference: CodecPreference,
     ) -> impl Future<Output = Result<AudioStreamSource, RipError>> + Send;
-    fn fetch_lyrics(&self, lookup: &LyricsLookup) -> impl Future<Output = Option<String>> + Send;
-    fn fetch_artwork(&self, url: &str) -> impl Future<Output = Option<Vec<u8>>> + Send;
-    fn tag_m4a(
-        &self,
-        raw_path: &Path,
-        output_path: &Path,
-        meta: &TrackMeta,
-        cover: Option<&[u8]>,
-        lyrics: Option<&str>,
-    ) -> impl Future<Output = Result<(), RipError>> + Send;
+    fn observe_stream_failure(&self, source: &SourceId, kind: SourceFailureKind, detail: &str);
+    fn track_tags(&self, meta: &TrackMeta) -> media::TrackTags;
+}
+
+struct ReqwestLyricsHttp {
+    client: reqwest::Client,
+    timeout: Duration,
+}
+
+impl LyricsHttp for ReqwestLyricsHttp {
+    fn get_json<'a>(&'a self, url: &'a str) -> lyrics::LyricsFuture<'a, Option<String>> {
+        Box::pin(async move {
+            let response = self
+                .client
+                .get(url)
+                .header("User-Agent", "AlacBot/1.0")
+                .timeout(self.timeout)
+                .send()
+                .await
+                .ok()?;
+            if !response.status().is_success() {
+                return None;
+            }
+            response.text().await.ok()
+        })
+    }
+}
+
+async fn fetch_lyrics(
+    client: reqwest::Client,
+    timeout: Duration,
+    registry: Arc<LyricsRegistry>,
+    lookup: LyricsLookup,
+) -> Option<String> {
+    let http = ReqwestLyricsHttp { client, timeout };
+    lyrics::lookup(&http, registry.as_ref(), &lookup).await
+}
+
+async fn fetch_artwork_with_client(
+    client: reqwest::Client,
+    timeout: Duration,
+    url: &str,
+) -> Option<Vec<u8>> {
+    let response = client
+        .get(url)
+        .header("User-Agent", "AlacBot/1.0")
+        .timeout(timeout)
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    Some(response.bytes().await.ok()?.to_vec())
+}
+
+/// Fetch artwork for the orchestrator's album ZIP enrichment seam.
+pub async fn fetch_artwork_bytes(config: &RipperConfig, url: &str) -> Option<Vec<u8>> {
+    fetch_artwork_with_client(config.artwork_client.clone(), config.artwork_timeout, url).await
+}
+
+fn assemble_tags(
+    stage: &impl RipStage,
+    meta: &TrackMeta,
+    cover: Option<&[u8]>,
+    lyrics: Option<&str>,
+) -> media::TrackTags {
+    let mut tags = stage.track_tags(meta);
+    tags.lyrics = lyrics.map(str::to_owned).filter(|value| !value.is_empty());
+    tags.artwork_jpeg = cover.filter(|value| !value.is_empty()).map(<[u8]>::to_vec);
+    tags
+}
+
+fn map_media_finalize_error(error: media::MediaError) -> RipError {
+    match error {
+        media::MediaError::SourceValidation(media::SourceValidationError::Decode(message)) => {
+            RipError::Decode {
+                source: None,
+                detail: message,
+            }
+        }
+        media::MediaError::SourceValidation(media::SourceValidationError::Invalid(message)) => {
+            RipError::Decode {
+                source: None,
+                detail: message,
+            }
+        }
+        media::MediaError::Io(error) => RipError::LocalIo {
+            message: error.to_string(),
+        },
+        error => RipError::Message(error.to_string()),
+    }
+}
+
+async fn finalize_m4a(
+    raw_path: &Path,
+    output_path: &Path,
+    tags: &media::TrackTags,
+) -> Result<(), RipError> {
+    let cancellation = CancellationToken::new();
+    media::MediaProcessor::new()
+        .finalize_m4a(raw_path, output_path, tags, &cancellation)
+        .await
+        .map(|_| ())
+        .map_err(map_media_finalize_error)
 }
 
 /// Retrying wrapper around `rip_once`.
@@ -296,9 +408,9 @@ impl AlacTrackRipper {
         &self.config
     }
 
-    pub async fn rip<D: RipperDeps>(
+    pub async fn rip<D: RipStage>(
         &self,
-        deps: &D,
+        stage: &D,
         track_id: &str,
         options: RipOptions<'_>,
     ) -> Result<TrackRipResult, RipError> {
@@ -309,7 +421,7 @@ impl AlacTrackRipper {
                 return Err(RipError::Cancelled);
             }
 
-            match self.rip_once(deps, track_id, &options).await {
+            match self.rip_once(stage, track_id, &options).await {
                 Ok(result) => return Ok(result),
                 Err(err) => {
                     if matches!(
@@ -367,9 +479,9 @@ impl AlacTrackRipper {
         }
     }
 
-    async fn rip_once<D: RipperDeps>(
+    async fn rip_once<D: RipStage>(
         &self,
-        deps: &D,
+        stage: &D,
         track_id: &str,
         options: &RipOptions<'_>,
     ) -> Result<TrackRipResult, RipError> {
@@ -407,7 +519,7 @@ impl AlacTrackRipper {
         // as stream and tagging errors.
         let result: Result<TrackRipResult, RipError> = async {
             emit_progress(on_progress, "Fetching track metadata...", None, None);
-            let meta = deps.track_meta(track_id, storefront).await?;
+            let meta = stage.track_meta(track_id, storefront).await?;
 
             if signal.is_some_and(|t| t.is_cancelled()) {
                 return Err(RipError::Cancelled);
@@ -431,8 +543,11 @@ impl AlacTrackRipper {
             let lyrics_task = {
                 let lookup = lyrics_lookup.clone();
                 let track_id = track_id.to_owned();
+                let client = self.config.lyrics_client.clone();
+                let timeout = self.config.lyrics_timeout;
+                let registry = Arc::clone(&self.config.lyrics_registry);
                 async move {
-                    match deps.fetch_lyrics(&lookup).await {
+                    match fetch_lyrics(client, timeout, registry, lookup).await {
                         Some(l) => {
                             debug!(track_id, found = true, "Lyrics prefetch completed");
                             Some(l)
@@ -447,11 +562,13 @@ impl AlacTrackRipper {
             let artwork_task = {
                 let track_id = track_id.to_owned();
                 let artwork_url = meta.artwork_url.clone();
+                let client = self.config.artwork_client.clone();
+                let timeout = self.config.artwork_timeout;
                 async move {
                     if artwork_url.is_empty() {
                         return None;
                     }
-                    let artwork = deps.fetch_artwork(&artwork_url).await;
+                    let artwork = fetch_artwork_with_client(client, timeout, &artwork_url).await;
                     debug!(
                         track_id,
                         size_bytes = artwork.as_ref().map_or(0, Vec::len),
@@ -466,7 +583,7 @@ impl AlacTrackRipper {
             let stream_progress: Option<ProgressCallback> = on_progress
                 .cloned()
                 .map(|cb| Arc::new(move |status: &str| cb(status, None, None)) as Arc<_>);
-            let mut stream = deps
+            let mut stream = stage
                 .connect_stream(track_id, signal.cloned(), stream_progress, codec_preference)
                 .await?;
 
@@ -591,7 +708,7 @@ impl AlacTrackRipper {
                                 source: stream.source.clone(),
                                 secs: CHUNK_INACTIVITY_TIMEOUT.as_secs(),
                             };
-                            deps.report_source_failure(
+                            stage.observe_stream_failure(
                                 &stream.source,
                                 SourceFailureKind::Stream,
                                 &error.to_string(),
@@ -608,7 +725,7 @@ impl AlacTrackRipper {
                                     source: stream.source.clone(),
                                     detail: error.to_string(),
                                 };
-                                deps.report_source_failure(
+                                stage.observe_stream_failure(
                                     &stream.source,
                                     SourceFailureKind::Stream,
                                     &error.to_string(),
@@ -655,7 +772,7 @@ impl AlacTrackRipper {
                             expected,
                             received: downloaded_bytes,
                         };
-                        deps.report_source_failure(
+                        stage.observe_stream_failure(
                             &stream.source,
                             SourceFailureKind::IncompleteBody,
                             &error.to_string(),
@@ -700,20 +817,12 @@ impl AlacTrackRipper {
                     return Err(RipError::Cancelled);
                 }
 
-                // `tag_m4a` only produces `Decode` for pre-tag source
-                // validation: the provider cannot know the stream source, so
-                // the ripper attaches it here. Post-tag failures arrive as
-                // `Message`/`LocalIo` and never trip the circuit.
-                match deps
-                    .tag_m4a(
-                        &temp_raw_path,
-                        &final_path,
-                        &meta,
-                        cover.as_deref(),
-                        lyrics.as_deref(),
-                    )
-                    .await
-                {
+                // Only source validation produces `Decode`: the stage cannot
+                // know the stream source, so the ripper attaches it here.
+                // Post-tag failures arrive as `Message`/`LocalIo` and never
+                // trip the circuit.
+                let tags = assemble_tags(stage, &meta, cover.as_deref(), lyrics.as_deref());
+                match finalize_m4a(&temp_raw_path, &final_path, &tags).await {
                     Ok(()) => {}
                     Err(RipError::Decode { source, detail }) => {
                         if signal.is_some_and(|token| token.is_cancelled()) {
@@ -723,7 +832,7 @@ impl AlacTrackRipper {
                             source: source.or_else(|| Some(stream.source.clone())),
                             detail,
                         };
-                        deps.report_source_failure(
+                        stage.observe_stream_failure(
                             &stream.source,
                             SourceFailureKind::MediaValidation,
                             &error.to_string(),
@@ -816,4 +925,47 @@ fn unique_temp_suffix() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{map_media_finalize_error, RipError};
+
+    #[test]
+    fn source_validation_is_attributed_to_the_acquired_stream() {
+        let error = map_media_finalize_error(media::MediaError::SourceValidation(
+            media::SourceValidationError::Decode("unexpected end of bitstream".to_owned()),
+        ));
+        assert!(matches!(
+            error,
+            RipError::Decode { source: None, detail }
+                if detail == "unexpected end of bitstream"
+        ));
+    }
+
+    #[test]
+    fn post_tag_failures_do_not_look_like_source_corruption() {
+        let decode = map_media_finalize_error(media::MediaError::Decode(
+            "post-tag decode failed".to_owned(),
+        ));
+        assert!(matches!(
+            decode,
+            RipError::Message(message) if message == "audio decode failed: post-tag decode failed"
+        ));
+
+        let invalid = map_media_finalize_error(media::MediaError::Invalid(
+            "finalized file has no duration".to_owned(),
+        ));
+        assert!(matches!(
+            invalid,
+            RipError::Message(message) if message == "invalid media: finalized file has no duration"
+        ));
+
+        let local_io =
+            map_media_finalize_error(media::MediaError::Io(std::io::Error::other("disk full")));
+        assert!(matches!(
+            local_io,
+            RipError::LocalIo { message } if message == "disk full"
+        ));
+    }
 }

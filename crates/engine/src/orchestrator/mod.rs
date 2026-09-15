@@ -69,6 +69,7 @@ use crate::{
 #[derive(Debug)]
 pub enum OrchestratorError {
     DependenciesNotSet,
+    Cancelled,
     Message(String),
     ResolutionFailed { failures: Vec<ResolutionFailure> },
     AdmissionLimit,
@@ -82,6 +83,7 @@ impl std::fmt::Display for OrchestratorError {
                 f,
                 "RipOrchestrator dependencies not configured. Call setDependencies() first."
             ),
+            Self::Cancelled => f.write_str("Download was cancelled"),
             Self::Message(message) => f.write_str(message),
             Self::ResolutionFailed { failures } => {
                 write!(f, "Failed to resolve any tracks")?;
@@ -1081,9 +1083,7 @@ impl RipOrchestrator {
 
         for item in &options.parsed_items {
             if job_controller.is_cancelled() {
-                return Err(OrchestratorError::Message(
-                    "Download was cancelled".to_string(),
-                ));
+                return Err(OrchestratorError::Cancelled);
             }
 
             let effective_sf = item
@@ -1496,9 +1496,7 @@ impl RipOrchestrator {
 
         for item in &tracks_to_process {
             if job_controller.is_cancelled() {
-                return Err(OrchestratorError::Message(
-                    "Download was cancelled".to_string(),
-                ));
+                return Err(OrchestratorError::Cancelled);
             }
             for rendition in options.rendition_policy.renditions() {
                 let cached = rendition.accepted_cache_codecs().iter().find_map(|codec| {

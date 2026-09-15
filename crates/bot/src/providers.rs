@@ -84,7 +84,7 @@ impl TrackAcquisition for ProviderRegistry {
 
 impl ArtworkProvider for ProviderRegistry {
     async fn fetch_artwork(&self, url: &str) -> Option<Vec<u8>> {
-        self.apple.ripper_deps().fetch_artwork_bytes(url).await
+        engine::ripper::fetch_artwork_bytes(self.ripper.config(), url).await
     }
 
     fn artwork_url_at_size(&self, url: &str, size: u16) -> String {

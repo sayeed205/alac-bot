@@ -126,13 +126,13 @@ impl RipDeps {
             .await
             .map_err(|error| DeliveryError::Unavailable(format!("load settings: {error}")))?;
 
-        let apple = apple::AppleProduction::new(apple::AppleProductionConfig::default())
-            .with_lyrics_registry(LyricsRegistry::all_sources());
+        let apple = apple::AppleProduction::new(apple::AppleProductionConfig::default());
         let probe_policy = apple.mirror_policy().shared();
         let (retry_base_ms, max_retries) = retry_values();
         let ripper_config = RipperConfig {
             base_delay_ms: retry_base_ms,
             max_retries,
+            lyrics_registry: Arc::new(LyricsRegistry::all_sources()),
             ..Default::default()
         };
 
