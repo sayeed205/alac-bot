@@ -157,10 +157,12 @@ async fn ping(msg: ferogram::update::IncomingMessage, state: Arc<BotState>) {
     let mirror = state.rip_deps.probe_mirror_health().await;
     let mirror_latency = u128::from(mirror.latency_ms);
     let jobs = state.rip_orchestrator.get_active_jobs();
-    let processing = jobs.iter().any(|job| job.phase == JobPhase::Processing);
+    let processing = jobs
+        .iter()
+        .any(|job| job.phase == JobPhase::Processing || job.phase == JobPhase::Delivering);
     let pending = jobs
         .iter()
-        .filter(|job| job.phase == JobPhase::Queued)
+        .filter(|job| job.phase == JobPhase::Queued || job.phase == JobPhase::WaitingDuplicate)
         .count();
     let queue_state = if processing {
         format!("Processing ({pending} queued)")

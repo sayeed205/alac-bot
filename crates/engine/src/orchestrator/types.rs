@@ -17,6 +17,8 @@ pub enum JobPhase {
     CheckingCache,
     Queued,
     Processing,
+    Delivering,
+    WaitingDuplicate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,6 +199,7 @@ pub enum JobActivity {
     SkippingUncached,
     CachedDelivered,
     ProcessingNext,
+    WaitingDuplicate { inflight_job_id: String },
 }
 
 /// A progress snapshot; every display slot is optional.

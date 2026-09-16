@@ -35,6 +35,8 @@ pub trait DashboardSink: Send + Sync {
 pub enum JobPhase {
     Processing,
     Queued,
+    Delivering,
+    WaitingDuplicate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +103,8 @@ pub fn render(
         let number = start + offset + 1;
         let state = match job.phase {
             JobPhase::Processing => "Processing".to_owned(),
+            JobPhase::Delivering => "⚡ Delivering (Cache)".to_owned(),
+            JobPhase::WaitingDuplicate => "⏳ Waiting on inflight rip".to_owned(),
             JobPhase::Queued => job.queue_position.map_or_else(
                 || "Queued".to_owned(),
                 |position| format!("Queued · position #{position}"),
@@ -200,6 +204,9 @@ fn render_job_activity(activity: &JobActivity) -> String {
         JobActivity::SkippingUncached => "<b>⏭️ Skipping uncached tracks...</b>\n".to_owned(),
         JobActivity::CachedDelivered => "<b>✅ Delivered cached tracks...</b>\n".to_owned(),
         JobActivity::ProcessingNext => "<b>⏭️ Processing next track...</b>\n".to_owned(),
+        JobActivity::WaitingDuplicate { inflight_job_id } => {
+            format!("<b>⏳ Waiting on active download</b> <code>#{inflight_job_id}</code>\n")
+        }
     }
 }
 

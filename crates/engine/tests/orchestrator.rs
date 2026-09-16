@@ -735,6 +735,7 @@ impl TrackCache for FakeDeps {
             };
             (state.save_track_error.clone(), unavailable)
         };
+        self.cache_track_with_codec(&input.track_key.track_id, input.message_id, input.codec);
         self.state.lock().unwrap().saved_tracks.push(input);
         Box::pin(async move {
             if unavailable {
@@ -2490,16 +2491,16 @@ async fn gated_cached_work_does_not_hold_another_jobs_lane_one() {
         .await
         .unwrap()
         .expect("fresh job completes after gate release");
-    assert_eq!(
-        state
-            .lock()
-            .unwrap()
-            .copies
-            .iter()
-            .map(|copy| copy.1)
-            .collect::<Vec<_>>(),
-        vec![4242, 777],
-        "ordered lane-two cache and upload work remains deterministic"
+    let copies: Vec<i64> = state
+        .lock()
+        .unwrap()
+        .copies
+        .iter()
+        .map(|copy| copy.1)
+        .collect();
+    assert!(
+        copies == vec![4242, 777] || copies == vec![777, 4242],
+        "both cached and fresh deliveries succeed concurrently: {copies:?}"
     );
 }
 
@@ -4061,4 +4062,282 @@ async fn staging_failure_queues_rip_for_cached_track() {
     assert!(st.rip_calls.contains(&"s2".to_string()), "s2 ripped");
     assert_eq!(summary.ripped_count, 2);
     assert_eq!(st.saved_albums.len(), 1, "archive complete and cached");
+}
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fully_cached_multi_track_album_bypasses_rip_queue_while_rip_queue_is_occupied() {
+    let (orch, deps, state, _) = setup();
+    let meta = |id: &str| FakeDeps::track_meta(id, "Track", "Artist");
+    deps.albums.lock().unwrap().insert(
+        "alb.bypass".into(),
+        FakeDeps::album(vec![meta("byp_t1"), meta("byp_t2")]),
+    );
+    deps.cache_track("byp_t1", 101);
+    deps.cache_track("byp_t2", 102);
+    let hash = expected_generation_hash("alb.bypass", &["byp_t1", "byp_t2"]);
+    state.lock().unwrap().found_albums.insert(
+        "alb.bypass".into(),
+        vec![
+            cached_zip_row("alb.bypass", 1, 2, &hash),
+            cached_zip_row("alb.bypass", 2, 2, &hash),
+        ],
+    );
+
+    // Job A holds the rip queue with a gate
+    let rip_gate = tokio_util::sync::CancellationToken::new();
+    state.lock().unwrap().gate_uploads = None;
+    deps.rip_scripts.lock().unwrap().insert("blocking_rip".into(), RipScript::OkWithFile(vec![1]));
+    state.lock().unwrap().initial_rip_track = Some("blocking_rip".into());
+    state.lock().unwrap().initial_rip_gate = Some(rip_gate.clone());
+
+    let orch = Arc::new(orch);
+    let first_orch = Arc::clone(&orch);
+    let first_deps = Arc::clone(&deps);
+    let first_task = tokio::spawn(async move {
+        run_async(
+            &first_orch,
+            &first_deps,
+            &options(vec![track_item("blocking_rip")], true),
+        )
+        .await
+    });
+
+    // Wait until Job A has started ripping and is holding the queue
+    loop {
+        let notified = deps.rip_notify.notified();
+        if state.lock().unwrap().initial_rip_started {
+            break;
+        }
+        notified.await;
+    }
+
+    // Now submit Job B (the 100% cached album). It must NOT wait behind Job A!
+    let second_orch = Arc::clone(&orch);
+    let second_deps = Arc::clone(&deps);
+    let summary = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        run_async(&second_orch, &second_deps, &album_options("alb.bypass", false, false)),
+    )
+    .await
+    .expect("cached album job must not wait behind Job A in sequential rip queue")
+    .expect("job succeeds");
+
+    assert_eq!(summary.cached_count, 2);
+    assert_eq!(summary.ripped_count, 0);
+
+    // Release Job A so test finishes cleanly
+    rip_gate.cancel();
+    let _ = first_task.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inflight_duplicate_job_waits_for_primary_and_delivers_from_cache() {
+    let (deps, state) = FakeDeps::new();
+    let orch = Arc::new(RipOrchestrator::new(OrchestratorConfig::test()));
+
+    let rip_gate = tokio_util::sync::CancellationToken::new();
+    deps.rip_scripts.lock().unwrap().insert("shared_dup".into(), RipScript::OkWithFile(vec![1, 2]));
+    state.lock().unwrap().initial_rip_track = Some("shared_dup".into());
+    state.lock().unwrap().initial_rip_gate = Some(rip_gate.clone());
+    state.lock().unwrap().send_audio_results.push_back(FakeDeps::upload_ok());
+
+    let o1 = Arc::clone(&orch);
+    let d1 = Arc::clone(&deps);
+    let opts1 = options(vec![track_item("shared_dup")], true);
+    let task1 = tokio::spawn(async move { o1.start_job(d1, &opts1).await });
+
+    // Wait until job 1 starts ripping
+    loop {
+        let notified = deps.rip_notify.notified();
+        if state.lock().unwrap().initial_rip_started {
+            break;
+        }
+        notified.await;
+    }
+
+    // Now job 2 requests the same item
+    let o2 = Arc::clone(&orch);
+    let d2 = Arc::clone(&deps);
+    let opts2 = options(vec![track_item("shared_dup")], false);
+    let task2 = tokio::spawn(async move { o2.start_job(d2, &opts2).await });
+
+    // Wait a brief moment and verify job 2 is WaitingDuplicate
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let active_jobs = orch.get_active_jobs();
+    assert_eq!(active_jobs.len(), 2);
+    let job2 = active_jobs.iter().find(|j| j.phase == JobPhase::WaitingDuplicate).expect("job 2 in WaitingDuplicate");
+    assert_eq!(job2.phase, JobPhase::WaitingDuplicate);
+
+    // Release job 1's rip gate
+    rip_gate.cancel();
+    let res1 = task1.await.unwrap().expect("job 1 succeeds");
+    assert_eq!(res1.ripped_count, 1);
+
+    // Job 2 should now awaken and complete from cache!
+    let res2 = tokio::time::timeout(std::time::Duration::from_secs(3), task2)
+        .await
+        .expect("job 2 must complete quickly after job 1 finishes")
+        .unwrap()
+        .expect("job 2 succeeds from cache");
+    assert_eq!(res2.cached_count, 1);
+    assert_eq!(res2.ripped_count, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inflight_duplicate_job_can_be_cancelled_independently() {
+    let (deps, state) = FakeDeps::new();
+    let orch = Arc::new(RipOrchestrator::new(OrchestratorConfig::test()));
+
+    let rip_gate = tokio_util::sync::CancellationToken::new();
+    deps.rip_scripts.lock().unwrap().insert("cancel_dup".into(), RipScript::OkWithFile(vec![1, 2]));
+    state.lock().unwrap().initial_rip_track = Some("cancel_dup".into());
+    state.lock().unwrap().initial_rip_gate = Some(rip_gate.clone());
+    state.lock().unwrap().send_audio_results.push_back(FakeDeps::upload_ok());
+
+    let o1 = Arc::clone(&orch);
+    let d1 = Arc::clone(&deps);
+    let opts1 = options(vec![track_item("cancel_dup")], true);
+    let task1 = tokio::spawn(async move { o1.start_job(d1, &opts1).await });
+
+    loop {
+        let notified = deps.rip_notify.notified();
+        if state.lock().unwrap().initial_rip_started {
+            break;
+        }
+        notified.await;
+    }
+
+    let o2 = Arc::clone(&orch);
+    let d2 = Arc::clone(&deps);
+    let opts2 = options(vec![track_item("cancel_dup")], false);
+    let task2 = tokio::spawn(async move { o2.start_job(d2, &opts2).await });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let active_jobs = orch.get_active_jobs();
+    let job2 = active_jobs.iter().find(|j| j.phase == JobPhase::WaitingDuplicate).expect("job 2 in WaitingDuplicate");
+    let job2_id = job2.id.clone();
+
+    // Cancel job 2 independently
+    assert!(orch.cancel_job(&job2_id, Some("tester")));
+
+    let res2 = task2.await.unwrap();
+    assert!(res2.is_err(), "cancelled duplicate returns error / cancelled");
+
+    // Job 1 should still be running and completes when unblocked
+    rip_gate.cancel();
+    let res1 = task1.await.unwrap().expect("job 1 completes unaffected");
+    assert_eq!(res1.ripped_count, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inflight_duplicate_job_takes_over_rip_if_primary_fails() {
+    let (deps, state) = FakeDeps::new();
+    let orch = Arc::new(RipOrchestrator::new(OrchestratorConfig::test()));
+
+    let rip_gate = tokio_util::sync::CancellationToken::new();
+    deps.rip_scripts.lock().unwrap().insert("fail_dup".into(), RipScript::OkWithFile(vec![1, 2]));
+    state.lock().unwrap().initial_rip_track = Some("fail_dup".into());
+    state.lock().unwrap().initial_rip_gate = Some(rip_gate.clone());
+    state.lock().unwrap().send_audio_results.push_back(FakeDeps::upload_ok());
+
+    let o1 = Arc::clone(&orch);
+    let d1 = Arc::clone(&deps);
+    let opts1 = options(vec![track_item("fail_dup")], true);
+    let task1 = tokio::spawn(async move { o1.start_job(d1, &opts1).await });
+
+    loop {
+        let notified = deps.rip_notify.notified();
+        if state.lock().unwrap().initial_rip_started {
+            break;
+        }
+        notified.await;
+    }
+
+    let o2 = Arc::clone(&orch);
+    let d2 = Arc::clone(&deps);
+    let opts2 = options(vec![track_item("fail_dup")], false);
+    let task2 = tokio::spawn(async move { o2.start_job(d2, &opts2).await });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let active_jobs = orch.get_active_jobs();
+    let job1 = active_jobs.iter().find(|j| j.phase != JobPhase::WaitingDuplicate).expect("job 1 active");
+    let job1_id = job1.id.clone();
+
+    // Cancel job 1 (the primary)
+    assert!(orch.cancel_job(&job1_id, Some("tester")));
+    rip_gate.cancel();
+    let _ = task1.await;
+
+    // Job 2 should take over, rip "fail_dup", and complete!
+    let res2 = tokio::time::timeout(std::time::Duration::from_secs(3), task2)
+        .await
+        .expect("job 2 must take over and complete")
+        .unwrap()
+        .expect("job 2 succeeds as active ripper");
+    assert_eq!(res2.ripped_count, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn single_track_cached_album_bypasses_rip_queue_while_rip_queue_is_occupied() {
+    let (orch, deps, state, _) = setup();
+    let rip_gate = tokio_util::sync::CancellationToken::new();
+    state.lock().unwrap().initial_rip_track = Some("blocking_rip_single".into());
+    state.lock().unwrap().initial_rip_gate = Some(rip_gate.clone());
+
+    let orch = Arc::new(orch);
+
+    // Job 1 occupies the serial rip queue
+    let o1 = Arc::clone(&orch);
+    let d1 = Arc::clone(&deps);
+    let opts1 = options(vec![track_item("blocking_rip_single")], false);
+    let task1 = tokio::spawn(async move { o1.start_job(d1, &opts1).await });
+
+    // Wait until Job 1 has actually entered lane one (ripping)
+    loop {
+        let notified = deps.rip_notify.notified();
+        if state.lock().unwrap().initial_rip_started {
+            break;
+        }
+        notified.await;
+    }
+
+    // Job 2 is a single-track album that is already cached
+    deps.albums.lock().unwrap().insert(
+        "alb.single_cached".into(),
+        FakeDeps::album(vec![FakeDeps::track_meta("single_t1", "Ausiko Raat", "Studio King")]),
+    );
+    deps.cache_track("single_t1", 9999);
+
+    let o2 = Arc::clone(&orch);
+    let d2 = Arc::clone(&deps);
+    let mut opts2 = album_options("alb.single_cached", false, false);
+    opts2.delivery_chat_id = 777;
+    let task2 = tokio::spawn(async move { o2.start_job(d2, &opts2).await });
+
+    // Job 2 MUST complete immediately via the cache delivery lane
+    let res2 = tokio::time::timeout(std::time::Duration::from_secs(2), task2)
+        .await
+        .expect("single-track cached album must bypass rip queue without waiting")
+        .unwrap()
+        .expect("cached single-track album succeeds");
+
+    assert_eq!(res2.cached_count, 1);
+    assert_eq!(res2.ripped_count, 0);
+
+    // Verify copy was delivered to chat 777
+    assert!(
+        state
+            .lock()
+            .unwrap()
+            .copies
+            .iter()
+            .any(|(chat, msg, _, _)| *chat == 777 && *msg == 9999),
+        "cached track 9999 must have been delivered to chat 777"
+    );
+
+    // Unblock Job 1 so it finishes
+    rip_gate.cancel();
+    let res1 = task1.await.unwrap().expect("job 1 completes");
+    assert_eq!(res1.ripped_count, 1);
 }

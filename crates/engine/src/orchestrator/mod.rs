@@ -511,6 +511,70 @@ impl Drop for DownloadProgressGuard {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct InflightTargetKey {
+    pub provider: Provider,
+    pub kind: TargetKind,
+    pub id: String,
+    pub storefront: Option<String>,
+}
+
+pub struct InflightEntry {
+    pub job_id: String,
+    pub notify: Arc<tokio::sync::Notify>,
+    pub success: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct InflightGuard {
+    table: Arc<Mutex<HashMap<InflightTargetKey, Arc<InflightEntry>>>>,
+    keys: Vec<InflightTargetKey>,
+    entry: Arc<InflightEntry>,
+    armed: bool,
+}
+
+impl InflightGuard {
+    fn new(
+        table: Arc<Mutex<HashMap<InflightTargetKey, Arc<InflightEntry>>>>,
+        keys: Vec<InflightTargetKey>,
+        entry: Arc<InflightEntry>,
+    ) -> Self {
+        Self {
+            table,
+            keys,
+            entry,
+            armed: true,
+        }
+    }
+
+    fn finish(mut self, success: bool) {
+        if success {
+            self.entry
+                .success
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        self.cleanup();
+    }
+
+    fn cleanup(&mut self) {
+        if self.armed {
+            {
+                let mut guard = self.table.lock().expect("inflight poisoned");
+                for key in &self.keys {
+                    guard.remove(key);
+                }
+            }
+            self.entry.notify.notify_waiters();
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
 /// The orchestrator: subscriber registry + job table + the rip queue.
 pub struct RipOrchestrator {
     config: OrchestratorConfig,
@@ -524,6 +588,8 @@ pub struct RipOrchestrator {
     /// stalled upload lane back-pressures lane 1 instead of eating disk.
     upload_lane: Arc<Mutex<Option<tokio::sync::mpsc::Sender<LaneTask>>>>,
     admissions: Arc<Mutex<Admissions>>,
+    cache_delivery_semaphore: Arc<tokio::sync::Semaphore>,
+    inflight_items: Arc<Mutex<HashMap<InflightTargetKey, Arc<InflightEntry>>>>,
 }
 
 impl Default for RipOrchestrator {
@@ -780,6 +846,8 @@ impl RipOrchestrator {
             queue: SequentialRipQueue::new(),
             upload_lane: Arc::new(Mutex::new(None)),
             admissions: Arc::new(Mutex::new(Admissions::default())),
+            cache_delivery_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
+            inflight_items: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -999,6 +1067,68 @@ impl RipOrchestrator {
             self.bus.emit(&OrchestratorEvent::Created(&guard.job));
         }
 
+        let target_keys: Vec<InflightTargetKey> = options
+            .parsed_items
+            .iter()
+            .map(|item| InflightTargetKey {
+                provider: options.provider,
+                kind: item.kind,
+                id: item.id.clone(),
+                storefront: item
+                    .storefront
+                    .clone()
+                    .or_else(|| options.single_storefront.clone()),
+            })
+            .collect();
+
+        let inflight_entry = loop {
+            let maybe_inflight = if !target_keys.is_empty() {
+                let guard = self.inflight_items.lock().expect("inflight poisoned");
+                target_keys.iter().find_map(|k| guard.get(k).cloned())
+            } else {
+                None
+            };
+
+            let Some(inflight) = maybe_inflight else {
+                let entry = Arc::new(InflightEntry {
+                    job_id: job_id.clone(),
+                    notify: Arc::new(tokio::sync::Notify::new()),
+                    success: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                });
+                let mut guard = self.inflight_items.lock().expect("inflight poisoned");
+                for key in &target_keys {
+                    guard.insert(key.clone(), Arc::clone(&entry));
+                }
+                break entry;
+            };
+
+            self.set_phase(&shared, JobPhase::WaitingDuplicate);
+            self.bus.set_job_activity(
+                &shared,
+                Some(JobActivity::WaitingDuplicate {
+                    inflight_job_id: inflight.job_id.clone(),
+                }),
+            );
+            self.bus.emit_progress(&shared);
+
+            let notify = Arc::clone(&inflight.notify);
+            tokio::select! {
+                _ = notify.notified() => {}
+                _ = job_controller.cancelled() => {
+                    self.terminalize(&shared, TerminalJobState::Cancelled, None, None);
+                    job_table_guard.remove();
+                    admission_guard.release();
+                    return Err(OrchestratorError::Cancelled);
+                }
+            }
+        };
+
+        let inflight_guard = InflightGuard::new(
+            Arc::clone(&self.inflight_items),
+            target_keys,
+            inflight_entry,
+        );
+
         let result =
             match futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(self.run_job(
                 Arc::clone(&deps),
@@ -1012,6 +1142,8 @@ impl RipOrchestrator {
                 Ok(result) => result,
                 Err(panic) => Err(OrchestratorError::Message(panic_message(panic))),
             };
+
+        inflight_guard.finish(result.is_ok());
 
         let cancelled = shared.lock().expect("job poisoned").job.is_cancelled;
         let result = if cancelled {
@@ -1658,6 +1790,294 @@ impl RipOrchestrator {
             uncached_items.retain(|item| item.cached.is_some());
         }
 
+        let all_tracks_cached = uncached_items.iter().all(|item| item.cached.is_some());
+        let album_zip_reusable = !zip_build || zip_reuse.contains_key(&Rendition::Primary);
+
+        if all_tracks_cached && album_zip_reusable {
+            let current_job_id = shared.lock().expect("job poisoned").job.id.clone();
+            tracing::info!(
+                job_id = %current_job_id,
+                tracks_count = uncached_items.len(),
+                is_album = is_album_job,
+                "Job is 100% cached; executing priority cache delivery bypassing rip queue"
+            );
+            self.set_phase(&shared, JobPhase::Delivering);
+            self.bus.set_job_activity(&shared, Some(JobActivity::CachedDelivered));
+            self.bus.emit_progress(&shared);
+
+            let _permit = self
+                .cache_delivery_semaphore
+                .acquire()
+                .await
+                .map_err(|_| OrchestratorError::Cancelled)?;
+
+            if job_controller.is_cancelled() {
+                let elapsed = format!(
+                    "{:.1}",
+                    (now_ms().saturating_sub(
+                        shared.lock().expect("job poisoned").job.start_time_ms
+                    ) as f64)
+                        / 1000.0
+                );
+                return Ok(summary(
+                    0,
+                    0,
+                    Vec::new(),
+                    Vec::new(),
+                    &elapsed,
+                    None,
+                    None,
+                ));
+            }
+
+            {
+                let guard = shared.lock().expect("job poisoned");
+                self.bus.emit(&OrchestratorEvent::Started(&guard.job));
+            }
+
+            let mut cached_count = 0usize;
+            let mut first_delivered_msg_id: Option<ChatMessageRef> = None;
+            let should_pace = uncached_items.len() > 1;
+            let mut delivery_failed = false;
+
+            if !options.is_cache_only && !zip_deliver {
+                for item in uncached_items.iter_mut() {
+                    if job_controller.is_cancelled() {
+                        let elapsed = format!(
+                            "{:.1}",
+                            (now_ms().saturating_sub(
+                                shared.lock().expect("job poisoned").job.start_time_ms
+                            ) as f64)
+                                / 1000.0
+                        );
+                        return Ok(summary(
+                            cached_count,
+                            0,
+                            Vec::new(),
+                            Vec::new(),
+                            &elapsed,
+                            None,
+                            first_delivered_msg_id,
+                        ));
+                    }
+                    if let Some(cached) = &item.cached {
+                        let cache_key = TrackKey::new(options.provider, item.track_id.clone())
+                            .with_codec(cached.codec);
+                        self.bus.set_download(
+                            &shared,
+                            Some(DownloadLane::CachedDelivery {
+                                track: TrackLabel::new(cached.title.clone(), cached.artist.clone()),
+                            }),
+                        );
+                        self.bus.emit_progress(&shared);
+
+                        let reply_to = (options.delivery_chat_id == options.chat_id)
+                            .then_some(options.reply_to_message_id)
+                            .flatten();
+
+                        let copy_result = tokio::select! {
+                            res = deps.deliver_to_chat(ChatDelivery::DumpCopy {
+                                destination: ChatRef::new(options.delivery_chat_id),
+                                source: DumpMessageRef::new(cached.message_id),
+                                reply_to: reply_to.map(ChatMessageRef::new),
+                                silent: is_multi_track,
+                            }) => res,
+                            _ = job_controller.cancelled() => {
+                                let elapsed = format!(
+                                    "{:.1}",
+                                    (now_ms().saturating_sub(
+                                        shared.lock().expect("job poisoned").job.start_time_ms
+                                    ) as f64)
+                                        / 1000.0
+                                );
+                                return Ok(summary(
+                                    cached_count,
+                                    0,
+                                    Vec::new(),
+                                    Vec::new(),
+                                    &elapsed,
+                                    None,
+                                    first_delivered_msg_id,
+                                ));
+                            }
+                        };
+
+                        match copy_result {
+                            Ok(DeliveryReceipt::Message(sent_id)) => {
+                                if first_delivered_msg_id.is_none() {
+                                    first_delivered_msg_id = Some(sent_id);
+                                }
+                                let _ = deps
+                                    .log_request(RequestLog {
+                                        telegram_id: options.user_id,
+                                        chat_id: options.chat_id,
+                                        track_key: cache_key,
+                                        is_cache_hit: true,
+                                        duration_ms: Some(0),
+                                        status: "completed".to_owned(),
+                                        error_reason: None,
+                                    })
+                                    .await;
+
+                                cached_count += 1;
+                                {
+                                    let mut guard = shared.lock().expect("job poisoned");
+                                    guard.job.cached_count = cached_count;
+                                }
+                                self.bus.set_download(&shared, None);
+                                self.bus.set_job_activity(&shared, Some(JobActivity::CachedDelivered));
+                                self.bus.emit_progress(&shared);
+
+                                if should_pace {
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(120)).await;
+                                }
+                            }
+                            Ok(DeliveryReceipt::PreviewDelivered) | Err(_) => {
+                                tracing::warn!(
+                                    track_id = %item.track_id,
+                                    "cached track delivery failed; deleting cache and falling back to rip queue"
+                                );
+                                let _ = deps.delete_track(&cache_key).await;
+                                item.cached = None;
+                                self.bus.set_download(&shared, None);
+                                delivery_failed = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            } else if zip_deliver && !options.is_cache_only {
+                let mut zip_deliveries = Vec::new();
+                for state in &zip_states {
+                    if let Some(rows) = zip_reuse.get(&state.rendition) {
+                        let direct_res = deliver_cached_zip_rows_direct(
+                            &deps,
+                            &shared,
+                            options,
+                            state.rendition,
+                            rows,
+                            &job_controller,
+                            &mut first_delivered_msg_id,
+                        )
+                        .await;
+
+                        match direct_res {
+                            Ok((delivered, size)) => {
+                                if delivered > 0 {
+                                    let codec = rows[0].codec.as_str().to_owned();
+                                    let info = ZipDeliveryInfo {
+                                        album: album_name.clone().unwrap_or_else(|| "Album".to_owned()),
+                                        artist: album_artist
+                                            .clone()
+                                            .unwrap_or_else(|| "Unknown Artist".to_owned()),
+                                        release_year: album_release_date
+                                            .clone()
+                                            .unwrap_or_default()
+                                            .chars()
+                                            .take(4)
+                                            .collect(),
+                                        total_tracks: tracks_to_process.len(),
+                                        delivered_tracks: if state.rendition == Rendition::Primary {
+                                            Some(tracks_to_process.len())
+                                        } else {
+                                            zip_reuse_atmos_track_count
+                                        },
+                                        total_parts: delivered,
+                                        size_bytes: size,
+                                        is_partial: false,
+                                        album_id: options
+                                            .parsed_items
+                                            .first()
+                                            .map(|i| i.id.clone())
+                                            .unwrap_or_default(),
+                                        album_url: match (&album_id, &album_sf) {
+                                            (Some(id), Some(storefront)) => {
+                                                deps.providers().presentation().album_url(id, storefront)
+                                            }
+                                            _ => None,
+                                        },
+                                        artwork_url: album_artwork_url
+                                            .clone()
+                                            .filter(|url| !url.is_empty()),
+                                        genre: album_genre.clone(),
+                                        record_label: album_record_label.clone(),
+                                        copyright: album_copyright.clone(),
+                                        photo_delivered: false,
+                                        codec: Some(codec),
+                                    };
+                                    zip_deliveries.push(info);
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    "cached ZIP delivery failed; falling back to rip queue"
+                                );
+                                delivery_failed = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if !delivery_failed {
+                    cached_count = tracks_to_process.len();
+                    {
+                        let mut guard = shared.lock().expect("job poisoned");
+                        guard.job.cached_count = cached_count;
+                    }
+                    self.bus.set_job_activity(&shared, Some(JobActivity::CachedDelivered));
+                    self.bus.emit_progress(&shared);
+                    let first_zip = zip_deliveries.first().cloned();
+                    let elapsed = format!(
+                        "{:.1}",
+                        (now_ms().saturating_sub(
+                            shared.lock().expect("job poisoned").job.start_time_ms
+                        ) as f64)
+                            / 1000.0
+                    );
+                    let mut res = summary(
+                        cached_count,
+                        0,
+                        Vec::new(),
+                        Vec::new(),
+                        &elapsed,
+                        first_zip,
+                        first_delivered_msg_id,
+                    );
+                    res.zip_deliveries = zip_deliveries;
+                    return Ok(res);
+                }
+            } else {
+                cached_count = tracks_to_process.len();
+                {
+                    let mut guard = shared.lock().expect("job poisoned");
+                    guard.job.cached_count = cached_count;
+                }
+                self.bus.set_job_activity(&shared, Some(JobActivity::CachedDelivered));
+                self.bus.emit_progress(&shared);
+            }
+
+            if !delivery_failed {
+                let elapsed = format!(
+                    "{:.1}",
+                    (now_ms().saturating_sub(
+                        shared.lock().expect("job poisoned").job.start_time_ms
+                    ) as f64)
+                        / 1000.0
+                );
+
+                return Ok(summary(
+                    cached_count,
+                    0,
+                    Vec::new(),
+                    Vec::new(),
+                    &elapsed,
+                    None,
+                    first_delivered_msg_id,
+                ));
+            }
+        }
+
         self.set_phase(&shared, JobPhase::Queued);
         self.bus
             .set_job_activity(&shared, Some(JobActivity::Queued { position: 1 }));
@@ -1726,7 +2146,7 @@ impl RipOrchestrator {
             queue_start_time_ms: queue_start_time,
             ripped_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             failed_tracks: Arc::new(Mutex::new(Vec::new())),
-            first_delivered_msg_id: Arc::new(Mutex::new(first_delivered_msg_id)),
+            first_delivered_msg_id: Arc::new(Mutex::new(None)),
             zip_delivery_infos: Arc::new(Mutex::new(Vec::new())),
         });
 
@@ -3343,6 +3763,72 @@ where
         }
     }
     result
+}
+
+async fn deliver_cached_zip_rows_direct<D>(
+    deps: &Arc<D>,
+    shared: &Arc<Mutex<JobShared>>,
+    options: &RipJobOptions,
+    rendition: Rendition,
+    rows: &[CachedAlbum],
+    job_controller: &CancellationToken,
+    first_delivered_msg_id: &mut Option<ChatMessageRef>,
+) -> Result<(usize, i64), String>
+where
+    D: Delivery,
+{
+    let reply_to = (options.delivery_chat_id == options.chat_id)
+        .then_some(options.reply_to_message_id)
+        .flatten();
+    let mut delivered = 0usize;
+    let mut size = 0i64;
+    for row in rows {
+        if shared.lock().expect("job poisoned").job.is_cancelled || job_controller.is_cancelled() {
+            return Ok((delivered, size));
+        }
+        let result = tokio::select! {
+            res = deps.deliver_to_chat(ChatDelivery::DumpCopy {
+                destination: ChatRef::new(options.delivery_chat_id),
+                source: DumpMessageRef::new(row.message_id),
+                reply_to: reply_to.map(ChatMessageRef::new),
+                silent: rows.len() > 1,
+            }) => res,
+            _ = job_controller.cancelled() => return Ok((delivered, size)),
+        };
+        match result {
+            Ok(DeliveryReceipt::Message(sent_id)) => {
+                if shared.lock().expect("job poisoned").job.is_cancelled
+                    || job_controller.is_cancelled()
+                {
+                    return Ok((delivered, size));
+                }
+                if first_delivered_msg_id.is_none() {
+                    *first_delivered_msg_id = Some(sent_id);
+                }
+                delivered += 1;
+                size += row.file_size;
+                if rows.len() > 1 {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(120)).await;
+                }
+            }
+            Ok(DeliveryReceipt::PreviewDelivered) if rendition == Rendition::Primary => {
+                return Err("primary ZIP delivery returned a preview receipt".to_owned());
+            }
+            Ok(DeliveryReceipt::PreviewDelivered) => {
+                tracing::warn!(
+                    rendition = ?rendition,
+                    "optional Atmos ZIP delivery returned a preview receipt"
+                );
+            }
+            Err(error) if rendition == Rendition::Primary => {
+                return Err(format!("primary ZIP delivery failed: {error}"));
+            }
+            Err(error) => {
+                tracing::warn!(%error, rendition = ?rendition, "optional Atmos ZIP delivery failed");
+            }
+        }
+    }
+    Ok((delivered, size))
 }
 
 async fn deliver_cached_zip_rows<D>(

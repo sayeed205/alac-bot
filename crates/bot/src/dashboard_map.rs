@@ -1,5 +1,5 @@
 //! Engine job snapshot → dashboard view-model mapping.
-//!
+//
 //! Pure functions only: no Telegram I/O, no orchestrator state. The event
 //! bridge stores the last engine snapshot per job and every dashboard render
 //! (open, refresh callback, `refresh_all`) goes through [`snapshot_from`].
@@ -96,13 +96,16 @@ impl JobContexts {
     }
 }
 
-/// Map an engine phase to the dashboard's two-state view.
+/// Map an engine phase to the dashboard's view.
 ///
 /// `Resolving`/`CheckingCache` render as `Processing` (an active-stage label):
-/// the dashboard only distinguishes waiting-in-queue from active work.
+/// the dashboard distinguishes waiting-in-queue, delivering from cache, and
+/// waiting on an inflight duplicate from active work.
 pub fn phase_from(engine_phase: EnginePhase) -> JobPhase {
     match engine_phase {
         EnginePhase::Queued => JobPhase::Queued,
+        EnginePhase::Delivering => JobPhase::Delivering,
+        EnginePhase::WaitingDuplicate => JobPhase::WaitingDuplicate,
         _ => JobPhase::Processing,
     }
 }
@@ -120,6 +123,8 @@ fn fallback_job_activity(job: &ActiveRipJob) -> Option<JobActivity> {
                 .unwrap_or(1),
         }),
         EnginePhase::Processing => None,
+        EnginePhase::Delivering => Some(JobActivity::CachedDelivered),
+        EnginePhase::WaitingDuplicate => None,
     }
 }
 
@@ -181,12 +186,14 @@ pub fn snapshot_from(
     ordered.sort_by(|left, right| {
         fn key(job: &ActiveRipJob) -> (u8, u64, u64) {
             match job.phase {
-                // The currently running job is always listed before work
+                // The currently running/delivering job is always listed before work
                 // waiting in the queue. Queue positions then order pending
-                // jobs deterministically; start time breaks ties.
+                // jobs deterministically; waiting duplicate jobs come after queued jobs.
+                EnginePhase::Delivering | EnginePhase::Processing => (0, 0, job.start_time_ms),
                 EnginePhase::Queued => {
                     (1, job.queue_position.unwrap_or(u64::MAX), job.start_time_ms)
                 }
+                EnginePhase::WaitingDuplicate => (2, 0, job.start_time_ms),
                 _ => (0, 0, job.start_time_ms),
             }
         }
@@ -206,7 +213,7 @@ pub fn snapshot_from(
             })
     });
     let current_download = ordered.iter().find_map(|job| {
-        (job.phase != EnginePhase::Queued)
+        (job.phase != EnginePhase::Queued && job.phase != EnginePhase::WaitingDuplicate)
             .then(|| {
                 contexts
                     .get(&job.id)
@@ -215,7 +222,7 @@ pub fn snapshot_from(
             .flatten()
     });
     let current_upload = ordered.iter().find_map(|job| {
-        (job.phase != EnginePhase::Queued)
+        (job.phase != EnginePhase::Queued && job.phase != EnginePhase::WaitingDuplicate)
             .then(|| {
                 contexts
                     .get(&job.id)
@@ -323,6 +330,11 @@ mod tests {
             assert_eq!(phase_from(job.phase), JobPhase::Processing);
         }
         assert_eq!(phase_from(EnginePhase::Queued), JobPhase::Queued);
+        assert_eq!(phase_from(EnginePhase::Delivering), JobPhase::Delivering);
+        assert_eq!(
+            phase_from(EnginePhase::WaitingDuplicate),
+            JobPhase::WaitingDuplicate
+        );
     }
 
     #[test]
