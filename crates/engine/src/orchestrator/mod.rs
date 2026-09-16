@@ -55,11 +55,11 @@ use crate::{
     queue::{EnqueueOptions, SequentialRipQueue},
     ripper::{RipError, RipOptions, RipProgressCallback},
     settings::BotSettings,
-    tagger::{bound_filename_with_suffix, MAX_FILENAME_BYTES},
+    filename::StandardFilename,
     types::{AlbumTracks, ArtistTracks, Codec, Provider, TargetKind, TrackKey, TrackRipResult},
     zip::{
-        album_generation_hash, create_zip_archive, plan_zip_parts_with_codec,
-        sanitize_archive_filename, ZipTrackEntry, MAX_ZIP_ENTRY_FILENAME_BYTES,
+        album_generation_hash, build_zip_entry_filename, create_zip_archive, plan_zip_parts_with_codec,
+        ZipTrackEntry,
         TELEGRAM_SPLIT_THRESHOLD_BYTES,
     },
 };
@@ -2371,13 +2371,7 @@ where
 
     if ctx.zip_build && !ctx.zip_reuse.contains_key(&item.rendition) {
         if let Some(state) = ctx.zip_state(item.rendition) {
-            let suffix = format!(" [{}].m4a", item.track_id);
-            let name = format!(
-                "{} - {}{suffix}",
-                sanitize_archive_filename(&cached.title),
-                sanitize_archive_filename(&cached.artist)
-            );
-            let filename = bound_filename_with_suffix(&name, &suffix, MAX_ZIP_ENTRY_FILENAME_BYTES);
+            let filename = build_zip_entry_filename(None, &cached.title, &cached.artist, &item.track_id);
             let destination = state.dir.join(&filename);
             let download_result = tokio::select! {
                 result = deps.materialize_cached(
@@ -3209,14 +3203,12 @@ async fn run_upload_item<D>(
         shared.lock().expect("job poisoned").job.is_cancelled || job_controller.is_cancelled();
     if uploaded_ok && ctx.zip_build && !cancelled {
         if let Some(state) = ctx.zip_state(upload_item.rendition) {
-            let suffix = format!(" [{}].m4a", upload_item.track_id);
-            let name = format!(
-                "{:02} - {} - {}{suffix}",
-                upload_item.rip_result.track_number,
-                sanitize_archive_filename(&upload_item.rip_result.title),
-                sanitize_archive_filename(&upload_item.rip_result.artist)
+            let filename = build_zip_entry_filename(
+                Some(upload_item.rip_result.track_number),
+                &upload_item.rip_result.title,
+                &upload_item.rip_result.artist,
+                &upload_item.track_id,
             );
-            let filename = bound_filename_with_suffix(&name, &suffix, MAX_ZIP_ENTRY_FILENAME_BYTES);
             let destination = state.dir.join(&filename);
             if let Err(error) =
                 tokio::fs::copy(&upload_item.rip_result.file_path, &destination).await
@@ -3583,24 +3575,13 @@ where
             Published(DumpPublication),
             Delivered,
         }
-        for original in plans {
-            let mut plan = original;
-            if !complete {
-                plan.archive_filename = plan
-                    .archive_filename
-                    .strip_suffix(".zip")
-                    .map(|name| {
-                        let suffix = " [Partial].zip";
-                        let partial_name = format!("{name}{suffix}");
-                        bound_filename_with_suffix(&partial_name, suffix, MAX_FILENAME_BYTES)
-                    })
-                    .unwrap_or_else(|| {
-                        let suffix = " [Partial]";
-                        let partial_name = format!("{}{suffix}", plan.archive_filename);
-                        bound_filename_with_suffix(&partial_name, suffix, MAX_FILENAME_BYTES)
-                    });
-            }
-            let output = state.dir.join(&plan.archive_filename);
+        for plan in plans {
+            let archive_name: StandardFilename = if complete {
+                plan.archive_filename.clone().into_standard()
+            } else {
+                plan.archive_filename.clone().into_partial()
+            };
+            let output = state.dir.join(&archive_name);
             let zip_title = if plan.total_parts > 1 {
                 format!(
                     "{} (Part {}/{})",
@@ -3698,7 +3679,7 @@ where
                     codec: Some(album_codec.as_str()),
                     album: &ctx.zip_album,
                     artist: &ctx.zip_artist,
-                    filename: &plan.archive_filename,
+                    filename: archive_name.as_str(),
                     part_index: plan.part_index as i32,
                     total_parts: plan.total_parts as i32,
                     generation_hash: state.generation_hash.as_deref().unwrap_or(""),
@@ -3848,7 +3829,7 @@ where
                         file_id: upload.file_id,
                         file_unique_id: upload.file_unique_id,
                         file_size: size as i64,
-                        file_name: plan.archive_filename.clone(),
+                        file_name: archive_name.to_string(),
                         generation_hash: state.generation_hash.clone().unwrap_or_default(),
                     });
                 }

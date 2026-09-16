@@ -21,7 +21,9 @@ use crate::{
     limits::MAX_AUDIO_BYTES,
     orchestrator::types::{ByteProgress, RipActivity, TrackLabel},
     streaming::{AudioStreamSource, ProgressCallback, SourceId, StreamError},
-    tagger::{self, bound_filename_with_suffix, MAX_FILENAME_BYTES},
+    filename::StandardFilename,
+    tagger,
+
     types::{TrackMeta, TrackRipResult},
 };
 
@@ -613,15 +615,15 @@ impl AlacTrackRipper {
                 unique_temp_suffix()
             );
             let temp_raw_name =
-                bound_filename_with_suffix(&temp_raw_name, ".raw", MAX_FILENAME_BYTES);
+                StandardFilename::sanitize_and_bound(&temp_raw_name, Some(".raw"));
             let temp_raw_path = track_dir.join(temp_raw_name);
             // The raw stream is staged in the private lane, but the completed
             // file must live outside it: callers consume this path after `rip`
             // returns, while the lane is removed on every outcome. Reserve the
             // normal human-readable name first, falling back to a unique name
             // rather than clobbering a concurrent rip's output.
-            let final_name = tagger::build_track_filename_with_codec(&meta, &stream.codec);
-            let stem = final_name.strip_suffix(".m4a").unwrap_or(&final_name);
+            let base_name = tagger::build_track_filename_with_codec(&meta, &stream.codec);
+            let mut final_name = base_name.clone();
             let mut final_path = target_dir.join(&final_name);
             loop {
                 match tokio::fs::OpenOptions::new()
@@ -632,24 +634,9 @@ impl AlacTrackRipper {
                 {
                     Ok(_) => break,
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                        let collision_id = unique_temp_suffix();
-                        let legacy_collision_name = format!("{stem}_{collision_id}.m4a");
-                        let collision_name = if legacy_collision_name.len() <= MAX_FILENAME_BYTES {
-                            legacy_collision_name
-                        } else {
-                            let suffix =
-                                tagger::track_filename_suffix(meta.explicit, &stream.codec);
-                            let prefix = final_name.strip_suffix(&suffix).unwrap_or(stem);
-                            let suffix_stem = suffix.strip_suffix(".m4a").unwrap_or(&suffix);
-                            let collision_suffix = format!("{suffix_stem}_{collision_id}.m4a");
-                            let name = format!("{prefix}{collision_suffix}");
-                            bound_filename_with_suffix(&name, &collision_suffix, MAX_FILENAME_BYTES)
-                        };
-                        final_path = target_dir.join(bound_filename_with_suffix(
-                            &collision_name,
-                            ".m4a",
-                            MAX_FILENAME_BYTES,
-                        ));
+                        let collision_id = unique_temp_suffix().to_string();
+                        final_name = base_name.with_collision_id(&collision_id);
+                        final_path = target_dir.join(&final_name);
                     }
                     Err(error) => return Err(error.into()),
                 }

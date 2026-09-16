@@ -18,7 +18,7 @@ use engine::{
         RipperConfig, SourceFailureKind,
     },
     streaming::{AudioStreamSource, ByteStream, ProgressCallback},
-    tagger::MAX_FILENAME_BYTES,
+    filename::MAX_FILENAME_BYTES,
     types::TrackMeta,
 };
 use futures_util::stream;
@@ -605,11 +605,11 @@ async fn long_metadata_filename_is_bounded_and_rip_succeeds() {
 }
 
 #[tokio::test]
-async fn local_filename_error_is_non_retryable() {
+async fn local_io_error_is_non_retryable() {
     let dir = tempfile::tempdir().unwrap();
     let mut deps = FakeStage::ok();
     deps.connect_error = Some(RipError::LocalIo {
-        message: "local path error: ENAMETOOLONG (File name too long)".into(),
+        message: "local io failure: disk full".into(),
     });
     let ripper = AlacTrackRipper::new(config(dir.path(), 4, 1));
     let (cb, log) = record();
@@ -621,11 +621,11 @@ async fn local_filename_error_is_non_retryable() {
             RipOptions::new(Provider::Apple, "us").with_progress(&cb),
         )
         .await
-        .expect_err("a local filename error should fail without retries");
+        .expect_err("a local io error should fail without retries");
 
     assert!(matches!(
         error,
-        RipError::LocalIo { message } if message.contains("ENAMETOOLONG")
+        RipError::LocalIo { message } if message.contains("disk full")
     ));
     assert_eq!(deps.connect_calls.load(Ordering::SeqCst), 1);
     assert!(log
