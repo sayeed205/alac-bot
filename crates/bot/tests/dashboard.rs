@@ -1,4 +1,21 @@
 use bot::dashboard::{cancelable_job_ids, render, DashboardJob, DashboardSnapshot, JobPhase};
+use engine::orchestrator::types::{
+    ByteProgress, DownloadLane, RipActivity, TrackLabel, UploadLane,
+};
+
+fn track(title: &str, artist: &str) -> TrackLabel {
+    TrackLabel::new(title, artist)
+}
+
+fn downloading(title: &str, artist: &str) -> DownloadLane {
+    DownloadLane::Rip(RipActivity::Downloading {
+        track: track(title, artist),
+        progress: ByteProgress {
+            completed: 1_048_576,
+            total: Some(2_097_152),
+        },
+    })
+}
 
 fn job(n: usize, allowed: bool) -> DashboardJob {
     DashboardJob {
@@ -17,8 +34,9 @@ fn job(n: usize, allowed: bool) -> DashboardJob {
         failed: 0,
         total: 10,
         percent: 50,
-        downloading: None,
-        uploading: None,
+        job_activity: None,
+        download: None,
+        upload: None,
         is_cancel_allowed_for_viewer: allowed,
     }
 }
@@ -28,6 +46,7 @@ fn empty_dashboard_is_exact_and_pages_are_mobile_friendly() {
     let empty = DashboardSnapshot {
         ripping_mode: "sequential".into(),
         mirror_health: None,
+        current_job_activity: None,
         current_download: None,
         current_upload: None,
         jobs: vec![],
@@ -37,6 +56,7 @@ fn empty_dashboard_is_exact_and_pages_are_mobile_friendly() {
     let snapshot = DashboardSnapshot {
         ripping_mode: "sequential".into(),
         mirror_health: Some("healthy".into()),
+        current_job_activity: None,
         current_download: None,
         current_upload: None,
         jobs,
@@ -53,6 +73,7 @@ fn cancel_controls_are_only_rendered_for_allowed_rows() {
     let snapshot = DashboardSnapshot {
         ripping_mode: "sequential".into(),
         mirror_health: None,
+        current_job_activity: None,
         current_download: None,
         current_upload: None,
         jobs: vec![job(0, true), job(1, false)],
@@ -70,16 +91,25 @@ fn header_renders_both_lane_lines_independently() {
     let both = DashboardSnapshot {
         ripping_mode: "sequential".into(),
         mirror_health: None,
-        current_download: Some("<b>Song</b> <code>1 MB</code>".into()),
-        current_upload: Some("<b>Album.zip</b>".into()),
+        current_job_activity: None,
+        current_download: Some(downloading("Song", "")),
+        current_upload: Some(UploadLane::ArchiveUpload {
+            archive: "Album.zip".into(),
+            progress: ByteProgress {
+                completed: 0,
+                total: None,
+            },
+        }),
         jobs: vec![job(0, true)],
     };
     let (text, _) = render(&both, 1);
-    assert!(text.contains("<b>⬇️ Downloading:</b> <b>Song</b> <code>1 MB</code>"));
-    assert!(text.contains("<b>⬆️ Uploading:</b> <b>Album.zip</b>"));
+    assert!(text.contains(
+        "<b>⬇️ Downloading:</b> <b>Song</b> <code>[■■■■■■□□□□□□] 50% (1.0/2.0 MB)</code>"
+    ));
+    assert!(text.contains("<b>⬆️ Uploading ZIP:</b> <b>Album.zip</b>"));
 
     let download_only = DashboardSnapshot {
-        current_download: Some("<b>Song</b>".into()),
+        current_download: Some(downloading("Song", "")),
         current_upload: None,
         ..both.clone()
     };
@@ -102,12 +132,18 @@ fn header_renders_both_lane_lines_independently() {
 fn upload_only_header_does_not_render_a_downloading_lane() {
     let snapshot = DashboardSnapshot {
         current_download: None,
-        current_upload: Some("<b>Song</b> <code>4 MB</code>".into()),
+        current_upload: Some(UploadLane::Track {
+            track: track("Song", ""),
+            progress: ByteProgress {
+                completed: 4 * 1_048_576,
+                total: None,
+            },
+        }),
         jobs: vec![job(0, true)],
         ..DashboardSnapshot::default()
     };
 
     let (text, _) = render(&snapshot, 1);
     assert!(!text.contains("⬇️"));
-    assert!(text.contains("<b>⬆️ Uploading:</b> <b>Song</b> <code>4 MB</code>"));
+    assert!(text.contains("<b>⬆️ Uploading:</b> <b>Song</b> <code>4.0 MB</code>"));
 }

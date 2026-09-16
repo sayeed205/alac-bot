@@ -2,6 +2,9 @@
 //! ferogram; the small sink makes it usable by both Telegram and tests.
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration};
 
+use engine::orchestrator::types::{
+    ByteProgress, DownloadLane, JobActivity, RipActivity, TrackLabel, UploadLane,
+};
 use tokio::sync::Mutex;
 
 pub type DashboardFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, EditError>> + Send + 'a>>;
@@ -47,10 +50,9 @@ pub struct DashboardJob {
     pub failed: u64,
     pub total: u64,
     pub percent: u8,
-    /// Current per-track activity, if the pipeline is downloading/uploading.
-    /// Values are trusted presentation fragments with dynamic text escaped.
-    pub downloading: Option<String>,
-    pub uploading: Option<String>,
+    pub job_activity: Option<JobActivity>,
+    pub download: Option<DownloadLane>,
+    pub upload: Option<UploadLane>,
     pub is_cancel_allowed_for_viewer: bool,
 }
 
@@ -58,10 +60,12 @@ pub struct DashboardJob {
 pub struct DashboardSnapshot {
     pub ripping_mode: String,
     pub mirror_health: Option<String>,
-    /// First active lane-1 job's download text (header line, hidden when idle).
-    pub current_download: Option<String>,
-    /// First active lane-2 job's upload text (header line, hidden when idle).
-    pub current_upload: Option<String>,
+    /// First active job's independent job activity, hidden when idle.
+    pub current_job_activity: Option<JobActivity>,
+    /// First active lane-1 job's download facts, hidden when idle.
+    pub current_download: Option<DownloadLane>,
+    /// First active lane-2 job's upload facts, hidden when idle.
+    pub current_upload: Option<UploadLane>,
     pub jobs: Vec<DashboardJob>,
 }
 
@@ -81,11 +85,14 @@ pub fn render(
         esc(&snapshot.ripping_mode),
         esc(health)
     );
-    if let Some(download) = snapshot.current_download.as_deref() {
-        text.push_str(&format_lane_header(download, "Downloading", "⬇️"));
+    if let Some(activity) = snapshot.current_job_activity.as_ref() {
+        text.push_str(&render_job_activity(activity));
     }
-    if let Some(upload) = snapshot.current_upload.as_deref() {
-        text.push_str(&format_lane_header(upload, "Uploading", "⬆️"));
+    if let Some(download) = snapshot.current_download.as_ref() {
+        text.push_str(&render_download_lane(download));
+    }
+    if let Some(upload) = snapshot.current_upload.as_ref() {
+        text.push_str(&render_upload_lane(upload));
     }
     for (offset, job) in snapshot.jobs.iter().skip(start).take(5).enumerate() {
         let number = start + offset + 1;
@@ -178,183 +185,81 @@ fn esc(s: &str) -> String {
     crate::html::escape(s)
 }
 
-/// Formats an activity description into a rich dashboard lane header line.
-///
-/// If the text indicates a distinct pipeline stage (Tagging, Decrypting, Zipping,
-/// Checking cache, Resolving, Connecting, Uploading, Downloading), it extracts
-/// the appropriate emoji, action verb, and remaining track/progress details.
-/// If no specific stage is recognized, it falls back to the lane's default verb and emoji.
-pub fn format_lane_header(activity: &str, default_verb: &str, default_emoji: &str) -> String {
-    let trimmed = activity.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-
-    let stages: [(&str, &str, &[&str]); 9] = [
-        (
-            "🏷️",
-            "Tagging",
-            &["🏷️ Tagging:", "🏷️ Tagging", "Tagging:", "🏷️"],
-        ),
-        (
-            "🔓",
-            "Decrypting",
-            &[
-                "🔓 Decrypting:",
-                "🔓 Decrypting",
-                "Decrypting:",
-                "🔓",
-                "🔑 Decrypting:",
-                "🔑",
-            ],
-        ),
-        (
-            "📦",
-            "Zipping",
-            &["📦 Zipping:", "📦 Zipping", "Zipping:", "📦"],
-        ),
-        (
-            "🔍",
-            "Checking cache",
-            &[
-                "🔍 Checking cache:",
-                "🔍 Checking cache...",
-                "🔍 Checking cache",
-                "🔍 Checking:",
-                "🔍 Checking",
-                "Checking cache:",
-                "Checking cache...",
-                "Checking cache",
-                "Checking:",
-                "🔍",
-            ],
-        ),
-        (
-            "🔍",
-            "Resolving",
-            &[
-                "🔍 Resolving:",
-                "🔍 Resolving",
-                "Resolving:",
-                "🌐 Resolving:",
-            ],
-        ),
-        (
-            "🌐",
-            "Connecting",
-            &["🌐 Connecting:", "🌐 Connecting", "Connecting:", "🌐"],
-        ),
-        (
-            "⬆️",
-            "Uploading ZIP",
-            &[
-                "<b>⬆️ Uploading ZIP:</b>",
-                "⬆️ Uploading ZIP:",
-                "⬆️ Uploading ZIP",
-                "<b>Uploading ZIP:</b>",
-                "Uploading ZIP:",
-                "Uploading ZIP",
-            ],
-        ),
-        (
-            "⬆️",
-            "Uploading",
-            &[
-                "<b>⬆️ Uploading:</b>",
-                "⬆️ Uploading:",
-                "⬆️ Uploading",
-                "<b>Uploading:</b>",
-                "Uploading:",
-                "⬆️",
-            ],
-        ),
-        (
-            "⬇️",
-            "Downloading",
-            &[
-                "<b>⬇️ Downloading:</b>",
-                "⬇️ Downloading from TG:",
-                "⬇️ Downloading:",
-                "⬇️ Downloading",
-                "Downloading from TG:",
-                "Downloading:",
-                "⬇️",
-            ],
-        ),
-    ];
-
-    for (emoji, verb, prefixes) in stages {
-        for prefix in prefixes {
-            if let Some(rest) = trimmed.strip_prefix(prefix) {
-                let body = strip_activity_decorations(rest);
-                if body.is_empty() || body == "..." {
-                    return if verb.ends_with("cache") {
-                        format!("<b>{emoji} {verb}...</b>\n")
-                    } else {
-                        format!("<b>{emoji} {verb}</b>\n")
-                    };
-                }
-                return format!("<b>{emoji} {verb}:</b> {body}\n");
-            }
+fn render_job_activity(activity: &JobActivity) -> String {
+    match activity {
+        JobActivity::Resolving => "<b>🔍 Resolving...</b>\n".to_owned(),
+        JobActivity::CheckingCache { item } => {
+            format!("<b>🔍 Checking cache:</b> {}\n", esc(item))
         }
+        JobActivity::Queued { position } => {
+            format!("<b>⏳ Queued:</b> position #{position}\n")
+        }
+        JobActivity::SkippingUncached => "<b>⏭️ Skipping uncached tracks...</b>\n".to_owned(),
+        JobActivity::CachedDelivered => "<b>✅ Delivered cached tracks...</b>\n".to_owned(),
+        JobActivity::ProcessingNext => "<b>⏭️ Processing next track...</b>\n".to_owned(),
     }
-
-    let lower = trimmed.to_lowercase();
-    if lower.contains("uploading zip") {
-        let body = strip_activity_decorations(trimmed);
-        return format!("<b>⬆️ Uploading ZIP:</b> {body}\n");
-    } else if lower.contains("tagging") {
-        let body = strip_activity_decorations(trimmed);
-        return format!("<b>🏷️ Tagging:</b> {body}\n");
-    } else if lower.contains("decrypt") {
-        let body = strip_activity_decorations(trimmed);
-        return format!("<b>🔓 Decrypting:</b> {body}\n");
-    } else if lower.contains("zipping") {
-        let body = strip_activity_decorations(trimmed);
-        return format!("<b>📦 Zipping:</b> {body}\n");
-    } else if lower.contains("checking") {
-        let body = strip_activity_decorations(trimmed);
-        return if body.is_empty() || body == "..." {
-            "<b>🔍 Checking cache...</b>\n".to_string()
-        } else {
-            format!("<b>🔍 Checking cache:</b> {body}\n")
-        };
-    }
-
-    format!("<b>{default_emoji} {default_verb}:</b> {trimmed}\n")
 }
 
-fn strip_activity_decorations(text: &str) -> &str {
-    let mut s = text.trim();
-    if let Some(rest) = s.strip_prefix(':') {
-        s = rest.trim();
-    }
-    for prefix in [
-        "<b>Uploading ZIP:</b>",
-        "<b>Uploading:</b>",
-        "<b>Downloading:</b>",
-        "<b>Tagging:</b>",
-        "<b>Decrypting:</b>",
-        "<b>Zipping:</b>",
-        "<b>Checking:</b>",
-        "Uploading ZIP:",
-        "Uploading:",
-        "Downloading:",
-        "Tagging:",
-        "Decrypting:",
-        "Zipping:",
-        "Checking:",
-        "cache...",
-        "local cache...",
-    ] {
-        if let Some(rest) = s.strip_prefix(prefix) {
-            s = rest.trim();
+fn render_download_lane(lane: &DownloadLane) -> String {
+    match lane {
+        DownloadLane::Rip(activity) => render_rip_activity(activity),
+        DownloadLane::CachedDelivery { track } => {
+            format!("<b>⬇️ Cached delivery:</b> <b>{}</b>\n", track_text(track))
         }
     }
-    if let Some(rest) = s.strip_prefix(':') {
-        s = rest.trim();
+}
+
+fn render_rip_activity(activity: &RipActivity) -> String {
+    match activity {
+        RipActivity::ResolvingMetadata => "<b>🔍 Resolving metadata...</b>\n".to_owned(),
+        RipActivity::Connecting { track } => {
+            format!("<b>🌐 Connecting:</b> <b>{}</b>\n", track_text(track))
+        }
+        RipActivity::Downloading { track, progress } => format!(
+            "<b>⬇️ Downloading:</b> <b>{}</b> <code>{}</code>\n",
+            track_text(track),
+            byte_progress(progress)
+        ),
+        RipActivity::Decrypting { track } => {
+            format!("<b>🔓 Decrypting:</b> <b>{}</b>\n", track_text(track))
+        }
+        RipActivity::Tagging { track } => {
+            format!("<b>🏷️ Tagging:</b> <b>{}</b>\n", track_text(track))
+        }
     }
-    s
+}
+
+fn render_upload_lane(lane: &UploadLane) -> String {
+    match lane {
+        UploadLane::Track { track, progress } => format!(
+            "<b>⬆️ Uploading:</b> <b>{}</b> <code>{}</code>\n",
+            track_text(track),
+            byte_progress(progress)
+        ),
+        UploadLane::ArchiveBuild { archive, progress } => format!(
+            "<b>📦 Zipping:</b> <b>{}</b> <code>{}</code>\n",
+            esc(archive),
+            byte_progress(progress)
+        ),
+        UploadLane::ArchiveUpload { archive, progress } => format!(
+            "<b>⬆️ Uploading ZIP:</b> <b>{}</b> <code>{}</code>\n",
+            esc(archive),
+            byte_progress(progress)
+        ),
+    }
+}
+
+fn track_text(track: &TrackLabel) -> String {
+    match (track.title.is_empty(), track.artist.is_empty()) {
+        (false, false) => format!("{} - {}", esc(&track.title), esc(&track.artist)),
+        (false, true) => esc(&track.title),
+        (true, false) => esc(&track.artist),
+        (true, true) => "Unknown track".to_owned(),
+    }
+}
+
+fn byte_progress(progress: &ByteProgress) -> String {
+    engine::progress::format_byte_progress(progress.completed, progress.total.unwrap_or(0), 12)
 }
 
 pub fn cancelable_job_ids(
@@ -652,6 +557,30 @@ impl DashboardManager {
 mod tests {
     use super::*;
 
+    fn track(title: &str, artist: &str) -> TrackLabel {
+        TrackLabel::new(title, artist)
+    }
+
+    fn downloading(title: &str, artist: &str) -> DownloadLane {
+        DownloadLane::Rip(RipActivity::Downloading {
+            track: track(title, artist),
+            progress: ByteProgress {
+                completed: 1_048_576,
+                total: Some(2_097_152),
+            },
+        })
+    }
+
+    fn uploading_track(title: &str, artist: &str) -> UploadLane {
+        UploadLane::Track {
+            track: track(title, artist),
+            progress: ByteProgress {
+                completed: 1_048_576,
+                total: Some(2_097_152),
+            },
+        }
+    }
+
     #[test]
     fn rich_job_headers_render_as_html_and_plain_button_labels() {
         let snapshot = DashboardSnapshot {
@@ -667,8 +596,9 @@ mod tests {
                 failed: 0,
                 total: 1,
                 percent: 0,
-                downloading: None,
-                uploading: None,
+                job_activity: None,
+                download: None,
+                upload: None,
                 is_cancel_allowed_for_viewer: true,
             }],
             ..DashboardSnapshot::default()
@@ -697,8 +627,9 @@ mod tests {
                 failed: 0,
                 total: 1,
                 percent: 0,
-                downloading: None,
-                uploading: None,
+                job_activity: None,
+                download: None,
+                upload: None,
                 is_cancel_allowed_for_viewer: false,
             }],
             ..DashboardSnapshot::default()
@@ -724,8 +655,9 @@ mod tests {
                 failed: 0,
                 total: 1,
                 percent: 0,
-                downloading: None,
-                uploading: None,
+                job_activity: None,
+                download: None,
+                upload: None,
                 is_cancel_allowed_for_viewer: false,
             })
             .collect();
@@ -754,12 +686,19 @@ mod tests {
                 failed: 0,
                 total: 1,
                 percent: 0,
-                downloading: Some("<b>Song - Artist:</b> <code>1 MB</code>".into()),
-                uploading: Some("<i>Song - Artist</i>".into()),
+                job_activity: None,
+                download: None,
+                upload: None,
                 is_cancel_allowed_for_viewer: true,
             }],
-            current_download: Some("<b>Song</b>".into()),
-            current_upload: Some("<b>Album.zip</b>".into()),
+            current_download: Some(downloading("Song", "")),
+            current_upload: Some(UploadLane::Track {
+                track: track("Album.zip", ""),
+                progress: ByteProgress {
+                    completed: 0,
+                    total: None,
+                },
+            }),
             ..DashboardSnapshot::default()
         };
 
@@ -793,11 +732,12 @@ mod tests {
                 failed: 0,
                 total: 1,
                 percent: 0,
-                downloading: None,
-                uploading: None,
+                job_activity: None,
+                download: None,
+                upload: None,
                 is_cancel_allowed_for_viewer: true,
             }],
-            current_download: Some("<b>Song</b>".into()),
+            current_download: Some(downloading("Song", "")),
             ..DashboardSnapshot::default()
         };
         let (text, _) = render(&snapshot, 1);
@@ -819,29 +759,34 @@ mod tests {
             failed: 0,
             total: 1,
             percent: 0,
-            downloading: None,
-            uploading: None,
+            job_activity: None,
+            download: None,
+            upload: None,
             is_cancel_allowed_for_viewer: true,
         };
 
         let s_checking = DashboardSnapshot {
-            current_download: Some("🔍 Checking cache: <b>Album</b>".into()),
+            current_job_activity: Some(JobActivity::CheckingCache {
+                item: "Album".into(),
+            }),
             jobs: vec![base_job.clone()],
             ..DashboardSnapshot::default()
         };
         let (text, _) = render(&s_checking, 1);
-        assert!(text.contains("<b>🔍 Checking cache:</b> <b>Album</b>"));
+        assert!(text.contains("<b>🔍 Checking cache:</b> Album"));
 
-        let s_checking_plain = DashboardSnapshot {
-            current_download: Some("🔍 Checking cache...".into()),
+        let s_resolving = DashboardSnapshot {
+            current_job_activity: Some(JobActivity::Resolving),
             jobs: vec![base_job.clone()],
             ..DashboardSnapshot::default()
         };
-        let (text, _) = render(&s_checking_plain, 1);
-        assert!(text.contains("<b>🔍 Checking cache...</b>"));
+        let (text, _) = render(&s_resolving, 1);
+        assert!(text.contains("<b>🔍 Resolving...</b>"));
 
         let s_decrypt = DashboardSnapshot {
-            current_download: Some("🔓 Decrypting: <b>Track 1</b>".into()),
+            current_download: Some(DownloadLane::Rip(RipActivity::Decrypting {
+                track: track("Track 1", ""),
+            })),
             jobs: vec![base_job.clone()],
             ..DashboardSnapshot::default()
         };
@@ -849,7 +794,9 @@ mod tests {
         assert!(text.contains("<b>🔓 Decrypting:</b> <b>Track 1</b>"));
 
         let s_tag = DashboardSnapshot {
-            current_download: Some("🏷️ Tagging: <b>Track 1</b>".into()),
+            current_download: Some(DownloadLane::Rip(RipActivity::Tagging {
+                track: track("Track 1", ""),
+            })),
             jobs: vec![base_job.clone()],
             ..DashboardSnapshot::default()
         };
@@ -857,41 +804,43 @@ mod tests {
         assert!(text.contains("<b>🏷️ Tagging:</b> <b>Track 1</b>"));
 
         let s_zip = DashboardSnapshot {
-            current_upload: Some("📦 Zipping: <b>Album.zip</b> <code>[===]</code>".into()),
+            current_upload: Some(UploadLane::ArchiveBuild {
+                archive: "Album.zip".into(),
+                progress: ByteProgress {
+                    completed: 0,
+                    total: None,
+                },
+            }),
             jobs: vec![base_job.clone()],
             ..DashboardSnapshot::default()
         };
         let (text, _) = render(&s_zip, 1);
-        assert!(text.contains("<b>📦 Zipping:</b> <b>Album.zip</b> <code>[===]</code>"));
+        assert!(text.contains("<b>📦 Zipping:</b> <b>Album.zip</b> <code>0.0 MB</code>"));
 
         let s_upload_zip = DashboardSnapshot {
-            current_upload: Some(
-                "⬆️ Uploading ZIP: <b>Bharat</b> <code>[===] 32% (81.0/251.7 MB)</code>".into(),
-            ),
+            current_upload: Some(UploadLane::ArchiveUpload {
+                archive: "Bharat".into(),
+                progress: ByteProgress {
+                    completed: 1_048_576,
+                    total: Some(2_097_152),
+                },
+            }),
             jobs: vec![base_job.clone()],
             ..DashboardSnapshot::default()
         };
         let (text, _) = render(&s_upload_zip, 1);
         assert!(text.contains(
-            "<b>⬆️ Uploading ZIP:</b> <b>Bharat</b> <code>[===] 32% (81.0/251.7 MB)</code>"
+            "<b>⬆️ Uploading ZIP:</b> <b>Bharat</b> <code>[■■■■■■□□□□□□] 50% (1.0/2.0 MB)</code>"
         ));
-        assert!(!text.contains("Uploading: Uploading ZIP:"));
-
-        let s_upload_zip_cleaned = DashboardSnapshot {
-            current_upload: Some("Uploading ZIP: <b>Bharat</b> <code>[===]</code>".into()),
-            jobs: vec![base_job.clone()],
-            ..DashboardSnapshot::default()
-        };
-        let (text, _) = render(&s_upload_zip_cleaned, 1);
-        assert!(text.contains("<b>⬆️ Uploading ZIP:</b> <b>Bharat</b> <code>[===]</code>"));
-        assert!(!text.contains("Uploading: Uploading ZIP:"));
 
         let s_upload = DashboardSnapshot {
-            current_upload: Some("⬆️ Uploading: <b>Track 1</b> <code>[===]</code>".into()),
+            current_upload: Some(uploading_track("Track 1", "")),
             jobs: vec![base_job],
             ..DashboardSnapshot::default()
         };
         let (text, _) = render(&s_upload, 1);
-        assert!(text.contains("<b>⬆️ Uploading:</b> <b>Track 1</b> <code>[===]</code>"));
+        assert!(text.contains(
+            "<b>⬆️ Uploading:</b> <b>Track 1</b> <code>[■■■■■■□□□□□□] 50% (1.0/2.0 MB)</code>"
+        ));
     }
 }

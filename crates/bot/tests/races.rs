@@ -409,9 +409,9 @@ fn unresolved_progress_has_zero_total_tracks() {
         failed_count: 0,
         skipped_count: 0,
         percent: 0,
-        active_download_text: None,
-        active_upload_text: None,
-        activity_override: None,
+        job_activity: None,
+        download: None,
+        upload: None,
     };
     assert_eq!(progress.total_tracks, 0);
 }

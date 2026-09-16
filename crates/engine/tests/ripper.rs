@@ -12,6 +12,7 @@ use std::{
 
 use bytes::Bytes;
 use engine::{
+    orchestrator::types::{RipActivity, TrackLabel},
     ripper::{
         fetch_artwork_bytes, AlacTrackRipper, RipError, RipOptions, RipProgressCallback, RipStage,
         RipperConfig, SourceFailureKind,
@@ -127,11 +128,12 @@ impl RipStage for FakeStage {
     async fn connect_stream(
         &self,
         track_id: &str,
+        meta: &TrackMeta,
         signal: Option<CancellationToken>,
         on_progress: Option<ProgressCallback>,
         codec_preference: CodecPreference,
     ) -> Result<AudioStreamSource, RipError> {
-        let _ = (track_id, signal, on_progress, codec_preference);
+        let _ = (track_id, meta, signal, on_progress, codec_preference);
         let n = self.connect_calls.fetch_add(1, Ordering::SeqCst);
         if self.connect_unavailable {
             return Err(RipError::RenditionUnavailable {
@@ -186,13 +188,13 @@ fn config(dir: &Path, retries: u32, base_ms: u64) -> RipperConfig {
     }
 }
 
-type ProgressLog = Arc<Mutex<Vec<(String, Option<u64>, Option<u64>)>>>;
+type ProgressLog = Arc<Mutex<Vec<RipActivity>>>;
 
 fn record() -> (RipProgressCallback, ProgressLog) {
     let log: ProgressLog = Arc::new(Mutex::new(Vec::new()));
     let log2 = log.clone();
-    let cb: RipProgressCallback = Arc::new(move |status: &str, d, t| {
-        log2.lock().unwrap().push((status.to_owned(), d, t));
+    let cb: RipProgressCallback = Arc::new(move |activity| {
+        log2.lock().unwrap().push(activity);
     });
     (cb, log)
 }
@@ -227,16 +229,25 @@ async fn happy_path_progress_and_result_mapping() {
     // Progress sequence (TS: lastProgressUpdate=0 → the FIRST chunk always
     // emits a byte-progress update).
     let log = log.lock().unwrap();
-    let statuses: Vec<&str> = log.iter().map(|(s, _, _)| s.as_str()).collect();
+    assert_eq!(log[0], RipActivity::ResolvingMetadata);
     assert_eq!(
-        statuses[..3],
-        [
-            "Fetching track metadata...",
-            "Connecting stream for Title - Artist...",
-            "Downloading lossless audio: 0.0 MB"
-        ]
+        log[1],
+        RipActivity::Connecting {
+            track: TrackLabel::new("Title", "Artist")
+        }
     );
-    assert!(statuses.contains(&"Tagging and embedding lossless artwork..."));
+    assert!(matches!(
+        log[2],
+        RipActivity::Downloading { ref track, ref progress }
+            if track == &TrackLabel::new("Title", "Artist")
+                && progress.completed > 0
+                && progress.total.is_none()
+    ));
+    assert!(log.iter().any(|activity| matches!(
+        activity,
+        RipActivity::Tagging { track }
+            if track == &TrackLabel::new("Title", "Artist")
+    )));
 
     // Finalized output exists; temp raw cleaned up.
     assert!(Path::new(&result.file_path).is_file());
@@ -294,16 +305,11 @@ async fn retry_succeeds_after_two_failures() {
         "3 attempts total"
     );
     let log = log.lock().unwrap();
-    let retry_msgs: Vec<&str> = log
+    let connecting_events: Vec<_> = log
         .iter()
-        .map(|(s, _, _)| s.as_str())
-        .filter(|s| s.starts_with("⚠️"))
+        .filter(|activity| matches!(activity, RipActivity::Connecting { .. }))
         .collect();
-    assert_eq!(retry_msgs.len(), 2);
-    assert!(retry_msgs[0]
-        .starts_with("⚠️ Rip failed, retrying (attempt 1/3) in 0.0s: Audio stream stalled"));
-    assert!(retry_msgs[1]
-        .starts_with("⚠️ Rip failed, retrying (attempt 2/3) in 0.0s: Audio stream stalled"));
+    assert_eq!(connecting_events.len(), 3);
 }
 
 #[tokio::test]
@@ -345,13 +351,14 @@ async fn cancelled_error_bypasses_retries() {
         async fn connect_stream(
             &self,
             track_id: &str,
+            meta: &TrackMeta,
             signal: Option<CancellationToken>,
             on_progress: Option<ProgressCallback>,
             codec_preference: music::CodecPreference,
         ) -> Result<AudioStreamSource, RipError> {
             let _ = self
                 .0
-                .connect_stream(track_id, signal, on_progress, codec_preference)
+                .connect_stream(track_id, meta, signal, on_progress, codec_preference)
                 .await;
             Err(RipError::Cancelled)
         }
@@ -379,12 +386,7 @@ async fn cancelled_error_bypasses_retries() {
         .await
         .unwrap_err();
     assert!(matches!(error, RipError::Cancelled));
-    // No retry progress messages.
-    assert!(log
-        .lock()
-        .unwrap()
-        .iter()
-        .all(|(s, _, _)| !s.starts_with("⚠️")));
+    assert_eq!(log.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -442,11 +444,12 @@ async fn stalled_stream_is_retryable() {
         async fn connect_stream(
             &self,
             track_id: &str,
+            meta: &TrackMeta,
             signal: Option<CancellationToken>,
             on_progress: Option<ProgressCallback>,
             codec_preference: music::CodecPreference,
         ) -> Result<AudioStreamSource, RipError> {
-            let _ = (track_id, signal, on_progress, codec_preference);
+            let _ = (track_id, meta, signal, on_progress, codec_preference);
             self.0.connect_calls.fetch_add(1, Ordering::SeqCst);
             let pending: ByteStream = Box::pin(stream::pending());
             Ok(AudioStreamSource {
@@ -520,13 +523,16 @@ async fn progress_totals_with_content_length() {
         .await
         .unwrap();
     let log = log.lock().unwrap();
-    let download_events: Vec<_> = log
+    let download_events: Vec<&RipActivity> = log
         .iter()
-        .filter(|(s, _, _)| s.starts_with("Downloading lossless audio"))
+        .filter(|activity| matches!(activity, RipActivity::Downloading { .. }))
         .collect();
     assert!(!download_events.is_empty());
     // Byte progress includes the known total when content length is present.
-    assert!(download_events[0].0.contains("(0.0/0.0 MB)"));
+    assert!(matches!(
+        download_events[0],
+        RipActivity::Downloading { progress, .. } if progress.total == Some(stream_length)
+    ));
 }
 
 #[tokio::test]
@@ -626,7 +632,7 @@ async fn local_filename_error_is_non_retryable() {
         .lock()
         .unwrap()
         .iter()
-        .all(|(status, _, _)| !status.starts_with("⚠️")));
+        .all(|activity| !matches!(activity, RipActivity::Downloading { .. })));
 }
 
 #[tokio::test]
@@ -649,7 +655,7 @@ async fn progress_throttles_to_one_per_second() {
     let log = log.lock().unwrap();
     let download_events: Vec<_> = log
         .iter()
-        .filter(|(s, _, _)| s.starts_with("Downloading lossless audio"))
+        .filter(|activity| matches!(activity, RipActivity::Downloading { .. }))
         .collect();
     // All chunks delivered within the same paused "second" → at most a
     // handful of updates (first fires immediately due to the backdated

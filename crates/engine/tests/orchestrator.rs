@@ -18,7 +18,10 @@ use engine::{
             StorageRetryPolicy, TrackAcquisition, TrackCache, TrackCacheError, TrackCacheOperation,
             UploadProgressCallback,
         },
-        types::{JobPhase, OrchestratorEvent, RipJobOptions, RipJobSummary},
+        types::{
+            DownloadLane, JobActivity, JobPhase, OrchestratorEvent, RipJobOptions, RipJobProgress,
+            RipJobSummary, UploadLane,
+        },
         OrchestratorError, RipOrchestrator,
     },
     ripper::RipError,
@@ -949,16 +952,19 @@ impl Delivery for FakeDeps {
 #[derive(Clone)]
 struct EventLog {
     records: Arc<Mutex<Vec<String>>>,
-    upload_progress: Arc<Mutex<Vec<String>>>,
+    progress: Arc<Mutex<Vec<RipJobProgress>>>,
+    upload_progress: Arc<Mutex<Vec<UploadLane>>>,
 }
 
 impl EventLog {
     fn attach(orch: &RipOrchestrator) -> Self {
         let log = Self {
             records: Arc::new(Mutex::new(Vec::new())),
+            progress: Arc::new(Mutex::new(Vec::new())),
             upload_progress: Arc::new(Mutex::new(Vec::new())),
         };
         let records = Arc::clone(&log.records);
+        let progress = Arc::clone(&log.progress);
         let upload_progress = Arc::clone(&log.upload_progress);
         orch.subscribe(Arc::new(move |event: &OrchestratorEvent<'_>| {
             let mut v = records.lock().unwrap();
@@ -971,15 +977,10 @@ impl EventLog {
                 }
                 OrchestratorEvent::Failed(_, msg) => v.push(format!("failed:{msg}")),
                 OrchestratorEvent::Progress(_, p) => {
-                    if let Some(text) = &p.active_upload_text {
-                        upload_progress.lock().unwrap().push(text.clone());
+                    progress.lock().unwrap().push((*p).clone());
+                    if let Some(upload) = &p.upload {
+                        upload_progress.lock().unwrap().push(upload.clone());
                     }
-                    v.push(format!(
-                        "progress:{}:{}:{}",
-                        p.percent,
-                        p.activity_override.as_deref().unwrap_or("-"),
-                        p.completed_tracks,
-                    ));
                 }
             }
         }));
@@ -990,8 +991,12 @@ impl EventLog {
         self.records.lock().unwrap().clone()
     }
 
-    fn upload_progress_snapshot(&self) -> Vec<String> {
+    fn upload_progress_snapshot(&self) -> Vec<UploadLane> {
         self.upload_progress.lock().unwrap().clone()
+    }
+
+    fn progress_snapshot(&self) -> Vec<RipJobProgress> {
+        self.progress.lock().unwrap().clone()
     }
 }
 
@@ -1286,8 +1291,22 @@ async fn all_cached_uses_ordered_pipeline_once() {
     assert_eq!(st.request_logs[0].duration_ms, Some(0));
     drop(st);
 
+    let progress = events.progress_snapshot();
+    assert!(progress.iter().any(|snapshot| {
+        snapshot.completed_tracks == 1
+            && snapshot.percent == 100
+            && matches!(
+                snapshot.job_activity.as_ref(),
+                Some(JobActivity::CachedDelivered)
+            )
+            && snapshot.download.is_none()
+    }));
+    assert!(progress.iter().any(|snapshot| matches!(
+        snapshot.download.as_ref(),
+        Some(DownloadLane::CachedDelivery { track })
+            if track.title == "T1440828878"
+    )));
     let ev = events.snapshot();
-    assert!(ev.contains(&"progress:100:Delivered cached tracks...:1".to_string()));
     assert_eq!(*ev.last().unwrap(), "completed");
     assert!(
         ev.contains(&"started".to_string()),
@@ -2623,28 +2642,19 @@ async fn progress_percent_math() {
     let (orch, deps, _, events) = setup();
     let meta = |id: &str| FakeDeps::track_meta(id, "Says", "Nils Frahm");
     deps.albums.lock().unwrap().insert(
-        "alb.1".into(),
-        FakeDeps::album(vec![meta("t1"), meta("t2")]),
+        "alb.prog".into(),
+        FakeDeps::album(vec![meta("prog_t1"), meta("prog_t2")]),
     );
 
-    let summary = run_async(&orch, &deps, &options(vec![album_item("alb.1")], true))
+    let summary = run_async(&orch, &deps, &options(vec![album_item("alb.prog")], true))
         .await
         .expect("job succeeds");
     assert_eq!(summary.ripped_count, 2);
 
-    let ev = events.snapshot();
-    // Upload completion publishes a fresh progress snapshot after clearing
-    // the active upload text, so the dashboard reaches 100% before the
-    // terminal event.
-    let last_progress = ev
-        .iter()
-        .rev()
-        .find(|e| e.starts_with("progress:"))
-        .expect("progress events exist");
-    assert!(
-        last_progress.starts_with("progress:100:"),
-        "got {last_progress}"
-    );
+    let progress = events.progress_snapshot();
+    let last_progress = progress.last().expect("progress events exist");
+    assert_eq!(last_progress.percent, 100);
+    assert!(last_progress.upload.is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3004,11 +3014,11 @@ async fn zip_primary_and_atmos_progress_reaches_event_consumers() {
     let progress = events.upload_progress_snapshot();
     let build_progress = progress
         .iter()
-        .filter(|text| text.starts_with("📦 Zipping:"))
+        .filter(|activity| matches!(activity, UploadLane::ArchiveBuild { .. }))
         .collect::<Vec<_>>();
     let upload_progress = progress
         .iter()
-        .filter(|text| text.starts_with("⬆️ Uploading ZIP:"))
+        .filter(|activity| matches!(activity, UploadLane::ArchiveUpload { .. }))
         .collect::<Vec<_>>();
     assert_eq!(
         build_progress.len(),
@@ -3020,11 +3030,14 @@ async fn zip_primary_and_atmos_progress_reaches_event_consumers() {
         6,
         "both archives emit upload status and bytes"
     );
-    assert!(
-        build_progress.iter().any(|text| text.contains("<code>"))
-            && upload_progress.iter().any(|text| text.contains("<code>")),
-        "byte progress remains visible to EventBus consumers: {progress:?}"
-    );
+    assert!(build_progress.iter().any(|activity| matches!(
+        activity,
+        UploadLane::ArchiveBuild { progress, .. } if progress.completed > 0
+    )));
+    assert!(upload_progress.iter().any(|activity| matches!(
+        activity,
+        UploadLane::ArchiveUpload { progress, .. } if progress.completed > 0
+    )));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

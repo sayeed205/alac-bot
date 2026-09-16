@@ -6,7 +6,7 @@
 //! path (default `/tmp/opencode/cenc_probe.m4a`).
 
 use apple::wrapper::{CodecPreference, WrapperEngine};
-use engine::streaming::StreamError;
+use engine::streaming::{ProgressCallback, StreamError};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -29,8 +29,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine = WrapperEngine::new(&wrapper_url, None);
 
     println!("ripping {track_id} via {wrapper_url} (preference: {preference:?})");
-    let progress = std::sync::Arc::new(|msg: &str| println!("  progress: {msg}"))
-        as std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+    let progress: ProgressCallback = std::sync::Arc::new(|activity| {
+        println!("  progress: {activity:?}");
+    });
     let source = engine
         .rip_track(&track_id, None, Some(progress), preference)
         .await

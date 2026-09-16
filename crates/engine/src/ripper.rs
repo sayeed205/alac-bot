@@ -19,6 +19,7 @@ use tracing::{debug, warn};
 
 use crate::{
     limits::MAX_AUDIO_BYTES,
+    orchestrator::types::{ByteProgress, RipActivity, TrackLabel},
     streaming::{AudioStreamSource, ProgressCallback, SourceId, StreamError},
     tagger::{self, bound_filename_with_suffix, MAX_FILENAME_BYTES},
     types::{TrackMeta, TrackRipResult},
@@ -170,9 +171,7 @@ impl From<std::io::Error> for RipError {
     }
 }
 
-/// `(status, downloaded_bytes, total_bytes)` — the latter two present only
-/// for the byte-progress updates.
-pub type RipProgressCallback = Arc<dyn Fn(&str, Option<u64>, Option<u64>) + Send + Sync>;
+pub type RipProgressCallback = Arc<dyn Fn(RipActivity) + Send + Sync>;
 
 /// Configuration knobs (default retries 3, base delay 2s).
 #[derive(Clone)]
@@ -228,6 +227,7 @@ pub trait RipStage: Send + Sync {
     fn connect_stream(
         &self,
         track_id: &str,
+        meta: &TrackMeta,
         signal: Option<CancellationToken>,
         on_progress: Option<ProgressCallback>,
         codec_preference: CodecPreference,
@@ -446,16 +446,6 @@ impl AlacTrackRipper {
                     let jitter = 0.8 + jitter_fraction() * 0.4;
                     let delay_ms = (raw_delay as f64 * jitter).round() as u64;
 
-                    let wait_sec = delay_ms as f64 / 1000.0;
-                    emit_progress(
-                        options.on_progress,
-                        &format!(
-                            "⚠️ Rip failed, retrying (attempt {attempt}/{}) in {wait_sec:.1}s: {err}",
-                            self.config.max_retries
-                        ),
-                        None,
-                        None,
-                    );
                     warn!(
                         track_id,
                         attempt,
@@ -518,8 +508,9 @@ impl AlacTrackRipper {
         // result so metadata/connect/cancellation errors get the same cleanup
         // as stream and tagging errors.
         let result: Result<TrackRipResult, RipError> = async {
-            emit_progress(on_progress, "Fetching track metadata...", None, None);
+            emit_progress(on_progress, RipActivity::ResolvingMetadata);
             let meta = stage.track_meta(track_id, storefront).await?;
+            let track = TrackLabel::from_meta(&meta);
 
             if signal.is_some_and(|t| t.is_cancelled()) {
                 return Err(RipError::Cancelled);
@@ -527,9 +518,9 @@ impl AlacTrackRipper {
 
             emit_progress(
                 on_progress,
-                &format!("Connecting stream for {} - {}...", meta.title, meta.artist),
-                None,
-                None,
+                RipActivity::Connecting {
+                    track: track.clone(),
+                },
             );
 
             // Concurrent prefetch: lyrics + artwork run while the audio streams.
@@ -580,11 +571,15 @@ impl AlacTrackRipper {
 
             // Connect the audio stream.
             let stream_start = std::time::Instant::now();
-            let stream_progress: Option<ProgressCallback> = on_progress
-                .cloned()
-                .map(|cb| Arc::new(move |status: &str| cb(status, None, None)) as Arc<_>);
+            let stream_progress: Option<ProgressCallback> = on_progress.cloned();
             let mut stream = stage
-                .connect_stream(track_id, signal.cloned(), stream_progress, codec_preference)
+                .connect_stream(
+                    track_id,
+                    &meta,
+                    signal.cloned(),
+                    stream_progress,
+                    codec_preference,
+                )
                 .await?;
 
             debug!(
@@ -747,17 +742,15 @@ impl AlacTrackRipper {
 
                     if last_progress_update.elapsed() > Duration::from_secs(1) {
                         last_progress_update = std::time::Instant::now();
-                        let total_for_bar = total.unwrap_or(0);
-                        let progress_str = crate::progress::format_byte_progress(
-                            downloaded_bytes,
-                            total_for_bar,
-                            12,
-                        );
                         emit_progress(
                             on_progress,
-                            &format!("Downloading lossless audio: {progress_str}"),
-                            Some(downloaded_bytes),
-                            total,
+                            RipActivity::Downloading {
+                                track: track.clone(),
+                                progress: ByteProgress {
+                                    completed: downloaded_bytes,
+                                    total,
+                                },
+                            },
                         );
                     }
                 }
@@ -797,9 +790,9 @@ impl AlacTrackRipper {
 
                 emit_progress(
                     on_progress,
-                    "Tagging and embedding lossless artwork...",
-                    None,
-                    None,
+                    RipActivity::Tagging {
+                        track: track.clone(),
+                    },
                 );
                 let tag_start = std::time::Instant::now();
 
@@ -890,14 +883,9 @@ impl AlacTrackRipper {
     }
 }
 
-fn emit_progress(
-    on_progress: Option<&RipProgressCallback>,
-    status: &str,
-    downloaded: Option<u64>,
-    total: Option<u64>,
-) {
+fn emit_progress(on_progress: Option<&RipProgressCallback>, activity: RipActivity) {
     if let Some(callback) = on_progress {
-        callback(status, downloaded, total);
+        callback(activity);
     }
 }
 

@@ -46,12 +46,12 @@ use crate::{
             UploadProgressCallback,
         },
         types::{
-            ActiveRipJob, EventCallback, FailedTrack, FailedTrackKind, JobPhase, OrchestratorEvent,
-            ResolutionFailure, RipJobOptions, RipJobProgress, RipJobSummary, TerminalJobState,
+            ActiveRipJob, ByteProgress, DownloadLane, EventCallback, FailedTrack, FailedTrackKind,
+            JobActivity, JobPhase, OrchestratorEvent, ResolutionFailure, RipActivity,
+            RipJobOptions, RipJobProgress, RipJobSummary, TerminalJobState, TrackLabel, UploadLane,
             ZipDeliveryInfo,
         },
     },
-    progress::format_byte_progress,
     queue::{EnqueueOptions, SequentialRipQueue},
     ripper::{RipError, RipOptions, RipProgressCallback},
     settings::BotSettings,
@@ -189,13 +189,6 @@ struct PipelineRipResult {
     rendition: Rendition,
 }
 
-fn stream_display_label(status: &str) -> Option<&str> {
-    status
-        .strip_prefix("Connecting stream for ")
-        .map(|value| value.strip_suffix("...").unwrap_or(value).trim())
-        .filter(|value| !value.is_empty())
-}
-
 /// Independent archive state for one requested rendition. Keeping the
 /// directories and source lists separate is important: a sparse Atmos
 /// archive must never contaminate the primary archive.
@@ -251,7 +244,6 @@ struct JobContext {
     queue_start_time_ms: u64,
     ripped_count: Arc<std::sync::atomic::AtomicUsize>,
     failed_tracks: Arc<Mutex<Vec<FailedTrack>>>,
-    texts: Arc<PipelineTexts>,
     first_delivered_msg_id: Arc<Mutex<Option<ChatMessageRef>>>,
     zip_delivery_infos: Arc<Mutex<Vec<ZipDeliveryInfo>>>,
 }
@@ -391,26 +383,14 @@ fn codec_allowed_for_rendition(rendition: Rendition, codec: Codec) -> bool {
 /// reference from several concurrent stages).
 struct JobShared {
     job: ActiveRipJob,
+    progress: PipelineState,
 }
 
-/// The current lane-1/lane-2 progress texts, shared by closure capture
-/// across pipeline stages.
 #[derive(Default)]
-struct PipelineTexts {
-    download: Mutex<Option<String>>,
-    upload: Mutex<Option<String>>,
-}
-
-impl PipelineTexts {
-    /// Snapshot both lane slots for an emit. Each lane owns its slot:
-    /// emitting with `None` would erase the other lane's live progress
-    /// from the dashboard.
-    fn snapshot(&self) -> (Option<String>, Option<String>) {
-        (
-            self.download.lock().expect("texts poisoned").clone(),
-            self.upload.lock().expect("texts poisoned").clone(),
-        )
-    }
+struct PipelineState {
+    job_activity: Mutex<Option<JobActivity>>,
+    download: Mutex<Option<DownloadLane>>,
+    upload: Mutex<Option<UploadLane>>,
 }
 
 /// Event registry shared by the orchestrator and its pipelines.
@@ -446,15 +426,34 @@ impl EventBus {
         }
     }
 
-    /// Snapshot counters and emit a progress event, optionally overriding
-    /// the activity text.
-    fn emit_progress(
-        &self,
-        shared: &Arc<Mutex<JobShared>>,
-        activity_override: Option<&str>,
-        active_download: Option<&str>,
-        active_upload: Option<&str>,
-    ) {
+    fn set_job_activity(&self, shared: &Arc<Mutex<JobShared>>, activity: Option<JobActivity>) {
+        let guard = shared.lock().expect("job poisoned");
+        *guard
+            .progress
+            .job_activity
+            .lock()
+            .expect("job activity poisoned") = activity;
+    }
+
+    fn set_download(&self, shared: &Arc<Mutex<JobShared>>, lane: Option<DownloadLane>) {
+        let guard = shared.lock().expect("job poisoned");
+        *guard
+            .progress
+            .download
+            .lock()
+            .expect("download progress poisoned") = lane;
+    }
+
+    fn set_upload(&self, shared: &Arc<Mutex<JobShared>>, lane: Option<UploadLane>) {
+        let guard = shared.lock().expect("job poisoned");
+        *guard
+            .progress
+            .upload
+            .lock()
+            .expect("upload progress poisoned") = lane;
+    }
+
+    fn emit_progress(&self, shared: &Arc<Mutex<JobShared>>) {
         let (job, progress) = {
             let guard = shared.lock().expect("job poisoned");
             let completed_tracks = guard.job.cached_count
@@ -475,13 +474,40 @@ impl EventBus {
                 failed_count: guard.job.failed_count,
                 skipped_count: guard.job.skipped_count,
                 percent,
-                active_download_text: active_download.map(str::to_string),
-                active_upload_text: active_upload.map(str::to_string),
-                activity_override: activity_override.map(str::to_string),
+                job_activity: guard
+                    .progress
+                    .job_activity
+                    .lock()
+                    .expect("job activity poisoned")
+                    .clone(),
+                download: guard
+                    .progress
+                    .download
+                    .lock()
+                    .expect("download progress poisoned")
+                    .clone(),
+                upload: guard
+                    .progress
+                    .upload
+                    .lock()
+                    .expect("upload progress poisoned")
+                    .clone(),
             };
             (guard.job.clone(), progress)
         };
         self.emit(&OrchestratorEvent::Progress(&job, &progress));
+    }
+}
+
+struct DownloadProgressGuard {
+    bus: EventBus,
+    shared: Arc<Mutex<JobShared>>,
+}
+
+impl Drop for DownloadProgressGuard {
+    fn drop(&mut self) {
+        self.bus.set_download(&self.shared, None);
+        self.bus.emit_progress(&self.shared);
     }
 }
 
@@ -953,7 +979,6 @@ impl RipOrchestrator {
                 failed_count: 0,
                 completed: false,
                 start_time_ms: now_ms(),
-                active_action_text: None,
                 queue_position: None,
                 phase: JobPhase::Resolving,
                 terminal_state: None,
@@ -962,6 +987,7 @@ impl RipOrchestrator {
                 is_group: options.is_group,
                 reply_to_message_id: options.reply_to_message_id,
             },
+            progress: PipelineState::default(),
         }));
         self.jobs
             .lock()
@@ -1060,14 +1086,9 @@ impl RipOrchestrator {
         settings: BotSettings,
     ) -> Result<RipJobSummary, OrchestratorError> {
         self.set_phase(&shared, JobPhase::Resolving);
-        shared.lock().expect("job poisoned").job.active_action_text =
-            Some("🔍 Resolving metadata & tracklist...".to_string());
-        self.bus.emit_progress(
-            &shared,
-            Some("Resolving metadata & tracklist..."),
-            Some("🔍 Resolving metadata & tracklist..."),
-            None,
-        );
+        self.bus
+            .set_job_activity(&shared, Some(JobActivity::Resolving));
+        self.bus.emit_progress(&shared);
 
         let mut resolved_tracks: Vec<ResolvedTrackItem> = Vec::new();
         let mut album_name: Option<String> = None;
@@ -1338,17 +1359,15 @@ impl RipOrchestrator {
         }
 
         self.set_phase(&shared, JobPhase::CheckingCache);
-        let check_label = {
+        let check_item = {
             let header = shared.lock().expect("job poisoned").job.job_header.clone();
-            format!("🔍 Checking cache: {header}")
+            header
         };
-        shared.lock().expect("job poisoned").job.active_action_text = Some(check_label.clone());
-        self.bus.emit_progress(
+        self.bus.set_job_activity(
             &shared,
-            Some("Checking local cache..."),
-            Some(&check_label),
-            None,
+            Some(JobActivity::CheckingCache { item: check_item }),
         );
+        self.bus.emit_progress(&shared);
         let requested_ids: Vec<TrackKey> = tracks_to_process
             .iter()
             .flat_map(|track| {
@@ -1377,7 +1396,7 @@ impl RipOrchestrator {
             }
         };
 
-        shared.lock().expect("job poisoned").job.active_action_text = None;
+        self.bus.set_job_activity(&shared, None);
 
         if options.is_force && options.is_admin {
             let mut old_message_ids: Vec<DumpMessageRef> = Vec::new();
@@ -1609,7 +1628,8 @@ impl RipOrchestrator {
                 guard.job.skipped_count = skipped.len();
             }
             self.bus
-                .emit_progress(&shared, Some("Skipping uncached tracks..."), None, None);
+                .set_job_activity(&shared, Some(JobActivity::SkippingUncached));
+            self.bus.emit_progress(&shared);
             let elapsed = format!(
                 "{:.1}",
                 (now_ms().saturating_sub(shared.lock().expect("job poisoned").job.start_time_ms)
@@ -1640,7 +1660,8 @@ impl RipOrchestrator {
 
         self.set_phase(&shared, JobPhase::Queued);
         self.bus
-            .emit_progress(&shared, Some("Queued for ripping..."), None, None);
+            .set_job_activity(&shared, Some(JobActivity::Queued { position: 1 }));
+        self.bus.emit_progress(&shared);
 
         let job_id = shared.lock().expect("job poisoned").job.id.clone();
         tracing::info!(
@@ -1705,7 +1726,6 @@ impl RipOrchestrator {
             queue_start_time_ms: queue_start_time,
             ripped_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             failed_tracks: Arc::new(Mutex::new(Vec::new())),
-            texts: Arc::new(PipelineTexts::default()),
             first_delivered_msg_id: Arc::new(Mutex::new(first_delivered_msg_id)),
             zip_delivery_infos: Arc::new(Mutex::new(Vec::new())),
         });
@@ -1746,12 +1766,13 @@ impl RipOrchestrator {
                 .expect("job poisoned")
                 .job
                 .queue_position = Some(position);
-            callback_bus.emit_progress(
+            callback_bus.set_job_activity(
                 &callback_shared,
-                Some(&format!("In Queue: Position #{position}")),
-                None,
-                None,
+                Some(JobActivity::Queued {
+                    position: u32::try_from(position).unwrap_or(u32::MAX),
+                }),
             );
+            callback_bus.emit_progress(&callback_shared);
         });
         let callback_shared = Arc::clone(&shared);
         let callback_bus = self.bus.clone();
@@ -1763,6 +1784,9 @@ impl RipOrchestrator {
             }
             let guard = callback_shared.lock().expect("job poisoned");
             callback_bus.emit(&OrchestratorEvent::Started(&guard.job));
+            drop(guard);
+            callback_bus.set_job_activity(&callback_shared, None);
+            callback_bus.emit_progress(&callback_shared);
         });
 
         let task = move |queue_signal: CancellationToken| {
@@ -1964,6 +1988,9 @@ where
     if is_lane_cancelled(shared, job_controller, queue_signal) {
         return RipLaneOutcome::Cancelled;
     }
+    bus.set_job_activity(shared, None);
+    bus.set_download(shared, None);
+    bus.emit_progress(shared);
     if item.is_streamable == Some(false) {
         if item.rendition == Rendition::Atmos {
             return RipLaneOutcome::Finished;
@@ -1998,77 +2025,43 @@ where
         if let Err(error) = log_result {
             tracing::warn!(%error, track_id = %item.track_id, "request log failed for unavailable track");
         }
-        let (download_text, upload_text) = ctx.texts.snapshot();
-        bus.emit_progress(
-            shared,
-            None,
-            download_text.as_deref(),
-            upload_text.as_deref(),
-        );
+        bus.set_job_activity(shared, Some(JobActivity::ProcessingNext));
+        bus.emit_progress(shared);
         return RipLaneOutcome::Finished;
     }
 
     let track_start_time = now_ms();
-    let track_label = match (&item.meta_title, &item.meta_artist) {
-        (Some(title), Some(artist)) if !title.is_empty() && !artist.is_empty() => {
-            format!("{title} - {artist}")
-        }
-        _ => format!("Track {}", item.track_id),
-    };
-    let dynamic_label = Arc::new(Mutex::new(track_label.clone()));
     let update_single_track_header =
         !ctx.is_multi_track && item.meta_title.is_none() && item.meta_artist.is_none();
 
     let on_progress: RipProgressCallback = {
-        let texts = Arc::clone(&ctx.texts);
         let shared = Arc::clone(shared);
         let bus = bus.clone();
-        let dynamic_label = Arc::clone(&dynamic_label);
-        Arc::new(move |status, downloaded, total| {
-            if let Some(label) = stream_display_label(status) {
-                *dynamic_label.lock().expect("label poisoned") = label.to_owned();
-                if update_single_track_header {
-                    shared.lock().expect("job poisoned").job.job_header =
-                        format!("<b>{}</b>", html_escape(label));
-                }
-            }
-            let track_label = dynamic_label.lock().expect("label poisoned").clone();
-            let text = match (downloaded, total) {
-                (Some(downloaded), Some(total)) => format!(
-                    "⬇️ Downloading: <b>{}</b> <code>{}</code>",
-                    html_escape(&track_label),
-                    format_byte_progress(downloaded, total, 12)
-                ),
-                _ => {
-                    let lower = status.to_lowercase();
-                    if lower.contains("tag") {
-                        format!("🏷️ Tagging: <b>{}</b>", html_escape(&track_label))
-                    } else if lower.contains("decrypt") || lower.contains("remux") {
-                        format!("🔓 Decrypting: <b>{}</b>", html_escape(&track_label))
-                    } else if lower.contains("connect") || lower.contains("key") {
-                        format!("🌐 Connecting: <b>{}</b>", html_escape(&track_label))
-                    } else if lower.contains("meta") || lower.contains("fetch") {
-                        format!("🔍 Resolving: <b>{}</b>", html_escape(&track_label))
-                    } else if lower.contains("download") {
-                        format!("⬇️ Downloading: <b>{}</b>", html_escape(&track_label))
+        Arc::new(move |activity| {
+            if update_single_track_header {
+                let track = match &activity {
+                    RipActivity::Connecting { track }
+                    | RipActivity::Downloading { track, .. }
+                    | RipActivity::Decrypting { track }
+                    | RipActivity::Tagging { track } => Some(track),
+                    RipActivity::ResolvingMetadata => None,
+                };
+                if let Some(track) = track {
+                    let label = if track.artist.is_empty() {
+                        track.title.clone()
+                    } else if track.title.is_empty() {
+                        track.artist.clone()
                     } else {
-                        format!(
-                            "⬇️ <b>{}:</b> {}",
-                            html_escape(&track_label),
-                            html_escape(status)
-                        )
+                        format!("{} - {}", track.title, track.artist)
+                    };
+                    if !label.is_empty() {
+                        shared.lock().expect("job poisoned").job.job_header =
+                            format!("<b>{}</b>", html_escape(&label));
                     }
                 }
-            };
-            *texts.download.lock().expect("texts poisoned") = Some(text.clone());
-            shared.lock().expect("job poisoned").job.active_action_text = Some(text);
-            let (download_text, upload_text) = texts.snapshot();
-            bus.emit_progress(
-                &shared,
-                None,
-                download_text.as_deref(),
-                upload_text.as_deref(),
-            );
+            }
+            bus.set_download(&shared, Some(DownloadLane::Rip(activity)));
+            bus.emit_progress(&shared);
         })
     };
 
@@ -2089,14 +2082,16 @@ where
     {
         Ok(rip_result) => rip_result,
         Err(error) => {
-            *ctx.texts.download.lock().expect("texts poisoned") = None;
+            bus.set_download(shared, None);
             if is_lane_cancelled(shared, job_controller, queue_signal) {
+                bus.emit_progress(shared);
                 return RipLaneOutcome::Cancelled;
             }
             if item.rendition == Rendition::Atmos
                 && matches!(&error, RipError::RenditionUnavailable { .. })
             {
                 tracing::debug!(track_id = %item.track_id, "Atmos rendition unavailable");
+                bus.emit_progress(shared);
                 return RipLaneOutcome::Finished;
             }
 
@@ -2144,13 +2139,8 @@ where
                 );
             }
 
-            let (download_text, upload_text) = ctx.texts.snapshot();
-            bus.emit_progress(
-                shared,
-                Some("Processing next track..."),
-                download_text.as_deref(),
-                upload_text.as_deref(),
-            );
+            bus.set_job_activity(shared, Some(JobActivity::ProcessingNext));
+            bus.emit_progress(shared);
             // Source-offline failures skip this track but no longer stop the
             // batch: the wrapper fallback covers the remaining tracks.
             if matches!(error, RipError::SourceOffline { .. })
@@ -2166,15 +2156,8 @@ where
         }
     };
 
-    *ctx.texts.download.lock().expect("texts poisoned") = None;
-    shared.lock().expect("job poisoned").job.active_action_text = None;
-    let (download_text, upload_text) = ctx.texts.snapshot();
-    bus.emit_progress(
-        shared,
-        None,
-        download_text.as_deref(),
-        upload_text.as_deref(),
-    );
+    bus.set_download(shared, None);
+    bus.emit_progress(shared);
     if is_lane_cancelled(shared, job_controller, queue_signal) {
         return RipLaneOutcome::Cancelled;
     }
@@ -2290,6 +2273,20 @@ where
         let _ = deps.delete_track(&cache_key).await;
         return CacheResolution::Rerip;
     }
+
+    bus.set_job_activity(shared, None);
+    bus.set_download(
+        shared,
+        Some(DownloadLane::CachedDelivery {
+            track: TrackLabel::new(cached.title.clone(), cached.artist.clone()),
+        }),
+    );
+    bus.emit_progress(shared);
+    let progress_guard = DownloadProgressGuard {
+        bus: bus.clone(),
+        shared: Arc::clone(shared),
+    };
+    let _ = &progress_guard;
 
     if !ctx.options.is_cache_only && !ctx.zip_deliver {
         let reply_to = (ctx.options.delivery_chat_id == ctx.options.chat_id)
@@ -2443,7 +2440,7 @@ where
     if item.rendition == Rendition::Primary {
         shared.lock().expect("job poisoned").job.cached_count += 1;
     }
-    bus.emit_progress(shared, Some("Delivered cached tracks..."), None, None);
+    bus.set_job_activity(shared, Some(JobActivity::CachedDelivered));
     CacheResolution::Hit
 }
 
@@ -3614,7 +3611,6 @@ where
             };
             let bus_clone = bus.clone();
             let shared_clone = Arc::clone(shared);
-            let texts = Arc::clone(&ctx.texts);
             let cancel = job_controller.clone();
             let output_clone = output.clone();
             let plan_clone = plan.clone();
@@ -3623,29 +3619,32 @@ where
                 return Ok(first_delivery);
             }
             let build = tokio::task::spawn_blocking(move || {
-                let text = format!("📦 Zipping: <b>{}</b>", html_escape(&title_clone));
-                *texts.upload.lock().expect("texts poisoned") = Some(text);
-                let (download_text, upload_text) = texts.snapshot();
-                bus_clone.emit_progress(
+                bus_clone.set_upload(
                     &shared_clone,
-                    None,
-                    download_text.as_deref(),
-                    upload_text.as_deref(),
+                    Some(UploadLane::ArchiveBuild {
+                        archive: title_clone.clone(),
+                        progress: ByteProgress {
+                            completed: 0,
+                            total: None,
+                        },
+                    }),
                 );
-                let progress_texts = Arc::clone(&texts);
-                let progress_shared = Arc::clone(&shared_clone);
+                bus_clone.emit_progress(&shared_clone);
                 let progress_bus = bus_clone.clone();
+                let progress_shared = Arc::clone(&shared_clone);
+                let progress_title = title_clone.clone();
                 let on_progress = move |uploaded: u64, total: u64| {
-                    let progress = format_byte_progress(uploaded, total, 12);
-                    let text = format!("📦 Zipping: <code>{progress}</code>");
-                    *progress_texts.upload.lock().expect("texts poisoned") = Some(text);
-                    let (download_text, upload_text) = progress_texts.snapshot();
-                    progress_bus.emit_progress(
+                    progress_bus.set_upload(
                         &progress_shared,
-                        None,
-                        download_text.as_deref(),
-                        upload_text.as_deref(),
+                        Some(UploadLane::ArchiveBuild {
+                            archive: progress_title.clone(),
+                            progress: ByteProgress {
+                                completed: uploaded,
+                                total: Some(total),
+                            },
+                        }),
                     );
+                    progress_bus.emit_progress(&progress_shared);
                 };
                 let result = create_zip_archive(
                     &output_clone,
@@ -3653,7 +3652,8 @@ where
                     Some(&on_progress),
                     Some(&cancel),
                 );
-                *texts.upload.lock().expect("texts poisoned") = None;
+                bus_clone.set_upload(&shared_clone, None);
+                bus_clone.emit_progress(&shared_clone);
                 result
             })
             .await;
@@ -3712,37 +3712,34 @@ where
                 return Ok(first_delivery);
             }
             let on_upload: UploadProgressCallback = {
-                let texts = Arc::clone(&ctx.texts);
                 let shared = Arc::clone(shared);
                 let bus = bus.clone();
                 let title = zip_title.clone();
                 Arc::new(move |uploaded, total| {
-                    let progress = format_byte_progress(uploaded, total, 12);
-                    let text = format!(
-                        "⬆️ Uploading ZIP: <b>{}</b> <code>{progress}</code>",
-                        html_escape(&title)
-                    );
-                    *texts.upload.lock().expect("texts poisoned") = Some(text);
-                    let (download_text, upload_text) = texts.snapshot();
-                    bus.emit_progress(
+                    bus.set_upload(
                         &shared,
-                        None,
-                        download_text.as_deref(),
-                        upload_text.as_deref(),
+                        Some(UploadLane::ArchiveUpload {
+                            archive: title.clone(),
+                            progress: ByteProgress {
+                                completed: uploaded,
+                                total: Some(total),
+                            },
+                        }),
                     );
+                    bus.emit_progress(&shared);
                 })
             };
-            *ctx.texts.upload.lock().expect("texts poisoned") = Some(format!(
-                "⬆️ Uploading ZIP: <b>{}</b>",
-                html_escape(&zip_title)
-            ));
-            let (download_text, upload_text) = ctx.texts.snapshot();
-            bus.emit_progress(
+            bus.set_upload(
                 shared,
-                None,
-                download_text.as_deref(),
-                upload_text.as_deref(),
+                Some(UploadLane::ArchiveUpload {
+                    archive: zip_title.clone(),
+                    progress: ByteProgress {
+                        completed: 0,
+                        total: None,
+                    },
+                }),
             );
+            bus.emit_progress(shared);
             let upload: Result<ZipSendOutcome, DeliveryError> = if complete {
                 tokio::select! {
                     result = deps.publish_to_dump(DumpPublish::ZipDocument {
@@ -3752,7 +3749,8 @@ where
                         on_upload_progress: Some(Arc::clone(&on_upload)),
                     }) => result.map(ZipSendOutcome::Published),
                     _ = job_controller.cancelled() => {
-                        *ctx.texts.upload.lock().expect("texts poisoned") = None;
+                        bus.set_upload(shared, None);
+                        bus.emit_progress(shared);
                         return Ok(first_delivery);
                     }
                 }
@@ -3765,7 +3763,11 @@ where
                         caption_html: caption.clone(),
                         on_upload_progress: Some(Arc::clone(&on_upload)),
                     }) => result,
-                    _ = job_controller.cancelled() => return Ok(first_delivery),
+                    _ = job_controller.cancelled() => {
+                        bus.set_upload(shared, None);
+                        bus.emit_progress(shared);
+                        return Ok(first_delivery);
+                    }
                 };
                 match chat_upload {
                     Ok(DeliveryReceipt::Message(sent_id)) => {
@@ -3779,7 +3781,8 @@ where
                     Err(error) => Err(error),
                 }
             };
-            *ctx.texts.upload.lock().expect("texts poisoned") = None;
+            bus.set_upload(shared, None);
+            bus.emit_progress(shared);
             match upload {
                 Ok(ZipSendOutcome::Published(upload)) if complete => {
                     rendition_dump_messages.push(upload.message);
@@ -4094,10 +4097,9 @@ where
     D: TrackCache + Delivery + JobBookkeeping,
 {
     let options = &ctx.options;
-    let texts = &ctx.texts;
     let track_id = upload_item.track_id.clone();
     let rip_result = &upload_item.rip_result;
-    let track_label = format!("{} - {}", rip_result.title, rip_result.artist);
+    let track_label = TrackLabel::new(rip_result.title.clone(), rip_result.artist.clone());
     let is_cancelled =
         || shared.lock().expect("job poisoned").job.is_cancelled || job_controller.is_cancelled();
 
@@ -4122,16 +4124,17 @@ where
     let mut current_caption = caption.clone();
     let mut used_plain_caption = false;
 
-    let upload_text = format!("⬆️ Uploading: <b>{}</b>", html_escape(&track_label));
-    *texts.upload.lock().expect("texts poisoned") = Some(upload_text.clone());
-    shared.lock().expect("job poisoned").job.active_action_text = Some(upload_text);
-    let (download_text, upload_text) = texts.snapshot();
-    bus.emit_progress(
+    bus.set_upload(
         shared,
-        None,
-        download_text.as_deref(),
-        upload_text.as_deref(),
+        Some(UploadLane::Track {
+            track: track_label.clone(),
+            progress: ByteProgress {
+                completed: 0,
+                total: None,
+            },
+        }),
     );
+    bus.emit_progress(shared);
 
     // Send with configured retries.  The initial call is attempt zero, so
     // `max_retries + 1` calls are made in the ordinary case.
@@ -4145,26 +4148,21 @@ where
             break 'upload;
         }
         let on_upload: UploadProgressCallback = {
-            let texts = Arc::clone(texts);
             let shared = Arc::clone(shared);
             let bus = bus.clone();
             let label = track_label.clone();
             Arc::new(move |uploaded, total| {
-                let prog = format_byte_progress(uploaded, total, 12);
-                let text = format!(
-                    "⬆️ Uploading: <b>{}</b> <code>{}</code>",
-                    html_escape(&label),
-                    prog
-                );
-                *texts.upload.lock().expect("texts poisoned") = Some(text.clone());
-                shared.lock().expect("job poisoned").job.active_action_text = Some(text.clone());
-                let (download_text, upload_text) = texts.snapshot();
-                bus.emit_progress(
+                bus.set_upload(
                     &shared,
-                    None,
-                    download_text.as_deref(),
-                    upload_text.as_deref(),
+                    Some(UploadLane::Track {
+                        track: label.clone(),
+                        progress: ByteProgress {
+                            completed: uploaded,
+                            total: Some(total),
+                        },
+                    }),
                 );
+                bus.emit_progress(&shared);
             })
         };
 
@@ -4237,15 +4235,8 @@ where
                         });
                         shared.lock().expect("job poisoned").job.failed_count = failures.len();
                     }
-                    *texts.upload.lock().expect("texts poisoned") = None;
-                    shared.lock().expect("job poisoned").job.active_action_text = None;
-                    let (download_text, upload_text) = texts.snapshot();
-                    bus.emit_progress(
-                        shared,
-                        None,
-                        download_text.as_deref(),
-                        upload_text.as_deref(),
-                    );
+                    bus.set_upload(shared, None);
+                    bus.emit_progress(shared);
                     return false;
                 }
             }
@@ -4254,15 +4245,8 @@ where
 
     let Some(outcome) = outcome else {
         // Cancelled mid-retries: stop without recording a failure.
-        *texts.upload.lock().expect("texts poisoned") = None;
-        shared.lock().expect("job poisoned").job.active_action_text = None;
-        let (download_text, upload_text) = texts.snapshot();
-        bus.emit_progress(
-            shared,
-            None,
-            download_text.as_deref(),
-            upload_text.as_deref(),
-        );
+        bus.set_upload(shared, None);
+        bus.emit_progress(shared);
         return false;
     };
 
@@ -4366,8 +4350,7 @@ where
 
     match post_upload {
         Ok(total_duration_ms) => {
-            *texts.upload.lock().expect("texts poisoned") = None;
-            shared.lock().expect("job poisoned").job.active_action_text = None;
+            bus.set_upload(shared, None);
             if upload_item.rendition == Rendition::Primary {
                 let new_count = ctx
                     .ripped_count
@@ -4379,13 +4362,7 @@ where
             // Publish the completed upload immediately. Without this event a
             // single-track job could leave the dashboard showing
             // `Uploading` until the terminal refresh arrived.
-            let (download_text, upload_text) = texts.snapshot();
-            bus.emit_progress(
-                shared,
-                None,
-                download_text.as_deref(),
-                upload_text.as_deref(),
-            );
+            bus.emit_progress(shared);
 
             tracing::info!(
                 track = format!("{} - {}", rip_result.title, rip_result.artist),
@@ -4400,8 +4377,7 @@ where
             true
         }
         Err(err_msg) => {
-            *texts.upload.lock().expect("texts poisoned") = None;
-            shared.lock().expect("job poisoned").job.active_action_text = None;
+            bus.set_upload(shared, None);
             if is_cancelled() {
                 return false;
             }
@@ -4420,13 +4396,7 @@ where
                 )
                 .await;
             }
-            let (download_text, upload_text) = texts.snapshot();
-            bus.emit_progress(
-                shared,
-                None,
-                download_text.as_deref(),
-                upload_text.as_deref(),
-            );
+            bus.emit_progress(shared);
             false
         }
     }
@@ -4539,15 +4509,6 @@ mod hardening_tests {
             callback_data.strip_prefix("cancel:").map(str::trim),
             Some(id.as_str())
         );
-    }
-
-    #[test]
-    fn stream_status_extracts_human_label() {
-        assert_eq!(
-            stream_display_label("Connecting stream for Never Gonna Give You Up - Rick Astley..."),
-            Some("Never Gonna Give You Up - Rick Astley")
-        );
-        assert_eq!(stream_display_label("Fetching track metadata..."), None);
     }
 
     #[test]

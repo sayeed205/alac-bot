@@ -10,6 +10,10 @@ use engine::streaming::{
     AudioStreamSource, FetchEndpointOptions, ProgressCallback, SourceId, StreamError, StreamHttp,
     StreamTransport,
 };
+use engine::{
+    orchestrator::types::{RipActivity, TrackLabel},
+    types::TrackMeta,
+};
 use music::CodecPreference;
 use tokio_util::sync::CancellationToken;
 
@@ -55,6 +59,11 @@ enum AcquisitionAttempt {
     RenditionAbsent,
     Typed(StreamError),
     NoSource,
+}
+
+struct TrackRequest<'a> {
+    id: &'a str,
+    label: &'a TrackLabel,
 }
 
 /// Result of Apple source selection.
@@ -147,10 +156,12 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
     pub async fn connect_stream(
         &self,
         track_id: &str,
+        meta: &TrackMeta,
         signal: Option<CancellationToken>,
         on_progress: Option<ProgressCallback>,
         codec_preference: CodecPreference,
     ) -> Result<AcquisitionOutcome, StreamError> {
+        let track = TrackLabel::from_meta(meta);
         let rounds = self.retry_config.retry_rounds;
         let base_delay = self.retry_config.retry_base_delay_ms;
         let mut all_errors = Vec::new();
@@ -170,12 +181,12 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
                     break;
                 }
                 let delay = base_delay * 2u64.pow(round - 1);
-                if let Some(callback) = on_progress.as_ref() {
-                    callback(&format!(
-                        "All sources failed; retrying (round {round}/{rounds}) in {:.1}s...",
-                        delay as f32 / 1000.0
-                    ));
-                }
+                tracing::debug!(
+                    round,
+                    rounds,
+                    delay_ms = delay,
+                    "retrying Apple stream acquisition"
+                );
                 if let Some(token) = signal.as_ref() {
                     tokio::select! {
                         _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
@@ -189,7 +200,10 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
             let mut round_errors = Vec::new();
             let attempt = self
                 .connect_once(
-                    track_id,
+                    TrackRequest {
+                        id: track_id,
+                        label: &track,
+                    },
                     signal.clone(),
                     on_progress.clone(),
                     codec_preference,
@@ -243,7 +257,7 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
 
     async fn connect_once(
         &self,
-        track_id: &str,
+        request: TrackRequest<'_>,
         signal: Option<CancellationToken>,
         on_progress: Option<ProgressCallback>,
         codec_preference: CodecPreference,
@@ -258,7 +272,7 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
                 let result = self
                     .stream_transport
                     .fetch_endpoint(FetchEndpointOptions {
-                        stream_url: format!("{mirror_url}/api/stream/{track_id}"),
+                        stream_url: format!("{mirror_url}/api/stream/{}", request.id),
                         api_key: Some(primary.api_key.clone()),
                         source: SourceId::PrimaryMirror,
                         signal: signal.clone(),
@@ -309,7 +323,7 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
             }
         } else {
             tracing::debug!(
-                track_id,
+                track_id = request.id,
                 "Primary mirror manifest/status lookup failed, will attempt fallback"
             );
         }
@@ -324,7 +338,9 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
             return AcquisitionAttempt::NoSource;
         };
         if let Some(callback) = on_progress.as_ref() {
-            callback("Primary mirror unavailable. Connecting to fallback wrapper...");
+            callback(RipActivity::Connecting {
+                track: request.label.clone(),
+            });
         }
 
         // The wrapper flavor is decided once, at construction: the configured
@@ -334,7 +350,13 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
         if self.wrapper_kind == WrapperKind::Native {
             let wrapper_engine = WrapperEngine::new(clean_wrapper, self.wrapper_api_key.as_deref());
             match wrapper_engine
-                .rip_track_with_outcome(track_id, signal, on_progress, codec_preference)
+                .rip_track_with_outcome(
+                    request.id,
+                    request.label,
+                    signal,
+                    on_progress,
+                    codec_preference,
+                )
                 .await
             {
                 Ok(WrapperTrackOutcome::Source(source)) => {
@@ -360,8 +382,8 @@ impl<S: StreamHttp, M: MirrorHttp> AppleStreamAcquisition<S, M> {
             let mut only_unavailable = true;
             let mut unavailable_reason = None;
             for endpoint in [
-                format!("{clean_wrapper}/api/stream/{track_id}"),
-                format!("{clean_wrapper}/stream/{track_id}"),
+                format!("{clean_wrapper}/api/stream/{}", request.id),
+                format!("{clean_wrapper}/stream/{}", request.id),
             ] {
                 if signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
                     errors.push(format!(
@@ -649,13 +671,14 @@ impl engine::ripper::RipStage for AppleRipperDeps {
     async fn connect_stream(
         &self,
         track_id: &str,
+        meta: &music::TrackMeta,
         signal: Option<CancellationToken>,
         on_progress: Option<ProgressCallback>,
         codec_preference: CodecPreference,
     ) -> Result<AudioStreamSource, engine::ripper::RipError> {
         map_acquisition_outcome(
             self.acquisition
-                .connect_stream(track_id, signal, on_progress, codec_preference)
+                .connect_stream(track_id, meta, signal, on_progress, codec_preference)
                 .await,
         )
     }

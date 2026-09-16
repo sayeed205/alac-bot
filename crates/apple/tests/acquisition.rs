@@ -12,6 +12,7 @@ use apple::{
 };
 use bytes::Bytes;
 use engine::{
+    orchestrator::types::{RipActivity, TrackLabel},
     ripper::{AlacTrackRipper, RipError, RipOptions, RipStage, RipperConfig, SourceFailureKind},
     streaming::{
         AudioStreamSource, ByteStream, ProgressCallback, SourceId, StreamError, StreamHttp,
@@ -183,11 +184,11 @@ impl StreamHttp for CorruptMirrorStream {
     }
 }
 
-fn progress_log() -> (ProgressCallback, Arc<Mutex<Vec<String>>>) {
+fn progress_log() -> (ProgressCallback, Arc<Mutex<Vec<RipActivity>>>) {
     let messages = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&messages);
-    let callback: ProgressCallback = Arc::new(move |message| {
-        captured.lock().unwrap().push(message.to_owned());
+    let callback: ProgressCallback = Arc::new(move |activity| {
+        captured.lock().unwrap().push(activity);
     });
     (callback, messages)
 }
@@ -369,13 +370,14 @@ impl RipStage for FallbackRipStage {
     async fn connect_stream(
         &self,
         track_id: &str,
+        meta: &TrackMeta,
         signal: Option<CancellationToken>,
         on_progress: Option<ProgressCallback>,
         codec_preference: apple::CodecPreference,
     ) -> Result<AudioStreamSource, RipError> {
         map_acquisition_outcome(
             self.acquisition
-                .connect_stream(track_id, signal, on_progress, codec_preference)
+                .connect_stream(track_id, meta, signal, on_progress, codec_preference)
                 .await,
         )
     }
@@ -443,7 +445,13 @@ async fn transient_mirror_failure_reuses_resolved_endpoint_on_retry_round() {
         2,
     );
     let source = match acquisition
-        .connect_stream("42", None, None, apple::CodecPreference::HighestQuality)
+        .connect_stream(
+            "42",
+            &test_track_meta(),
+            None,
+            None,
+            apple::CodecPreference::HighestQuality,
+        )
         .await
         .unwrap()
     {
@@ -464,7 +472,13 @@ async fn wrapper_candidates_are_tried_in_order_after_mirror_failure() {
         1,
     );
     acquisition
-        .connect_stream("42", None, None, apple::CodecPreference::HighestQuality)
+        .connect_stream(
+            "42",
+            &test_track_meta(),
+            None,
+            None,
+            apple::CodecPreference::HighestQuality,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -494,7 +508,13 @@ async fn highest_quality_endpoint_wrapper_returns_non_ec3_stream() {
     );
 
     let outcome = acquisition
-        .connect_stream("42", None, None, apple::CodecPreference::HighestQuality)
+        .connect_stream(
+            "42",
+            &test_track_meta(),
+            None,
+            None,
+            apple::CodecPreference::HighestQuality,
+        )
         .await
         .expect("a non-EC-3 endpoint stream is valid for highest quality");
 
@@ -527,7 +547,13 @@ async fn wrapper_failures_are_aggregated_in_candidate_order() {
         1,
     );
     let error = acquisition
-        .connect_stream("42", None, None, apple::CodecPreference::HighestQuality)
+        .connect_stream(
+            "42",
+            &test_track_meta(),
+            None,
+            None,
+            apple::CodecPreference::HighestQuality,
+        )
         .await
         .unwrap_err();
     assert_eq!(
@@ -562,6 +588,7 @@ async fn cancellation_does_not_retry_or_open_primary_circuit() {
     let error = acquisition
         .connect_stream(
             "42",
+            &test_track_meta(),
             Some(signal),
             None,
             apple::CodecPreference::HighestQuality,
@@ -591,7 +618,13 @@ async fn primary_failure_opens_circuit_and_primary_success_clears_it() {
         1,
     );
     failed_acquisition
-        .connect_stream("42", None, None, apple::CodecPreference::HighestQuality)
+        .connect_stream(
+            "42",
+            &test_track_meta(),
+            None,
+            None,
+            apple::CodecPreference::HighestQuality,
+        )
         .await
         .unwrap_err();
     assert!(failed_acquisition.mirror_policy().is_circuit_open());
@@ -614,7 +647,13 @@ async fn primary_failure_opens_circuit_and_primary_success_clears_it() {
         },
     );
     successful_acquisition
-        .connect_stream("42", None, None, apple::CodecPreference::HighestQuality)
+        .connect_stream(
+            "42",
+            &test_track_meta(),
+            None,
+            None,
+            apple::CodecPreference::HighestQuality,
+        )
         .await
         .unwrap();
     assert!(!successful_acquisition.mirror_policy().is_circuit_open());
@@ -633,6 +672,7 @@ async fn fallback_reports_progress_when_primary_is_unavailable() {
     acquisition
         .connect_stream(
             "42",
+            &test_track_meta(),
             None,
             Some(callback),
             apple::CodecPreference::HighestQuality,
@@ -642,7 +682,9 @@ async fn fallback_reports_progress_when_primary_is_unavailable() {
 
     assert_eq!(
         *messages.lock().unwrap(),
-        vec!["Primary mirror unavailable. Connecting to fallback wrapper..."]
+        vec![RipActivity::Connecting {
+            track: TrackLabel::new("Title", "Artist")
+        }]
     );
 }
 
@@ -734,7 +776,13 @@ async fn atmos_wrapper_m3u8_404_returns_absence_without_retry() {
     );
     let (callback, messages) = progress_log();
     let outcome = acquisition
-        .connect_stream("42", None, Some(callback), apple::CodecPreference::Atmos)
+        .connect_stream(
+            "42",
+            &test_track_meta(),
+            None,
+            Some(callback),
+            apple::CodecPreference::Atmos,
+        )
         .await
         .expect("an Atmos wrapper 404 is optional absence");
 
@@ -745,7 +793,7 @@ async fn atmos_wrapper_m3u8_404_returns_absence_without_retry() {
         .lock()
         .unwrap()
         .iter()
-        .all(|message| !message.contains("retry") && !message.contains("failed")));
+        .all(|activity| matches!(activity, RipActivity::Connecting { .. })));
     server.abort();
 }
 
@@ -760,7 +808,13 @@ async fn primary_wrapper_m3u8_404_is_permanent_without_retry() {
         3,
     );
     let error = acquisition
-        .connect_stream("42", None, None, apple::CodecPreference::HighestQuality)
+        .connect_stream(
+            "42",
+            &test_track_meta(),
+            None,
+            None,
+            apple::CodecPreference::HighestQuality,
+        )
         .await
         .expect_err("a primary wrapper 404 remains a permanent failure");
 
@@ -784,7 +838,13 @@ async fn wrapper_license_404_remains_retryable_technical_failure() {
         3,
     );
     let error = acquisition
-        .connect_stream("42", None, None, apple::CodecPreference::HighestQuality)
+        .connect_stream(
+            "42",
+            &test_track_meta(),
+            None,
+            None,
+            apple::CodecPreference::HighestQuality,
+        )
         .await
         .expect_err("a license 404 is a technical failure, not track absence");
 
@@ -812,7 +872,13 @@ async fn wrapper_service_offline_is_typed_without_retry() {
         3,
     );
     let error = acquisition
-        .connect_stream("42", None, None, apple::CodecPreference::HighestQuality)
+        .connect_stream(
+            "42",
+            &test_track_meta(),
+            None,
+            None,
+            apple::CodecPreference::HighestQuality,
+        )
         .await
         .expect_err("an unreachable wrapper service is a typed offline failure");
 
@@ -863,7 +929,13 @@ async fn wrapper_authentication_rejection_is_typed() {
         3,
     );
     let error = acquisition
-        .connect_stream("42", None, None, apple::CodecPreference::HighestQuality)
+        .connect_stream(
+            "42",
+            &test_track_meta(),
+            None,
+            None,
+            apple::CodecPreference::HighestQuality,
+        )
         .await
         .expect_err("a 401 from the wrapper is a typed authentication failure");
 
@@ -888,7 +960,13 @@ async fn primary_wrapper_m3u8_404_maps_to_track_unavailable_in_rip_error() {
         3,
     );
     let error = acquisition
-        .connect_stream("42", None, None, apple::CodecPreference::HighestQuality)
+        .connect_stream(
+            "42",
+            &test_track_meta(),
+            None,
+            None,
+            apple::CodecPreference::HighestQuality,
+        )
         .await
         .expect_err("a primary wrapper 404 is typed track absence");
 
@@ -912,7 +990,13 @@ async fn atmos_wrapper_m3u8_404_returns_public_absence() {
         3,
     );
     let outcome = acquisition
-        .connect_stream("42", None, None, apple::CodecPreference::Atmos)
+        .connect_stream(
+            "42",
+            &test_track_meta(),
+            None,
+            None,
+            apple::CodecPreference::Atmos,
+        )
         .await
         .expect("an Atmos wrapper 404 is optional absence");
 
@@ -926,7 +1010,13 @@ async fn atmos_absence_maps_to_rendition_unavailable_in_rip_stage() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let stage = fallback_rip_stage(false, "mp4a.40.2", false, calls);
     let error = stage
-        .connect_stream("42", None, None, apple::CodecPreference::Atmos)
+        .connect_stream(
+            "42",
+            &test_track_meta(),
+            None,
+            None,
+            apple::CodecPreference::Atmos,
+        )
         .await
         .expect_err("Atmos absence should map to a typed rip error");
 
@@ -963,7 +1053,13 @@ async fn atmos_all_non_ec3_wrapper_candidates_are_unavailable_without_retry() {
         3,
     );
     let outcome = acquisition
-        .connect_stream("42", None, None, apple::CodecPreference::Atmos)
+        .connect_stream(
+            "42",
+            &test_track_meta(),
+            None,
+            None,
+            apple::CodecPreference::Atmos,
+        )
         .await
         .expect("all non-EC-3 candidates must be unavailable");
 
@@ -981,7 +1077,13 @@ async fn atmos_non_ec3_candidate_does_not_hide_technical_wrapper_failure() {
         2,
     );
     let error = acquisition
-        .connect_stream("42", None, None, apple::CodecPreference::Atmos)
+        .connect_stream(
+            "42",
+            &test_track_meta(),
+            None,
+            None,
+            apple::CodecPreference::Atmos,
+        )
         .await
         .expect_err("a technical candidate failure must remain retryable");
 
@@ -1013,7 +1115,13 @@ async fn cancellation_after_non_ec3_candidate_is_not_typed_unavailable() {
     );
     let signal = CancellationToken::new();
     let error = acquisition
-        .connect_stream("42", Some(signal), None, apple::CodecPreference::Atmos)
+        .connect_stream(
+            "42",
+            &test_track_meta(),
+            Some(signal),
+            None,
+            apple::CodecPreference::Atmos,
+        )
         .await
         .expect_err("cancellation must not become optional absence");
 
@@ -1039,7 +1147,13 @@ async fn atmos_non_ec3_wrapper_candidate_falls_back_to_ec3_candidate() {
     );
 
     let source = match acquisition
-        .connect_stream("42", None, None, apple::CodecPreference::Atmos)
+        .connect_stream(
+            "42",
+            &test_track_meta(),
+            None,
+            None,
+            apple::CodecPreference::Atmos,
+        )
         .await
         .expect("the second wrapper candidate is a valid Atmos stream")
     {
@@ -1065,6 +1179,7 @@ async fn injected_retry_config_controls_exponential_backoff_and_rounds() {
     acquisition
         .connect_stream(
             "42",
+            &test_track_meta(),
             None,
             Some(callback),
             apple::CodecPreference::HighestQuality,
@@ -1073,11 +1188,5 @@ async fn injected_retry_config_controls_exponential_backoff_and_rounds() {
         .unwrap();
 
     assert_eq!(calls.lock().unwrap().len(), 3);
-    assert_eq!(
-        *messages.lock().unwrap(),
-        vec![
-            "All sources failed; retrying (round 1/3) in 0.1s...",
-            "All sources failed; retrying (round 2/3) in 0.2s...",
-        ]
-    );
+    assert!(messages.lock().unwrap().is_empty());
 }

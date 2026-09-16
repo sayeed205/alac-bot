@@ -559,7 +559,6 @@ mod tests {
             failed_count: 0,
             completed: false,
             start_time_ms: 0,
-            active_action_text: None,
             queue_position: None,
             phase: EnginePhase::Processing,
             terminal_state: None,
@@ -580,9 +579,9 @@ mod tests {
             failed_count: 0,
             skipped_count: 0,
             percent: 50,
-            active_download_text: None,
-            active_upload_text: None,
-            activity_override: None,
+            job_activity: None,
+            download: None,
+            upload: None,
         }
     }
 

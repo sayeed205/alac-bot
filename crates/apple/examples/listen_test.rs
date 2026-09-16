@@ -17,7 +17,7 @@
 //! `http://localhost:12340`).
 
 use apple::wrapper::{CodecPreference, WrapperEngine};
-use engine::streaming::StreamError;
+use engine::streaming::{ProgressCallback, StreamError};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -105,8 +105,9 @@ async fn rip_one(
     out_dir: &str,
 ) -> Result<Option<(String, String)>, StreamError> {
     println!("[{track_id}] ripping {label}...");
-    let progress = std::sync::Arc::new(|msg: &str| println!("    {msg}"))
-        as std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+    let progress: ProgressCallback = std::sync::Arc::new(|activity| {
+        println!("    progress: {activity:?}");
+    });
 
     let source = engine
         .rip_track(track_id, None, Some(progress), preference)

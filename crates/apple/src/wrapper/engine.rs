@@ -11,6 +11,7 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use bytes::Bytes;
+use engine::orchestrator::types::{ByteProgress, RipActivity, TrackLabel};
 use engine::streaming::{AudioStreamSource, ProgressCallback, SourceId, StreamError};
 use music::CodecPreference;
 use tokio_util::sync::CancellationToken;
@@ -68,8 +69,9 @@ impl WrapperEngine {
         on_progress: Option<ProgressCallback>,
         preference: CodecPreference,
     ) -> Result<AudioStreamSource, StreamError> {
+        let track = TrackLabel::new(format!("Track {track_id}"), String::new());
         match self
-            .rip_track_with_outcome(track_id, signal, on_progress, preference)
+            .rip_track_with_outcome(track_id, &track, signal, on_progress, preference)
             .await?
         {
             WrapperTrackOutcome::Source(source) => Ok(source),
@@ -83,6 +85,7 @@ impl WrapperEngine {
     pub(crate) async fn rip_track_with_outcome(
         &self,
         track_id: &str,
+        track: &TrackLabel,
         signal: Option<CancellationToken>,
         on_progress: Option<ProgressCallback>,
         preference: CodecPreference,
@@ -91,9 +94,12 @@ impl WrapperEngine {
             return Err(StreamError::Cancelled);
         }
 
-        if let Some(cb) = &on_progress {
-            cb("Connecting to wrapper-lite engine...");
-        }
+        report(
+            on_progress.as_ref(),
+            RipActivity::Connecting {
+                track: track.clone(),
+            },
+        );
 
         let master_url = match self.client.fetch_m3u8_url(track_id).await {
             Ok(url) => url,
@@ -126,8 +132,13 @@ impl WrapperEngine {
             }
             Err(error) => {
                 if !looks_like_master_playlist(&master_text) {
-                    self.webplayback_fallback(track_id, signal.as_ref(), on_progress.as_ref())
-                        .await?
+                    self.webplayback_fallback(
+                        track_id,
+                        track,
+                        signal.as_ref(),
+                        on_progress.as_ref(),
+                    )
+                    .await?
                 } else {
                     return Err(StreamError::PlaylistParse {
                         which: "master",
@@ -146,9 +157,12 @@ impl WrapperEngine {
             "Selected ALAC stream variant"
         );
 
-        if let Some(cb) = &on_progress {
-            cb("Fetching media playlist and FairPlay keys...");
-        }
+        report(
+            on_progress.as_ref(),
+            RipActivity::Connecting {
+                track: track.clone(),
+            },
+        );
 
         let media_resp = self
             .http_client
@@ -184,6 +198,7 @@ impl WrapperEngine {
                     track_id,
                     &media_info,
                     &kid_b64,
+                    track,
                     signal.as_ref(),
                     on_progress.as_ref(),
                 )
@@ -213,9 +228,16 @@ impl WrapperEngine {
             }
         }
 
-        if let Some(cb) = &on_progress {
-            cb("Downloading encrypted audio stream from Apple CDN...");
-        }
+        report(
+            on_progress.as_ref(),
+            RipActivity::Downloading {
+                track: track.clone(),
+                progress: ByteProgress {
+                    completed: 0,
+                    total: None,
+                },
+            },
+        );
 
         // In Apple Music, media_info.single_file_url is almost always present
         let decrypted_bytes = if let Some(single_url) = &media_info.single_file_url {
@@ -230,9 +252,12 @@ impl WrapperEngine {
                 .await
                 .map_err(|e| self.map_reqwest_error("Read audio stream bytes", e))?;
 
-            if let Some(cb) = &on_progress {
-                cb("Decrypting FairPlay audio samples with Temari...");
-            }
+            report(
+                on_progress.as_ref(),
+                RipActivity::Decrypting {
+                    track: track.clone(),
+                },
+            );
 
             self.decrypt_single_file_stream(&raw_data, &media_info, &key_templates, track_id)?
         } else {
@@ -241,6 +266,7 @@ impl WrapperEngine {
                 &media_info,
                 &key_templates,
                 track_id,
+                track,
                 on_progress.as_ref(),
             )
             .await?
@@ -316,15 +342,19 @@ impl WrapperEngine {
     async fn webplayback_fallback(
         &self,
         track_id: &str,
+        track: &TrackLabel,
         signal: Option<&CancellationToken>,
         on_progress: Option<&ProgressCallback>,
     ) -> Result<AlacStreamInfo, StreamError> {
         if signal.is_some_and(|t| t.is_cancelled()) {
             return Err(StreamError::Cancelled);
         }
-        if let Some(cb) = on_progress {
-            cb("No lossless stream; using web playback...");
-        }
+        report(
+            on_progress,
+            RipActivity::Connecting {
+                track: track.clone(),
+            },
+        );
         let media_url = self
             .client
             .fetch_webplayback(track_id)
@@ -347,6 +377,7 @@ impl WrapperEngine {
         track_id: &str,
         media_info: &super::playlist::MediaPlaylistInfo,
         kid_b64: &str,
+        track: &TrackLabel,
         signal: Option<&CancellationToken>,
         on_progress: Option<&ProgressCallback>,
     ) -> Result<AudioStreamSource, StreamError> {
@@ -355,9 +386,12 @@ impl WrapperEngine {
         if signal.is_some_and(|t| t.is_cancelled()) {
             return Err(StreamError::Cancelled);
         }
-        if let Some(cb) = on_progress {
-            cb("Fetching Widevine license for encrypted AAC...");
-        }
+        report(
+            on_progress,
+            RipActivity::Decrypting {
+                track: track.clone(),
+            },
+        );
 
         let kid = B64.decode(kid_b64).map_err(|e| StreamError::Decrypt {
             detail: format!("decode CENC key id: {e}"),
@@ -401,9 +435,16 @@ impl WrapperEngine {
         if signal.is_some_and(|t| t.is_cancelled()) {
             return Err(StreamError::Cancelled);
         }
-        if let Some(cb) = on_progress {
-            cb("Downloading encrypted AAC stream...");
-        }
+        report(
+            on_progress,
+            RipActivity::Downloading {
+                track: track.clone(),
+                progress: ByteProgress {
+                    completed: 0,
+                    total: None,
+                },
+            },
+        );
 
         // Whole-file layout: init (EXT-X-MAP byterange) + fragments
         // (EXT-X-BYTERANGE) all reference one file.
@@ -426,9 +467,12 @@ impl WrapperEngine {
             .await
             .map_err(|e| self.map_reqwest_error("Read audio stream bytes", e))?;
 
-        if let Some(cb) = on_progress {
-            cb("Decrypting CENC audio samples...");
-        }
+        report(
+            on_progress,
+            RipActivity::Decrypting {
+                track: track.clone(),
+            },
+        );
 
         let (init_offset, init_len) = media_info.init_byte_range.unwrap_or((0, 1037));
         if raw_data.len() < (init_offset + init_len) as usize {
@@ -590,8 +634,15 @@ impl WrapperEngine {
         media_info: &super::playlist::MediaPlaylistInfo,
         key_templates: &HashMap<String, Arc<temari::rounds::Template>>,
         track_id: &str,
-        _: Option<&ProgressCallback>,
+        track: &TrackLabel,
+        on_progress: Option<&ProgressCallback>,
     ) -> Result<Vec<u8>, StreamError> {
+        report(
+            on_progress,
+            RipActivity::Decrypting {
+                track: track.clone(),
+            },
+        );
         let init_resp = self
             .http_client
             .get(&media_info.init_uri)
@@ -645,6 +696,12 @@ impl WrapperEngine {
 
         let progressive = defragment_m4a_container(&output, track_id)?;
         Ok(progressive)
+    }
+}
+
+fn report(callback: Option<&ProgressCallback>, activity: RipActivity) {
+    if let Some(callback) = callback {
+        callback(activity);
     }
 }
 

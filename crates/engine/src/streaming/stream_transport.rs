@@ -10,6 +10,7 @@ use super::{
     source_id::SourceId,
 };
 use crate::limits::{MAX_AUDIO_BYTES, MAX_ERROR_BODY_BYTES};
+use crate::orchestrator::types::RipActivity;
 
 pub struct FetchEndpointOptions {
     pub stream_url: String,
@@ -129,7 +130,7 @@ impl fmt::Debug for AudioStreamSource {
     }
 }
 
-pub type ProgressCallback = Arc<dyn Fn(&str) + Send + Sync>;
+pub type ProgressCallback = Arc<dyn Fn(RipActivity) + Send + Sync>;
 
 /// Transport over an injectable streaming adapter.
 pub struct StreamTransport<H: StreamHttp> {

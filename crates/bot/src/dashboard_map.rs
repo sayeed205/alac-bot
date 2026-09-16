@@ -6,7 +6,9 @@
 
 use std::collections::HashMap;
 
-use engine::orchestrator::types::{ActiveRipJob, JobPhase as EnginePhase, RipJobProgress};
+use engine::orchestrator::types::{
+    ActiveRipJob, DownloadLane, JobActivity, JobPhase as EnginePhase, RipJobProgress, UploadLane,
+};
 
 use crate::dashboard::{DashboardJob, DashboardSnapshot, JobPhase};
 
@@ -24,8 +26,9 @@ pub struct JobContext {
     pub header: String,
     /// Requester display name (`user_name` from options).
     pub requester_name: String,
-    pub downloading: Option<String>,
-    pub uploading: Option<String>,
+    pub job_activity: Option<JobActivity>,
+    pub download: Option<DownloadLane>,
+    pub upload: Option<UploadLane>,
 }
 
 impl JobContexts {
@@ -37,11 +40,17 @@ impl JobContexts {
 
     /// Remember a job's rendering context from its latest engine snapshot.
     pub fn remember(&mut self, job: &ActiveRipJob) {
-        let (downloading, uploading) = self
+        let (job_activity, download, upload) = self
             .jobs
             .get(&job.id)
-            .map(|context| (context.downloading.clone(), context.uploading.clone()))
-            .unwrap_or((None, None));
+            .map(|context| {
+                (
+                    context.job_activity.clone(),
+                    context.download.clone(),
+                    context.upload.clone(),
+                )
+            })
+            .unwrap_or((None, None, None));
         self.jobs.insert(
             job.id.clone(),
             JobContext {
@@ -50,18 +59,20 @@ impl JobContexts {
                     .user_name
                     .clone()
                     .unwrap_or_else(|| format!("User {}", job.user_id)),
-                downloading,
-                uploading,
+                job_activity,
+                download,
+                upload,
             },
         );
     }
 
-    /// Remember the latest pipeline activity while retaining the job's
+    /// Remember the latest pipeline facts while retaining the job's
     /// presentation context across subsequent engine snapshots.
     pub fn remember_progress(&mut self, progress: &RipJobProgress) {
         if let Some(context) = self.jobs.get_mut(&progress.job_id) {
-            context.downloading = progress.active_download_text.as_deref().map(clean_activity);
-            context.uploading = progress.active_upload_text.as_deref().map(clean_activity);
+            context.job_activity = progress.job_activity.clone();
+            context.download = progress.download.clone();
+            context.upload = progress.upload.clone();
         }
     }
 
@@ -96,35 +107,25 @@ pub fn phase_from(engine_phase: EnginePhase) -> JobPhase {
     }
 }
 
+fn fallback_job_activity(job: &ActiveRipJob) -> Option<JobActivity> {
+    match job.phase {
+        EnginePhase::Resolving => Some(JobActivity::Resolving),
+        EnginePhase::CheckingCache => Some(JobActivity::CheckingCache {
+            item: job.job_header.clone(),
+        }),
+        EnginePhase::Queued => Some(JobActivity::Queued {
+            position: job
+                .queue_position
+                .and_then(|position| u32::try_from(position).ok())
+                .unwrap_or(1),
+        }),
+        EnginePhase::Processing => None,
+    }
+}
+
 /// Percent for the dashboard row, clamped to 100.
 pub fn percent_from(progress: &RipJobProgress) -> u8 {
     progress.percent.min(100) as u8
-}
-
-/// Dashboard rows use text labels for routine activity. The pipeline's
-/// progress strings carry the lane prefix (`⬇️ Downloading: …` /
-/// `⬆️ Uploading: …`) for the legacy detailed renderer, so strip that
-/// leading decoration at this presentation boundary — the dashboard
-/// header prepends its own labels and must not duplicate them.
-fn clean_activity(text: &str) -> String {
-    let stripped = text
-        .strip_prefix("⬇️ ")
-        .or_else(|| text.strip_prefix("⬆️ "))
-        .unwrap_or(text);
-    let stripped = stripped
-        .strip_prefix("Downloading: ")
-        .or_else(|| stripped.strip_prefix("Uploading: "))
-        .unwrap_or(stripped);
-    stripped.to_owned()
-}
-
-fn is_upload_activity(text: &str) -> bool {
-    let trimmed = text.trim();
-    let stripped = trimmed.strip_prefix("⬆️ ").unwrap_or(trimmed);
-    stripped.starts_with("Uploading:")
-        || stripped.starts_with("Uploading ZIP:")
-        || stripped.starts_with("<b>Uploading:")
-        || stripped.starts_with("<b>Uploading ZIP:")
 }
 
 /// Map an engine job snapshot into a dashboard row for a specific viewer.
@@ -158,8 +159,9 @@ pub fn job_to_dashboard(
         total,
         percent,
         is_cancel_allowed_for_viewer: viewer_is_admin || viewer_id == job.user_id,
-        downloading: context.downloading.clone(),
-        uploading: context.uploading.clone(),
+        job_activity: context.job_activity.clone(),
+        download: context.download.clone(),
+        upload: context.upload.clone(),
     }
 }
 
@@ -192,51 +194,34 @@ pub fn snapshot_from(
             .cmp(&key(right))
             .then_with(|| left.id.cmp(&right.id))
     });
-    // Two-lane header: the first active job's lane-1 text and the first
-    // active job's lane-2 text, independently — downloads and uploads
-    // now run concurrently on different jobs. Queued jobs never carry
-    // lane activity. `active_action_text` (engine's legacy single field)
-    // seeds whichever lane has no remembered text. Upload activity must never
-    // fall through to the download line just because it is the legacy field's
-    // current value.
+    let current_job_activity = ordered.iter().find_map(|job| {
+        let context = contexts.get(&job.id);
+        context
+            .and_then(|value| value.job_activity.clone())
+            .or_else(|| {
+                context
+                    .is_none()
+                    .then(|| fallback_job_activity(job))
+                    .flatten()
+            })
+    });
     let current_download = ordered.iter().find_map(|job| {
-        if job.phase == EnginePhase::Queued {
-            return None;
-        }
-        let ctx = contexts.get(&job.id);
-        if let Some(downloading) = ctx.and_then(|c| c.downloading.as_ref()) {
-            return Some(downloading.clone());
-        }
-        // The remembered lane texts are already cleaned; the legacy
-        // single-field fallback still carries its own decoration. It is not
-        // safe to use an upload action as a download fallback.
-        if let Some(action) = job.active_action_text.as_ref() {
-            if !is_upload_activity(action) {
-                return Some(clean_activity(action));
-            }
-        }
-        if job.phase == EnginePhase::CheckingCache {
-            return Some("🔍 Checking cache...".into());
-        }
-        if job.phase == EnginePhase::Resolving {
-            return Some("🔍 Resolving...".into());
-        }
-        None
+        (job.phase != EnginePhase::Queued)
+            .then(|| {
+                contexts
+                    .get(&job.id)
+                    .and_then(|context| context.download.clone())
+            })
+            .flatten()
     });
     let current_upload = ordered.iter().find_map(|job| {
-        if job.phase == EnginePhase::Queued {
-            return None;
-        }
-        let remembered = contexts
-            .get(&job.id)
-            .and_then(|c| c.uploading.as_ref())
-            .cloned();
-        remembered.or_else(|| {
-            job.active_action_text
-                .as_deref()
-                .filter(|action| is_upload_activity(action))
-                .map(clean_activity)
-        })
+        (job.phase != EnginePhase::Queued)
+            .then(|| {
+                contexts
+                    .get(&job.id)
+                    .and_then(|context| context.upload.clone())
+            })
+            .flatten()
     });
     let jobs = ordered
         .iter()
@@ -250,8 +235,9 @@ pub fn snapshot_from(
                         .user_name
                         .clone()
                         .unwrap_or_else(|| format!("User {}", job.user_id)),
-                    downloading: None,
-                    uploading: None,
+                    job_activity: None,
+                    download: None,
+                    upload: None,
                 });
             job_to_dashboard(job, &context, viewer_id, viewer_is_admin)
         })
@@ -259,6 +245,7 @@ pub fn snapshot_from(
     DashboardSnapshot {
         ripping_mode: ripping_mode.to_owned(),
         mirror_health,
+        current_job_activity,
         current_download,
         current_upload,
         jobs,
@@ -268,6 +255,7 @@ pub fn snapshot_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engine::orchestrator::types::{ByteProgress, RipActivity, TrackLabel};
 
     fn engine_job(
         phase: EnginePhase,
@@ -293,7 +281,6 @@ mod tests {
             failed_count: 1,
             completed: false,
             start_time_ms: 0,
-            active_action_text: None,
             queue_position,
             phase,
             terminal_state: None,
@@ -310,8 +297,9 @@ mod tests {
         let ctx = JobContext {
             header: job.job_header.clone(),
             requester_name: "Alice".into(),
-            downloading: None,
-            uploading: None,
+            job_activity: None,
+            download: None,
+            upload: None,
         };
         let row = job_to_dashboard(&job, &ctx, 7, false);
         assert_eq!(row.phase, JobPhase::Queued);
@@ -342,8 +330,9 @@ mod tests {
         let ctx = JobContext {
             header: "h".into(),
             requester_name: "u".into(),
-            downloading: None,
-            uploading: None,
+            job_activity: None,
+            download: None,
+            upload: None,
         };
         let job = engine_job(EnginePhase::Processing, None, 42, Some("Bob"));
         assert!(job_to_dashboard(&job, &ctx, 42, false).is_cancel_allowed_for_viewer);
@@ -391,6 +380,20 @@ mod tests {
     #[test]
     fn progress_activity_is_preserved_for_dashboard_rows() {
         let job = engine_job(EnginePhase::Processing, Some(0), 7, Some("Alice"));
+        let download = DownloadLane::Rip(RipActivity::Downloading {
+            track: TrackLabel::new("Song", "Artist"),
+            progress: ByteProgress {
+                completed: 1_048_576,
+                total: Some(2_097_152),
+            },
+        });
+        let upload = UploadLane::Track {
+            track: TrackLabel::new("Song", "Artist"),
+            progress: ByteProgress {
+                completed: 1_048_576,
+                total: Some(2_097_152),
+            },
+        };
         let mut contexts = JobContexts::new();
         contexts.remember(&job);
         contexts.remember_progress(&RipJobProgress {
@@ -402,39 +405,34 @@ mod tests {
             failed_count: 0,
             skipped_count: 0,
             percent: 20,
-            active_download_text: Some("⬇️ <b>Song - Artist:</b> <code>1 MB</code>".into()),
-            active_upload_text: Some("⬆️ <b>Uploading:</b> <i>Song - Artist</i>".into()),
-            activity_override: None,
+            job_activity: Some(JobActivity::ProcessingNext),
+            download: Some(download.clone()),
+            upload: Some(upload.clone()),
         });
 
         let snapshot = snapshot_from(&[job], &contexts, 7, false, "live", None);
-        // Per-row lane texts and header lines are all stored cleaned
-        // (decoration stripped at this boundary; the header re-adds it).
         assert_eq!(
-            snapshot.jobs[0].downloading.as_deref(),
-            Some("<b>Song - Artist:</b> <code>1 MB</code>")
+            snapshot.jobs[0].job_activity,
+            Some(JobActivity::ProcessingNext)
         );
-        assert_eq!(
-            snapshot.jobs[0].uploading.as_deref(),
-            Some("<b>Uploading:</b> <i>Song - Artist</i>")
-        );
-        assert_eq!(
-            snapshot.current_download.as_deref(),
-            Some("<b>Song - Artist:</b> <code>1 MB</code>")
-        );
-        assert_eq!(
-            snapshot.current_upload.as_deref(),
-            Some("<b>Uploading:</b> <i>Song - Artist</i>")
-        );
+        assert_eq!(snapshot.jobs[0].download, Some(download.clone()));
+        assert_eq!(snapshot.jobs[0].upload, Some(upload.clone()));
+        assert_eq!(snapshot.current_download, Some(download));
+        assert_eq!(snapshot.current_upload, Some(upload));
     }
 
     #[test]
     fn upload_only_progress_stays_in_the_upload_lane() {
-        let mut job = engine_job(EnginePhase::Processing, Some(0), 7, Some("Alice"));
-        job.active_action_text =
-            Some("⬆️ Uploading: <b>Song - Artist</b> <code>4 MB</code>".into());
+        let job = engine_job(EnginePhase::Processing, Some(0), 7, Some("Alice"));
         let mut contexts = JobContexts::new();
         contexts.remember(&job);
+        let upload = UploadLane::Track {
+            track: TrackLabel::new("Song", "Artist"),
+            progress: ByteProgress {
+                completed: 4 * 1_048_576,
+                total: None,
+            },
+        };
         contexts.remember_progress(&RipJobProgress {
             job_id: job.id.clone(),
             total_tracks: 1,
@@ -444,31 +442,30 @@ mod tests {
             failed_count: 0,
             skipped_count: 0,
             percent: 0,
-            active_download_text: None,
-            active_upload_text: Some("⬆️ Uploading: <b>Song - Artist</b> <code>4 MB</code>".into()),
-            activity_override: None,
+            job_activity: None,
+            download: None,
+            upload: Some(upload.clone()),
         });
 
         let snapshot = snapshot_from(&[job], &contexts, 7, false, "live", None);
         assert_eq!(snapshot.current_download, None);
-        assert_eq!(
-            snapshot.current_upload.as_deref(),
-            Some("<b>Song - Artist</b> <code>4 MB</code>")
-        );
-        assert_eq!(snapshot.jobs[0].downloading, None);
-        assert_eq!(
-            snapshot.jobs[0].uploading.as_deref(),
-            Some("<b>Song - Artist</b> <code>4 MB</code>")
-        );
+        assert_eq!(snapshot.current_upload, Some(upload.clone()));
+        assert_eq!(snapshot.jobs[0].download, None);
+        assert_eq!(snapshot.jobs[0].upload, Some(upload));
     }
 
     #[test]
     fn zip_upload_progress_stays_in_the_upload_lane() {
-        let mut job = engine_job(EnginePhase::Processing, Some(0), 7, Some("Alice"));
-        job.active_action_text =
-            Some("⬆️ Uploading ZIP: <b>Bharat</b> <code>32% (81.0/251.7 MB)</code>".into());
+        let job = engine_job(EnginePhase::Processing, Some(0), 7, Some("Alice"));
         let mut contexts = JobContexts::new();
         contexts.remember(&job);
+        let upload = UploadLane::ArchiveUpload {
+            archive: "Bharat".into(),
+            progress: ByteProgress {
+                completed: 1_048_576,
+                total: Some(2_097_152),
+            },
+        };
         contexts.remember_progress(&RipJobProgress {
             job_id: job.id.clone(),
             total_tracks: 1,
@@ -478,23 +475,18 @@ mod tests {
             failed_count: 0,
             skipped_count: 0,
             percent: 0,
-            active_download_text: None,
-            active_upload_text: Some(
-                "⬆️ Uploading ZIP: <b>Bharat</b> <code>32% (81.0/251.7 MB)</code>".into(),
-            ),
-            activity_override: None,
+            job_activity: None,
+            download: None,
+            upload: Some(upload.clone()),
         });
 
         let snapshot = snapshot_from(&[job], &contexts, 7, false, "live", None);
         assert_eq!(snapshot.current_download, None);
-        assert_eq!(
-            snapshot.current_upload.as_deref(),
-            Some("Uploading ZIP: <b>Bharat</b> <code>32% (81.0/251.7 MB)</code>")
-        );
+        assert_eq!(snapshot.current_upload, Some(upload));
         let (rendered, _) = crate::dashboard::render(&snapshot, 1);
-        assert!(rendered
-            .contains("<b>⬆️ Uploading ZIP:</b> <b>Bharat</b> <code>32% (81.0/251.7 MB)</code>"));
-        assert!(!rendered.contains("Uploading: Uploading ZIP:"));
+        assert!(rendered.contains(
+            "<b>⬆️ Uploading ZIP:</b> <b>Bharat</b> <code>[■■■■■■□□□□□□] 50% (1.0/2.0 MB)</code>"
+        ));
     }
 
     #[test]
@@ -503,16 +495,17 @@ mod tests {
         let contexts = JobContexts::new();
         let s_cache = snapshot_from(&[job_cache], &contexts, 1, false, "live", None);
         assert_eq!(
-            s_cache.current_download.as_deref(),
-            Some("🔍 Checking cache...")
+            s_cache.current_job_activity,
+            Some(JobActivity::CheckingCache {
+                item: "Album: <b>X</b> by <b>Y</b>".into()
+            })
         );
+        assert_eq!(s_cache.current_download, None);
 
         let job_resolve = engine_job(EnginePhase::Resolving, None, 1, Some("Alice"));
         let s_resolve = snapshot_from(&[job_resolve], &contexts, 1, false, "live", None);
-        assert_eq!(
-            s_resolve.current_download.as_deref(),
-            Some("🔍 Resolving...")
-        );
+        assert_eq!(s_resolve.current_job_activity, Some(JobActivity::Resolving));
+        assert_eq!(s_resolve.current_download, None);
     }
 
     #[test]
@@ -526,9 +519,9 @@ mod tests {
             failed_count: 0,
             skipped_count: 0,
             percent: 0,
-            active_download_text: None,
-            active_upload_text: None,
-            activity_override: None,
+            job_activity: None,
+            download: None,
+            upload: None,
         };
         assert_eq!(percent_from(&progress), 0);
     }

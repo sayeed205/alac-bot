@@ -52,8 +52,6 @@ pub struct ActiveRipJob {
     pub failed_count: usize,
     pub completed: bool,
     pub start_time_ms: u64,
-    /// Last `activeActionText` written by a progress update.
-    pub active_action_text: Option<String>,
     /// Queue position, maintained by the queue rather than the job flow.
     pub queue_position: Option<u64>,
     pub phase: JobPhase,
@@ -126,7 +124,82 @@ mod rendition_tests {
     }
 }
 
-/// A progress snapshot; every display field is optional.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ByteProgress {
+    pub completed: u64,
+    pub total: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackLabel {
+    pub title: String,
+    pub artist: String,
+}
+
+impl TrackLabel {
+    pub fn new(title: impl Into<String>, artist: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            artist: artist.into(),
+        }
+    }
+
+    pub fn from_meta(meta: &crate::types::TrackMeta) -> Self {
+        Self::new(meta.title.clone(), meta.artist.clone())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RipActivity {
+    ResolvingMetadata,
+    Connecting {
+        track: TrackLabel,
+    },
+    Downloading {
+        track: TrackLabel,
+        progress: ByteProgress,
+    },
+    Decrypting {
+        track: TrackLabel,
+    },
+    Tagging {
+        track: TrackLabel,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DownloadLane {
+    Rip(RipActivity),
+    CachedDelivery { track: TrackLabel },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UploadLane {
+    Track {
+        track: TrackLabel,
+        progress: ByteProgress,
+    },
+    ArchiveBuild {
+        archive: String,
+        progress: ByteProgress,
+    },
+    ArchiveUpload {
+        archive: String,
+        progress: ByteProgress,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobActivity {
+    Resolving,
+    CheckingCache { item: String },
+    Queued { position: u32 },
+    SkippingUncached,
+    CachedDelivered,
+    ProcessingNext,
+}
+
+/// A progress snapshot; every display slot is optional.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RipJobProgress {
     pub job_id: String,
@@ -137,9 +210,9 @@ pub struct RipJobProgress {
     pub failed_count: usize,
     pub skipped_count: usize,
     pub percent: u32,
-    pub active_download_text: Option<String>,
-    pub active_upload_text: Option<String>,
-    pub activity_override: Option<String>,
+    pub job_activity: Option<JobActivity>,
+    pub download: Option<DownloadLane>,
+    pub upload: Option<UploadLane>,
 }
 
 /// One failed track, as reported in the job summary.
