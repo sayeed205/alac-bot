@@ -98,7 +98,7 @@ pub fn find_child_box(
     let mut cur = parent_start;
     while cur + 8 <= parent_end && cur + 8 <= data.len() {
         let (box_len, box_type, _) = read_box_header(data, cur)?;
-        if box_len < 8 || cur + box_len > parent_end {
+        if box_len < 8 || cur + box_len > parent_end || cur + box_len > data.len() {
             break;
         }
         if &box_type == target_type {
@@ -122,7 +122,7 @@ pub fn find_all_child_boxes(
         let Some((box_len, box_type, _)) = read_box_header(data, cur) else {
             break;
         };
-        if box_len < 8 || cur + box_len > parent_end {
+        if box_len < 8 || cur + box_len > parent_end || cur + box_len > data.len() {
             break;
         }
         if &box_type == target_type {
@@ -637,11 +637,11 @@ pub fn decrypt_fragment(
     {
         let mut cur = traf_off + 8;
         let traf_end = traf_off + traf_len;
-        while cur + 8 <= traf_end {
+        while cur + 8 <= traf_end && cur + 8 <= out.len() {
             let Some((b_len, b_type, _)) = read_box_header(&out, cur) else {
                 break;
             };
-            if b_len < 8 || cur + b_len > traf_end {
+            if b_len < 8 || cur + b_len > traf_end || cur + b_len > out.len() {
                 break;
             }
             if (&b_type == b"sgpd" || &b_type == b"sbgp")
@@ -688,7 +688,9 @@ pub fn decrypt_fragment(
         // Sort descending by start offset so removing earlier boxes doesn't invalidate subsequent offsets
         boxes_to_remove.sort_by_key(|a| std::cmp::Reverse(a.0));
         for (b_off, b_len) in boxes_to_remove {
-            out.drain(b_off..b_off + b_len);
+            if b_off + b_len <= out.len() {
+                out.drain(b_off..b_off + b_len);
+            }
         }
     }
 
@@ -732,30 +734,32 @@ pub fn normalize_fragment(fragment: &mut Vec<u8>) {
                 }
                 cur += 4; // track_id precedes sample_description_index
                 let sdi_pos = cur; // sample_description_index field
-                fragment.drain(sdi_pos..sdi_pos + 4);
-                let new_flags = flags & !0x2;
-                fragment[tfhd_off + 9..tfhd_off + 12]
-                    .copy_from_slice(&new_flags.to_be_bytes()[1..4]);
-                write_u32_be(&mut fragment[tfhd_off..tfhd_off + 4], (tfhd_len - 4) as u32);
-                let traf_size = read_u32_be(&fragment[traf_off..traf_off + 4]);
-                write_u32_be(&mut fragment[traf_off..traf_off + 4], traf_size - 4);
-                let moof_size = read_u32_be(&fragment[moof_off..moof_off + 4]);
-                write_u32_be(&mut fragment[moof_off..moof_off + 4], moof_size - 4);
-                sdi_shrink = -4;
+                if sdi_pos + 4 <= fragment.len() {
+                    fragment.drain(sdi_pos..sdi_pos + 4);
+                    let new_flags = flags & !0x2;
+                    fragment[tfhd_off + 9..tfhd_off + 12]
+                        .copy_from_slice(&new_flags.to_be_bytes()[1..4]);
+                    write_u32_be(&mut fragment[tfhd_off..tfhd_off + 4], (tfhd_len - 4) as u32);
+                    let traf_size = read_u32_be(&fragment[traf_off..traf_off + 4]);
+                    write_u32_be(&mut fragment[traf_off..traf_off + 4], traf_size - 4);
+                    let moof_size = read_u32_be(&fragment[moof_off..moof_off + 4]);
+                    write_u32_be(&mut fragment[moof_off..moof_off + 4], moof_size - 4);
+                    sdi_shrink = -4;
+                }
             }
         }
     }
 
     // Collect rebuild candidates first, then splice back-to-front so
-    // earlier offsets stay valid.
-    let mut rebuilds: Vec<(usize, i32, Vec<u8>)> = Vec::new();
+    // earlier offsets stay valid without unstable index shifting.
+    let mut rebuilds: Vec<(usize, usize, i32, Vec<u8>)> = Vec::new();
     let mut cur = traf_off + 8;
     let traf_end = (traf_off as i64 + traf_len as i64 + sdi_shrink) as usize;
-    while cur + 8 <= traf_end {
+    while cur + 8 <= traf_end && cur + 8 <= fragment.len() {
         let Some((b_len, b_type, _)) = read_box_header(fragment, cur) else {
             break;
         };
-        if b_len < 8 || cur + b_len > traf_end {
+        if b_len < 8 || cur + b_len > traf_end || cur + b_len > fragment.len() {
             break;
         }
         if &b_type == b"trun" {
@@ -783,7 +787,7 @@ pub fn normalize_fragment(fragment: &mut Vec<u8>) {
                     new_trun.extend_from_slice(&duration.to_be_bytes());
                     new_trun.extend_from_slice(&(size as u32).to_be_bytes());
                 }
-                rebuilds.push((cur, trun.data_offset, new_trun));
+                rebuilds.push((cur, b_len, trun.data_offset, new_trun));
             }
         }
         cur += b_len;
@@ -799,16 +803,16 @@ pub fn normalize_fragment(fragment: &mut Vec<u8>) {
             // trun boxes for the tfhd shrink, since mdat moved.
             let mut cur = traf_off + 8;
             let traf_end = (traf_off as i64 + traf_len as i64 + sdi_shrink) as usize;
-            while cur + 8 <= traf_end {
+            while cur + 8 <= traf_end && cur + 8 <= fragment.len() {
                 let Some((b_len, b_type, _)) = read_box_header(fragment, cur) else {
                     break;
                 };
-                if b_len < 8 || cur + b_len > traf_end {
+                if b_len < 8 || cur + b_len > traf_end || cur + b_len > fragment.len() {
                     break;
                 }
                 if &b_type == b"trun" {
                     let flags = read_u24_be(&fragment[cur + 9..cur + 12]);
-                    if flags & 0x1 != 0 {
+                    if flags & 0x1 != 0 && cur + 20 <= fragment.len() {
                         let doff_pos = cur + 16;
                         let doff = i32::from_be_bytes(
                             fragment[doff_pos..doff_pos + 4].try_into().unwrap(),
@@ -826,15 +830,11 @@ pub fn normalize_fragment(fragment: &mut Vec<u8>) {
     // Rebuilt truns sit before mdat, so mdat (and every trun's data
     // target inside it) shifts by the total growth (including the tfhd
     // shrink). Patch each rebuilt trun's data_offset, then splice.
-    let total_delta: i64 = sdi_shrink
-        + rebuilds
-            .iter()
-            .map(|(_, _, new_trun)| new_trun.len() as i64)
-            .sum::<i64>()
-        - rebuilds
-            .iter()
-            .map(|(off, _, _)| read_u32_be(&fragment[*off..*off + 4]) as i64)
-            .sum::<i64>();
+    let total_trun_delta: i64 = rebuilds
+        .iter()
+        .map(|(_, old_len, _, new_trun)| new_trun.len() as i64 - *old_len as i64)
+        .sum::<i64>();
+    let total_delta: i64 = sdi_shrink + total_trun_delta;
 
     // Sibling truns keep their original boxes, but their samples live in
     // the same mdat, which moved by the total growth. A fragment mixing a
@@ -844,16 +844,16 @@ pub fn normalize_fragment(fragment: &mut Vec<u8>) {
     // their box offsets are still the collection-time ones.
     {
         let mut cur = traf_off + 8;
-        while cur + 8 <= traf_end {
+        while cur + 8 <= traf_end && cur + 8 <= fragment.len() {
             let Some((b_len, b_type, _)) = read_box_header(fragment, cur) else {
                 break;
             };
-            if b_len < 8 || cur + b_len > traf_end {
+            if b_len < 8 || cur + b_len > traf_end || cur + b_len > fragment.len() {
                 break;
             }
-            if &b_type == b"trun" && !rebuilds.iter().any(|(off, _, _)| *off == cur) {
+            if &b_type == b"trun" && !rebuilds.iter().any(|(off, _, _, _)| *off == cur) {
                 let flags = read_u24_be(&fragment[cur + 9..cur + 12]);
-                if flags & 0x1 != 0 && cur + 20 <= traf_end {
+                if flags & 0x1 != 0 && cur + 20 <= fragment.len() {
                     let doff_pos = cur + 16;
                     let doff =
                         i32::from_be_bytes(fragment[doff_pos..doff_pos + 4].try_into().unwrap());
@@ -865,32 +865,35 @@ pub fn normalize_fragment(fragment: &mut Vec<u8>) {
         }
     }
 
-    let mut delta: i64 = 0;
-    for (off, old_data_offset, mut new_trun) in rebuilds {
-        let old_len = read_u32_be(&fragment[off..off + 4]) as usize;
+    // Splice candidates strictly back-to-front so earlier offsets stay invariant.
+    for (off, old_len, old_data_offset, mut new_trun) in rebuilds.into_iter().rev() {
+        if off + old_len > fragment.len() {
+            continue;
+        }
         // data_offset field: size(4)+type(4)+verflags(4)+count(4) = offset 16.
-        new_trun[16..20]
-            .copy_from_slice(&((old_data_offset as i64 + total_delta) as i32).to_be_bytes());
-        let off_i = off as i64 + delta;
-        fragment.splice(
-            off_i as usize..off_i as usize + old_len,
-            new_trun.iter().copied(),
-        );
-        delta += new_trun.len() as i64 - old_len as i64;
+        if new_trun.len() >= 20 {
+            new_trun[16..20]
+                .copy_from_slice(&((old_data_offset as i64 + total_delta) as i32).to_be_bytes());
+        }
+        fragment.splice(off..off + old_len, new_trun);
     }
 
     // Grow parent sizes by the accumulated delta (moof, traf). The traf
     // size already absorbed sdi_shrink above; add only the trun delta.
-    let traf_size = read_u32_be(&fragment[traf_off..traf_off + 4]);
-    write_u32_be(
-        &mut fragment[traf_off..traf_off + 4],
-        (traf_size as i64 + delta) as u32,
-    );
-    let moof_size = read_u32_be(&fragment[moof_off..moof_off + 4]);
-    write_u32_be(
-        &mut fragment[moof_off..moof_off + 4],
-        (moof_size as i64 + delta) as u32,
-    );
+    if traf_off + 4 <= fragment.len() {
+        let traf_size = read_u32_be(&fragment[traf_off..traf_off + 4]);
+        write_u32_be(
+            &mut fragment[traf_off..traf_off + 4],
+            (traf_size as i64 + total_trun_delta) as u32,
+        );
+    }
+    if moof_off + 4 <= fragment.len() {
+        let moof_size = read_u32_be(&fragment[moof_off..moof_off + 4]);
+        write_u32_be(
+            &mut fragment[moof_off..moof_off + 4],
+            (moof_size as i64 + total_trun_delta) as u32,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1159,5 +1162,74 @@ mod tests {
         let mdat_payload = moof_off + moof_size + 8;
         assert_eq!(rebuilt_doff as usize, mdat_payload);
         assert_eq!(sibling_doff as usize, mdat_payload + 2 * 8224);
+    }
+
+    /// A fragment with multiple sizeless truns (common in Atmos / multi-channel streams).
+    /// Tests back-to-front splicing and ensures no slice index out of range panic.
+    #[test]
+    fn normalize_fragment_rebuilds_multiple_sizeless_truns() {
+        let mut tfhd_body = Vec::new();
+        tfhd_body.extend_from_slice(&1u32.to_be_bytes()); // track_id
+        tfhd_body.extend_from_slice(&1536u32.to_be_bytes()); // duration
+        tfhd_body.extend_from_slice(&3072u32.to_be_bytes()); // size
+        let tfhd_box = tfhd(0x020018, &tfhd_body);
+        let sizeless1 = trun(0x1, 2, 100, &[]);
+        let sizeless2 = trun(0x1, 3, 100 + 2 * 3072, &[]);
+        let (traf, _) = wrap_traf(&[tfhd_box, sizeless1, sizeless2]);
+        let mut mfhd = Vec::new();
+        mfhd.extend_from_slice(&16u32.to_be_bytes());
+        mfhd.extend_from_slice(b"mfhd");
+        mfhd.extend_from_slice(&0u32.to_be_bytes());
+        mfhd.extend_from_slice(&1u32.to_be_bytes());
+        let mut moof = Vec::new();
+        moof.extend_from_slice(&((8 + mfhd.len() + traf.len()) as u32).to_be_bytes());
+        moof.extend_from_slice(b"moof");
+        moof.extend_from_slice(&mfhd);
+        moof.extend_from_slice(&traf);
+        let payload = vec![0xEEu8; 5 * 3072];
+        let mut mdat = Vec::new();
+        mdat.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
+        mdat.extend_from_slice(b"mdat");
+        mdat.extend_from_slice(&payload);
+        let mut frag = moof;
+        frag.extend_from_slice(&mdat);
+
+        normalize_fragment(&mut frag);
+
+        let (moof_off, moof_size) = find_child_box(&frag, 0, frag.len(), b"moof").expect("moof");
+        let (traf_off, traf_len) =
+            find_child_box(&frag, moof_off + 8, moof_off + moof_size, b"traf").expect("traf");
+        let trun_boxes = find_all_child_boxes(&frag, traf_off + 8, traf_off + traf_len, b"trun");
+        assert_eq!(trun_boxes.len(), 2, "both truns rebuilt");
+
+        // trun 1 grew by (8+4+4+4+2*8) - 20 = 36 - 20 = 16 bytes
+        // trun 2 grew by (8+4+4+4+3*8) - 20 = 44 - 20 = 24 bytes
+        // total delta = 40 bytes
+        let (trun1_off, trun1_len) = trun_boxes[0];
+        let (trun2_off, trun2_len) = trun_boxes[1];
+
+        assert_eq!(trun1_len, 36);
+        assert_eq!(trun2_len, 44);
+        assert_eq!(read_u24_be(&frag[trun1_off + 9..trun1_off + 12]), 0x301);
+        assert_eq!(read_u24_be(&frag[trun2_off + 9..trun2_off + 12]), 0x301);
+
+        let doff1 = read_i32_be(&frag[trun1_off + 16..trun1_off + 20]);
+        let doff2 = read_i32_be(&frag[trun2_off + 16..trun2_off + 20]);
+        assert_eq!(doff1, 100 + 40);
+        assert_eq!(doff2, 100 + 2 * 3072 + 40);
+    }
+
+    /// Truncated or malformed inputs return safely without panicking.
+    #[test]
+    fn normalize_fragment_truncated_input_does_not_panic() {
+        let mut frag = vec![0u8; 32];
+        normalize_fragment(&mut frag);
+
+        // Valid moof header but truncated payload
+        let mut frag2 = Vec::new();
+        frag2.extend_from_slice(&64u32.to_be_bytes());
+        frag2.extend_from_slice(b"moof");
+        frag2.extend_from_slice(&[0u8; 16]);
+        normalize_fragment(&mut frag2);
     }
 }

@@ -33,8 +33,9 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     orchestrator::{
         caption::{
-            format_album_details_caption, format_dump_caption, format_zip_dump_caption,
-            html_escape, AlbumDetailsCaptionMetadata, DumpCaptionMetadata, DumpZipCaptionMetadata,
+            clamp_str_utf16, format_album_details_caption, format_dump_caption,
+            format_zip_dump_caption, html_escape, AlbumDetailsCaptionMetadata, DumpCaptionMetadata,
+            DumpZipCaptionMetadata,
         },
         deps::{
             AlbumCache, AlbumCacheError, AlbumReplacementExpectation, AlbumReplacementResult,
@@ -4658,11 +4659,13 @@ where
                 }
                 if matches!(
                     upload_err,
-                    DeliveryError::Rejected(DeliveryRejection::EntityBoundsInvalid)
+                    DeliveryError::Rejected(
+                        DeliveryRejection::EntityBoundsInvalid | DeliveryRejection::CaptionTooLong
+                    )
                 ) && !used_plain_caption
                 {
                     used_plain_caption = true;
-                    current_caption = plain_caption.clone();
+                    current_caption = clamp_str_utf16(&plain_caption, 1024);
                     continue 'upload;
                 }
                 if upload_err.is_transient() && attempt < max_retries {

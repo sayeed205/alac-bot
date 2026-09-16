@@ -1,7 +1,7 @@
 //! Input handling for the `/get` command.
 //!
 //! The parser itself lives in `apple`; this module only deals with Telegram
-//! replies and text documents .
+//! replies and text documents.
 
 use std::{
     path::PathBuf,
@@ -18,6 +18,9 @@ pub struct ParsedCommand {
     pub force: bool,
     pub storefront: Option<String>,
     pub document: bool,
+    pub from_reply: bool,
+    pub reply_sender_id: Option<i64>,
+    pub reply_sender_name: Option<String>,
 }
 
 pub fn has_force_token(text: &str) -> bool {
@@ -25,13 +28,35 @@ pub fn has_force_token(text: &str) -> bool {
 }
 
 pub fn parse_text(text: &str, reply: Option<&str>, force_override: bool) -> Option<ParsedCommand> {
-    let parsed = parse_alac_input(text, reply)?;
-    Some(ParsedCommand {
-        items: parsed.items,
-        force: force_override || parsed.force,
-        storefront: parsed.storefront,
-        document: false,
-    })
+    // 1. If direct command text contains items, those items belong directly to this message
+    if let Some(direct) = parse_alac_input(text, None) {
+        if !direct.items.is_empty() {
+            return Some(ParsedCommand {
+                items: direct.items,
+                force: force_override || direct.force,
+                storefront: direct.storefront,
+                document: false,
+                from_reply: false,
+                reply_sender_id: None,
+                reply_sender_name: None,
+            });
+        }
+    }
+    // 2. Otherwise, check if the replied-to message contains items
+    if let Some(reply_text) = reply {
+        if let Some(parsed) = parse_alac_input(text, Some(reply_text)) {
+            return Some(ParsedCommand {
+                items: parsed.items,
+                force: force_override || parsed.force,
+                storefront: parsed.storefront,
+                document: false,
+                from_reply: true,
+                reply_sender_id: None,
+                reply_sender_name: None,
+            });
+        }
+    }
+    None
 }
 
 fn temp_path() -> PathBuf {
@@ -65,9 +90,38 @@ pub async fn parse_message(
     }
 
     let reply = message.get_reply_with(client).await.ok().flatten();
-    let document = message
-        .document()
-        .or_else(|| reply.as_ref().and_then(IncomingMessage::document));
+    let (reply_sender_id, reply_sender_name) = match reply.as_ref() {
+        Some(r) => {
+            let uid = r.sender_user_id();
+            let name = match r.sender_user().await {
+                Ok(Some(u)) => u
+                    .username()
+                    .filter(|n| !n.trim().is_empty())
+                    .map(|n| format!("@{n}"))
+                    .or_else(|| {
+                        let first = u.first_name().unwrap_or_default().trim();
+                        match u.last_name().map(str::trim).filter(|l| !l.is_empty()) {
+                            Some(last) if !first.is_empty() => Some(format!("{first} {last}")),
+                            Some(last) => Some(last.to_owned()),
+                            None if !first.is_empty() => Some(first.to_owned()),
+                            None => None,
+                        }
+                    }),
+                _ => None,
+            };
+            (uid, name)
+        }
+        None => (None, None),
+    };
+
+    let msg_doc = message.document();
+    let reply_doc = reply.as_ref().and_then(IncomingMessage::document);
+    let (document, doc_from_reply) = match (msg_doc, reply_doc) {
+        (Some(doc), _) => (Some(doc), false),
+        (None, Some(doc)) => (Some(doc), true),
+        (None, None) => (None, false),
+    };
+
     if let Some(document) = document {
         let name = document.file_name().unwrap_or("").to_ascii_lowercase();
         let mime = document.mime_type().to_ascii_lowercase();
@@ -101,16 +155,23 @@ pub async fn parse_message(
             .await;
             let _ = tokio::fs::remove_file(&path).await;
             if let Ok(content) = result {
-                return ParsedCommand {
-                    items: extract_batch_items(&content),
-                    force: force_override || message.text().is_some_and(has_force_token),
-                    storefront: None,
-                    document: true,
-                };
+                let items = extract_batch_items(&content);
+                if !items.is_empty() {
+                    return ParsedCommand {
+                        items,
+                        force: force_override || message.text().is_some_and(has_force_token),
+                        storefront: None,
+                        document: true,
+                        from_reply: doc_from_reply,
+                        reply_sender_id: if doc_from_reply { reply_sender_id } else { None },
+                        reply_sender_name: if doc_from_reply { reply_sender_name } else { None },
+                    };
+                }
             }
         }
     }
-    parse_text(
+
+    let mut parsed = parse_text(
         message.text().unwrap_or_default(),
         reply.as_ref().and_then(IncomingMessage::text),
         force_override,
@@ -120,14 +181,47 @@ pub async fn parse_message(
         force: force_override,
         storefront: None,
         document: false,
-    })
+        from_reply: false,
+        reply_sender_id: None,
+        reply_sender_name: None,
+    });
+
+    if parsed.from_reply {
+        parsed.reply_sender_id = reply_sender_id;
+        parsed.reply_sender_name = reply_sender_name;
+    }
+
+    parsed
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn force_token_is_recognized() {
         assert!(has_force_token("/get --force 1"));
+    }
+
+    #[test]
+    fn parse_text_distinguishes_direct_from_reply() {
+        let direct = parse_text("/get https://music.apple.com/us/album/test/1440828878", None, false);
+        assert!(direct.is_some());
+        let direct = direct.unwrap();
+        assert_eq!(direct.items.len(), 1);
+        assert!(!direct.from_reply);
+
+        let reply = parse_text("/get", Some("https://music.apple.com/us/album/test/1440828878"), false);
+        assert!(reply.is_some());
+        let reply = reply.unwrap();
+        assert_eq!(reply.items.len(), 1);
+        assert!(reply.from_reply);
+
+        let reply_force = parse_text("/get -f", Some("https://music.apple.com/us/album/test/1440828878"), false);
+        assert!(reply_force.is_some());
+        let reply_force = reply_force.unwrap();
+        assert_eq!(reply_force.items.len(), 1);
+        assert!(reply_force.from_reply);
+        assert!(reply_force.force);
     }
 }

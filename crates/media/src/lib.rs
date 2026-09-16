@@ -246,9 +246,8 @@ impl MediaProcessor {
 
     /// Validate, tag, and commit an audio rip. The pipeline selects the
     /// best available codec (ALAC, ec-3, AAC); finalize never gates on the
-    /// codec itself — it validates the file decodes when symphonia has a
-    /// decoder for it, and falls back to container-level validation for
-    /// codecs without one (e.g. Dolby Digital Plus ec-3).
+    /// codec itself — it validates container integrity and packet boundaries
+    /// end-to-end before and after tagging.
     pub async fn finalize_m4a(
         &self,
         source: &Path,
@@ -383,17 +382,28 @@ fn decode_sync(
     let bit_depth = params
         .bits_per_sample
         .or_else(|| alac_bit_depth(params.codec, params.extra_data.as_deref()));
-    // Symphonia probed the container but has no decoder for this codec
-    // (e.g. ec-3): report probe-level info and skip sample decoding. The
-    // spectrogram path (`collect_samples`) still needs a real decoder.
-    let mut decoder = match decoder {
-        Ok(decoder) => Some(decoder),
-        Err(_) if !collect_samples => None,
-        Err(error) => {
-            return Err(MediaError::UnsupportedFormat.or_decode(error.to_string()));
+    // When `collect_samples` is false (e.g. `inspect_sync`), validation is
+    // container-level: packet walking verifies container integrity, track
+    // structure, and non-truncation end-to-end without requiring full PCM
+    // decoding. When `collect_samples` is true (spectrograms), a decoder
+    // is required.
+    let mut decoder = if collect_samples {
+        match decoder {
+            Ok(decoder) => Some(decoder),
+            Err(error) => {
+                return Err(MediaError::UnsupportedFormat.or_decode(error.to_string()));
+            }
         }
+    } else {
+        None
     };
-    let mut samples = vec![Vec::new(); channels as usize];
+    let mut samples = if collect_samples {
+        vec![Vec::new(); channels as usize]
+    } else {
+        Vec::new()
+    };
+    let mut decoded_packets = 0usize;
+    let mut first_decode_error = None;
     while let Some(packet) = format
         .next_packet()
         .map_err(|error| MediaError::Decode(error.to_string()))?
@@ -405,27 +415,51 @@ fn decode_sync(
             continue;
         }
         let Some(decoder) = decoder.as_mut() else {
-            // No decoder: packet walking still validates the container
-            // structure end to end.
+            // Container-level validation (inspect_sync) or codec without
+            // decoder (ec-3): packet walking validates container integrity,
+            // chunk offsets, and non-truncation end-to-end.
             continue;
         };
-        let audio_buf = decoder.decode(&packet).map_err(|error| match error {
-            SymphoniaError::DecodeError(message) => MediaError::Decode(message.to_string()),
-            other => MediaError::Decode(other.to_string()),
-        })?;
-        if collect_samples {
-            let count = audio_buf.frames();
-            if samples.len().saturating_add(count) > MAX_DECODED_FRAMES {
-                return Err(MediaError::Invalid(
-                    "decoded audio exceeds frame limit".into(),
-                ));
+        match decoder.decode(&packet) {
+            Ok(audio_buf) => {
+                decoded_packets += 1;
+                let count = audio_buf.frames();
+                if samples.len().saturating_add(count) > MAX_DECODED_FRAMES {
+                    return Err(MediaError::Invalid(
+                        "decoded audio exceeds frame limit".into(),
+                    ));
+                }
+                let mut interleaved = vec![f32::MID; audio_buf.samples_interleaved()];
+                audio_buf.copy_to_slice_interleaved(&mut interleaved);
+                let channel_count = channels as usize;
+                for (channel, sample) in interleaved.into_iter().enumerate() {
+                    samples[channel % channel_count].push(sample);
+                }
             }
-            let mut interleaved = vec![f32::MID; audio_buf.samples_interleaved()];
-            audio_buf.copy_to_slice_interleaved(&mut interleaved);
-            let channel_count = channels as usize;
-            for (channel, sample) in interleaved.into_iter().enumerate() {
-                samples[channel % channel_count].push(sample);
+            Err(SymphoniaError::DecodeError(message)) => {
+                // Non-fatal decode error on an individual packet (e.g. unsupported
+                // vendor extension element like PCE in ALAC). Pad silence for this
+                // packet's duration so remaining packets can still be rendered.
+                if first_decode_error.is_none() {
+                    first_decode_error = Some(message.to_string());
+                }
+                let pad_frames = if !packet.dur.is_zero() {
+                    packet.dur.get() as usize
+                } else {
+                    4096
+                };
+                for channel in &mut samples {
+                    channel.extend(std::iter::repeat_n(f32::MID, pad_frames));
+                }
             }
+            Err(other) => {
+                return Err(MediaError::Decode(other.to_string()));
+            }
+        }
+    }
+    if collect_samples && decoded_packets == 0 {
+        if let Some(err) = first_decode_error {
+            return Err(MediaError::Decode(err));
         }
     }
     Ok(DecodedAudio {
@@ -860,9 +894,9 @@ fn finalize_m4a_sync(
     }
     // Validate the rip before tagging. The codec gate was removed: the
     // pipeline picks the highest quality variant the storefront offers
-    // (ALAC, ec-3, AAC) and finalize must not reject a valid rip. Codecs
-    // without a symphonia decoder (ec-3) are validated by container
-    // structure instead of sample decoding.
+    // (ALAC, ec-3, AAC) and finalize must not reject a valid rip. Codec
+    // and container integrity are validated end-to-end via packet walking
+    // without requiring sample decoding for inspection.
     let info = inspect_sync(source, cancellation).map_err(mark_source_validation)?;
 
     let part = destination.with_extension("m4a.part");
@@ -1306,5 +1340,18 @@ mod tests {
             tag.strings_of(&label_freeform).next(),
             Some("Example Records")
         );
+    }
+
+    #[tokio::test]
+    async fn inspect_does_not_require_pcm_sample_decoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("tone.wav");
+        wav_fixture(&input);
+        let processor = MediaProcessor::new();
+        let token = CancellationToken::new();
+        let info = processor.inspect(&input, &token).await.unwrap();
+        assert_eq!(info.sample_rate, 8_000);
+        assert_eq!(info.channels, 1);
+        assert!(info.duration_secs > 0.9);
     }
 }

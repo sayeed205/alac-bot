@@ -8,6 +8,67 @@
 
 use crate::types::{Codec, Provider, TrackKey, TrackRipResult};
 
+/// Maximum plain-text length allowed by Telegram for media captions (in UTF-16 code units).
+pub const MAX_MEDIA_CAPTION_UTF16_LEN: usize = 1024;
+
+/// Clamps a string to at most `max_utf16` code units, appending an ellipsis ('…') if truncated.
+pub fn clamp_str_utf16(text: &str, max_utf16: usize) -> String {
+    let count = text.encode_utf16().count();
+    if count <= max_utf16 {
+        return text.to_string();
+    }
+    let mut curr_len = 0;
+    let mut byte_limit = text.len();
+    for (idx, ch) in text.char_indices() {
+        let ch_len = ch.len_utf16();
+        if curr_len + ch_len > max_utf16.saturating_sub(1) {
+            byte_limit = idx;
+            break;
+        }
+        curr_len += ch_len;
+    }
+    let mut truncated = text[..byte_limit].to_string();
+    truncated.push('…');
+    truncated
+}
+
+/// Estimates the plain-text UTF-16 code unit count after Telegram processes HTML tags and entities.
+pub fn estimate_html_utf16_len(html: &str) -> usize {
+    let mut count = 0;
+    let mut chars = html.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '<' {
+            let mut tag_name = String::new();
+            while let Some(&next_ch) = chars.peek() {
+                if next_ch == '>' {
+                    chars.next();
+                    break;
+                }
+                tag_name.push(chars.next().unwrap());
+            }
+            let tag_lower = tag_name.trim().to_lowercase();
+            if tag_lower.starts_with("br") {
+                count += 1;
+            }
+        } else if ch == '&' {
+            while let Some(&next_ch) = chars.peek() {
+                if next_ch == ';' {
+                    chars.next();
+                    break;
+                }
+                if next_ch == ' ' || next_ch == '<' {
+                    break;
+                }
+                chars.next();
+            }
+            count += 1;
+        } else {
+            count += ch.len_utf16();
+        }
+    }
+    count
+}
+
 /// Everything the dump caption builder takes; `None` fields are simply
 /// everything else required.
 #[derive(Debug, Clone, PartialEq)]
@@ -193,6 +254,8 @@ pub fn format_album_details_caption(meta: &AlbumDetailsCaptionMetadata<'_>) -> S
 /// The first three lines are for quick scanning in the dump channel. The
 /// expandable block contains the single canonical machine record consumed by
 /// the indexer; human-readable metadata is intentionally not repeated there.
+/// If the rendered text exceeds Telegram's 1,024 UTF-16 code unit limit, the
+/// format automatically falls back to compact JSON and abbreviated display text.
 pub fn format_dump_caption(meta: &DumpCaptionMetadata<'_>) -> String {
     let minutes = meta.duration / 60;
     let seconds = format!("{:02}", meta.duration % 60);
@@ -211,43 +274,88 @@ pub fn format_dump_caption(meta: &DumpCaptionMetadata<'_>) -> String {
         ),
         Some(_) => format!("{codec_label} · 256 kbps · {minutes}:{seconds}"),
     };
-    let summary = format!(
-        "<b>{}</b> — {}<br/><i>{}</i> · <code>{track_number}/{track_count}</code><br/><code>{quality_line}</code>",
-        html_escape(meta.title),
-        html_escape(meta.artist),
-        html_escape(meta.album),
-    );
+
     let canonical_codec = meta
         .codec
         .and_then(|c| c.parse::<crate::types::Codec>().ok())
         .map(|c| c.as_str())
         .unwrap_or("alac");
 
-    // Machine payload: JSON with 2-space indentation, each line
-    // escaped, joined with <br/>.
-    let payload_json = serde_json::json!({
-        "provider": meta.track_key.provider,
-        "track_id": meta.track_key.track_id,
-        "codec": canonical_codec,
-        "title": meta.title,
-        "artist": meta.artist,
-        "album": meta.album,
-        "dur": meta.duration,
-        "bit": meta.bit_depth,
-        "hz": meta.sample_rate,
-        "genre": meta.genre.unwrap_or("Music"),
-        "date": meta.release_date.unwrap_or(""),
-        "trk": meta.track_number.unwrap_or(1),
-        "cnt": meta.track_count.unwrap_or(1),
-    });
-    let pretty = serde_json::to_string_pretty(&payload_json).expect("payload serializes");
+    let make_summary = |artist: &str, title: &str, album: &str| {
+        format!(
+            "<b>{}</b> — {}<br/><i>{}</i> · <code>{track_number}/{track_count}</code><br/><code>{quality_line}</code>",
+            html_escape(title),
+            html_escape(artist),
+            html_escape(album),
+        )
+    };
+
+    let make_payload = |artist: &str, title: &str, album: &str| {
+        serde_json::json!({
+            "provider": meta.track_key.provider,
+            "track_id": meta.track_key.track_id,
+            "codec": canonical_codec,
+            "title": title,
+            "artist": artist,
+            "album": album,
+            "dur": meta.duration,
+            "bit": meta.bit_depth,
+            "hz": meta.sample_rate,
+            "genre": meta.genre.unwrap_or("Music"),
+            "date": meta.release_date.unwrap_or(""),
+            "trk": meta.track_number.unwrap_or(1),
+            "cnt": meta.track_count.unwrap_or(1),
+        })
+    };
+
+    // 1. Preferred layout: full human summary + pretty indented JSON
+    let summary = make_summary(meta.artist, meta.title, meta.album);
+    let payload = make_payload(meta.artist, meta.title, meta.album);
+    let pretty = serde_json::to_string_pretty(&payload).expect("payload serializes");
     let payload_html = pretty
         .lines()
         .map(html_escape)
         .collect::<Vec<_>>()
         .join("<br/>");
+    let candidate = format!("{summary}<br/><blockquote expandable>{payload_html}</blockquote>");
 
-    format!("{summary}<br/><blockquote expandable>{payload_html}</blockquote>")
+    if estimate_html_utf16_len(&candidate) <= MAX_MEDIA_CAPTION_UTF16_LEN {
+        return candidate;
+    }
+
+    // 2. Compact JSON layout if pretty JSON exceeded limit
+    let compact = serde_json::to_string(&payload).expect("payload serializes");
+    let compact_candidate =
+        format!("{summary}<br/><blockquote expandable>{}</blockquote>", html_escape(&compact));
+
+    if estimate_html_utf16_len(&compact_candidate) <= MAX_MEDIA_CAPTION_UTF16_LEN {
+        return compact_candidate;
+    }
+
+    // 3. Clamped layout: abbreviate long metadata strings (e.g. tracks with dozens of featured artists)
+    let clamped_summary_artist = clamp_str_utf16(meta.artist, 120);
+    let clamped_summary_title = clamp_str_utf16(meta.title, 120);
+    let clamped_summary_album = clamp_str_utf16(meta.album, 120);
+    let summary_clamped = make_summary(&clamped_summary_artist, &clamped_summary_title, &clamped_summary_album);
+
+    let clamped_payload_artist = clamp_str_utf16(meta.artist, 150);
+    let clamped_payload_title = clamp_str_utf16(meta.title, 150);
+    let clamped_payload_album = clamp_str_utf16(meta.album, 150);
+    let payload_clamped = make_payload(&clamped_payload_artist, &clamped_payload_title, &clamped_payload_album);
+
+    let compact_clamped = serde_json::to_string(&payload_clamped).expect("payload serializes");
+    let clamped_candidate = format!("{summary_clamped}<br/><blockquote expandable>{}</blockquote>", html_escape(&compact_clamped));
+
+    if estimate_html_utf16_len(&clamped_candidate) <= MAX_MEDIA_CAPTION_UTF16_LEN {
+        return clamped_candidate;
+    }
+
+    // 4. Hard safety fallback: further truncate summary strings
+    let tight_summary_artist = clamp_str_utf16(meta.artist, 60);
+    let tight_summary_title = clamp_str_utf16(meta.title, 60);
+    let tight_summary_album = clamp_str_utf16(meta.album, 60);
+    let summary_tight = make_summary(&tight_summary_artist, &tight_summary_title, &tight_summary_album);
+    format!("{summary_tight}<br/><blockquote expandable>{}</blockquote>", html_escape(&compact_clamped))
 }
 
 /// Formats an album ZIP caption.
@@ -298,7 +406,33 @@ pub fn format_zip_dump_caption(
         .collect::<Vec<_>>()
         .join("<br/>");
 
-    format!("{summary}<br/><blockquote expandable>{payload_html}</blockquote>")
+    let candidate = format!("{summary}<br/><blockquote expandable>{payload_html}</blockquote>");
+    if estimate_html_utf16_len(&candidate) <= MAX_MEDIA_CAPTION_UTF16_LEN {
+        return candidate;
+    }
+
+    let compact = serde_json::to_string(&payload_json).expect("payload serializes");
+    let compact_candidate =
+        format!("{summary}<br/><blockquote expandable>{}</blockquote>", html_escape(&compact));
+    if estimate_html_utf16_len(&compact_candidate) <= MAX_MEDIA_CAPTION_UTF16_LEN {
+        return compact_candidate;
+    }
+
+    let clamped_album = clamp_str_utf16(meta.album, 120);
+    let clamped_artist = clamp_str_utf16(meta.artist, 120);
+    let clamped_payload = serde_json::json!({
+        "type": "album_zip",
+        "provider": meta.provider,
+        "album_id": meta.album_id,
+        "codec": meta.codec.unwrap_or("alac"),
+        "album": clamped_album,
+        "artist": clamped_artist,
+        "part": meta.part_index,
+        "total_parts": meta.total_parts,
+        "hash": meta.generation_hash,
+    });
+    let compact_clamped = serde_json::to_string(&clamped_payload).expect("payload serializes");
+    format!("{summary}<br/><blockquote expandable>{}</blockquote>", html_escape(&compact_clamped))
 }
 
 /// The round-trip shape of the caption's embedded payload.
@@ -700,5 +834,50 @@ mod tests {
         assert_eq!(parsed.codec, Codec::Aac);
         assert_eq!(parsed.track_key.codec, Some(Codec::Aac));
         assert_eq!(parsed.track_key.track_id, "1561413895");
+    }
+
+    #[test]
+    fn estimate_html_utf16_len_calculates_correctly() {
+        let html = "<b>Hello</b> &amp; <i>World</i><br/>Second line";
+        // Plain text: "Hello & World\nSecond line"
+        // Length: 5 + 3 + 5 + 1 + 11 = 25
+        assert_eq!(estimate_html_utf16_len(html), 25);
+    }
+
+    #[test]
+    fn dump_caption_with_extremely_long_artist_fits_within_telegram_limit() {
+        let long_artist = "Rochak Kohli, Jubin Nautiyal, Tulsi Kumar, Sachet-Parampara, Parampara Tandon, Neha Kakkar, Guru Randhawa, Yo Yo Honey Singh, Darshan Raval, Neeti Mohan, Tanishk Bagchi, Meet Bros., Monali Thakur, Amaal Mallik, Armaan Malik, Mithoon, Shreya Ghoshal, Akhil Sachdeva, Mansheel Gujral, Dhvani Bhanushali, B Praak, Jasleen Royal, Harshdeep Kaur, Shekhar Ravjiani, Payal Dev & Stebin Ben";
+        let meta = DumpCaptionMetadata {
+            track_key: TrackKey::apple("1529537935"),
+            title: "Love Mashup 2020(Remix By Kedrock,Sd Style)",
+            artist: long_artist,
+            album: "Love Mashup 2020(Remix By Kedrock,Sd Style) - Single",
+            duration: 254,
+            bit_depth: 24,
+            sample_rate: 44100,
+            codec: Some("alac"),
+            genre: Some("Bollywood"),
+            release_date: Some("2020-08-25"),
+            track_number: Some(1),
+            track_count: Some(1),
+        };
+        let caption = format_dump_caption(&meta);
+        let utf16_len = estimate_html_utf16_len(&caption);
+        assert!(
+            utf16_len <= MAX_MEDIA_CAPTION_UTF16_LEN,
+            "caption utf16 length {utf16_len} exceeds limit {MAX_MEDIA_CAPTION_UTF16_LEN}"
+        );
+        // Verify parse_dump_caption succeeds on the resulting caption
+        let unescaped = caption
+            .replace("&quot;", "\"")
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&#39;", "'")
+            .replace("<br/>", "\n");
+        let parsed = parse_dump_caption(Some(&unescaped)).expect("payload parsed from long artist caption");
+        assert_eq!(parsed.track_key.track_id, "1529537935");
+        assert_eq!(parsed.codec, Codec::Alac);
+        assert_eq!(parsed.duration, 254);
     }
 }

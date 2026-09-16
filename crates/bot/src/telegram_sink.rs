@@ -10,6 +10,43 @@ use ferogram::{
     ErrorKind, InputMessage, InvocationError, InvocationErrorExt, PeerRef, TransferHandle,
 };
 
+/// Maximum caption length allowed by Telegram for media messages (in UTF-16 code units).
+const MAX_CAPTION_UTF16_LEN: usize = 1024;
+
+/// Clamps plain text to fit within `max_utf16` code units, appending an ellipsis if truncated.
+fn clamp_plain_text(text: &str, max_utf16: usize) -> String {
+    let mut curr_len = 0;
+    let mut byte_limit = text.len();
+    for (idx, ch) in text.char_indices() {
+        let ch_len = ch.len_utf16();
+        if curr_len + ch_len > max_utf16.saturating_sub(1) {
+            byte_limit = idx;
+            break;
+        }
+        curr_len += ch_len;
+    }
+    let mut truncated = text[..byte_limit].to_string();
+    truncated.push('…');
+    truncated
+}
+
+/// Prepares an `InputMessage` for media uploads, ensuring the caption never exceeds
+/// Telegram's 1024 UTF-16 code unit limit.
+fn prepare_media_caption(caption_html: &str) -> InputMessage {
+    let msg = InputMessage::html(caption_html);
+    let utf16_count = msg.text.encode_utf16().count();
+    if utf16_count <= MAX_CAPTION_UTF16_LEN {
+        return msg;
+    }
+    tracing::warn!(
+        utf16_count,
+        max = MAX_CAPTION_UTF16_LEN,
+        "Media caption exceeds 1024 UTF-16 code units; clamping to plain text"
+    );
+    let clamped = clamp_plain_text(&msg.text, MAX_CAPTION_UTF16_LEN);
+    InputMessage::text(clamped)
+}
+
 /// Ferogram-backed implementation of the engine's delivery port.
 pub struct FerogramTelegramSink {
     client: Arc<ferogram::Client>,
@@ -27,6 +64,9 @@ fn map_invocation(error: InvocationError) -> DeliveryError {
         ErrorKind::Rpc { code, .. } if code >= 500 => DeliveryError::Transient(detail),
         ErrorKind::Rpc { name, .. } if name == "ENTITY_BOUNDS_INVALID" => {
             DeliveryError::Rejected(DeliveryRejection::EntityBoundsInvalid)
+        }
+        ErrorKind::Rpc { name, .. } if name == "MEDIA_CAPTION_TOO_LONG" => {
+            DeliveryError::Rejected(DeliveryRejection::CaptionTooLong)
         }
         ErrorKind::Rpc { .. } => DeliveryError::Rejected(DeliveryRejection::Other(detail)),
         ErrorKind::Auth | ErrorKind::Cancelled | ErrorKind::Other => {
@@ -170,7 +210,7 @@ impl Delivery for FerogramTelegramSink {
                         .client
                         .send_message(
                             self.dump_peer.clone(),
-                            InputMessage::html(&caption_html)
+                            prepare_media_caption(&caption_html)
                                 .silent(true)
                                 .copy_media(media),
                         )
@@ -218,7 +258,7 @@ impl Delivery for FerogramTelegramSink {
                         .client
                         .send_message(
                             self.dump_peer.clone(),
-                            InputMessage::html(&caption_html)
+                            prepare_media_caption(&caption_html)
                                 .silent(true)
                                 .copy_media(media),
                         )
@@ -310,7 +350,7 @@ impl Delivery for FerogramTelegramSink {
                         .client
                         .send_message(
                             PeerRef::from(destination.id()),
-                            InputMessage::html(&caption_html).copy_media(media),
+                            prepare_media_caption(&caption_html).copy_media(media),
                         )
                         .await
                         .map_err(map_invocation)?;
@@ -332,7 +372,7 @@ impl Delivery for FerogramTelegramSink {
                     self.client
                         .send_message(
                             PeerRef::from(destination.id()),
-                            InputMessage::html(&caption_html).copy_media(media),
+                            prepare_media_caption(&caption_html).copy_media(media),
                         )
                         .await
                         .map_err(map_invocation)?;
@@ -440,6 +480,27 @@ mod tests {
             map_invocation(error),
             DeliveryError::Rejected(DeliveryRejection::Other(_))
         ));
+    }
+
+    #[test]
+    fn caption_too_long_rpc_error_is_typed() {
+        let error = InvocationError::Rpc(ferogram::RpcError {
+            code: 400,
+            name: "MEDIA_CAPTION_TOO_LONG".into(),
+            value: None,
+        });
+        assert_eq!(
+            map_invocation(error),
+            DeliveryError::Rejected(DeliveryRejection::CaptionTooLong)
+        );
+    }
+
+    #[test]
+    fn prepare_media_caption_clamps_long_text() {
+        let long_str = "a".repeat(1100);
+        let msg = prepare_media_caption(&long_str);
+        assert!(msg.text.encode_utf16().count() <= 1024);
+        assert!(msg.text.ends_with('…'));
     }
 
     #[test]

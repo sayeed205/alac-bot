@@ -181,6 +181,7 @@ pub enum DeliveryReceipt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeliveryRejection {
     EntityBoundsInvalid,
+    CaptionTooLong,
     Other(String),
 }
 
@@ -188,6 +189,7 @@ impl fmt::Display for DeliveryRejection {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EntityBoundsInvalid => formatter.write_str("entity bounds invalid"),
+            Self::CaptionTooLong => formatter.write_str("caption too long"),
             Self::Other(detail) => formatter.write_str(detail),
         }
     }
