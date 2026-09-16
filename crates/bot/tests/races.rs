@@ -284,6 +284,7 @@ fn race_options() -> RipJobOptions {
         reply_to_message_id: Some(555),
         status_msg_id: 999,
         is_admin: true,
+        codec_preference: None,
         rendition_policy: engine::orchestrator::types::RenditionPolicy::PrimaryWithOptionalAtmos,
     }
 }

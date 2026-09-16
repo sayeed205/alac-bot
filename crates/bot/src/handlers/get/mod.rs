@@ -65,7 +65,9 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
     let (owner_id, owner_display_name, owner_is_admin) =
         if let (true, Some(id)) = (parsed.from_reply, parsed.reply_sender_id) {
             let is_admin = state.auth.is_admin(id);
-            let name = parsed.reply_sender_name.unwrap_or_else(|| format!("User {id}"));
+            let name = parsed
+                .reply_sender_name
+                .unwrap_or_else(|| format!("User {id}"));
             (id, name, is_admin)
         } else {
             let user = msg.sender_user().await.ok().flatten();
@@ -109,7 +111,9 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
         return;
     }
     let settings = state.rip_deps.settings_snapshot();
-    if let Some(text) = gates::feature_gate(&settings, &parsed.items, effective_admin, parsed.document) {
+    if let Some(text) =
+        gates::feature_gate(&settings, &parsed.items, effective_admin, parsed.document)
+    {
         reply(&msg, text).await;
         return;
     }
@@ -164,10 +168,24 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
     // Keep one status dashboard message per chat. New jobs are added to the
     // shared snapshot by the engine's Created event; no per-job progress
     // message is sent.
-    super::ensure_dashboard(&state, chat, caller_id, caller_is_admin, super::chat_peer_ref(&msg)).await;
+    super::ensure_dashboard(
+        &state,
+        chat,
+        caller_id,
+        caller_is_admin,
+        super::chat_peer_ref(&msg),
+    )
+    .await;
+
+    let rendition_policy = match parsed.provider {
+        engine::Provider::Apple => {
+            engine::orchestrator::types::RenditionPolicy::PrimaryWithOptionalAtmos
+        }
+        engine::Provider::Qobuz => engine::orchestrator::types::RenditionPolicy::PrimaryOnly,
+    };
 
     let options = engine::orchestrator::types::RipJobOptions {
-        provider: engine::Provider::Apple,
+        provider: parsed.provider,
         chat_id: chat,
         user_id: owner_id,
         user_name: Some(owner_display_name),
@@ -183,7 +201,8 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
         // orchestration callers.
         status_msg_id: 0,
         is_admin: owner_is_admin,
-        rendition_policy: engine::orchestrator::types::RenditionPolicy::PrimaryWithOptionalAtmos,
+        codec_preference: parsed.codec_preference,
+        rendition_policy,
     };
 
     // Engine owns everything from here: resolution, cache-first, queue,

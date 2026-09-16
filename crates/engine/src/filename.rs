@@ -3,10 +3,7 @@
 //! Enforces OS-level single-component path length limits (commonly 255 bytes on Linux
 //! filesystems) and zip entry constraints at the type level.
 
-use std::borrow::Borrow;
-use std::fmt;
-use std::ops::Deref;
-use std::path::Path;
+use std::{borrow::Borrow, fmt, ops::Deref, path::Path};
 
 /// Standard maximum byte length for a single filesystem path component on Linux.
 pub const MAX_FILENAME_BYTES: usize = 255;
@@ -308,10 +305,7 @@ mod tests {
             BoundedName::<10>::try_new("bad/path"),
             Err(FilenameError::InvalidCharacter('/'))
         );
-        assert_eq!(
-            BoundedName::<10>::try_new("   "),
-            Err(FilenameError::Empty)
-        );
+        assert_eq!(BoundedName::<10>::try_new("   "), Err(FilenameError::Empty));
     }
 
     #[test]
@@ -367,15 +361,22 @@ mod tests {
         assert!(BoundedName::<10>::try_new(".").is_err());
         assert!(BoundedName::<10>::try_new("..").is_err());
 
-        assert_eq!(TrackFilename::sanitize_and_bound(".", None).as_str(), "track");
-        assert_eq!(TrackFilename::sanitize_and_bound("..", None).as_str(), "track");
+        assert_eq!(
+            TrackFilename::sanitize_and_bound(".", None).as_str(),
+            "track"
+        );
+        assert_eq!(
+            TrackFilename::sanitize_and_bound("..", None).as_str(),
+            "track"
+        );
     }
 
     #[test]
     fn oversized_suffix_and_collision_suffixes_are_handled() {
         // Suffix >= MAX
         let long_suffix = ".abcdefghijklmnop";
-        let bounded = BoundedName::<10>::sanitize_and_bound("test.abcdefghijklmnop", Some(long_suffix));
+        let bounded =
+            BoundedName::<10>::sanitize_and_bound("test.abcdefghijklmnop", Some(long_suffix));
         assert!(bounded.len() <= 10);
 
         // Collision suffix >= MAX

@@ -14,10 +14,13 @@ pub async fn migrate(pool: &DbPool) -> Result<(), DbError> {
         let mut connection =
             AsyncConnectionWrapper::<diesel_async::AsyncPgConnection>::establish(&database_url)
                 .map_err(|error| DbError::Migration(error.to_string()))?;
-        connection
+        let applied = connection
             .run_pending_migrations(MIGRATIONS)
-            .map(|_| ())
-            .map_err(|error| DbError::Migration(error.to_string()))
+            .map_err(|error| DbError::Migration(error.to_string()))?;
+        for version in applied {
+            tracing::info!("Applied database migration: {version}");
+        }
+        Ok(())
     })
     .await
     .map_err(|error| DbError::Migration(error.to_string()))?

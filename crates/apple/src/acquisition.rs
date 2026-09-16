@@ -6,12 +6,12 @@
 
 use std::time::Duration;
 
-use engine::streaming::{
-    AudioStreamSource, FetchEndpointOptions, ProgressCallback, SourceId, StreamError, StreamHttp,
-    StreamTransport,
-};
 use engine::{
     orchestrator::types::{RipActivity, TrackLabel},
+    streaming::{
+        AudioStreamSource, FetchEndpointOptions, ProgressCallback, SourceId, StreamError,
+        StreamHttp, StreamTransport,
+    },
     types::TrackMeta,
 };
 use music::CodecPreference;

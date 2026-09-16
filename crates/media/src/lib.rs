@@ -10,6 +10,7 @@ use std::{
 };
 
 use font8x8::UnicodeFonts;
+use id3::TagLike;
 use realfft::RealFftPlanner;
 use symphonia::core::{
     audio::sample::Sample,
@@ -109,11 +110,10 @@ pub struct SpectrogramReport {
     pub output: PathBuf,
 }
 
-/// Semantic metadata accepted by native M4A finalization.
+/// Semantic metadata accepted by native M4A/FLAC/MP3 finalization.
 ///
-/// The fields intentionally mirror the useful iTunes/Apple Music atoms while
-/// remaining provider-neutral. Empty strings are ignored, and identifiers are
-/// written only when they fit the 32-bit Apple atom representation.
+/// The fields intentionally mirror the useful metadata fields while
+/// remaining provider-neutral. Empty strings are ignored.
 #[derive(Clone, Debug, Default)]
 pub struct TrackTags {
     pub title: Option<String>,
@@ -245,7 +245,7 @@ impl MediaProcessor {
     }
 
     /// Validate, tag, and commit an audio rip. The pipeline selects the
-    /// best available codec (ALAC, ec-3, AAC); finalize never gates on the
+    /// best available codec (ALAC, ec-3, AAC, FLAC, MP3); finalize never gates on the
     /// codec itself — it validates container integrity and packet boundaries
     /// end-to-end before and after tagging.
     pub async fn finalize_m4a(
@@ -367,14 +367,10 @@ fn decode_sync(
     let track_id = track.id;
     let decoder = symphonia::default::get_codecs()
         .make_audio_decoder(params, &AudioDecoderOptions::default());
-    // Channel layout is present for every codec with a decoder; ec-3's
-    // probe omits it. Require it only when sample data will be decoded.
     let can_decode = decoder.is_ok();
     let channels = if can_decode {
         probed_channels.ok_or_else(|| MediaError::Invalid("channel count missing".into()))?
     } else if collect_samples {
-        // The spectrogram needs decoded samples; without a decoder there
-        // is nothing to render.
         return Err(MediaError::UnsupportedFormat);
     } else {
         probed_channels.unwrap_or(2)
@@ -382,11 +378,7 @@ fn decode_sync(
     let bit_depth = params
         .bits_per_sample
         .or_else(|| alac_bit_depth(params.codec, params.extra_data.as_deref()));
-    // When `collect_samples` is false (e.g. `inspect_sync`), validation is
-    // container-level: packet walking verifies container integrity, track
-    // structure, and non-truncation end-to-end without requiring full PCM
-    // decoding. When `collect_samples` is true (spectrograms), a decoder
-    // is required.
+
     let mut decoder = if collect_samples {
         match decoder {
             Ok(decoder) => Some(decoder),
@@ -415,9 +407,6 @@ fn decode_sync(
             continue;
         }
         let Some(decoder) = decoder.as_mut() else {
-            // Container-level validation (inspect_sync) or codec without
-            // decoder (ec-3): packet walking validates container integrity,
-            // chunk offsets, and non-truncation end-to-end.
             continue;
         };
         match decoder.decode(&packet) {
@@ -437,9 +426,6 @@ fn decode_sync(
                 }
             }
             Err(SymphoniaError::DecodeError(message)) => {
-                // Non-fatal decode error on an individual packet (e.g. unsupported
-                // vendor extension element like PCE in ALAC). Pad silence for this
-                // packet's duration so remaining packets can still be rendered.
                 if first_decode_error.is_none() {
                     first_decode_error = Some(message.to_string());
                 }
@@ -477,10 +463,6 @@ fn decode_sync(
     })
 }
 
-/// Keep codec values stable and human-readable at the media boundary. The
-/// `Debug` representation of `AudioCodecId` is an implementation detail (for
-/// example, ALAC appears as `AudioCodecId(8195)`) and must not be used for
-/// format checks or user-facing diagnostics.
 fn codec_name(codec: AudioCodecId) -> String {
     match codec {
         CODEC_ID_ALAC => "alac",
@@ -495,9 +477,6 @@ fn codec_name(codec: AudioCodecId) -> String {
     .to_owned()
 }
 
-/// Symphonia does not currently populate `bits_per_sample` for every ALAC
-/// sample entry. The ALAC magic cookie stores the encoded sample size at byte
-/// five, so use it as a checked fallback for accurate `AudioInfo` values.
 fn alac_bit_depth(codec: AudioCodecId, extra_data: Option<&[u8]>) -> Option<u32> {
     if codec != CODEC_ID_ALAC {
         return None;
@@ -598,10 +577,6 @@ fn render_image(
             for y in 0..plot_height {
                 let bin = (plot_height - 1 - y) * (spectrum.len() - 1) / plot_height;
                 let amplitude = (spectrum[bin].norm() * 2.0 / window_sum).max(1.0e-9);
-                // The reference renderer uses a windowed power spectral
-                // density. The FFT magnitude is normalized to full-scale
-                // amplitude here; a small calibration lift keeps the heat
-                // levels on the same visual dBFS scale.
                 let db = 20.0 * amplitude.log10() + 18.0;
                 let level =
                     ((db + options.dynamic_range_db) / options.dynamic_range_db).clamp(0.0, 1.0);
@@ -883,6 +858,189 @@ fn draw_text_vertical(
     }
 }
 
+fn tag_flac(path: &Path, tags: &TrackTags) -> Result<(), MediaError> {
+    let mut tag = metaflac::Tag::read_from_path(path)
+        .map_err(|error| MediaError::Invalid(error.to_string()))?;
+    let comments = tag.vorbis_comments_mut();
+    if let Some(value) = non_empty(tags.title.as_deref()) {
+        comments.set_title(vec![value]);
+    }
+    if let Some(value) = non_empty(tags.artist.as_deref()) {
+        comments.set_artist(vec![value]);
+    }
+    if let Some(value) = non_empty(tags.album.as_deref()) {
+        comments.set_album(vec![value]);
+    }
+    if let Some(value) = non_empty(tags.album_artist.as_deref()) {
+        comments.set_album_artist(vec![value]);
+    }
+    if let Some(value) = non_empty(tags.release_date.as_deref()) {
+        comments.set("DATE", vec![value]);
+    }
+    if let Some(value) = non_empty(tags.genre.as_deref()) {
+        comments.set_genre(vec![value]);
+    }
+    if let Some(value) = non_empty(tags.composer.as_deref()) {
+        comments.set("COMPOSER", vec![value]);
+    }
+    if let Some(value) = tags.track_number {
+        comments.set_track(value as u32);
+    }
+    if let Some(value) = tags.track_count {
+        comments.set_total_tracks(value as u32);
+    }
+    if let Some(value) = tags.disc_number {
+        comments.set("DISCNUMBER", vec![value.to_string()]);
+    }
+    if let Some(value) = tags.disc_count {
+        comments.set("DISCTOTAL", vec![value.to_string()]);
+    }
+    if let Some(value) = non_empty(tags.lyrics.as_deref()) {
+        comments.set_lyrics(vec![value]);
+    }
+    if let Some(value) = non_empty(tags.isrc.as_deref()) {
+        comments.set("ISRC", vec![value]);
+    }
+    if let Some(value) = non_empty(tags.copyright.as_deref()) {
+        comments.set("COPYRIGHT", vec![value]);
+    }
+    if let Some(image) = tags
+        .artwork_jpeg
+        .as_deref()
+        .filter(|image| !image.is_empty())
+    {
+        let mime_type = if image.starts_with(b"\x89PNG\r\n\x1a\n") {
+            "image/png"
+        } else {
+            "image/jpeg"
+        };
+        tag.add_picture(
+            mime_type,
+            metaflac::block::PictureType::CoverFront,
+            image.to_vec(),
+        );
+    }
+    tag.save()
+        .map_err(|error| MediaError::Metadata(error.to_string()))?;
+    Ok(())
+}
+
+fn tag_mp3(path: &Path, tags: &TrackTags) -> Result<(), MediaError> {
+    let mut tag = id3::Tag::read_from_path(path).unwrap_or_default();
+    if let Some(value) = non_empty(tags.title.as_deref()) {
+        tag.set_title(value);
+    }
+    if let Some(value) = non_empty(tags.artist.as_deref()) {
+        tag.set_artist(value);
+    }
+    if let Some(value) = non_empty(tags.album.as_deref()) {
+        tag.set_album(value);
+    }
+    if let Some(value) = non_empty(tags.album_artist.as_deref()) {
+        tag.set_album_artist(value);
+    }
+    if let Some(value) = non_empty(tags.genre.as_deref()) {
+        tag.set_genre(value);
+    }
+    if let Some(value) = tags.track_number {
+        tag.set_track(value as u32);
+    }
+    if let Some(value) = tags.track_count {
+        tag.set_total_tracks(value as u32);
+    }
+    if let Some(value) = tags.disc_number {
+        tag.set_disc(value as u32);
+    }
+    if let Some(value) = tags.disc_count {
+        tag.set_total_discs(value as u32);
+    }
+    if let Some(image) = tags
+        .artwork_jpeg
+        .as_deref()
+        .filter(|image| !image.is_empty())
+    {
+        let mime_type = if image.starts_with(b"\x89PNG\r\n\x1a\n") {
+            "image/png".to_string()
+        } else {
+            "image/jpeg".to_string()
+        };
+        tag.add_frame(id3::frame::Picture {
+            mime_type,
+            picture_type: id3::frame::PictureType::CoverFront,
+            description: String::new(),
+            data: image.to_vec(),
+        });
+    }
+    tag.write_to_path(path, id3::Version::Id3v24)
+        .map_err(|error| MediaError::Metadata(error.to_string()))?;
+    Ok(())
+}
+
+fn tag_m4a(path: &Path, tags: &TrackTags) -> Result<(), MediaError> {
+    let mut tag = mp4ameta::Tag::read_from_path(path)
+        .map_err(|error| MediaError::Invalid(error.to_string()))?;
+    if let Some(value) = non_empty(tags.title.as_deref()) {
+        tag.set_title(value);
+    }
+    if let Some(value) = non_empty(tags.title_sort.as_deref()) {
+        tag.set_title_sort_order(value);
+    }
+    if let Some(value) = non_empty(tags.artist.as_deref()) {
+        tag.set_artist(value);
+    }
+    if let Some(value) = non_empty(tags.artist_sort.as_deref()) {
+        tag.set_artist_sort_order(value);
+    }
+    if let Some(value) = non_empty(tags.album.as_deref()) {
+        tag.set_album(value);
+    }
+    if let Some(value) = non_empty(tags.album_sort.as_deref()) {
+        tag.set_album_sort_order(value);
+    }
+    if let Some(value) = non_empty(tags.album_artist.as_deref()) {
+        tag.set_album_artist(value);
+    }
+    if let Some(value) = non_empty(tags.album_artist_sort.as_deref()) {
+        tag.set_album_artist_sort_order(value);
+    }
+    if let Some(value) = non_empty(tags.release_date.as_deref()) {
+        tag.set_year(value);
+    }
+    if let Some(value) = non_empty(tags.genre.as_deref()) {
+        tag.set_genre(value);
+    }
+    if let Some(value) = non_empty(tags.composer.as_deref()) {
+        tag.set_composer(value);
+    }
+    if let Some(value) = non_empty(tags.composer_sort.as_deref()) {
+        tag.set_composer_sort_order(value);
+    }
+    if let Some(value) = tags.track_number {
+        tag.set_track(value, tags.track_count.unwrap_or(0));
+    }
+    if let Some(value) = tags.disc_number {
+        tag.set_disc(value, tags.disc_count.unwrap_or(0));
+    }
+    if let Some(value) = non_empty(tags.lyrics.as_deref()) {
+        tag.set_lyrics(value);
+    }
+    if let Some(image) = tags
+        .artwork_jpeg
+        .as_deref()
+        .filter(|image| !image.is_empty())
+    {
+        if image.starts_with(b"\x89PNG\r\n\x1a\n") {
+            tag.set_artwork(mp4ameta::Img::png(image));
+        } else {
+            tag.set_artwork(mp4ameta::Img::jpeg(image));
+        }
+    }
+    write_extended_metadata(&mut tag, tags);
+    tag.write_to_path(path)
+        .map_err(|error| MediaError::Metadata(error.to_string()))?;
+    Ok(())
+}
+
 fn finalize_m4a_sync(
     source: &Path,
     destination: &Path,
@@ -892,15 +1050,13 @@ fn finalize_m4a_sync(
     if cancellation.is_cancelled() {
         return Err(MediaError::Cancelled);
     }
-    // Validate the rip before tagging. The codec gate was removed: the
-    // pipeline picks the highest quality variant the storefront offers
-    // (ALAC, ec-3, AAC) and finalize must not reject a valid rip. Codec
-    // and container integrity are validated end-to-end via packet walking
-    // without requiring sample decoding for inspection.
     let info = inspect_sync(source, cancellation).map_err(mark_source_validation)?;
 
-    let part = destination.with_extension("m4a.part");
-    // Keep the legacy part name unless it would exceed one component.
+    let ext = destination
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("m4a");
+    let part = destination.with_extension(format!("{ext}.part"));
     let part = match part.file_name().and_then(|value| value.to_str()) {
         Some(name) if name.len() <= 255 => part,
         _ => destination.with_extension("p"),
@@ -913,67 +1069,18 @@ fn finalize_m4a_sync(
         if cancellation.is_cancelled() {
             return Err(MediaError::Cancelled);
         }
-        let mut tag = mp4ameta::Tag::read_from_path(&part)
-            .map_err(|error| MediaError::Invalid(error.to_string()))?;
-        if let Some(value) = non_empty(tags.title.as_deref()) {
-            tag.set_title(value);
+
+        let is_flac = ext == "flac" || info.codec == "flac";
+        let is_mp3 = ext == "mp3" || info.codec == "mp3";
+
+        if is_flac {
+            tag_flac(&part, tags)?;
+        } else if is_mp3 {
+            tag_mp3(&part, tags)?;
+        } else {
+            tag_m4a(&part, tags)?;
         }
-        if let Some(value) = non_empty(tags.title_sort.as_deref()) {
-            tag.set_title_sort_order(value);
-        }
-        if let Some(value) = non_empty(tags.artist.as_deref()) {
-            tag.set_artist(value);
-        }
-        if let Some(value) = non_empty(tags.artist_sort.as_deref()) {
-            tag.set_artist_sort_order(value);
-        }
-        if let Some(value) = non_empty(tags.album.as_deref()) {
-            tag.set_album(value);
-        }
-        if let Some(value) = non_empty(tags.album_sort.as_deref()) {
-            tag.set_album_sort_order(value);
-        }
-        if let Some(value) = non_empty(tags.album_artist.as_deref()) {
-            tag.set_album_artist(value);
-        }
-        if let Some(value) = non_empty(tags.album_artist_sort.as_deref()) {
-            tag.set_album_artist_sort_order(value);
-        }
-        if let Some(value) = non_empty(tags.release_date.as_deref()) {
-            tag.set_year(value);
-        }
-        if let Some(value) = non_empty(tags.genre.as_deref()) {
-            tag.set_genre(value);
-        }
-        if let Some(value) = non_empty(tags.composer.as_deref()) {
-            tag.set_composer(value);
-        }
-        if let Some(value) = non_empty(tags.composer_sort.as_deref()) {
-            tag.set_composer_sort_order(value);
-        }
-        if let Some(value) = tags.track_number {
-            tag.set_track(value, tags.track_count.unwrap_or(0));
-        }
-        if let Some(value) = tags.disc_number {
-            tag.set_disc(value, tags.disc_count.unwrap_or(0));
-        }
-        if let Some(value) = non_empty(tags.lyrics.as_deref()) {
-            tag.set_lyrics(value);
-        }
-        if let Some(image) = tags
-            .artwork_jpeg
-            .as_deref()
-            .filter(|image| !image.is_empty())
-        {
-            if image.starts_with(b"\x89PNG\r\n\x1a\n") {
-                tag.set_artwork(mp4ameta::Img::png(image));
-            } else {
-                tag.set_artwork(mp4ameta::Img::jpeg(image));
-            }
-        }
-        write_extended_metadata(&mut tag, tags);
-        tag.write_to_path(&part)
-            .map_err(|error| MediaError::Metadata(error.to_string()))?;
+
         if cancellation.is_cancelled() {
             return Err(MediaError::Cancelled);
         }
@@ -1102,9 +1209,6 @@ fn write_extended_metadata(tag: &mut mp4ameta::Tag, tags: &TrackTags) {
             AdvisoryKind::Clean => mp4ameta::AdvisoryRating::Clean,
             AdvisoryKind::Inoffensive => mp4ameta::AdvisoryRating::Inoffensive,
         };
-        // Symphonia (and several players) expect these integer atoms to use
-        // the signed-integer data type (21), not the generic reserved type
-        // emitted by mp4ameta's convenience setter.
         tag.set_data(
             mp4ameta::ident::ADVISORY_RATING,
             mp4ameta::Data::BeSigned(vec![rating.code()]),
@@ -1242,8 +1346,6 @@ mod tests {
                 if message == "no audio track"
         ));
 
-        // Post-tag validation returns the ordinary error directly; only the
-        // pre-tag inspection above passes through the source marker.
         let post_tag_decode = MediaError::Decode("finalized file could not be decoded".into());
         let post_tag_invalid = MediaError::Invalid("finalized file has no duration".into());
         assert!(!matches!(post_tag_decode, MediaError::SourceValidation(_)));

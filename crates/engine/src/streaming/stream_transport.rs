@@ -9,8 +9,10 @@ use super::{
     http::{ByteStream, StreamHttp, StreamHttpError},
     source_id::SourceId,
 };
-use crate::limits::{MAX_AUDIO_BYTES, MAX_ERROR_BODY_BYTES};
-use crate::orchestrator::types::RipActivity;
+use crate::{
+    limits::{MAX_AUDIO_BYTES, MAX_ERROR_BODY_BYTES},
+    orchestrator::types::RipActivity,
+};
 
 pub struct FetchEndpointOptions {
     pub stream_url: String,

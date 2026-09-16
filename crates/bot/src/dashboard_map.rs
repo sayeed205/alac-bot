@@ -261,8 +261,9 @@ pub fn snapshot_from(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use engine::orchestrator::types::{ByteProgress, RipActivity, TrackLabel};
+
+    use super::*;
 
     fn engine_job(
         phase: EnginePhase,

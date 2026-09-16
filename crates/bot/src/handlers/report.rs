@@ -738,6 +738,7 @@ async fn admin_callback(state: Arc<BotState>, query: CallbackQuery, action: Repo
                 reply_to_message_id: None,
                 status_msg_id: 0,
                 is_admin: true,
+                codec_preference: None,
                 rendition_policy: engine::orchestrator::types::RenditionPolicy::PrimaryOnly,
             };
             match state

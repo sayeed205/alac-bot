@@ -99,7 +99,13 @@ pub fn render(
     if let Some(upload) = snapshot.current_upload.as_ref() {
         text.push_str(&render_upload_lane(upload));
     }
-    for (offset, job) in snapshot.jobs.iter().skip(start).take(DASHBOARD_PAGE_SIZE).enumerate() {
+    for (offset, job) in snapshot
+        .jobs
+        .iter()
+        .skip(start)
+        .take(DASHBOARD_PAGE_SIZE)
+        .enumerate()
+    {
         let number = start + offset + 1;
         let state = match job.phase {
             JobPhase::Processing => "Processing".to_owned(),
@@ -533,7 +539,12 @@ impl DashboardManager {
                 {
                     return None;
                 }
-                let pages = entry.snapshot.jobs.len().div_ceil(DASHBOARD_PAGE_SIZE).max(1);
+                let pages = entry
+                    .snapshot
+                    .jobs
+                    .len()
+                    .div_ceil(DASHBOARD_PAGE_SIZE)
+                    .max(1);
                 let page = page.clamp(1, pages);
                 entry.page = page;
                 let (text, keyboard) = render(&entry.snapshot, page);

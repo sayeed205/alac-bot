@@ -18,12 +18,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::{
+    filename::StandardFilename,
     limits::MAX_AUDIO_BYTES,
     orchestrator::types::{ByteProgress, RipActivity, TrackLabel},
     streaming::{AudioStreamSource, ProgressCallback, SourceId, StreamError},
-    filename::StandardFilename,
     tagger,
-
     types::{TrackMeta, TrackRipResult},
 };
 
@@ -614,8 +613,7 @@ impl AlacTrackRipper {
                 "stream_{safe_track_id}_{unix_ms}_{}.raw",
                 unique_temp_suffix()
             );
-            let temp_raw_name =
-                StandardFilename::sanitize_and_bound(&temp_raw_name, Some(".raw"));
+            let temp_raw_name = StandardFilename::sanitize_and_bound(&temp_raw_name, Some(".raw"));
             let temp_raw_path = track_dir.join(temp_raw_name);
             // The raw stream is staged in the private lane, but the completed
             // file must live outside it: callers consume this path after `rip`

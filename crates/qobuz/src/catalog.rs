@@ -1,0 +1,84 @@
+//! Qobuz catalog queries and collection resolution.
+
+use std::sync::Arc;
+
+use engine::{
+    orchestrator::deps::CollectionResolver,
+    types::{AlbumTracks, ArtistTracks},
+};
+use music::PlaylistData;
+
+use crate::gateway::QobuzGateway;
+
+#[derive(Clone)]
+pub struct QobuzCatalog {
+    primary: Arc<dyn QobuzGateway>,
+    fallback: Option<Arc<dyn QobuzGateway>>,
+}
+
+impl QobuzCatalog {
+    pub fn new(primary: Arc<dyn QobuzGateway>, fallback: Option<Arc<dyn QobuzGateway>>) -> Self {
+        Self { primary, fallback }
+    }
+}
+
+impl CollectionResolver for QobuzCatalog {
+    async fn fetch_album_tracks(&self, id: &str, _storefront: &str) -> Result<AlbumTracks, String> {
+        match self.primary.fetch_album_tracks(id).await {
+            Ok(album) => Ok(album),
+            Err(err) => {
+                if let Some(fallback) = &self.fallback {
+                    tracing::warn!("Primary Qobuz catalog failed ({err}), trying fallback");
+                    fallback
+                        .fetch_album_tracks(id)
+                        .await
+                        .map_err(|e| e.to_string())
+                } else {
+                    Err(err.to_string())
+                }
+            }
+        }
+    }
+
+    async fn fetch_artist_tracks(
+        &self,
+        id: &str,
+        _storefront: &str,
+    ) -> Result<ArtistTracks, String> {
+        match self.primary.fetch_artist_tracks(id).await {
+            Ok(artist) => Ok(artist),
+            Err(err) => {
+                if let Some(fallback) = &self.fallback {
+                    tracing::warn!("Primary Qobuz catalog failed ({err}), trying fallback");
+                    fallback
+                        .fetch_artist_tracks(id)
+                        .await
+                        .map_err(|e| e.to_string())
+                } else {
+                    Err(err.to_string())
+                }
+            }
+        }
+    }
+
+    async fn fetch_playlist_tracks(
+        &self,
+        id: &str,
+        _storefront: &str,
+    ) -> Result<PlaylistData, String> {
+        match self.primary.fetch_playlist_tracks(id).await {
+            Ok(playlist) => Ok(playlist),
+            Err(err) => {
+                if let Some(fallback) = &self.fallback {
+                    tracing::warn!("Primary Qobuz catalog failed ({err}), trying fallback");
+                    fallback
+                        .fetch_playlist_tracks(id)
+                        .await
+                        .map_err(|e| e.to_string())
+                } else {
+                    Err(err.to_string())
+                }
+            }
+        }
+    }
+}

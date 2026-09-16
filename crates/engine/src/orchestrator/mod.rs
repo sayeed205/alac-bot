@@ -31,6 +31,7 @@ use music::Rendition;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    filename::StandardFilename,
     orchestrator::{
         caption::{
             clamp_str_utf16, format_album_details_caption, format_dump_caption,
@@ -56,12 +57,10 @@ use crate::{
     queue::{EnqueueOptions, SequentialRipQueue},
     ripper::{RipError, RipOptions, RipProgressCallback},
     settings::BotSettings,
-    filename::StandardFilename,
     types::{AlbumTracks, ArtistTracks, Codec, Provider, TargetKind, TrackKey, TrackRipResult},
     zip::{
-        album_generation_hash, build_zip_entry_filename, create_zip_archive, plan_zip_parts_with_codec,
-        ZipTrackEntry,
-        TELEGRAM_SPLIT_THRESHOLD_BYTES,
+        album_generation_hash, build_zip_entry_filename_with_codec, create_zip_archive,
+        plan_zip_parts_with_codec, ZipTrackEntry, TELEGRAM_SPLIT_THRESHOLD_BYTES,
     },
 };
 
@@ -326,6 +325,7 @@ fn take_uncommitted_zip_dump_messages(ctx: &JobContext) -> Vec<DumpMessageRef> {
 fn archive_codec_replaced(replacement: Codec, existing: Codec) -> bool {
     match replacement {
         Codec::Alac | Codec::Aac => matches!(existing, Codec::Alac | Codec::Aac),
+        Codec::Flac => existing == Codec::Flac,
         other => existing == other,
     }
 }
@@ -358,10 +358,9 @@ fn record_lane_task_panic(
 /// row all derive from this value.
 fn seed_zip_codec(state: &ZipState, codec: Codec) {
     let rank = |codec: Codec| match codec {
-        Codec::Alac => 3,
+        Codec::Alac | Codec::Flac => 3,
         Codec::Ec3 => 2,
         Codec::Aac => 1,
-        Codec::Flac => 0,
     };
     let mut current = state.codec.lock().expect("zip codec poisoned");
     if current
@@ -375,7 +374,7 @@ fn seed_zip_codec(state: &ZipState, codec: Codec) {
 
 fn codec_allowed_for_rendition(rendition: Rendition, codec: Codec) -> bool {
     match rendition {
-        Rendition::Primary => matches!(codec, Codec::Alac | Codec::Aac),
+        Rendition::Primary => matches!(codec, Codec::Alac | Codec::Aac | Codec::Flac),
         Rendition::Atmos => codec == Codec::Ec3,
     }
 }
@@ -998,7 +997,7 @@ impl RipOrchestrator {
         deps: Arc<D>,
         options: &RipJobOptions,
     ) -> Result<RipJobSummary, OrchestratorError> {
-        if deps.providers().provider() != options.provider {
+        if !deps.providers().supports_provider(options.provider) {
             return Err(OrchestratorError::Message(format!(
                 "provider {} is not available",
                 options.provider
@@ -1589,7 +1588,10 @@ impl RipOrchestrator {
                 .iter()
                 .map(|rendition| {
                     let replacement_codec = match rendition {
-                        Rendition::Primary => Codec::Alac,
+                        Rendition::Primary => match options.provider {
+                            Provider::Qobuz => Codec::Flac,
+                            _ => Codec::Alac,
+                        },
                         Rendition::Atmos => Codec::Ec3,
                     };
                     let rows = existing_album_rows
@@ -1622,7 +1624,7 @@ impl RipOrchestrator {
             if !options.is_force {
                 for rendition in options.rendition_policy.renditions() {
                     let codecs: &[Codec] = match rendition {
-                        Rendition::Primary => &[Codec::Alac, Codec::Aac],
+                        Rendition::Primary => &[Codec::Alac, Codec::Flac, Codec::Aac],
                         Rendition::Atmos => &[Codec::Ec3],
                     };
                     for codec in codecs {
@@ -1803,7 +1805,8 @@ impl RipOrchestrator {
                 "Job is 100% cached; executing priority cache delivery bypassing rip queue"
             );
             self.set_phase(&shared, JobPhase::Delivering);
-            self.bus.set_job_activity(&shared, Some(JobActivity::CachedDelivered));
+            self.bus
+                .set_job_activity(&shared, Some(JobActivity::CachedDelivered));
             self.bus.emit_progress(&shared);
 
             let _permit = self
@@ -1815,20 +1818,11 @@ impl RipOrchestrator {
             if job_controller.is_cancelled() {
                 let elapsed = format!(
                     "{:.1}",
-                    (now_ms().saturating_sub(
-                        shared.lock().expect("job poisoned").job.start_time_ms
-                    ) as f64)
+                    (now_ms().saturating_sub(shared.lock().expect("job poisoned").job.start_time_ms)
+                        as f64)
                         / 1000.0
                 );
-                return Ok(summary(
-                    0,
-                    0,
-                    Vec::new(),
-                    Vec::new(),
-                    &elapsed,
-                    None,
-                    None,
-                ));
+                return Ok(summary(0, 0, Vec::new(), Vec::new(), &elapsed, None, None));
             }
 
             {
@@ -1926,11 +1920,13 @@ impl RipOrchestrator {
                                     guard.job.cached_count = cached_count;
                                 }
                                 self.bus.set_download(&shared, None);
-                                self.bus.set_job_activity(&shared, Some(JobActivity::CachedDelivered));
+                                self.bus
+                                    .set_job_activity(&shared, Some(JobActivity::CachedDelivered));
                                 self.bus.emit_progress(&shared);
 
                                 if should_pace {
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(120)).await;
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(120))
+                                        .await;
                                 }
                             }
                             Ok(DeliveryReceipt::PreviewDelivered) | Err(_) => {
@@ -1967,7 +1963,9 @@ impl RipOrchestrator {
                                 if delivered > 0 {
                                     let codec = rows[0].codec.as_str().to_owned();
                                     let info = ZipDeliveryInfo {
-                                        album: album_name.clone().unwrap_or_else(|| "Album".to_owned()),
+                                        album: album_name
+                                            .clone()
+                                            .unwrap_or_else(|| "Album".to_owned()),
                                         artist: album_artist
                                             .clone()
                                             .unwrap_or_else(|| "Unknown Artist".to_owned()),
@@ -1992,9 +1990,10 @@ impl RipOrchestrator {
                                             .map(|i| i.id.clone())
                                             .unwrap_or_default(),
                                         album_url: match (&album_id, &album_sf) {
-                                            (Some(id), Some(storefront)) => {
-                                                deps.providers().presentation().album_url(id, storefront)
-                                            }
+                                            (Some(id), Some(storefront)) => deps
+                                                .providers()
+                                                .presentation()
+                                                .album_url(id, storefront),
                                             _ => None,
                                         },
                                         artwork_url: album_artwork_url
@@ -2026,14 +2025,15 @@ impl RipOrchestrator {
                         let mut guard = shared.lock().expect("job poisoned");
                         guard.job.cached_count = cached_count;
                     }
-                    self.bus.set_job_activity(&shared, Some(JobActivity::CachedDelivered));
+                    self.bus
+                        .set_job_activity(&shared, Some(JobActivity::CachedDelivered));
                     self.bus.emit_progress(&shared);
                     let first_zip = zip_deliveries.first().cloned();
                     let elapsed = format!(
                         "{:.1}",
-                        (now_ms().saturating_sub(
-                            shared.lock().expect("job poisoned").job.start_time_ms
-                        ) as f64)
+                        (now_ms()
+                            .saturating_sub(shared.lock().expect("job poisoned").job.start_time_ms)
+                            as f64)
                             / 1000.0
                     );
                     let mut res = summary(
@@ -2054,16 +2054,16 @@ impl RipOrchestrator {
                     let mut guard = shared.lock().expect("job poisoned");
                     guard.job.cached_count = cached_count;
                 }
-                self.bus.set_job_activity(&shared, Some(JobActivity::CachedDelivered));
+                self.bus
+                    .set_job_activity(&shared, Some(JobActivity::CachedDelivered));
                 self.bus.emit_progress(&shared);
             }
 
             if !delivery_failed {
                 let elapsed = format!(
                     "{:.1}",
-                    (now_ms().saturating_sub(
-                        shared.lock().expect("job poisoned").job.start_time_ms
-                    ) as f64)
+                    (now_ms().saturating_sub(shared.lock().expect("job poisoned").job.start_time_ms)
+                        as f64)
                         / 1000.0
                 );
 
@@ -2487,13 +2487,20 @@ where
     };
 
     let storefront = item.storefront.clone().unwrap_or_else(|| "us".to_owned());
+    let codec_preference = if item.rendition == Rendition::Atmos {
+        music::CodecPreference::Atmos
+    } else {
+        ctx.options
+            .codec_preference
+            .unwrap_or_else(|| item.rendition.codec_preference())
+    };
     let rip_options = RipOptions {
         provider: ctx.options.provider,
         storefront: &storefront,
         on_progress: Some(&on_progress),
         signal: Some(queue_signal.clone()),
         output_dir: Some(rip_job_dir),
-        codec_preference: item.rendition.codec_preference(),
+        codec_preference,
     };
     let rip_result = match deps
         .providers()
@@ -2792,7 +2799,13 @@ where
 
     if ctx.zip_build && !ctx.zip_reuse.contains_key(&item.rendition) {
         if let Some(state) = ctx.zip_state(item.rendition) {
-            let filename = build_zip_entry_filename(None, &cached.title, &cached.artist, &item.track_id);
+            let filename = build_zip_entry_filename_with_codec(
+                None,
+                &cached.title,
+                &cached.artist,
+                &item.track_id,
+                cached.codec.as_str(),
+            );
             let destination = state.dir.join(&filename);
             let download_result = tokio::select! {
                 result = deps.materialize_cached(
@@ -3624,11 +3637,12 @@ async fn run_upload_item<D>(
         shared.lock().expect("job poisoned").job.is_cancelled || job_controller.is_cancelled();
     if uploaded_ok && ctx.zip_build && !cancelled {
         if let Some(state) = ctx.zip_state(upload_item.rendition) {
-            let filename = build_zip_entry_filename(
+            let filename = build_zip_entry_filename_with_codec(
                 Some(upload_item.rip_result.track_number),
                 &upload_item.rip_result.title,
                 &upload_item.rip_result.artist,
                 &upload_item.track_id,
+                &upload_item.rip_result.codec,
             );
             let destination = state.dir.join(&filename);
             if let Err(error) =
@@ -4028,14 +4042,22 @@ where
         let thumb_path_str = thumb_path
             .as_deref()
             .map(|path| path.to_string_lossy().into_owned());
+        let default_codec = match ctx.options.provider {
+            Provider::Qobuz => "flac",
+            _ => "alac",
+        };
+        let default_enum_codec = match ctx.options.provider {
+            Provider::Qobuz => Codec::Flac,
+            _ => Codec::Alac,
+        };
         let codec = state
             .codec
             .lock()
             .expect("zip codec poisoned")
             .clone()
             .or_else(|| (state.rendition == Rendition::Atmos).then(|| "ec-3".to_owned()))
-            .unwrap_or_else(|| "alac".to_owned());
-        let album_codec = codec.parse::<Codec>().unwrap_or(Codec::Alac);
+            .unwrap_or_else(|| default_codec.to_owned());
+        let album_codec = codec.parse::<Codec>().unwrap_or(default_enum_codec);
         let plans = match plan_zip_parts_with_codec(
             &ctx.zip_artist,
             &ctx.zip_album,
@@ -4962,6 +4984,7 @@ mod hardening_tests {
             reply_to_message_id: None,
             status_msg_id: 0,
             is_admin,
+            codec_preference: None,
             rendition_policy: music::RenditionPolicy::PrimaryOnly,
         }
     }

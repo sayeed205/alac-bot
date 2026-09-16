@@ -80,6 +80,7 @@ pub fn rendition_label(codec: Option<&str>) -> &'static str {
     match codec {
         Some("ec-3") => "Dolby Atmos",
         Some("aac") | Some("mp4a.40.2") | Some("mp4a.40.5") => "AAC",
+        Some("flac") => "FLAC",
         Some("alac") | None => "ALAC",
         Some(_) => "Audio",
     }
@@ -196,6 +197,7 @@ mod tests {
     #[test]
     fn rendition_labels_keep_codec_fallbacks_visible() {
         assert_eq!(rendition_label(Some("alac")), "ALAC");
+        assert_eq!(rendition_label(Some("flac")), "FLAC");
         assert_eq!(rendition_label(Some("aac")), "AAC");
         assert_eq!(rendition_label(Some("ec-3")), "Dolby Atmos");
         assert_eq!(rendition_label(None), "ALAC");

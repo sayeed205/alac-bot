@@ -7,6 +7,8 @@ pub enum SourceId {
     PrimaryMirror,
     WrapperLite { url: String },
     WrapperCandidate { endpoint: String },
+    QobuzBackend { url: String },
+    QobuzNative,
 }
 
 impl fmt::Display for SourceId {
@@ -17,6 +19,8 @@ impl fmt::Display for SourceId {
             Self::WrapperCandidate { endpoint } => {
                 write!(formatter, "wrapper candidate ({endpoint})")
             }
+            Self::QobuzBackend { url } => write!(formatter, "qobuz backend ({url})"),
+            Self::QobuzNative => formatter.write_str("qobuz native ripper"),
         }
     }
 }

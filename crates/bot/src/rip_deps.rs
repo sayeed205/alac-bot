@@ -139,13 +139,22 @@ impl RipDeps {
         let albums = db::AlbumsRepository::new(database);
         let sink = FerogramTelegramSink::new(client, dump_peer).await?;
 
+        let qobuz = qobuz::QobuzProduction::from_env();
+        if qobuz.is_some() {
+            tracing::info!("Qobuz provider initialized successfully");
+        } else {
+            tracing::info!(
+                "Qobuz provider not configured (missing QOBUZ_BACKEND_URL or credentials)"
+            );
+        }
+
         Ok(Self {
             sink,
             albums,
             tracks,
             requests,
             settings,
-            providers: ProviderRegistry::new(apple, ripper_config),
+            providers: ProviderRegistry::new(apple, qobuz, ripper_config),
             mirror_policy: probe_policy,
         })
     }

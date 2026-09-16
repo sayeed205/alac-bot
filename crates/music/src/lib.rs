@@ -14,12 +14,14 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
     Apple,
+    Qobuz,
 }
 
 impl Provider {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Apple => "apple",
+            Self::Qobuz => "qobuz",
         }
     }
 }
@@ -34,8 +36,9 @@ impl std::str::FromStr for Provider {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
+        match value.trim().to_ascii_lowercase().as_str() {
             "apple" => Ok(Self::Apple),
+            "qobuz" => Ok(Self::Qobuz),
             other => Err(format!("unknown provider: {other}")),
         }
     }
@@ -77,12 +80,41 @@ pub enum Codec {
 }
 
 /// Audio variant selected when a provider offers more than one representation.
-/// Apple uses this for its highest-quality and Dolby Atmos streams.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+/// Used for highest-quality ALAC/FLAC, resolution tiers, and Dolby Atmos streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum CodecPreference {
     #[default]
     HighestQuality,
+    HiRes192,
+    HiRes96,
+    LosslessCd,
+    Mp3_320,
     Atmos,
+}
+
+impl CodecPreference {
+    pub const fn qobuz_format_id(self) -> u32 {
+        match self {
+            Self::HighestQuality | Self::HiRes192 => 27,
+            Self::HiRes96 => 7,
+            Self::LosslessCd => 6,
+            Self::Mp3_320 => 5,
+            Self::Atmos => 27,
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        let clean = s.trim().trim_start_matches('-').to_ascii_lowercase();
+        match clean.as_str() {
+            "highest" | "max" | "best" => Some(Self::HighestQuality),
+            "hires" | "hires192" | "24-192" | "192" => Some(Self::HiRes192),
+            "hires96" | "24-96" | "96" => Some(Self::HiRes96),
+            "lossless" | "cd" | "16-44" | "flac" => Some(Self::LosslessCd),
+            "mp3" | "320" => Some(Self::Mp3_320),
+            "atmos" => Some(Self::Atmos),
+            _ => None,
+        }
+    }
 }
 
 /// Renditions requested by one orchestration job. Atmos is deliberately an
@@ -115,7 +147,7 @@ impl Rendition {
 
     pub const fn accepted_cache_codecs(self) -> &'static [Codec] {
         match self {
-            Self::Primary => &[Codec::Alac, Codec::Aac],
+            Self::Primary => &[Codec::Alac, Codec::Aac, Codec::Flac],
             Self::Atmos => &[Codec::Ec3],
         }
     }
@@ -285,6 +317,14 @@ impl TrackKey {
     pub fn apple_codec(track_id: impl Into<String>, codec: Codec) -> Self {
         Self::new(Provider::Apple, track_id).with_codec(codec)
     }
+
+    pub fn qobuz(track_id: impl Into<String>) -> Self {
+        Self::new(Provider::Qobuz, track_id)
+    }
+
+    pub fn qobuz_codec(track_id: impl Into<String>, codec: Codec) -> Self {
+        Self::new(Provider::Qobuz, track_id).with_codec(codec)
+    }
 }
 
 /// The kind of music target a parsed link/id refers to.
@@ -411,9 +451,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn provider_wire_format_is_apple_only() {
+    fn provider_wire_format_supports_apple_and_qobuz() {
         assert_eq!(Provider::Apple.as_str(), "apple");
         assert_eq!("apple".parse::<Provider>(), Ok(Provider::Apple));
+        assert_eq!(Provider::Qobuz.as_str(), "qobuz");
+        assert_eq!("qobuz".parse::<Provider>(), Ok(Provider::Qobuz));
         assert!("other".parse::<Provider>().is_err());
     }
 
@@ -422,6 +464,10 @@ mod tests {
         let key = TrackKey::apple("123");
         assert_eq!(key.codec, None);
         assert_eq!(key.clone().with_codec(Codec::Alac).track_id, "123");
+
+        let qkey = TrackKey::qobuz("456");
+        assert_eq!(qkey.provider, Provider::Qobuz);
+        assert_eq!(qkey.with_codec(Codec::Flac).track_id, "456");
     }
 
     #[test]
@@ -438,7 +484,7 @@ mod tests {
         assert!(!Rendition::Atmos.required());
         assert_eq!(
             Rendition::Primary.accepted_cache_codecs(),
-            &[Codec::Alac, Codec::Aac]
+            &[Codec::Alac, Codec::Aac, Codec::Flac]
         );
         assert_eq!(Rendition::Atmos.accepted_cache_codecs(), &[Codec::Ec3]);
     }
@@ -453,10 +499,30 @@ mod tests {
         assert_eq!(units[0].rendition(), Rendition::Primary);
         assert_eq!(units[0].codec_preference(), CodecPreference::HighestQuality);
         assert!(units[0].required());
-        assert_eq!(units[0].accepted_cache_codecs(), &[Codec::Alac, Codec::Aac]);
+        assert_eq!(
+            units[0].accepted_cache_codecs(),
+            &[Codec::Alac, Codec::Aac, Codec::Flac]
+        );
         assert_eq!(units[1].rendition(), Rendition::Atmos);
         assert_eq!(units[1].codec_preference(), CodecPreference::Atmos);
         assert!(!units[1].required());
         assert_eq!(units[1].accepted_cache_codecs(), &[Codec::Ec3]);
+    }
+
+    #[test]
+    fn codec_preference_options_and_qobuz_format_ids() {
+        assert_eq!(CodecPreference::HighestQuality.qobuz_format_id(), 27);
+        assert_eq!(CodecPreference::HiRes192.qobuz_format_id(), 27);
+        assert_eq!(CodecPreference::HiRes96.qobuz_format_id(), 7);
+        assert_eq!(CodecPreference::LosslessCd.qobuz_format_id(), 6);
+        assert_eq!(CodecPreference::Mp3_320.qobuz_format_id(), 5);
+        assert_eq!(
+            CodecPreference::parse("hires"),
+            Some(CodecPreference::HiRes192)
+        );
+        assert_eq!(
+            CodecPreference::parse("cd"),
+            Some(CodecPreference::LosslessCd)
+        );
     }
 }

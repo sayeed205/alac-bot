@@ -332,6 +332,7 @@ async fn run_auto_dump_pipeline_inner(
         reply_to_message_id: None,
         status_msg_id: 0,
         is_admin: true,
+        codec_preference: None,
         rendition_policy: engine::orchestrator::types::RenditionPolicy::PrimaryOnly,
     };
     let job = state

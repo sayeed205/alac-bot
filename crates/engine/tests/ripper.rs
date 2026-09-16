@@ -12,13 +12,13 @@ use std::{
 
 use bytes::Bytes;
 use engine::{
+    filename::MAX_FILENAME_BYTES,
     orchestrator::types::{RipActivity, TrackLabel},
     ripper::{
         fetch_artwork_bytes, AlacTrackRipper, RipError, RipOptions, RipProgressCallback, RipStage,
         RipperConfig, SourceFailureKind,
     },
     streaming::{AudioStreamSource, ByteStream, ProgressCallback},
-    filename::MAX_FILENAME_BYTES,
     types::TrackMeta,
 };
 use futures_util::stream;

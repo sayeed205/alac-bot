@@ -15,8 +15,8 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
-use crate::filename::{ArchiveFilename, StandardFilename, ZipEntryName};
 pub use crate::filename::MAX_ZIP_ENTRY_FILENAME_BYTES;
+use crate::filename::{ArchiveFilename, StandardFilename, ZipEntryName};
 
 /// Conservative ceiling for the current bot-only uploader.
 pub const TELEGRAM_SPLIT_THRESHOLD_BYTES: u64 = 1_900_000_000;
@@ -82,14 +82,20 @@ pub fn sanitize_archive_filename(name: &str) -> String {
     }
 }
 
-/// Builds a bounded ZIP entry filename, safely formatted with track number and track ID.
-pub fn build_zip_entry_filename(
+/// Builds a bounded ZIP entry filename, safely formatted with track number, track ID, and codec extension.
+pub fn build_zip_entry_filename_with_codec(
     track_number: Option<i64>,
     title: &str,
     artist: &str,
     track_id: &str,
+    codec: &str,
 ) -> ZipEntryName {
-    let suffix = format!(" [{track_id}].m4a");
+    let ext = match codec {
+        "flac" => "flac",
+        "mp3" => "mp3",
+        _ => "m4a",
+    };
+    let suffix = format!(" [{track_id}].{ext}");
     let name = match track_number {
         Some(num) => format!("{num:02} - {title} - {artist}{suffix}"),
         None => format!("{title} - {artist}{suffix}"),
@@ -97,13 +103,27 @@ pub fn build_zip_entry_filename(
     ZipEntryName::sanitize_and_bound(&name, Some(&suffix))
 }
 
+/// Builds a bounded ZIP entry filename, safely formatted with track number and track ID.
+pub fn build_zip_entry_filename(
+    track_number: Option<i64>,
+    title: &str,
+    artist: &str,
+    track_id: &str,
+) -> ZipEntryName {
+    build_zip_entry_filename_with_codec(track_number, title, artist, track_id, "alac")
+}
+
 /// Builds the base archive filename without the `.zip` extension.
-pub fn build_album_archive_base_name(artist: &str, album: &str, release_date: &str) -> ArchiveFilename {
+pub fn build_album_archive_base_name(
+    artist: &str,
+    album: &str,
+    release_date: &str,
+) -> ArchiveFilename {
     build_album_archive_base_name_with_codec(artist, album, release_date, "alac")
 }
 
 /// Same as [`build_album_archive_base_name`], labeled with the highest
-/// codec delivered in the archive (`alac`, `aac`, `mp4a.40.2`, `ec-3`).
+/// codec delivered in the archive (`alac`, `aac`, `mp4a.40.2`, `ec-3`, `flac`).
 pub fn build_album_archive_base_name_with_codec(
     artist: &str,
     album: &str,
@@ -126,6 +146,7 @@ fn archive_codec_label(codec: &str) -> &'static str {
     match codec {
         "ec-3" => "Atmos",
         "aac" | "mp4a.40.2" | "mp4a.40.5" => "AAC",
+        "flac" => "FLAC",
         _ => "ALAC",
     }
 }
@@ -507,6 +528,18 @@ mod tests {
         assert_eq!(
             build_album_archive_base_name("AC/DC", "Back in Black: Live?", "1980"),
             "AC_DC - Back in Black_ Live_ (1980) [ALAC]"
+        );
+    }
+
+    #[test]
+    fn naming_flac_archive_and_entries() {
+        assert_eq!(
+            build_album_archive_base_name_with_codec("Artist", "Album", "2024", "flac"),
+            "Artist - Album (2024) [FLAC]"
+        );
+        assert_eq!(
+            build_zip_entry_filename_with_codec(Some(1), "Song", "Artist", "123", "flac").as_str(),
+            "01 - Song - Artist [123].flac"
         );
     }
 

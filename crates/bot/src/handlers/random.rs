@@ -421,7 +421,12 @@ async fn is_album_already_dumped(
             .iter()
             .map(|t| TrackKey::new(Provider::Apple, t.id.clone()))
             .collect();
-        if let Ok(cached) = state.rip_deps.tracks().find_cached_tracks(&track_keys).await {
+        if let Ok(cached) = state
+            .rip_deps
+            .tracks()
+            .find_cached_tracks(&track_keys)
+            .await
+        {
             if cached.len() == tracks.len() {
                 return true;
             }
@@ -562,17 +567,14 @@ async fn random(state: Arc<BotState>, msg: IncomingMessage) {
         .map(str::to_owned)
         .collect();
     let source_arg = tokens.first().map(|s| s.to_lowercase());
-    let storefront_arg = tokens
-        .get(1)
-        .map(|s| s.to_lowercase())
-        .unwrap_or_else(|| {
-            if let Some(src) = &source_arg {
-                if is_south_asia_source(src) {
-                    return "in".to_owned();
-                }
+    let storefront_arg = tokens.get(1).map(|s| s.to_lowercase()).unwrap_or_else(|| {
+        if let Some(src) = &source_arg {
+            if is_south_asia_source(src) {
+                return "in".to_owned();
             }
-            "us".to_owned()
-        });
+        }
+        "us".to_owned()
+    });
 
     let Some(source_arg) = source_arg else {
         let _ = msg
@@ -762,6 +764,7 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery, action: Discov
                 // The shared dashboard is the only live status surface.
                 status_msg_id: 0,
                 is_admin: true,
+                codec_preference: None,
                 rendition_policy: engine::orchestrator::types::RenditionPolicy::PrimaryOnly,
             };
             super::ensure_dashboard(&state, marked_chat, query.user_id, true, peer.clone()).await;

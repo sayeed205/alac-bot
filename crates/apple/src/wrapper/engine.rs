@@ -11,8 +11,10 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use bytes::Bytes;
-use engine::orchestrator::types::{ByteProgress, RipActivity, TrackLabel};
-use engine::streaming::{AudioStreamSource, ProgressCallback, SourceId, StreamError};
+use engine::{
+    orchestrator::types::{ByteProgress, RipActivity, TrackLabel},
+    streaming::{AudioStreamSource, ProgressCallback, SourceId, StreamError},
+};
 use music::CodecPreference;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};

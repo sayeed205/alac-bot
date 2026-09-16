@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-pub use music::{Rendition, RenditionPolicy, RenditionWorkPlan, RenditionWorkUnit};
+pub use music::{
+    CodecPreference, Rendition, RenditionPolicy, RenditionWorkPlan, RenditionWorkUnit,
+};
 use tokio_util::sync::CancellationToken;
 
 use super::deps::ChatMessageRef;
@@ -82,6 +84,8 @@ pub struct RipJobOptions {
     pub reply_to_message_id: Option<i64>,
     pub status_msg_id: i64,
     pub is_admin: bool,
+    /// Preferred audio codec/quality preference (e.g. for Qobuz).
+    pub codec_preference: Option<CodecPreference>,
     /// Renditions to acquire for this request. Primary is always required;
     /// Atmos, when selected, is optional.
     pub rendition_policy: RenditionPolicy,
@@ -110,7 +114,7 @@ mod rendition_tests {
         );
         assert_eq!(
             plan.units()[0].accepted_cache_codecs(),
-            &[Codec::Alac, Codec::Aac]
+            &[Codec::Alac, Codec::Aac, Codec::Flac]
         );
         assert_eq!(plan.units()[1].accepted_cache_codecs(), &[Codec::Ec3]);
     }

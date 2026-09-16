@@ -305,13 +305,13 @@ fn group_rank(
         ("ec-3", CodecPreference::Atmos) if is_atmos_group => {
             Ok(Some(20_000 + group_bitrate(group_id, "audio-atmos-")?))
         }
-        ("alac", CodecPreference::HighestQuality) => {
+        ("alac", p) if p != CodecPreference::Atmos => {
             Ok(Some(10_000_000 + alac_group_specs(group_id)?.0 as i64))
         }
-        ("mp4a.40.2", CodecPreference::HighestQuality) => {
+        ("mp4a.40.2", p) if p != CodecPreference::Atmos => {
             Ok(Some(5_000 + group_bitrate(group_id, "audio-stereo-")?))
         }
-        ("mp4a.40.5", CodecPreference::HighestQuality) => {
+        ("mp4a.40.5", p) if p != CodecPreference::Atmos => {
             Ok(Some(4_000 + group_bitrate(group_id, "audio-HE-stereo-")?))
         }
         _ => Ok(None),
@@ -402,7 +402,7 @@ fn select_variant(
     let (_, variant, sample_rate, bit_depth) = best.ok_or_else(|| {
         let what = match preference {
             CodecPreference::Atmos => "Dolby Atmos",
-            CodecPreference::HighestQuality => "no audio",
+            _ => "no audio",
         };
         let message = format!("No {what} stream variant found in master playlist");
         if preference == CodecPreference::Atmos {

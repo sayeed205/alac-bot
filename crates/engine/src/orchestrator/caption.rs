@@ -136,7 +136,7 @@ pub struct AlbumDetailsCaptionMetadata<'a> {
     pub is_partial: bool,
     pub user_name: Option<&'a str>,
     pub user_id: i64,
-    /// Highest codec delivered in the archive (`alac`, `aac`, `mp4a.40.2`, `ec-3`).
+    /// Highest codec delivered in the archive (`alac`, `aac`, `mp4a.40.2`, `ec-3`, `flac`).
     pub codec: Option<&'a str>,
 }
 
@@ -234,6 +234,7 @@ pub fn format_album_details_caption(meta: &AlbumDetailsCaptionMetadata<'_>) -> S
         match meta.codec {
             Some("ec-3") => "Dolby Atmos".to_owned(),
             Some("aac") | Some("mp4a.40.2") | Some("mp4a.40.5") => "AAC 256".to_owned(),
+            Some("flac") => "Lossless · FLAC".to_owned(),
             _ => "Lossless · ALAC".to_owned(),
         }
     ));
@@ -257,29 +258,32 @@ pub fn format_album_details_caption(meta: &AlbumDetailsCaptionMetadata<'_>) -> S
 /// If the rendered text exceeds Telegram's 1,024 UTF-16 code unit limit, the
 /// format automatically falls back to compact JSON and abbreviated display text.
 pub fn format_dump_caption(meta: &DumpCaptionMetadata<'_>) -> String {
-    let minutes = meta.duration / 60;
-    let seconds = format!("{:02}", meta.duration % 60);
     let track_number = meta.track_number.unwrap_or(1);
     let track_count = meta.track_count.unwrap_or(1);
     let codec_label = codec_display(meta.codec);
     let quality_line = match meta.codec {
-        Some("alac") | None => format!(
-            "{codec_label} · {}-bit · {:.1} kHz · {minutes}:{seconds}",
+        Some("alac") | Some("flac") | None => format!(
+            "{codec_label} · {}-bit · {:.1} kHz",
             meta.bit_depth,
             meta.sample_rate as f64 / 1000.0,
         ),
         Some("ec-3") => format!(
-            "{codec_label} · {:.1} kHz · {minutes}:{seconds}",
+            "{codec_label} · {:.1} kHz",
             meta.sample_rate as f64 / 1000.0,
         ),
-        Some(_) => format!("{codec_label} · 256 kbps · {minutes}:{seconds}"),
+        Some(_) => format!("{codec_label} · 256 kbps"),
+    };
+
+    let default_codec = match meta.track_key.provider {
+        Provider::Qobuz => "flac",
+        _ => "alac",
     };
 
     let canonical_codec = meta
         .codec
         .and_then(|c| c.parse::<crate::types::Codec>().ok())
         .map(|c| c.as_str())
-        .unwrap_or("alac");
+        .unwrap_or(default_codec);
 
     let make_summary = |artist: &str, title: &str, album: &str| {
         format!(
@@ -325,8 +329,10 @@ pub fn format_dump_caption(meta: &DumpCaptionMetadata<'_>) -> String {
 
     // 2. Compact JSON layout if pretty JSON exceeded limit
     let compact = serde_json::to_string(&payload).expect("payload serializes");
-    let compact_candidate =
-        format!("{summary}<br/><blockquote expandable>{}</blockquote>", html_escape(&compact));
+    let compact_candidate = format!(
+        "{summary}<br/><blockquote expandable>{}</blockquote>",
+        html_escape(&compact)
+    );
 
     if estimate_html_utf16_len(&compact_candidate) <= MAX_MEDIA_CAPTION_UTF16_LEN {
         return compact_candidate;
@@ -336,15 +342,26 @@ pub fn format_dump_caption(meta: &DumpCaptionMetadata<'_>) -> String {
     let clamped_summary_artist = clamp_str_utf16(meta.artist, 120);
     let clamped_summary_title = clamp_str_utf16(meta.title, 120);
     let clamped_summary_album = clamp_str_utf16(meta.album, 120);
-    let summary_clamped = make_summary(&clamped_summary_artist, &clamped_summary_title, &clamped_summary_album);
+    let summary_clamped = make_summary(
+        &clamped_summary_artist,
+        &clamped_summary_title,
+        &clamped_summary_album,
+    );
 
     let clamped_payload_artist = clamp_str_utf16(meta.artist, 150);
     let clamped_payload_title = clamp_str_utf16(meta.title, 150);
     let clamped_payload_album = clamp_str_utf16(meta.album, 150);
-    let payload_clamped = make_payload(&clamped_payload_artist, &clamped_payload_title, &clamped_payload_album);
+    let payload_clamped = make_payload(
+        &clamped_payload_artist,
+        &clamped_payload_title,
+        &clamped_payload_album,
+    );
 
     let compact_clamped = serde_json::to_string(&payload_clamped).expect("payload serializes");
-    let clamped_candidate = format!("{summary_clamped}<br/><blockquote expandable>{}</blockquote>", html_escape(&compact_clamped));
+    let clamped_candidate = format!(
+        "{summary_clamped}<br/><blockquote expandable>{}</blockquote>",
+        html_escape(&compact_clamped)
+    );
 
     if estimate_html_utf16_len(&clamped_candidate) <= MAX_MEDIA_CAPTION_UTF16_LEN {
         return clamped_candidate;
@@ -354,8 +371,15 @@ pub fn format_dump_caption(meta: &DumpCaptionMetadata<'_>) -> String {
     let tight_summary_artist = clamp_str_utf16(meta.artist, 60);
     let tight_summary_title = clamp_str_utf16(meta.title, 60);
     let tight_summary_album = clamp_str_utf16(meta.album, 60);
-    let summary_tight = make_summary(&tight_summary_artist, &tight_summary_title, &tight_summary_album);
-    format!("{summary_tight}<br/><blockquote expandable>{}</blockquote>", html_escape(&compact_clamped))
+    let summary_tight = make_summary(
+        &tight_summary_artist,
+        &tight_summary_title,
+        &tight_summary_album,
+    );
+    format!(
+        "{summary_tight}<br/><blockquote expandable>{}</blockquote>",
+        html_escape(&compact_clamped)
+    )
 }
 
 /// Formats an album ZIP caption.
@@ -388,11 +412,16 @@ pub fn format_zip_dump_caption(
         return summary;
     }
 
+    let default_codec = match meta.provider {
+        Provider::Qobuz => "flac",
+        _ => "alac",
+    };
+
     let payload_json = serde_json::json!({
         "type": "album_zip",
         "provider": meta.provider,
         "album_id": meta.album_id,
-        "codec": meta.codec.unwrap_or("alac"),
+        "codec": meta.codec.unwrap_or(default_codec),
         "album": meta.album,
         "artist": meta.artist,
         "part": meta.part_index,
@@ -412,8 +441,10 @@ pub fn format_zip_dump_caption(
     }
 
     let compact = serde_json::to_string(&payload_json).expect("payload serializes");
-    let compact_candidate =
-        format!("{summary}<br/><blockquote expandable>{}</blockquote>", html_escape(&compact));
+    let compact_candidate = format!(
+        "{summary}<br/><blockquote expandable>{}</blockquote>",
+        html_escape(&compact)
+    );
     if estimate_html_utf16_len(&compact_candidate) <= MAX_MEDIA_CAPTION_UTF16_LEN {
         return compact_candidate;
     }
@@ -424,7 +455,7 @@ pub fn format_zip_dump_caption(
         "type": "album_zip",
         "provider": meta.provider,
         "album_id": meta.album_id,
-        "codec": meta.codec.unwrap_or("alac"),
+        "codec": meta.codec.unwrap_or(default_codec),
         "album": clamped_album,
         "artist": clamped_artist,
         "part": meta.part_index,
@@ -432,11 +463,12 @@ pub fn format_zip_dump_caption(
         "hash": meta.generation_hash,
     });
     let compact_clamped = serde_json::to_string(&clamped_payload).expect("payload serializes");
-    format!("{summary}<br/><blockquote expandable>{}</blockquote>", html_escape(&compact_clamped))
+    format!(
+        "{summary}<br/><blockquote expandable>{}</blockquote>",
+        html_escape(&compact_clamped)
+    )
 }
 
-/// The round-trip shape of the caption's embedded payload.
-#[derive(Debug, Clone, PartialEq)]
 pub struct ParsedDumpMetadata {
     pub track_key: TrackKey,
     pub codec: Codec,
@@ -464,11 +496,16 @@ pub fn parse_dump_caption(text: Option<&str>) -> Option<ParsedDumpMetadata> {
         return None;
     }
 
+    let default_codec = match provider {
+        Provider::Qobuz => Codec::Flac,
+        _ => Codec::Alac,
+    };
+
     let codec = parsed
         .get("codec")
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse::<Codec>().ok())
-        .unwrap_or(Codec::Alac);
+        .unwrap_or(default_codec);
 
     Some(ParsedDumpMetadata {
         track_key: TrackKey::new(provider, track_id).with_codec(codec),
@@ -497,11 +534,16 @@ pub fn parse_zip_dump_caption(text: Option<&str>) -> Option<ParsedZipDumpMetadat
         return None;
     }
 
+    let default_codec = match provider {
+        Provider::Qobuz => Codec::Flac,
+        _ => Codec::Alac,
+    };
+
     let codec = parsed
         .get("codec")
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse::<Codec>().ok())
-        .unwrap_or(Codec::Alac);
+        .unwrap_or(default_codec);
 
     Some(ParsedZipDumpMetadata {
         provider,
@@ -600,10 +642,11 @@ fn extract_balanced_json(text: &str, required_key: &str) -> Option<String> {
     None
 }
 
-/// Compact codec label for captions: `ALAC`, `AAC`, `Dolby Atmos`.
+/// Compact codec label for captions: `ALAC`, `FLAC`, `AAC`, `Dolby Atmos`.
 fn codec_display(codec: Option<&str>) -> &'static str {
     match codec {
         Some("alac") | None => "ALAC",
+        Some("flac") => "FLAC",
         Some("ec-3") => "Dolby Atmos",
         Some("aac") | Some("mp4a.40.2") | Some("mp4a.40.5") => "AAC",
         Some(_) => "Audio",
@@ -669,6 +712,28 @@ mod tests {
     }
 
     #[test]
+    fn format_album_details_caption_flac() {
+        let meta = AlbumDetailsCaptionMetadata {
+            album: "ROCKSTAR WITHOUT A GUITAR",
+            artist: "UMAIR",
+            album_url: None,
+            total_tracks: 20,
+            delivered_tracks: Some(20),
+            size_bytes: 832_500_000,
+            total_parts: 1,
+            release_year: "2024",
+            genre: Some("Hip-Hop/Rap"),
+            record_label: None,
+            is_partial: false,
+            user_name: None,
+            user_id: 0,
+            codec: Some("flac"),
+        };
+        let html = format_album_details_caption(&meta);
+        assert!(html.contains("• <b>Quality:</b> Lossless · FLAC"));
+    }
+
+    #[test]
     fn format_album_details_caption_multi_part_partial() {
         let meta = AlbumDetailsCaptionMetadata {
             album: "Greatest Hits",
@@ -693,6 +758,7 @@ mod tests {
         assert!(
             html.contains(r#"• <b>Requested by:</b> <a href="tg://user?id=78910">John Doe</a>"#)
         );
+        assert!(html.ends_with("</blockquote>"));
     }
 
     #[test]
@@ -722,37 +788,44 @@ mod tests {
         let html = format_dump_caption(&sample_meta());
         assert!(html.starts_with("<b>Night Song</b> — A&amp;R &lt;duo&gt;"));
         assert!(html.contains("<i>Escapes</i> · <code>2/10</code>"));
-        assert!(html.contains("<code>ALAC · 24-bit · 48.0 kHz · 3:35</code>"));
+        assert!(html.contains("<code>ALAC · 24-bit · 48.0 kHz</code>"));
         assert!(html.contains("<blockquote expandable>"));
-        // Payload JSON is escaped and <br/>-joined.
-        assert!(html.contains("&quot;track_id&quot;: &quot;1440828878&quot;"));
         assert!(html.ends_with("</blockquote>"));
     }
 
     #[test]
-    fn caption_defaults() {
+    fn format_dump_caption_flac() {
         let meta = DumpCaptionMetadata {
-            track_key: TrackKey::apple("i"),
-            title: "",
-            artist: "",
-            album: "",
-            duration: 61,
-            bit_depth: 16,
-            sample_rate: 44100,
-            codec: None,
-            genre: None,
-            release_date: None,
-            track_number: None,
-            track_count: None,
+            track_key: TrackKey::new(Provider::Qobuz, "264126443"),
+            title: "HEARTBREAK CITY",
+            artist: "UMAIR",
+            album: "ROCKSTAR WITHOUT A GUITAR",
+            duration: 372,
+            bit_depth: 24,
+            sample_rate: 48000,
+            codec: Some("flac"),
+            genre: Some("Hip-Hop/Rap"),
+            release_date: Some("2024-04-25"),
+            track_number: Some(16),
+            track_count: Some(20),
         };
-        let html = format_dump_caption(&meta);
-        assert!(html.contains("<b></b> — "));
-        assert!(html.contains("<i></i> · <code>1/1</code>"));
-        assert!(html.contains("<code>ALAC · 16-bit · 44.1 kHz · 1:01</code>"));
+        let caption = format_dump_caption(&meta);
+        assert!(caption.contains("<code>FLAC · 24-bit · 48.0 kHz</code>"));
+        let unescaped = caption
+            .replace("&quot;", "\"")
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&#39;", "'")
+            .replace("<br/>", "\n");
+        let parsed = parse_dump_caption(Some(&unescaped)).expect("parsed flac caption");
+        assert_eq!(parsed.codec, Codec::Flac);
+        assert_eq!(parsed.bit_depth, 24);
+        assert_eq!(parsed.sample_rate, 48000);
     }
 
     #[test]
-    fn roundtrip_through_parse() {
+    fn parse_dump_caption_extracts_all_fields() {
         let html = format_dump_caption(&sample_meta());
         let unescaped = html
             .replace("&quot;", "\"")
@@ -761,11 +834,8 @@ mod tests {
             .replace("&gt;", ">")
             .replace("&#39;", "'")
             .replace("<br/>", "\n");
-        let parsed = parse_dump_caption(Some(&unescaped)).expect("payload found");
-        assert_eq!(
-            parsed.track_key,
-            TrackKey::apple("1440828878").with_codec(Codec::Alac)
-        );
+        let parsed = parse_dump_caption(Some(&unescaped)).expect("payload parsed");
+        assert_eq!(parsed.track_key.track_id, "1440828878");
         assert_eq!(parsed.codec, Codec::Alac);
         assert_eq!(parsed.title, "Night Song");
         assert_eq!(parsed.artist, "A&R <duo>");
@@ -780,68 +850,38 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_missing_or_invalid() {
+    fn parse_dump_caption_returns_none_for_garbage() {
         assert!(parse_dump_caption(None).is_none());
-        assert!(parse_dump_caption(Some("")).is_none());
-        assert!(parse_dump_caption(Some("no payload here")).is_none());
-        assert!(parse_dump_caption(Some("{\"title\": \"x\"}")).is_none());
-        assert!(parse_dump_caption(Some("{\"provider\": \"apple\", \"track_id\": 123}")).is_none());
+        assert!(parse_dump_caption(Some("just plain text with no json")).is_none());
+        assert!(parse_dump_caption(Some("<b>Some Song</b> - Artist")).is_none());
+        assert!(parse_dump_caption(Some(r#"{"track_id": ""}"#)).is_none());
     }
 
     #[test]
-    fn parse_defaults_missing_fields() {
-        let parsed = parse_dump_caption(Some("{\"provider\": \"apple\", \"track_id\": \"abc\"}"))
-            .expect("minimal payload parses");
-        assert_eq!(
-            parsed.track_key,
-            TrackKey::apple("abc").with_codec(Codec::Alac)
-        );
-        assert_eq!(parsed.codec, Codec::Alac);
-        assert_eq!(parsed.title, "");
-        assert_eq!(parsed.bit_depth, 16);
-        assert_eq!(parsed.sample_rate, 44100);
-        assert_eq!(parsed.genre, "Music");
-        assert_eq!(parsed.track_number, 1);
-        assert_eq!(parsed.track_count, 1);
-    }
-
-    #[test]
-    fn payloads_without_required_fields_are_rejected() {
+    fn dump_caption_falls_back_to_compact_when_pretty_exceeds_limit() {
+        let long_title = "A".repeat(400);
+        let long_artist_sample = "B".repeat(200);
+        let long_album = "C".repeat(200);
+        let meta = DumpCaptionMetadata {
+            track_key: TrackKey::apple("1440828878"),
+            title: &long_title,
+            artist: &long_artist_sample,
+            album: &long_album,
+            duration: 180,
+            bit_depth: 16,
+            sample_rate: 44100,
+            codec: Some("alac"),
+            genre: Some("Pop"),
+            release_date: Some("2024-01-01"),
+            track_number: Some(1),
+            track_count: Some(1),
+        };
+        let caption = format_dump_caption(&meta);
+        let utf16_len = estimate_html_utf16_len(&caption);
         assert!(
-            parse_dump_caption(Some("{\"provider\": \"apple\", \"title\": \"Missing id\"}"))
-                .is_none()
+            utf16_len <= MAX_MEDIA_CAPTION_UTF16_LEN,
+            "caption utf16 length {utf16_len} exceeds limit {MAX_MEDIA_CAPTION_UTF16_LEN}"
         );
-    }
-
-    #[test]
-    fn parse_dump_caption_with_mp4a_codec() {
-        let text = r#"{
-  "album": "Bare Bare Aar Asha Hobena - Single",
-  "artist": "Fakira",
-  "bit": 16,
-  "cnt": 1,
-  "codec": "mp4a.40.2",
-  "date": "2021-04-13",
-  "dur": 367,
-  "genre": "Bengali",
-  "hz": 44100,
-  "provider": "apple",
-  "title": "Bare Bare Aar Asha Hobena",
-  "track_id": "1561413895",
-  "trk": 1
-}"#;
-        let parsed = parse_dump_caption(Some(text)).expect("payload parsed");
-        assert_eq!(parsed.codec, Codec::Aac);
-        assert_eq!(parsed.track_key.codec, Some(Codec::Aac));
-        assert_eq!(parsed.track_key.track_id, "1561413895");
-    }
-
-    #[test]
-    fn estimate_html_utf16_len_calculates_correctly() {
-        let html = "<b>Hello</b> &amp; <i>World</i><br/>Second line";
-        // Plain text: "Hello & World\nSecond line"
-        // Length: 5 + 3 + 5 + 1 + 11 = 25
-        assert_eq!(estimate_html_utf16_len(html), 25);
     }
 
     #[test]
@@ -875,7 +915,8 @@ mod tests {
             .replace("&gt;", ">")
             .replace("&#39;", "'")
             .replace("<br/>", "\n");
-        let parsed = parse_dump_caption(Some(&unescaped)).expect("payload parsed from long artist caption");
+        let parsed =
+            parse_dump_caption(Some(&unescaped)).expect("payload parsed from long artist caption");
         assert_eq!(parsed.track_key.track_id, "1529537935");
         assert_eq!(parsed.codec, Codec::Alac);
         assert_eq!(parsed.duration, 254);

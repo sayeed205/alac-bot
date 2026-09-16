@@ -54,6 +54,11 @@ pub trait ProviderComposition: Send + Sync + 'static {
     type Presentation: ProviderPresentation;
 
     fn provider(&self) -> Provider;
+
+    fn supports_provider(&self, provider: Provider) -> bool {
+        self.provider() == provider
+    }
+
     fn collections(&self) -> &Self::Collections;
     fn acquisition(&self) -> &Self::Acquisition;
     fn artwork(&self) -> &Self::Artwork;
