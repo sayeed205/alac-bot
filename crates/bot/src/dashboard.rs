@@ -69,6 +69,9 @@ pub struct DashboardSnapshot {
     pub jobs: Vec<DashboardJob>,
 }
 
+/// Maximum active download jobs rendered per dashboard page.
+pub const DASHBOARD_PAGE_SIZE: usize = 2;
+
 pub fn render(
     snapshot: &DashboardSnapshot,
     page: usize,
@@ -76,9 +79,9 @@ pub fn render(
     if snapshot.jobs.is_empty() {
         return ("<b>No active downloads.</b>".into(), None);
     }
-    let pages = snapshot.jobs.len().div_ceil(5);
+    let pages = snapshot.jobs.len().div_ceil(DASHBOARD_PAGE_SIZE);
     let page = page.clamp(1, pages);
-    let start = (page - 1) * 5;
+    let start = (page - 1) * DASHBOARD_PAGE_SIZE;
     let health = snapshot.mirror_health.as_deref().unwrap_or("unknown");
     let mut text = format!(
         "<b>Live downloads</b>\n<i>Mode: {} · Mirror: {}</i>\n",
@@ -94,7 +97,7 @@ pub fn render(
     if let Some(upload) = snapshot.current_upload.as_ref() {
         text.push_str(&render_upload_lane(upload));
     }
-    for (offset, job) in snapshot.jobs.iter().skip(start).take(5).enumerate() {
+    for (offset, job) in snapshot.jobs.iter().skip(start).take(DASHBOARD_PAGE_SIZE).enumerate() {
         let number = start + offset + 1;
         let state = match job.phase {
             JobPhase::Processing => "Processing".to_owned(),
@@ -267,12 +270,12 @@ pub fn cancelable_job_ids(
     page: usize,
     viewer_is_admin: bool,
 ) -> Vec<String> {
-    let start = page.saturating_sub(1) * 5;
+    let start = page.saturating_sub(1) * DASHBOARD_PAGE_SIZE;
     snapshot
         .jobs
         .iter()
         .skip(start)
-        .take(5)
+        .take(DASHBOARD_PAGE_SIZE)
         .filter(|job| job.is_cancel_allowed_for_viewer || viewer_is_admin)
         .map(|job| job.id.clone())
         .collect()
@@ -523,7 +526,7 @@ impl DashboardManager {
                 {
                     return None;
                 }
-                let pages = entry.snapshot.jobs.len().div_ceil(5).max(1);
+                let pages = entry.snapshot.jobs.len().div_ceil(DASHBOARD_PAGE_SIZE).max(1);
                 let page = page.clamp(1, pages);
                 entry.page = page;
                 let (text, keyboard) = render(&entry.snapshot, page);
@@ -667,8 +670,14 @@ mod tests {
         };
 
         let (text, _) = render(&snapshot, 2);
-        assert!(text.contains("<i>6.</i> Track 6"));
+        assert!(text.contains("<i>3.</i> Track 3"));
+        assert!(text.contains("<i>4.</i> Track 4"));
         assert!(!text.contains("<i>1. Track 1</i>"));
+        assert!(!text.contains("<i>5. Track 5</i>"));
+
+        let (text_p3, _) = render(&snapshot, 3);
+        assert!(text_p3.contains("<i>5.</i> Track 5"));
+        assert!(text_p3.contains("<i>6.</i> Track 6"));
     }
 
     #[test]

@@ -65,7 +65,7 @@ fn empty_dashboard_is_exact_and_pages_are_mobile_friendly() {
     assert!(
         text.contains("Requester 0") && !text.contains("Status: Processing") && text.contains("1.")
     );
-    assert!(text.contains("Status: Queued") && text.contains("Page 1/2") && keyboard.is_some());
+    assert!(text.contains("Status: Queued") && text.contains("Page 1/3") && keyboard.is_some());
 }
 
 #[test]

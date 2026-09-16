@@ -4,7 +4,10 @@
 
 use std::sync::Arc;
 
-use engine::types::{ParsedTargetItem, TargetKind};
+use engine::{
+    types::{ParsedTargetItem, TargetKind, TrackKey},
+    Provider,
+};
 use ferogram::{
     filters::{self, Dispatcher},
     keyboard::{Button, InlineKeyboard},
@@ -72,11 +75,63 @@ pub const WILD_SEEDS: &[&str] = &[
     "memory",
 ];
 
+/// Curated search seeds covering the Indian subcontinent:
+/// India, Pakistan, Bangladesh, Afghanistan, Nepal, Bhutan, Sri Lanka.
+pub const SOUTH_ASIA_SEEDS: &[&str] = &[
+    // India (Bollywood, regional cinema, classical, indie, folk)
+    "bollywood",
+    "hindi album",
+    "punjabi album",
+    "tamil album",
+    "telugu album",
+    "malayalam album",
+    "kannada album",
+    "desi hip hop",
+    "indian indie",
+    "ghazal",
+    "indian classical",
+    "sufi",
+    // Pakistan (Coke Studio, Qawwali, Pakistani pop/rock, Urdu)
+    "pakistani pop",
+    "pakistani rock",
+    "coke studio",
+    "qawwali",
+    "sufi music",
+    "urdu album",
+    // Bangladesh (Bangla rock, Rabindra Sangeet, Bengali modern/folk)
+    "bangla rock",
+    "bengali album",
+    "rabindra sangeet",
+    "bangladesh music",
+    // Afghanistan (Afghan folk, Pashto, Rubab)
+    "afghan music",
+    "pashto songs",
+    // Nepal & Bhutan
+    "nepali album",
+    "nepali folk",
+    "bhutanese music",
+];
+
+pub fn is_south_asia_source(source: &str) -> bool {
+    matches!(
+        source.to_lowercase().as_str(),
+        "southasia"
+            | "subcontinent"
+            | "desi"
+            | "india"
+            | "pakistan"
+            | "bangladesh"
+            | "nepal"
+            | "bhutan"
+    )
+}
+
 /// SOURCE_LABELS.
 pub fn source_label(source: &str) -> Option<&'static str> {
     Some(match source {
         "charts" => "Top charts",
         "wild" => "Wild search",
+        s if is_south_asia_source(s) => "South Asia",
         "rock" => "Rock",
         "hiphop" => "Hip-hop",
         "pop" => "Pop",
@@ -177,16 +232,19 @@ fn sources_keyboard() -> ferogram::tl::enums::ReplyMarkup {
             Button::callback("Wild search", b"random:src:wild"),
         ])
         .row(vec![
+            Button::callback("🌏 South Asia", b"random:src:southasia:in"),
             Button::callback("Rock", b"random:src:rock"),
             Button::callback("Hip-hop", b"random:src:hiphop"),
-            Button::callback("Pop", b"random:src:pop"),
         ])
         .row(vec![
+            Button::callback("Pop", b"random:src:pop"),
             Button::callback("Electronic", b"random:src:electronic"),
             Button::callback("Jazz", b"random:src:jazz"),
-            Button::callback("Indie", b"random:src:indie"),
         ])
-        .row(vec![Button::callback("Close", b"random:close")])
+        .row(vec![
+            Button::callback("Indie", b"random:src:indie"),
+            Button::callback("Close", b"random:close"),
+        ])
         .into_markup()
 }
 
@@ -297,6 +355,29 @@ async fn fetch_wild_album(
     fetch_search_album(state, seed, storefront, rng).await
 }
 
+async fn fetch_south_asia_album(
+    state: &BotState,
+    storefront: &str,
+    rng: &mut u64,
+) -> Result<RandomAlbumCandidate, String> {
+    let sf = if storefront.is_empty() || storefront == "us" {
+        "in"
+    } else {
+        storefront
+    };
+
+    // 25% chance to pick from top charts in India
+    let pick_charts = pick_index(rng, 4) == 0;
+    if pick_charts {
+        if let Ok(candidate) = fetch_charts_album(state, sf, rng).await {
+            return Ok(candidate);
+        }
+    }
+
+    let seed = SOUTH_ASIA_SEEDS[pick_index(rng, SOUTH_ASIA_SEEDS.len())];
+    fetch_search_album(state, seed, sf, rng).await
+}
+
 /// Fetch one candidate album for a fixed source term.
 async fn fetch_candidate_by_source(
     state: &BotState,
@@ -308,6 +389,7 @@ async fn fetch_candidate_by_source(
     match source.as_str() {
         "charts" | "top" => fetch_charts_album(state, storefront, rng).await,
         "wild" | "random" => fetch_wild_album(state, storefront, rng).await,
+        s if is_south_asia_source(s) => fetch_south_asia_album(state, storefront, rng).await,
         _ => {
             let term = source_search_term(&source).unwrap_or(source.as_str());
             fetch_search_album(state, term, storefront, rng).await
@@ -315,19 +397,72 @@ async fn fetch_candidate_by_source(
     }
 }
 
-/// Pick and validate a candidate album, ensuring it has tracks available.
+/// Check if an album or all of its tracks have already been dumped to the database cache.
+async fn is_album_already_dumped(
+    state: &BotState,
+    album_id: &str,
+    tracks: &[music::TrackMeta],
+) -> bool {
+    // 1. Check if album ZIP archive parts are cached in albums table
+    if let Ok(parts) = state
+        .rip_deps
+        .albums()
+        .find_albums(Provider::Apple, album_id, None)
+        .await
+    {
+        if !parts.is_empty() {
+            return true;
+        }
+    }
+
+    // 2. Check if tracks of this album are all in the tracks cache
+    if !tracks.is_empty() {
+        let track_keys: Vec<TrackKey> = tracks
+            .iter()
+            .map(|t| TrackKey::new(Provider::Apple, t.id.clone()))
+            .collect();
+        if let Ok(cached) = state.rip_deps.tracks().find_cached_tracks(&track_keys).await {
+            if cached.len() == tracks.len() {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Pick and validate a candidate album, ensuring it has tracks available and is not already dumped.
 async fn discover_valid_candidate(
     state: &BotState,
     source: &str,
     storefront: &str,
     rng: &mut u64,
 ) -> Result<RandomAlbumCandidate, String> {
-    const MAX_ATTEMPTS: usize = 5;
+    const MAX_ATTEMPTS: usize = 15;
     let mut last_err = String::new();
 
     for attempt in 1..=MAX_ATTEMPTS {
         match fetch_candidate_by_source(state, source, storefront, rng).await {
             Ok(mut candidate) => {
+                // Fast-path check: is album ZIP already cached?
+                if let Ok(parts) = state
+                    .rip_deps
+                    .albums()
+                    .find_albums(Provider::Apple, &candidate.id, None)
+                    .await
+                {
+                    if !parts.is_empty() {
+                        tracing::info!(
+                            album_id = %candidate.id,
+                            title = %candidate.title,
+                            attempt,
+                            "Random album candidate ZIP is already cached in albums table, skipping..."
+                        );
+                        last_err = format!("Album {} is already dumped", candidate.id);
+                        continue;
+                    }
+                }
+
                 match state
                     .rip_deps
                     .catalog()
@@ -335,6 +470,18 @@ async fn discover_valid_candidate(
                     .await
                 {
                     Ok(full) if !full.tracks.is_empty() => {
+                        // Check if all tracks are already dumped in database
+                        if is_album_already_dumped(state, &candidate.id, &full.tracks).await {
+                            tracing::info!(
+                                album_id = %candidate.id,
+                                title = %candidate.title,
+                                attempt,
+                                "Random album candidate tracks are already dumped, skipping..."
+                            );
+                            last_err = format!("Album {} is already dumped", candidate.id);
+                            continue;
+                        }
+
                         candidate.track_count = Some(full.tracks.len());
                         if !full.album.title.is_empty() {
                             candidate.title = full.album.title;
@@ -376,7 +523,7 @@ async fn discover_valid_candidate(
     }
 
     Err(format!(
-        "Failed to find an album with available tracks after {MAX_ATTEMPTS} attempts: {last_err}"
+        "Failed to find an undumped album with available tracks after {MAX_ATTEMPTS} attempts: {last_err}"
     ))
 }
 
@@ -418,7 +565,14 @@ async fn random(state: Arc<BotState>, msg: IncomingMessage) {
     let storefront_arg = tokens
         .get(1)
         .map(|s| s.to_lowercase())
-        .unwrap_or("us".to_owned());
+        .unwrap_or_else(|| {
+            if let Some(src) = &source_arg {
+                if is_south_asia_source(src) {
+                    return "in".to_owned();
+                }
+            }
+            "us".to_owned()
+        });
 
     let Some(source_arg) = source_arg else {
         let _ = msg
@@ -714,6 +868,33 @@ mod tests {
         assert_eq!(source_label("charts"), Some("Top charts"));
         assert_eq!(source_label("hiphop"), Some("Hip-hop"));
         assert_eq!(source_label("unknown"), None);
+    }
+
+    #[test]
+    fn south_asia_source_and_labels_match() {
+        assert!(is_south_asia_source("southasia"));
+        assert!(is_south_asia_source("subcontinent"));
+        assert!(is_south_asia_source("desi"));
+        assert!(is_south_asia_source("india"));
+        assert!(is_south_asia_source("pakistan"));
+        assert!(is_south_asia_source("bangladesh"));
+        assert!(is_south_asia_source("nepal"));
+        assert!(is_south_asia_source("bhutan"));
+        assert!(!is_south_asia_source("rock"));
+
+        assert_eq!(source_label("southasia"), Some("South Asia"));
+        assert_eq!(source_label("subcontinent"), Some("South Asia"));
+        assert_eq!(source_label("desi"), Some("South Asia"));
+        assert_eq!(source_label("india"), Some("South Asia"));
+        assert_eq!(source_label("pakistan"), Some("South Asia"));
+
+        assert!(!SOUTH_ASIA_SEEDS.is_empty());
+        assert!(SOUTH_ASIA_SEEDS.contains(&"bollywood"));
+        assert!(SOUTH_ASIA_SEEDS.contains(&"pakistani pop"));
+        assert!(SOUTH_ASIA_SEEDS.contains(&"coke studio"));
+        assert!(SOUTH_ASIA_SEEDS.contains(&"bangla rock"));
+        assert!(SOUTH_ASIA_SEEDS.contains(&"nepali folk"));
+        assert!(SOUTH_ASIA_SEEDS.contains(&"afghan music"));
     }
 
     #[test]

@@ -382,6 +382,14 @@ fn valid_source(value: &str) -> bool {
             | "indie"
             | "rap"
             | "edm"
+            | "southasia"
+            | "subcontinent"
+            | "desi"
+            | "india"
+            | "pakistan"
+            | "bangladesh"
+            | "nepal"
+            | "bhutan"
     )
 }
 
@@ -483,6 +491,10 @@ mod tests {
             TelegramAction::Discovery(DiscoveryAction::Reroll {
                 source: "charts".into(),
                 storefront: "us".into(),
+            }),
+            TelegramAction::Discovery(DiscoveryAction::Discover {
+                source: "southasia".into(),
+                storefront: "in".into(),
             }),
             TelegramAction::DeliverCached {
                 track_id: "1".into(),
