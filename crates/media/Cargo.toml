@@ -1,6 +1,6 @@
 [package]
 name = "media"
-description = "Native audio inspection and spectrogram rendering for alac-bot"
+description = "Native audio inspection and spectrogram rendering for peerless"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

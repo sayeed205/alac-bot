@@ -123,7 +123,7 @@ fn format_stats_html(stats: &db::AlacStats) -> String {
     };
 
     format!(
-        "<b>📊 ALAC Bot Analytics</b><br/><br/><blockquote><b>📦 Storage & Caching</b><br/>• Cached Tracks: <code>{}</code> (<code>{}</code> Apple · <code>{}</code> Qobuz)<br/>• Total Requests: <code>{}</code><br/>• Cache Hit Ratio: <b>{}%</b> (<code>{}</code> hits / <code>{}</code> rips)<br/>• Failed Requests: <code>{}</code></blockquote><br/><blockquote><b>⚡ Latency Averages</b><br/>• Cache Retrieval: <code>{}</code><br/>• Mirror Rip Time: <code>{}</code></blockquote><br/><blockquote><b>🔥 Top Requested Tracks</b><br/>{top_tracks}</blockquote>",
+        "<b>📊 Peerless Analytics</b><br/><br/><blockquote><b>📦 Storage & Caching</b><br/>• Cached Tracks: <code>{}</code> (<code>{}</code> Apple · <code>{}</code> Qobuz)<br/>• Total Requests: <code>{}</code><br/>• Cache Hit Ratio: <b>{}%</b> (<code>{}</code> hits / <code>{}</code> rips)<br/>• Failed Requests: <code>{}</code></blockquote><br/><blockquote><b>⚡ Latency Averages</b><br/>• Cache Retrieval: <code>{}</code><br/>• Mirror Rip Time: <code>{}</code></blockquote><br/><blockquote><b>🔥 Top Requested Tracks</b><br/>{top_tracks}</blockquote>",
         stats.total_cached_tracks,
         stats.apple_cached_tracks,
         stats.qobuz_cached_tracks,
@@ -320,7 +320,7 @@ mod tests {
         };
         assert_eq!(
             format_stats_html(&stats),
-            "<b>📊 ALAC Bot Analytics</b><br/><br/><blockquote><b>📦 Storage & Caching</b><br/>• Cached Tracks: <code>3</code> (<code>2</code> Apple · <code>1</code> Qobuz)<br/>• Total Requests: <code>4</code><br/>• Cache Hit Ratio: <b>50%</b> (<code>2</code> hits / <code>2</code> rips)<br/>• Failed Requests: <code>1</code></blockquote><br/><blockquote><b>⚡ Latency Averages</b><br/>• Cache Retrieval: <code>12ms</code><br/>• Mirror Rip Time: <code>1.3s</code></blockquote><br/><blockquote><b>🔥 Top Requested Tracks</b><br/>1. <a href=\"https://music.apple.com/song/123\">Song Title — Artist Name</a> — <b>2</b> requests<br/>2. <a href=\"https://open.qobuz.com/track/456\"><code>456</code></a> — <b>1</b> request</blockquote>"
+            "<b>📊 Peerless Analytics</b><br/><br/><blockquote><b>📦 Storage & Caching</b><br/>• Cached Tracks: <code>3</code> (<code>2</code> Apple · <code>1</code> Qobuz)<br/>• Total Requests: <code>4</code><br/>• Cache Hit Ratio: <b>50%</b> (<code>2</code> hits / <code>2</code> rips)<br/>• Failed Requests: <code>1</code></blockquote><br/><blockquote><b>⚡ Latency Averages</b><br/>• Cache Retrieval: <code>12ms</code><br/>• Mirror Rip Time: <code>1.3s</code></blockquote><br/><blockquote><b>🔥 Top Requested Tracks</b><br/>1. <a href=\"https://music.apple.com/song/123\">Song Title — Artist Name</a> — <b>2</b> requests<br/>2. <a href=\"https://open.qobuz.com/track/456\"><code>456</code></a> — <b>1</b> request</blockquote>"
         );
     }
 }

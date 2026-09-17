@@ -314,7 +314,7 @@ async fn main() -> Result<()> {
     if let Err(error) = client
         .send_message(
             PeerRef::from(env.admin_id),
-            InputMessage::html("<b>ALAC Bot is up and alive.</b>\nStartup completed successfully."),
+            InputMessage::html("<b>Peerless is up and alive.</b>\nStartup completed successfully."),
         )
         .await
     {

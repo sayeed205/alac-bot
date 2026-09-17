@@ -2,8 +2,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;

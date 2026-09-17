@@ -20,8 +20,7 @@ use axum::{
 };
 pub use error::ServerError;
 use moka::future::Cache;
-use tokio::net::TcpListener;
-use tokio::sync::broadcast;
+use tokio::{net::TcpListener, sync::broadcast};
 use tokio_util::sync::CancellationToken;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
@@ -45,7 +44,13 @@ impl Default for ServerConfig {
 }
 
 pub type RipTaskRunner = Arc<
-    dyn Fn(String, music::Provider, String, Option<music::Codec>, i64) -> tokio::task::JoinHandle<()>
+    dyn Fn(
+            String,
+            music::Provider,
+            String,
+            Option<music::Codec>,
+            i64,
+        ) -> tokio::task::JoinHandle<()>
         + Send
         + Sync,
 >;
@@ -88,9 +93,10 @@ impl ServerState {
             .timeout(Duration::from_secs(10))
             .build()
             .unwrap_or_default();
-        let rip_task_runner: RipTaskRunner = Arc::new(|_task_id, _provider, _track_id, _codec, _user_id| {
-            tokio::spawn(async move {})
-        });
+        let rip_task_runner: RipTaskRunner =
+            Arc::new(|_task_id, _provider, _track_id, _codec, _user_id| {
+                tokio::spawn(async move {})
+            });
 
         Self {
             stream_engine,
@@ -169,7 +175,10 @@ pub fn create_router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/tasks/rip", post(tasks::create_rip_task))
         .route("/api/v1/tasks/{id}/events", get(tasks::task_events))
         // Assets
-        .route("/api/v1/assets/tracks/{id}/artwork", get(assets::get_artwork))
+        .route(
+            "/api/v1/assets/tracks/{id}/artwork",
+            get(assets::get_artwork),
+        )
         .route("/api/v1/assets/tracks/{id}/lyrics", get(assets::get_lyrics))
         // Library
         .route("/api/v1/me/favorites", get(library::list_favorites))

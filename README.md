@@ -1,4 +1,4 @@
-# ALAC Bot
+# Peerless Server
 
 A high-performance Telegram bot for downloading Apple Music lossless (ALAC) audio tracks, albums, and playlists with
 synchronized lyrics, embedded high-resolution artwork, and smart channel caching.
@@ -66,8 +66,8 @@ Built in Rust: [ferogram](https://github.com/ankit-chaubey/ferogram) (Telegram M
 ### 1. Clone & Configure
 
 ```bash
-git clone https://github.com/sayeed205/alac-bot.git
-cd alac-bot
+git clone https://github.com/Hitarashi/peerless-server.git
+cd peerless-server
 cp .env.example .env
 ```
 
@@ -81,7 +81,7 @@ ADMIN_ID=123456789
 DUMP_CHANNEL_ID=-1001234567890
 
 # PostgreSQL Connection
-DATABASE_URL=postgresql://user:password@localhost:5432/alac_bot
+DATABASE_URL=postgresql://user:password@localhost:5432/peerless
 
 # Logging (trace | debug | info | warn | error)
 LOG_LEVEL=info
@@ -111,11 +111,11 @@ just release && ./target/release/bot
 ### 3. Docker
 
 ```bash
-docker build -t alac-bot .
-docker run -d --name alac-bot \
+docker build -t peerless-server .
+docker run -d --name peerless-server \
   --env-file .env \
-  -v alac-bot-data:/app/bot-data \
-  alac-bot
+  -v peerless-server-data:/app/bot-data \
+  peerless-server
 ```
 
 The container includes only the TLS certificate bundle needed for HTTPS, runs as a non-root user, and persists the
@@ -236,7 +236,7 @@ Toolchains: **stable** for build/lint/test — **nightly** only for `fmt`, becau
 Testing requires a PostgreSQL database with the pg_trgm extension available:
 
 ```bash
-export TEST_DATABASE_URL=postgresql://admin:password@localhost:5432/alac_bot_test
+export TEST_DATABASE_URL=postgresql://admin:password@localhost:5432/peerless_test
 just test
 ```
 

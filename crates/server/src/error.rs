@@ -43,7 +43,14 @@ impl IntoResponse for ServerError {
             }
         };
 
-        (status, Json(ErrorBody { error: code, message })).into_response()
+        (
+            status,
+            Json(ErrorBody {
+                error: code,
+                message,
+            }),
+        )
+            .into_response()
     }
 }
 

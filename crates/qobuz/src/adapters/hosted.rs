@@ -26,7 +26,7 @@ impl HostedWorkerAdapter {
         let mut default_headers = HeaderMap::new();
         default_headers.insert(
             reqwest::header::USER_AGENT,
-            HeaderValue::from_static("alac-bot/1.0 (Linux; x86_64)"),
+            HeaderValue::from_static("peerless/1.0 (Linux; x86_64)"),
         );
         let client = reqwest::Client::builder()
             .default_headers(default_headers)

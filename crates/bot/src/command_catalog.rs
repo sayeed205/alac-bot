@@ -144,7 +144,7 @@ pub const COMMANDS: &[CommandDescriptor] = &[
 ];
 
 pub fn render_help(is_admin: bool) -> String {
-    let mut out = String::from("<b>ALAC Bot</b>\n\n<b>Start here</b>\n");
+    let mut out = String::from("<b>Peerless</b>\n\n<b>Start here</b>\n");
     for command in COMMANDS
         .iter()
         .filter(|command| command.role == CommandRole::User)

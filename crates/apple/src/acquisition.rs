@@ -749,7 +749,7 @@ impl engine::ripper::RipStage for AppleRipperDeps {
             gapless: Some(true),
             genre_id: None,
             storefront_id: None,
-            encoder: Some("alac-bot".to_owned()),
+            encoder: Some("peerless".to_owned()),
             comment: None,
             description: None,
         }

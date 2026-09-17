@@ -38,12 +38,14 @@ impl ChunkCache {
 
     /// Retrieve a cached chunk if present.
     pub async fn get(&self, document_id: i64, chunk_index: u64) -> Option<Bytes> {
-        self.get_by_key(ChunkKey::new(document_id, chunk_index)).await
+        self.get_by_key(ChunkKey::new(document_id, chunk_index))
+            .await
     }
 
     /// Insert a fetched chunk into the cache.
     pub async fn insert(&self, document_id: i64, chunk_index: u64, data: Bytes) {
-        self.insert_by_key(ChunkKey::new(document_id, chunk_index), data).await;
+        self.insert_by_key(ChunkKey::new(document_id, chunk_index), data)
+            .await;
     }
 
     /// Retrieve a cached chunk by ChunkKey if present.

@@ -1,4 +1,4 @@
-//! Telegram MTProto streaming engine for alac-bot.
+//! Telegram MTProto streaming engine for peerless.
 //!
 //! Provides a dedicated auxiliary worker pool, circuit breaker with FloodWait quarantine,
 //! in-memory LRU chunk cache with byte-weight accounting, and backpressure-regulated
@@ -14,7 +14,6 @@ pub use cache::{ChunkCache, ChunkKey, CHUNK_SIZE};
 pub use circuit_breaker::CircuitBreaker;
 pub use engine::{AudioStreamResponse, StreamEngine, TrackMediaMetadata};
 pub use pipe::{create_stream_pipe, ByteRange, ChunkStream, LocationRefresher, StreamPipeParams};
-
 pub use worker_pool::{hash_bot_token, StreamWorkerPool};
 
 /// Streaming engine errors.

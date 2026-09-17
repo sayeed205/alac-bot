@@ -47,7 +47,8 @@ async fn test_playback_ticket_cryptography() {
 #[tokio::test]
 async fn test_docs_and_unauthorized_endpoints() {
     let _ = dotenvy::from_filename(".env");
-    let Ok(db_url) = std::env::var("DATABASE_URL").or_else(|_| std::env::var("TEST_DATABASE_URL")) else {
+    let Ok(db_url) = std::env::var("DATABASE_URL").or_else(|_| std::env::var("TEST_DATABASE_URL"))
+    else {
         eprintln!("Skipping HTTP router integration test: DATABASE_URL not set");
         return;
     };
@@ -95,7 +96,9 @@ async fn test_docs_and_unauthorized_endpoints() {
         .unwrap();
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let html = String::from_utf8(body.to_vec()).unwrap();
     assert!(html.contains("@scalar/api-reference"));
     assert!(html.contains("/api/v1/docs.json"));
@@ -107,7 +110,9 @@ async fn test_docs_and_unauthorized_endpoints() {
         .unwrap();
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json = String::from_utf8(body.to_vec()).unwrap();
     assert!(json.contains("\"openapi\":\"3.1"));
 
@@ -163,7 +168,8 @@ async fn test_docs_and_unauthorized_endpoints() {
 #[tokio::test]
 async fn test_auth_and_library_lifecycle() {
     let _ = dotenvy::from_filename(".env");
-    let Ok(db_url) = std::env::var("DATABASE_URL").or_else(|_| std::env::var("TEST_DATABASE_URL")) else {
+    let Ok(db_url) = std::env::var("DATABASE_URL").or_else(|_| std::env::var("TEST_DATABASE_URL"))
+    else {
         eprintln!("Skipping database lifecycle test: DATABASE_URL not set");
         return;
     };
@@ -223,7 +229,9 @@ async fn test_auth_and_library_lifecycle() {
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let exchange_res: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(exchange_res["token_type"], "Bearer");
     assert_eq!(exchange_res["expires_in"], 259200);
@@ -246,7 +254,9 @@ async fn test_auth_and_library_lifecycle() {
         .unwrap();
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let refresh_res: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(refresh_res["token_type"], "Bearer");
     assert_eq!(refresh_res["access_token"], token);
@@ -263,9 +273,14 @@ async fn test_auth_and_library_lifecycle() {
         .unwrap();
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let pb_res: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(pb_res["stream_url"].as_str().unwrap().contains("/api/v1/stream?ticket="));
+    assert!(pb_res["stream_url"]
+        .as_str()
+        .unwrap()
+        .contains("/api/v1/stream?ticket="));
     assert_eq!(pb_res["expires_in"], 7200);
     assert!(pb_res["file_size"].as_i64().is_some());
 
@@ -296,7 +311,9 @@ async fn test_auth_and_library_lifecycle() {
         .unwrap();
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let me_res: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(me_res["user"]["telegram_id"], admin_id);
     assert!(!me_res["sessions"].as_array().unwrap().is_empty());
@@ -312,7 +329,9 @@ async fn test_auth_and_library_lifecycle() {
         .unwrap();
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let playlist_res: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let playlist_id = playlist_res["id"].as_i64().unwrap();
     assert_eq!(playlist_res["name"], "Phase 4 Lossless Hits");

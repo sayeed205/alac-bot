@@ -143,7 +143,7 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
                     .await
                     .ok()
                     .and_then(|me| me.username)
-                    .unwrap_or_else(|| "alac_bot".to_owned());
+                    .unwrap_or_else(|| "peerless_bot".to_owned());
                 let keyboard = ferogram::keyboard::InlineKeyboard::new()
                     .row([ferogram::keyboard::Button::url(
                         "Start bot in private chat",

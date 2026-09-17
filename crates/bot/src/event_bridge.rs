@@ -481,7 +481,7 @@ async fn notify_job_completed(state: &BotState, job: &ActiveRipJob, summary: &Ri
             } else {
                 format!(
                     "https://t.me/{}",
-                    state.bot_username.as_deref().unwrap_or("alac_bot")
+                    state.bot_username.as_deref().unwrap_or("peerless_bot")
                 )
             };
             ferogram::keyboard::InlineKeyboard::new()
