@@ -8,6 +8,7 @@
 !.env.example
 client.*
 !crates/apple/src/wrapper/client.rs
+!crates/qobuz/src/adapters/native/client.rs
 *.session*
 
 # Editor / OS noise

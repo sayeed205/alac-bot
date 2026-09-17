@@ -20,6 +20,25 @@ pub trait CollectionResolver: Send + Sync {
         storefront: &str,
     ) -> impl Future<Output = Result<ArtistTracks, String>> + Send;
 
+    fn fetch_artist_album_ids(
+        &self,
+        id: &str,
+        storefront: &str,
+    ) -> impl Future<Output = Result<Vec<String>, String>> + Send {
+        async move {
+            let res = self.fetch_artist_tracks(id, storefront).await?;
+            let mut album_ids = Vec::new();
+            for t in res.tracks {
+                if let Some(aid) = t.album_id {
+                    if !album_ids.contains(&aid) {
+                        album_ids.push(aid);
+                    }
+                }
+            }
+            Ok(album_ids)
+        }
+    }
+
     fn fetch_playlist_tracks(
         &self,
         id: &str,

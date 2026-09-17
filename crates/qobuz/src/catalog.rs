@@ -61,6 +61,27 @@ impl CollectionResolver for QobuzCatalog {
         }
     }
 
+    async fn fetch_artist_album_ids(
+        &self,
+        id: &str,
+        _storefront: &str,
+    ) -> Result<Vec<String>, String> {
+        match self.primary.fetch_artist_album_ids(id).await {
+            Ok(album_ids) => Ok(album_ids),
+            Err(err) => {
+                if let Some(fallback) = &self.fallback {
+                    tracing::warn!("Primary Qobuz catalog failed ({err}), trying fallback");
+                    fallback
+                        .fetch_artist_album_ids(id)
+                        .await
+                        .map_err(|e| e.to_string())
+                } else {
+                    Err(err.to_string())
+                }
+            }
+        }
+    }
+
     async fn fetch_playlist_tracks(
         &self,
         id: &str,

@@ -10,6 +10,7 @@ pub mod gates;
 pub mod input;
 
 use std::sync::Arc;
+use engine::orchestrator::deps::{CollectionResolver, ProviderAccess, ProviderComposition};
 
 use ferogram::{
     filters::{self, Dispatcher},
@@ -183,6 +184,124 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
         }
         engine::Provider::Qobuz => engine::orchestrator::types::RenditionPolicy::PrimaryOnly,
     };
+
+    // If any parsed item is an artist, expand each artist into its constituent
+    // albums and process them as individual album jobs so each album is packaged,
+    // cached, and delivered as its own ZIP archive.
+    let has_artist = parsed
+        .items
+        .iter()
+        .any(|it| it.kind == engine::types::TargetKind::Artist);
+
+    if has_artist {
+        let mut expanded_albums = Vec::new();
+        for item in &parsed.items {
+            if item.kind == engine::types::TargetKind::Artist {
+                let effective_sf = match parsed.provider {
+                    engine::Provider::Qobuz => "qobuz",
+                    engine::Provider::Apple => item
+                        .storefront
+                        .as_deref()
+                        .or(parsed.storefront.as_deref())
+                        .unwrap_or("us"),
+                };
+                match state
+                    .rip_deps
+                    .providers()
+                    .collections()
+                    .fetch_artist_album_ids(&item.id, effective_sf)
+                    .await
+                {
+                    Ok(album_ids) => {
+                        for aid in album_ids {
+                            expanded_albums.push(engine::types::ParsedTargetItem {
+                                id: aid,
+                                kind: engine::types::TargetKind::Album,
+                                storefront: Some(effective_sf.to_string()),
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(error = %error, "failed to resolve artist albums");
+                        reply(&msg, &format!("Failed to resolve artist albums: {error}")).await;
+                        return;
+                    }
+                }
+            } else {
+                expanded_albums.push(item.clone());
+            }
+        }
+
+        if expanded_albums.is_empty() {
+            reply(&msg, "No albums or tracks found to download.").await;
+            return;
+        }
+
+        let max_collection_limit = settings.max_collection_tracks;
+        let rip_orchestrator = Arc::clone(&state.rip_orchestrator);
+        let rip_deps = Arc::clone(&state.rip_deps);
+        let base_options = engine::orchestrator::types::RipJobOptions {
+            provider: parsed.provider,
+            chat_id: chat,
+            user_id: owner_id,
+            user_name: Some(owner_display_name.clone()),
+            delivery_chat_id,
+            is_group,
+            is_force: parsed.force,
+            is_cache_only,
+            single_storefront: parsed.storefront.clone(),
+            parsed_items: Vec::new(),
+            reply_to_message_id: Some(i64::from(msg.id())),
+            status_msg_id: 0,
+            is_admin: owner_is_admin,
+            codec_preference: parsed.codec_preference,
+            rendition_policy,
+        };
+
+        tokio::spawn(async move {
+            let mut total_tracks = 0usize;
+            for album_item in expanded_albums {
+                if !owner_is_admin
+                    && max_collection_limit > 0
+                    && total_tracks >= max_collection_limit as usize
+                {
+                    tracing::info!(
+                        user_id = owner_id,
+                        total_tracks,
+                        max_collection_limit,
+                        "discography reached collection limit, stopping"
+                    );
+                    break;
+                }
+
+                let mut album_options = base_options.clone();
+                album_options.parsed_items = vec![album_item];
+
+                match rip_orchestrator
+                    .start_job(Arc::clone(&rip_deps), &album_options)
+                    .await
+                {
+                    Ok(summary) => {
+                        total_tracks += summary.total_tracks;
+                    }
+                    Err(engine::orchestrator::OrchestratorError::Cancelled) => {
+                        tracing::info!(
+                            user_id = owner_id,
+                            "album sequence cancelled by user"
+                        );
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "album job in artist sequence failed"
+                        );
+                    }
+                }
+            }
+        });
+        return;
+    }
 
     let options = engine::orchestrator::types::RipJobOptions {
         provider: parsed.provider,

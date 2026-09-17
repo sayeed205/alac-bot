@@ -117,6 +117,24 @@ impl CollectionResolver for ProviderRegistry {
             .map_err(|error| error.to_string())
     }
 
+    async fn fetch_artist_album_ids(
+        &self,
+        id: &str,
+        storefront: &str,
+    ) -> Result<Vec<String>, String> {
+        if storefront == "qobuz" {
+            if let Some(qobuz) = &self.qobuz {
+                return qobuz.catalog().fetch_artist_album_ids(id, storefront).await;
+            } else {
+                return Err("Qobuz provider is not configured".to_string());
+            }
+        }
+        self.catalog()
+            .fetch_artist_album_ids(id, storefront)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn fetch_playlist_tracks(
         &self,
         id: &str,

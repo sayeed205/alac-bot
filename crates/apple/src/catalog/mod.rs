@@ -306,6 +306,7 @@ enum CacheValue {
     Track(TrackMeta),
     Album(AlbumTracks),
     Artist(ArtistTracks),
+    ArtistAlbumIds(Vec<String>),
     Search(Vec<TrackMeta>),
     Charts(Vec<ChartAlbum>),
 }
@@ -349,6 +350,18 @@ impl CachedValue for ArtistTracks {
     }
     fn into_value(self) -> CacheValue {
         CacheValue::Artist(self)
+    }
+}
+
+impl CachedValue for Vec<String> {
+    fn from_value(cached: &CacheValue) -> Option<Self> {
+        match cached {
+            CacheValue::ArtistAlbumIds(v) => Some(v.clone()),
+            _ => None,
+        }
+    }
+    fn into_value(self) -> CacheValue {
+        CacheValue::ArtistAlbumIds(self)
     }
 }
 
@@ -778,6 +791,54 @@ impl<T: Transport> Catalog<T> {
             storefront,
             "artist",
             do_fetch_artist_tracks(artist_id)
+        )
+    }
+
+    async fn do_fetch_artist_album_ids(
+        &self,
+        artist_id: &str,
+        sf: &str,
+    ) -> Result<Vec<String>, CatalogError> {
+        info_span!("itunes_artist_albums", artist_id, storefront = sf)
+            .in_scope(|| debug!("Querying iTunes API for artist album ids..."));
+        let discog_url = format!(
+            "https://itunes.apple.com/lookup?id={}&entity=album&limit=200&country={}",
+            urlencode(artist_id),
+            urlencode(sf)
+        );
+        let body = self
+            .fetch_itunes_body(
+                &discog_url,
+                ARTIST_TIMEOUT,
+                "artist",
+                "iTunes artist album lookup",
+            )
+            .await?;
+        let results = Self::parse_results(&body)?;
+        let collection_ids: Vec<String> = results
+            .into_iter()
+            .filter(|r| r.wrapper_type.as_deref() == Some("collection"))
+            .filter_map(|r| r.collection_id)
+            .map(|id| id.to_string())
+            .collect();
+        Ok(collection_ids)
+    }
+
+    /// Fetch an artist's album IDs with storefront fallback.
+    pub async fn fetch_artist_album_ids(
+        &self,
+        artist_id: &str,
+        storefront: &str,
+    ) -> Result<Vec<String>, CatalogError> {
+        let sf = normalize_storefront(storefront);
+        let cache_key = format!("artist_albums:{sf}:{artist_id}");
+        type R = Vec<String>;
+        with_fallback!(
+            self,
+            cache_key,
+            storefront,
+            "artist",
+            do_fetch_artist_album_ids(artist_id)
         )
     }
 

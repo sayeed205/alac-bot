@@ -1464,6 +1464,32 @@ async fn provider_disabled_admin_bypasses() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn artist_album_ids_resolution() {
+    let (_, deps, _, _) = setup();
+    let mut t1 = FakeDeps::track_meta("t1", "Track 1", "Artist");
+    t1.album_id = Some("alb.1".into());
+    let mut t2 = FakeDeps::track_meta("t2", "Track 2", "Artist");
+    t2.album_id = Some("alb.1".into());
+    let mut t3 = FakeDeps::track_meta("t3", "Track 3", "Artist");
+    t3.album_id = Some("alb.2".into());
+
+    deps.artists.lock().unwrap().insert(
+        "art.1".into(),
+        music::ArtistTracks {
+            artist_id: "art.1".into(),
+            artist_name: "Artist".into(),
+            tracks: vec![t1, t2, t3],
+        },
+    );
+
+    let album_ids = deps
+        .fetch_artist_album_ids("art.1", "us")
+        .await
+        .expect("artist album ids resolved");
+    assert_eq!(album_ids, vec!["alb.1".to_string(), "alb.2".to_string()]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn maintenance_gate_allows_admin_and_cache_only() {
     let (orch, deps, _, _) = setup();
     deps.set_settings(|s| s.ripping_mode = RippingMode::Paused);

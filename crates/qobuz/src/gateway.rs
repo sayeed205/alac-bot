@@ -114,6 +114,24 @@ pub trait QobuzGateway: Send + Sync {
         artist_id: &'a str,
     ) -> BoxFuture<'a, Result<ArtistTracks, QobuzError>>;
 
+    fn fetch_artist_album_ids<'a>(
+        &'a self,
+        artist_id: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<String>, QobuzError>> {
+        Box::pin(async move {
+            let res = self.fetch_artist_tracks(artist_id).await?;
+            let mut album_ids = Vec::new();
+            for t in res.tracks {
+                if let Some(aid) = t.album_id {
+                    if !album_ids.contains(&aid) {
+                        album_ids.push(aid);
+                    }
+                }
+            }
+            Ok(album_ids)
+        })
+    }
+
     fn fetch_playlist_tracks<'a>(
         &'a self,
         playlist_id: &'a str,

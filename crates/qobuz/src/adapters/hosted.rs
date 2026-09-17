@@ -242,6 +242,46 @@ impl QobuzGateway for HostedWorkerAdapter {
         })
     }
 
+    fn fetch_artist_album_ids<'a>(
+        &'a self,
+        artist_id: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<String>, QobuzError>> {
+        Box::pin(async move {
+            let url = format!("{}/api/artist/{}?smart=true", self.backend_url, artist_id);
+            let req = self.apply_auth(self.client.get(&url));
+
+            let res = req
+                .send()
+                .await
+                .map_err(|e| QobuzError::Network(format!("Failed to reach hosted backend: {e}")))?;
+
+            let what = format!("Artist {artist_id}");
+            if let Some(err) = self.status_error(res.status(), &what) {
+                return Err(err);
+            }
+
+            let body: QobuzArtistResponse = res
+                .json()
+                .await
+                .map_err(|e| QobuzError::Message(format!("Failed to parse artist JSON: {e}")))?;
+
+            if let Some(err) = body.error {
+                return Err(QobuzError::Message(err));
+            }
+
+            let artist_data = body.artist.ok_or_else(|| {
+                QobuzError::NotFound(format!("No artist payload for id {artist_id}"))
+            })?;
+
+            let album_ids = artist_data
+                .albums
+                .map(|a| a.items.into_iter().map(|item| item.id_string()).collect())
+                .unwrap_or_default();
+
+            Ok(album_ids)
+        })
+    }
+
     fn fetch_playlist_tracks<'a>(
         &'a self,
         playlist_id: &'a str,
