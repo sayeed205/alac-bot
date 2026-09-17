@@ -18,7 +18,9 @@ qobuz = { path = "../qobuz" }
 lyrics = { path = "../lyrics", features = ["lrclib", "betterlyrics", "paxsenix"] }
 music = { path = "../music" }
 media = { path = "../media" }
+stream = { path = "../stream" }
 ferogram.workspace = true
+
 regex.workspace = true
 futures-util.workspace = true
 serde_json.workspace = true

@@ -40,7 +40,10 @@ pub struct BotState {
     pub db_client: db::DbPool,
     /// Process start, for `/ping` uptime ).
     pub started_at: Instant,
+    /// Streaming engine coordinating MTProto worker pool and chunk cache.
+    pub stream_engine: Option<Arc<stream::StreamEngine>>,
 }
+
 
 pub type SharedState = Arc<BotState>;
 

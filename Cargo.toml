@@ -1,6 +1,16 @@
 [workspace]
 resolver = "2"
-members = ["crates/music", "crates/lyrics", "crates/engine", "crates/apple", "crates/qobuz", "crates/db", "crates/media", "crates/bot"]
+members = [
+    "crates/music",
+    "crates/lyrics",
+    "crates/engine",
+    "crates/apple",
+    "crates/qobuz",
+    "crates/db",
+    "crates/media",
+    "crates/stream",
+    "crates/bot",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -47,6 +57,9 @@ metaflac = "0.2"
 id3 = "1.17"
 font8x8 = "0.3"
 temari = { git = "https://github.com/WorldObservationLog/Temari" }
+moka = { version = "0.12", features = ["future"] }
+aes-gcm = "0.10"
+
 
 
 [workspace.lints.rust]

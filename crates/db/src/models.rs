@@ -3,8 +3,8 @@ use diesel::prelude::*;
 use music::{Codec, Provider};
 
 use crate::schema::{
-    albums, one_time_auth_codes, requests, settings, tracks, user_favorites, user_playlist_tracks,
-    user_playlists, user_sessions, users,
+    albums, one_time_auth_codes, requests, settings, tg_worker_sessions, tracks, user_favorites,
+    user_playlist_tracks, user_playlists, user_sessions, users,
 };
 
 #[derive(Debug, Clone, Default, Queryable, Selectable)]
@@ -245,4 +245,21 @@ pub struct NewUserPlaylistTrack {
     pub playlist_id: i32,
     pub track_id: i32,
     pub position: i32,
+}
+
+#[derive(Debug, Clone, Queryable, Selectable)]
+#[diesel(table_name = tg_worker_sessions)]
+pub struct TgWorkerSession {
+    pub bot_token_hash: String,
+    pub session_data: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Insertable, AsChangeset)]
+#[diesel(table_name = tg_worker_sessions)]
+pub struct NewTgWorkerSession<'a> {
+    pub bot_token_hash: &'a str,
+    pub session_data: &'a str,
+    pub updated_at: DateTime<Utc>,
 }

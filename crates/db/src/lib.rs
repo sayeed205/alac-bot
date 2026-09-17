@@ -17,6 +17,7 @@ mod schema;
 mod session;
 mod settings;
 mod tracks;
+mod worker_session;
 
 pub mod dump;
 mod stats;
@@ -28,15 +29,16 @@ pub use engine::orchestrator::deps::{CachedTrack, RequestLog, SaveTrackInput};
 pub use library::{LibraryManager, PlaylistDetails, UserPlaylistSummary};
 pub use migrations::migrate;
 pub use models::{
-    Album, NewAlbum, OneTimeAuthCode, Request, SettingsRow, Track, User, UserFavorite,
-    UserPlaylist, UserPlaylistTrack, UserSession,
+    Album, NewAlbum, OneTimeAuthCode, Request, SettingsRow, TgWorkerSession, Track, User,
+    UserFavorite, UserPlaylist, UserPlaylistTrack, UserSession,
 };
 pub use music::{Provider, TrackKey};
 pub use requests::RequestLogRepository;
-pub use session::{ClientMetadata, SessionIdentity, SessionManager, SessionTokens};
+pub use session::{hash_token, ClientMetadata, SessionIdentity, SessionManager, SessionTokens};
 pub use settings::SettingsStore;
 pub use stats::{AlacStats, StatsRepository, TopTrackStat};
 pub use tracks::TracksRepository;
+pub use worker_session::WorkerSessionStore;
 
 type DieselManager =
     diesel_async::pooled_connection::AsyncDieselConnectionManager<AsyncPgConnection>;

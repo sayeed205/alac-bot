@@ -109,6 +109,16 @@ impl TracksRepository {
             .optional()?)
     }
 
+    pub async fn find_track_by_id(&self, id: i32) -> Result<Option<Track>, DbError> {
+        let mut connection = self.pool.connection().await?;
+        Ok(tracks::table
+            .filter(tracks::id.eq(id))
+            .select(Track::as_select())
+            .first::<Track>(&mut *connection)
+            .await
+            .optional()?)
+    }
+
     pub async fn save_track<I>(&self, input: I) -> Result<Track, DbError>
     where
         I: Borrow<SaveTrackInput>,

@@ -16,7 +16,9 @@ struct Env {
     dump_channel_id: i64,
     database_url: String,
     log_level: String,
+    stream_worker_bot_tokens: Vec<String>,
 }
+
 
 fn required(name: &str, invalid: &mut Vec<String>) -> String {
     match std::env::var(name) {
@@ -66,6 +68,15 @@ fn load_env() -> Result<Env> {
     let log_level = std::env::var("LOG_LEVEL")
         .or_else(|_| std::env::var("RUST_LOG"))
         .unwrap_or_else(|_| "info".to_owned());
+    let stream_worker_bot_tokens = std::env::var("STREAM_WORKER_BOT_TOKENS")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
     if !invalid.is_empty() {
         return Err(anyhow!(
             "missing or invalid environment variables: {}",
@@ -80,7 +91,9 @@ fn load_env() -> Result<Env> {
         dump_channel_id,
         database_url,
         log_level,
+        stream_worker_bot_tokens,
     })
+
 }
 
 fn init_tracing(log_level: &str) {
@@ -163,6 +176,26 @@ async fn main() -> Result<()> {
     let orchestrator = Arc::new(engine::orchestrator::RipOrchestrator::new(
         bot::rip_deps::orchestrator_config(),
     ));
+
+    let session_store = db::WorkerSessionStore::from_env(database.clone());
+    let worker_pool = stream::StreamWorkerPool::new(
+        Some(client.clone()),
+        &env.stream_worker_bot_tokens,
+        env.api_id,
+        &env.api_hash,
+        Some(session_store),
+    )
+    .await
+    .context("initialize stream worker pool")?;
+
+    let stream_engine = Arc::new(stream::StreamEngine::new(
+        worker_pool,
+        Arc::new(stream::ChunkCache::default()),
+        db::TracksRepository::new(database.clone()),
+        client.clone(),
+        PeerRef::from(env.dump_channel_id),
+    ));
+
     let state = Arc::new(BotState {
         client: client.clone(),
         auth,
@@ -176,7 +209,9 @@ async fn main() -> Result<()> {
         stats: Some(db::StatsRepository::new(database.clone())),
         db_client: database.clone(),
         started_at: std::time::Instant::now(),
+        stream_engine: Some(stream_engine),
     });
+
     // Bridge subscribes once; its consumer renders status messages + dashboard.
     bot::event_bridge::start(Arc::clone(&state));
     // 24h auto-dump scheduler .

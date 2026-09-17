@@ -177,6 +177,10 @@ async fn session_lifecycle_and_sliding_auth() {
     );
 
     // 12. Purge expired sessions and codes
+    session_mgr
+        .revoke(&admin_tokens.refresh_token)
+        .await
+        .expect("revoke admin session");
     let purged_sessions = session_mgr
         .purge_expired_sessions()
         .await
@@ -187,4 +191,111 @@ async fn session_lifecycle_and_sliding_auth() {
         .purge_expired_codes()
         .await
         .expect("purge expired codes");
+
+    // 13. WorkerSessionStore tests
+    let worker_store = db::WorkerSessionStore::new(client.clone(), None);
+    let token_hash = "abc123def4567890123456789012345678901234567890123456789012345678";
+
+    // Initially absent
+    assert_eq!(
+        worker_store
+            .get_session(token_hash)
+            .await
+            .expect("get initial"),
+        None
+    );
+
+    // Save session
+    worker_store
+        .save_session(token_hash, "session_data_v1")
+        .await
+        .expect("save session v1");
+    assert_eq!(
+        worker_store
+            .get_session(token_hash)
+            .await
+            .expect("get saved"),
+        Some("session_data_v1".to_string())
+    );
+
+    // Update session (upsert)
+    worker_store
+        .save_session(token_hash, "session_data_v2")
+        .await
+        .expect("save session v2");
+    assert_eq!(
+        worker_store
+            .get_session(token_hash)
+            .await
+            .expect("get updated"),
+        Some("session_data_v2".to_string())
+    );
+
+    // Delete session
+    assert!(worker_store
+        .delete_session(token_hash)
+        .await
+        .expect("delete session"));
+    assert_eq!(
+        worker_store
+            .get_session(token_hash)
+            .await
+            .expect("get after delete"),
+        None
+    );
+
+    // 14. Encrypted WorkerSessionStore tests
+    let secret = "test-secret-key-32-bytes-long-abc";
+    let enc_store = db::WorkerSessionStore::new(client.clone(), Some(secret));
+    let enc_token_hash = "111222333444555666777888999000aaabbbcccdddeeefff1112223334445556";
+    let plain_session = "1?dc=2&auth_key=deadbeefcafe1234567890";
+
+    enc_store
+        .save_session(enc_token_hash, plain_session)
+        .await
+        .expect("save encrypted session");
+
+    // Verify round-trip load
+    let loaded = enc_store
+        .get_session(enc_token_hash)
+        .await
+        .expect("get encrypted session");
+    assert_eq!(loaded, Some(plain_session.to_string()));
+
+    // Verify that the underlying DB row contains ciphertext (not plaintext)
+    let raw_store = db::WorkerSessionStore::new(client.clone(), None);
+    let raw_db_data = raw_store
+        .get_session(enc_token_hash)
+        .await
+        .expect("get raw DB session")
+        .expect("raw DB row exists");
+    assert_ne!(raw_db_data, plain_session);
+
+    // Verify raw data is valid base64 and has at least 12 bytes
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&raw_db_data)
+        .expect("ciphertext is valid base64");
+    assert!(decoded.len() >= 12, "ciphertext has at least 12-byte nonce");
+
+    // Verify reading with a wrong secret key fails gracefully returning Ok(None)
+    let wrong_key_store = db::WorkerSessionStore::new(client.clone(), Some("wrong-secret-key"));
+    let decrypt_failed = wrong_key_store
+        .get_session(enc_token_hash)
+        .await
+        .expect("wrong key returns Ok(None)");
+    assert_eq!(decrypt_failed, None);
+
+    // Clean up
+    assert!(enc_store
+        .delete_session(enc_token_hash)
+        .await
+        .expect("delete encrypted session"));
+    assert_eq!(
+        enc_store
+            .get_session(enc_token_hash)
+            .await
+            .expect("get after delete"),
+        None
+    );
 }

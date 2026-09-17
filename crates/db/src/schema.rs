@@ -121,6 +121,15 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    tg_worker_sessions (bot_token_hash) {
+        bot_token_hash -> Varchar,
+        session_data -> Text,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
 diesel::allow_tables_to_appear_in_same_query!(
     users,
     tracks,
@@ -131,5 +140,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     one_time_auth_codes,
     user_favorites,
     user_playlists,
-    user_playlist_tracks
+    user_playlist_tracks,
+    tg_worker_sessions
 );

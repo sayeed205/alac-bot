@@ -227,6 +227,13 @@ impl RenditionWorkPlan {
 }
 
 impl Codec {
+    pub const fn mime_type(self) -> &'static str {
+        match self {
+            Self::Alac | Self::Aac | Self::Ec3 => "audio/mp4",
+            Self::Flac => "audio/flac",
+        }
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Alac => "alac",
@@ -524,5 +531,13 @@ mod tests {
             CodecPreference::parse("cd"),
             Some(CodecPreference::LosslessCd)
         );
+    }
+
+    #[test]
+    fn test_codec_mime_types() {
+        assert_eq!(Codec::Alac.mime_type(), "audio/mp4");
+        assert_eq!(Codec::Aac.mime_type(), "audio/mp4");
+        assert_eq!(Codec::Ec3.mime_type(), "audio/mp4");
+        assert_eq!(Codec::Flac.mime_type(), "audio/flac");
     }
 }

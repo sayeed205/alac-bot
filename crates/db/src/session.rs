@@ -42,16 +42,26 @@ pub struct SessionManager {
     admin_id: i64,
 }
 
+/// Compute lowercase hex-encoded SHA-256 hash of a token after trimming leading and trailing whitespace.
+pub fn hash_token(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token.trim().as_bytes());
+    let hash = hasher.finalize();
+    let mut s = String::with_capacity(64);
+    for byte in hash {
+        use std::fmt::Write;
+        let _ = write!(s, "{byte:02x}");
+    }
+    s
+}
+
 impl SessionManager {
     pub fn new(pool: DbPool, admin_id: i64) -> Self {
         Self { pool, admin_id }
     }
 
     pub fn hash_token(token: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(token.as_bytes());
-        let hash = hasher.finalize();
-        hash.iter().map(|b| format!("{b:02x}")).collect()
+        hash_token(token)
     }
 
     /// Generates a single-use 6-character OTP (e.g. "ABC-XYZ") valid for 5 minutes.
