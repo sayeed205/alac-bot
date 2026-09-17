@@ -305,6 +305,18 @@ mod tests {
         assert_eq!(cmd.items.len(), 1);
         assert_eq!(cmd.items[0].id, "0060253786977");
         assert_eq!(cmd.codec_preference, Some(CodecPreference::HighestQuality));
+
+        let interpreter = parse_text(
+            "/get https://www.qobuz.com/us-en/interpreter/billie-eilish/2867335",
+            None,
+            false,
+        );
+        assert!(interpreter.is_some());
+        let cmd = interpreter.unwrap();
+        assert_eq!(cmd.provider, engine::types::Provider::Qobuz);
+        assert_eq!(cmd.items.len(), 1);
+        assert_eq!(cmd.items[0].id, "2867335");
+        assert_eq!(cmd.items[0].kind, engine::types::TargetKind::Artist);
     }
 
     #[test]

@@ -19,12 +19,12 @@ pub struct QobuzEntity {
 }
 
 static QOBUZ_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)https?://(?:open|play|www)\.qobuz\.com/(?:[a-z]{2}-[a-z]{2}/)?(track|album|artist|playlist)/(?:[^/]+/)?([a-zA-Z0-9_-]+)"#)
+    Regex::new(r#"(?i)https?://(?:open|play|www)\.qobuz\.com/(?:[a-z]{2}-[a-z]{2}/)?(track|album|artist|interpreter|interprete|playlist)/(?:[^/]+/)?([a-zA-Z0-9_-]+)"#)
         .expect("valid regex")
 });
 
 static QOBUZ_URI_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)^qobuz:(track|album|artist|playlist):([a-zA-Z0-9_-]+)$"#)
+    Regex::new(r#"(?i)^qobuz:(track|album|artist|interpreter|interprete|playlist):([a-zA-Z0-9_-]+)$"#)
         .expect("valid regex")
 });
 
@@ -37,7 +37,7 @@ pub fn parse_qobuz_url(input: &str) -> Option<QobuzEntity> {
         let kind = match kind_str.as_str() {
             "track" => QobuzKind::Track,
             "album" => QobuzKind::Album,
-            "artist" => QobuzKind::Artist,
+            "artist" | "interpreter" | "interprete" => QobuzKind::Artist,
             "playlist" => QobuzKind::Playlist,
             _ => return None,
         };
@@ -50,7 +50,7 @@ pub fn parse_qobuz_url(input: &str) -> Option<QobuzEntity> {
         let kind = match kind_str.as_str() {
             "track" => QobuzKind::Track,
             "album" => QobuzKind::Album,
-            "artist" => QobuzKind::Artist,
+            "artist" | "interpreter" | "interprete" => QobuzKind::Artist,
             "playlist" => QobuzKind::Playlist,
             _ => return None,
         };
@@ -92,6 +92,20 @@ mod tests {
             Some(QobuzEntity {
                 kind: QobuzKind::Track,
                 id: "46487920".to_owned()
+            })
+        );
+        assert_eq!(
+            parse_qobuz_url("https://www.qobuz.com/us-en/interpreter/billie-eilish/2867335"),
+            Some(QobuzEntity {
+                kind: QobuzKind::Artist,
+                id: "2867335".to_owned()
+            })
+        );
+        assert_eq!(
+            parse_qobuz_url("https://play.qobuz.com/artist/2867335"),
+            Some(QobuzEntity {
+                kind: QobuzKind::Artist,
+                id: "2867335".to_owned()
             })
         );
     }
