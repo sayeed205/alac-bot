@@ -54,6 +54,8 @@ pub enum SettingsAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingFeature {
+    Apple,
+    Qobuz,
     Album,
     Playlist,
     Artist,
@@ -262,6 +264,8 @@ fn decode_settings(parts: Vec<&str>) -> Result<SettingsAction, DecodeError> {
         ["refresh"] => Ok(SettingsAction::Refresh),
         ["sf_menu"] => Ok(SettingsAction::Storefronts),
         ["mode"] => Ok(SettingsAction::Mode),
+        ["apple"] => Ok(SettingsAction::Toggle(SettingFeature::Apple)),
+        ["qobuz"] => Ok(SettingsAction::Toggle(SettingFeature::Qobuz)),
         ["album"] => Ok(SettingsAction::Toggle(SettingFeature::Album)),
         ["playlist"] => Ok(SettingsAction::Toggle(SettingFeature::Playlist)),
         ["artist"] => Ok(SettingsAction::Toggle(SettingFeature::Artist)),
@@ -402,6 +406,8 @@ fn encode_settings(action: &SettingsAction) -> String {
         SettingsAction::Toggle(feature) => format!(
             "settings:{}",
             match feature {
+                SettingFeature::Apple => "apple",
+                SettingFeature::Qobuz => "qobuz",
                 SettingFeature::Album => "album",
                 SettingFeature::Playlist => "playlist",
                 SettingFeature::Artist => "artist",

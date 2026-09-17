@@ -72,6 +72,16 @@ fn settings_keyboard(settings: &engine::settings::BotSettings) -> ferogram::tl::
         )])
         .row([
             Button::callback(
+                toggle_label("Apple", settings.apple_rip_enabled),
+                b"settings:apple",
+            ),
+            Button::callback(
+                toggle_label("Qobuz", settings.qobuz_rip_enabled),
+                b"settings:qobuz",
+            ),
+        ])
+        .row([
+            Button::callback(
                 toggle_label("Albums", settings.album_rip_enabled),
                 b"settings:album",
             ),
@@ -171,6 +181,8 @@ pub fn render_settings_text(settings: &engine::settings::BotSettings) -> String 
     format!(
         "<b>Bot settings and operation controls</b><br/><br/>\
 • <b>Engine Mode:</b> {}<br/>\
+• <b>Apple Music Ripping:</b> {}<br/>\
+• <b>Qobuz Ripping:</b> {}<br/>\
 • <b>Album Ripping:</b> {}<br/>\
 • <b>Playlist Ripping:</b> {}<br/>\
 • <b>Artist Ripping:</b> {}<br/>\
@@ -181,6 +193,8 @@ pub fn render_settings_text(settings: &engine::settings::BotSettings) -> String 
 • <b>Max Collection Limit:</b> <code>{limit_text}</code><br/><br/>\
 <blockquote><i>Use the buttons below to toggle settings. Owner requests bypass these limits.</i></blockquote>",
         mode_description(settings.ripping_mode),
+        flag(settings.apple_rip_enabled),
+        flag(settings.qobuz_rip_enabled),
         flag(settings.album_rip_enabled),
         flag(settings.playlist_rip_enabled),
         flag(settings.artist_rip_enabled),
@@ -313,6 +327,26 @@ async fn subcommand_reply(
                 .set_setting("ripping_mode", serde_json::json!(mode))
                 .await;
             Some(format!("Engine mode set to: <b>{mode}</b>"))
+        }
+        "apple" | "apple_music" => {
+            let val = matches!(raw_value, "on" | "true" | "1");
+            settings_store
+                .set_setting("apple_rip_enabled", serde_json::json!(val))
+                .await;
+            Some(format!(
+                "Apple Music ripping set to: <b>{}</b>",
+                if val { "ON" } else { "OFF" }
+            ))
+        }
+        "qobuz" => {
+            let val = matches!(raw_value, "on" | "true" | "1");
+            settings_store
+                .set_setting("qobuz_rip_enabled", serde_json::json!(val))
+                .await;
+            Some(format!(
+                "Qobuz ripping set to: <b>{}</b>",
+                if val { "ON" } else { "OFF" }
+            ))
         }
         "album" | "playlist" | "artist" | "txt" | "batch_txt" | "multilink" | "multi_link" => {
             let val = matches!(raw_value, "on" | "true" | "1");
@@ -471,6 +505,8 @@ pub async fn callback(state: Arc<BotState>, query: CallbackQuery, action: Settin
         SettingsAction::Toggle(feature) => {
             let settings_store = state.rip_deps.settings();
             let (enabled, label) = match feature {
+                SettingFeature::Apple => (settings_store.toggle_apple().await, "Apple Music"),
+                SettingFeature::Qobuz => (settings_store.toggle_qobuz().await, "Qobuz"),
                 SettingFeature::Album => (settings_store.toggle_album().await, "Album ripping"),
                 SettingFeature::Playlist => {
                     (settings_store.toggle_playlist().await, "Playlist ripping")

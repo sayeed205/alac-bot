@@ -89,11 +89,26 @@ fn format_stats_html(stats: &db::AlacStats) -> String {
             .iter()
             .enumerate()
             .map(|(index, track)| {
+                let url = match track.track_key.provider {
+                    music::Provider::Apple => {
+                        format!("https://music.apple.com/song/{}", track.track_key.track_id)
+                    }
+                    music::Provider::Qobuz => {
+                        format!("https://open.qobuz.com/track/{}", track.track_key.track_id)
+                    }
+                };
+                let display_text = match (&track.title, &track.artist) {
+                    (Some(title), Some(artist)) if !title.is_empty() && !artist.is_empty() => {
+                        format!("{} — {}", crate::html::escape(title), crate::html::escape(artist))
+                    }
+                    (Some(title), _) if !title.is_empty() => {
+                        crate::html::escape(title)
+                    }
+                    _ => format!("<code>{}</code>", crate::html::escape(&track.track_key.track_id)),
+                };
                 format!(
-                    "{}. <a href=\"https://music.apple.com/song/{}\"><code>{}</code></a> — <b>{}</b> request{}",
+                    "{}. <a href=\"{url}\">{display_text}</a> — <b>{}</b> request{}",
                     index + 1,
-                    track.track_key.track_id,
-                    track.track_key.track_id,
                     track.request_count,
                     if track.request_count > 1 { "s" } else { "" }
                 )
@@ -103,8 +118,10 @@ fn format_stats_html(stats: &db::AlacStats) -> String {
     };
 
     format!(
-        "<b>📊 ALAC Bot Analytics</b><br/><br/><blockquote><b>📦 Storage & Caching</b><br/>• Cached Tracks: <code>{}</code><br/>• Total Requests: <code>{}</code><br/>• Cache Hit Ratio: <b>{}%</b> (<code>{}</code> hits / <code>{}</code> rips)<br/>• Failed Requests: <code>{}</code></blockquote><br/><blockquote><b>⚡ Latency Averages</b><br/>• Cache Retrieval: <code>{}</code><br/>• Mirror Rip Time: <code>{}</code></blockquote><br/><blockquote><b>🔥 Top Requested Tracks</b><br/>{top_tracks}</blockquote>",
+        "<b>📊 ALAC Bot Analytics</b><br/><br/><blockquote><b>📦 Storage & Caching</b><br/>• Cached Tracks: <code>{}</code> (<code>{}</code> Apple · <code>{}</code> Qobuz)<br/>• Total Requests: <code>{}</code><br/>• Cache Hit Ratio: <b>{}%</b> (<code>{}</code> hits / <code>{}</code> rips)<br/>• Failed Requests: <code>{}</code></blockquote><br/><blockquote><b>⚡ Latency Averages</b><br/>• Cache Retrieval: <code>{}</code><br/>• Mirror Rip Time: <code>{}</code></blockquote><br/><blockquote><b>🔥 Top Requested Tracks</b><br/>{top_tracks}</blockquote>",
         stats.total_cached_tracks,
+        stats.apple_cached_tracks,
+        stats.qobuz_cached_tracks,
         stats.total_requests,
         stats.cache_hit_ratio,
         stats.cache_hits,
@@ -272,6 +289,8 @@ mod tests {
     fn stats_card_renders_expected_text() {
         let stats = db::AlacStats {
             total_cached_tracks: 3,
+            apple_cached_tracks: 2,
+            qobuz_cached_tracks: 1,
             total_requests: 4,
             cache_hits: 2,
             cache_misses: 2,
@@ -279,14 +298,24 @@ mod tests {
             avg_rip_duration_ms: 1_250,
             avg_cache_duration_ms: 12,
             total_failed_requests: 1,
-            top_tracks: vec![db::TopTrackStat {
-                track_key: engine::TrackKey::apple("123"),
-                request_count: 2,
-            }],
+            top_tracks: vec![
+                db::TopTrackStat {
+                    track_key: engine::TrackKey::apple("123"),
+                    title: Some("Song Title".to_owned()),
+                    artist: Some("Artist Name".to_owned()),
+                    request_count: 2,
+                },
+                db::TopTrackStat {
+                    track_key: engine::TrackKey::new(music::Provider::Qobuz, "456"),
+                    title: None,
+                    artist: None,
+                    request_count: 1,
+                },
+            ],
         };
         assert_eq!(
             format_stats_html(&stats),
-            "<b>📊 ALAC Bot Analytics</b><br/><br/><blockquote><b>📦 Storage & Caching</b><br/>• Cached Tracks: <code>3</code><br/>• Total Requests: <code>4</code><br/>• Cache Hit Ratio: <b>50%</b> (<code>2</code> hits / <code>2</code> rips)<br/>• Failed Requests: <code>1</code></blockquote><br/><blockquote><b>⚡ Latency Averages</b><br/>• Cache Retrieval: <code>12ms</code><br/>• Mirror Rip Time: <code>1.3s</code></blockquote><br/><blockquote><b>🔥 Top Requested Tracks</b><br/>1. <a href=\"https://music.apple.com/song/123\"><code>123</code></a> — <b>2</b> requests</blockquote>"
+            "<b>📊 ALAC Bot Analytics</b><br/><br/><blockquote><b>📦 Storage & Caching</b><br/>• Cached Tracks: <code>3</code> (<code>2</code> Apple · <code>1</code> Qobuz)<br/>• Total Requests: <code>4</code><br/>• Cache Hit Ratio: <b>50%</b> (<code>2</code> hits / <code>2</code> rips)<br/>• Failed Requests: <code>1</code></blockquote><br/><blockquote><b>⚡ Latency Averages</b><br/>• Cache Retrieval: <code>12ms</code><br/>• Mirror Rip Time: <code>1.3s</code></blockquote><br/><blockquote><b>🔥 Top Requested Tracks</b><br/>1. <a href=\"https://music.apple.com/song/123\">Song Title — Artist Name</a> — <b>2</b> requests<br/>2. <a href=\"https://open.qobuz.com/track/456\"><code>456</code></a> — <b>1</b> request</blockquote>"
         );
     }
 }

@@ -10,12 +10,16 @@ use crate::{DbError, DbPool};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopTrackStat {
     pub track_key: TrackKey,
+    pub title: Option<String>,
+    pub artist: Option<String>,
     pub request_count: i64,
 }
 
 #[derive(Debug, Clone)]
 pub struct AlacStats {
     pub total_cached_tracks: i64,
+    pub apple_cached_tracks: i64,
+    pub qobuz_cached_tracks: i64,
     pub total_requests: i64,
     pub cache_hits: i64,
     pub cache_misses: i64,
@@ -30,6 +34,10 @@ pub struct AlacStats {
 struct AggregateRow {
     #[diesel(sql_type = BigInt)]
     total_cached_tracks: i64,
+    #[diesel(sql_type = BigInt)]
+    apple_cached_tracks: i64,
+    #[diesel(sql_type = BigInt)]
+    qobuz_cached_tracks: i64,
     #[diesel(sql_type = BigInt)]
     total_requests: i64,
     #[diesel(sql_type = BigInt)]
@@ -50,6 +58,10 @@ struct TopTrackRow {
     track_id: String,
     #[diesel(sql_type = BigInt)]
     request_count: i64,
+    #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
+    title: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
+    artist: Option<String>,
 }
 
 #[derive(Clone)]
@@ -64,7 +76,7 @@ impl StatsRepository {
 
     pub async fn get_stats(&self) -> Result<AlacStats, DbError> {
         let mut connection = self.pool.connection().await?;
-        let row = sql_query("SELECT (SELECT COUNT(*) FROM tracks) AS total_cached_tracks, (SELECT COUNT(*) FROM requests) AS total_requests, (SELECT COUNT(*) FROM requests WHERE is_cache_hit) AS cache_hits, (SELECT COUNT(*) FROM requests WHERE status = 'failed') AS total_failed, (SELECT ROUND(AVG(duration_ms))::double precision FROM requests WHERE NOT is_cache_hit AND status = 'completed') AS avg_rip, (SELECT ROUND(AVG(duration_ms))::double precision FROM requests WHERE is_cache_hit AND status = 'completed') AS avg_cache")
+        let row = sql_query("SELECT (SELECT COUNT(*) FROM tracks) AS total_cached_tracks, (SELECT COUNT(*) FROM tracks WHERE provider = 'apple') AS apple_cached_tracks, (SELECT COUNT(*) FROM tracks WHERE provider = 'qobuz') AS qobuz_cached_tracks, (SELECT COUNT(*) FROM requests) AS total_requests, (SELECT COUNT(*) FROM requests WHERE is_cache_hit) AS cache_hits, (SELECT COUNT(*) FROM requests WHERE status = 'failed') AS total_failed, (SELECT ROUND(AVG(duration_ms))::double precision FROM requests WHERE NOT is_cache_hit AND status = 'completed') AS avg_rip, (SELECT ROUND(AVG(duration_ms))::double precision FROM requests WHERE is_cache_hit AND status = 'completed') AS avg_cache")
             .load::<AggregateRow>(&mut *connection)
             .await?
             .into_iter()
@@ -76,11 +88,13 @@ impl StatsRepository {
         } else {
             0.0
         };
-        let top_rows = sql_query("SELECT provider, track_id, COUNT(*) AS request_count FROM requests WHERE status = 'completed' GROUP BY provider, track_id ORDER BY COUNT(*) DESC LIMIT 5")
+        let top_rows = sql_query("SELECT r.provider, r.track_id, COUNT(*) AS request_count, MAX(t.title) AS title, MAX(t.artist) AS artist FROM requests r LEFT JOIN tracks t ON t.provider = r.provider AND t.track_id = r.track_id WHERE r.status = 'completed' GROUP BY r.provider, r.track_id ORDER BY COUNT(*) DESC LIMIT 5")
             .load::<TopTrackRow>(&mut *connection)
             .await?;
         Ok(AlacStats {
             total_cached_tracks: row.total_cached_tracks,
+            apple_cached_tracks: row.apple_cached_tracks,
+            qobuz_cached_tracks: row.qobuz_cached_tracks,
             total_requests: row.total_requests,
             cache_hits: row.cache_hits,
             cache_misses,
@@ -92,6 +106,8 @@ impl StatsRepository {
                 .into_iter()
                 .map(|row| TopTrackStat {
                     track_key: TrackKey::new(row.provider, row.track_id),
+                    title: row.title,
+                    artist: row.artist,
                     request_count: row.request_count,
                 })
                 .collect(),

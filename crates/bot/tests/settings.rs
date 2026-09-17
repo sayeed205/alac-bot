@@ -1,19 +1,12 @@
 //! `/settings` presentation and storefront behavior tests.
 
 use bot::handlers::settings::{render_settings_text, render_storefronts_text, POPULAR_STOREFRONTS};
-use engine::settings::{BotSettings, RippingMode};
+use engine::settings::{default_settings, BotSettings, RippingMode};
 
 fn settings() -> BotSettings {
     BotSettings {
-        ripping_mode: RippingMode::Live,
-        album_rip_enabled: true,
-        playlist_rip_enabled: true,
-        artist_rip_enabled: true,
-        txt_rip_enabled: true,
-        multi_link_rip_enabled: true,
         auto_dump_enabled: false,
-        auto_dump_storefronts: vec!["us".to_owned()],
-        max_collection_tracks: 50,
+        ..default_settings()
     }
 }
 
@@ -24,6 +17,8 @@ fn settings_text_renders_expected_layout() {
     assert!(text.contains(
         "• <b>Engine Mode:</b> <b>Live ripping</b> (Cache hits and live decryption)<br/>"
     ));
+    assert!(text.contains("• <b>Apple Music Ripping:</b> Enabled<br/>"));
+    assert!(text.contains("• <b>Qobuz Ripping:</b> Enabled<br/>"));
     assert!(text.contains("• <b>Album Ripping:</b> Enabled<br/>"));
     assert!(text.contains("• <b>Auto-Dump New Music:</b> Disabled<br/>"));
     assert!(text.contains("• <b>Auto-Dump Storefronts:</b> <code>US</code><br/>"));
@@ -77,4 +72,31 @@ fn db_settings_store_round_trips_auto_dump_and_storefronts() {
     assert!(s.auto_dump_enabled);
     s.auto_dump_storefronts.push("jp".to_owned());
     assert_eq!(s.auto_dump_storefronts, vec!["us", "jp"]);
+}
+
+#[test]
+fn settings_text_renders_provider_toggles() {
+    let mut s = settings();
+    s.apple_rip_enabled = false;
+    assert!(render_settings_text(&s).contains("• <b>Apple Music Ripping:</b> Disabled<br/>"));
+    assert!(render_settings_text(&s).contains("• <b>Qobuz Ripping:</b> Enabled<br/>"));
+
+    s.apple_rip_enabled = true;
+    s.qobuz_rip_enabled = false;
+    assert!(render_settings_text(&s).contains("• <b>Apple Music Ripping:</b> Enabled<br/>"));
+    assert!(render_settings_text(&s).contains("• <b>Qobuz Ripping:</b> Disabled<br/>"));
+}
+
+#[test]
+fn provider_setting_callbacks_round_trip() {
+    use bot::interaction::{SettingFeature, SettingsAction, TelegramAction};
+
+    let apple_action = TelegramAction::Settings(SettingsAction::Toggle(SettingFeature::Apple));
+    let qobuz_action = TelegramAction::Settings(SettingsAction::Toggle(SettingFeature::Qobuz));
+
+    assert_eq!(apple_action.encode(), "settings:apple");
+    assert_eq!(qobuz_action.encode(), "settings:qobuz");
+
+    assert_eq!(TelegramAction::decode("settings:apple").unwrap(), apple_action);
+    assert_eq!(TelegramAction::decode("settings:qobuz").unwrap(), qobuz_action);
 }

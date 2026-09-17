@@ -119,17 +119,24 @@ struct AlbumArchive {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct SettingsArchive {
-    ripping_mode: String,
-    album_rip_enabled: bool,
-    playlist_rip_enabled: bool,
-    artist_rip_enabled: bool,
-    txt_rip_enabled: bool,
-    multi_link_rip_enabled: bool,
-    max_collection_tracks: i32,
-    auto_dump_enabled: bool,
-    auto_dump_storefronts: Vec<String>,
-    updated_at: chrono::DateTime<chrono::Utc>,
+#[serde(untagged)]
+enum SettingsArchive {
+    Modern {
+        data: serde_json::Value,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    },
+    Legacy {
+        ripping_mode: String,
+        album_rip_enabled: bool,
+        playlist_rip_enabled: bool,
+        artist_rip_enabled: bool,
+        txt_rip_enabled: bool,
+        multi_link_rip_enabled: bool,
+        max_collection_tracks: i32,
+        auto_dump_enabled: bool,
+        auto_dump_storefronts: Vec<String>,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    },
 }
 
 impl From<User> for UserArchive {
@@ -202,16 +209,8 @@ impl From<Album> for AlbumArchive {
 
 impl From<SettingsRow> for SettingsArchive {
     fn from(row: SettingsRow) -> Self {
-        Self {
-            ripping_mode: row.ripping_mode,
-            album_rip_enabled: row.album_rip_enabled,
-            playlist_rip_enabled: row.playlist_rip_enabled,
-            artist_rip_enabled: row.artist_rip_enabled,
-            txt_rip_enabled: row.txt_rip_enabled,
-            multi_link_rip_enabled: row.multi_link_rip_enabled,
-            max_collection_tracks: row.max_collection_tracks,
-            auto_dump_enabled: row.auto_dump_enabled,
-            auto_dump_storefronts: row.auto_dump_storefronts,
+        Self::Modern {
+            data: row.data,
             updated_at: row.updated_at,
         }
     }
@@ -391,19 +390,40 @@ impl DbDumpService {
                         .execute(&mut *transaction)
                         .await?;
                 }
-                let row = archive.settings;
+                let (data, updated_at) = match archive.settings {
+                    SettingsArchive::Modern { data, updated_at } => (data, updated_at),
+                    SettingsArchive::Legacy {
+                        ripping_mode,
+                        album_rip_enabled,
+                        playlist_rip_enabled,
+                        artist_rip_enabled,
+                        txt_rip_enabled,
+                        multi_link_rip_enabled,
+                        max_collection_tracks,
+                        auto_dump_enabled,
+                        auto_dump_storefronts,
+                        updated_at,
+                    } => {
+                        let json_val = serde_json::json!({
+                            "ripping_mode": ripping_mode,
+                            "album_rip_enabled": album_rip_enabled,
+                            "playlist_rip_enabled": playlist_rip_enabled,
+                            "artist_rip_enabled": artist_rip_enabled,
+                            "txt_rip_enabled": txt_rip_enabled,
+                            "multi_link_rip_enabled": multi_link_rip_enabled,
+                            "max_collection_tracks": max_collection_tracks,
+                            "auto_dump_enabled": auto_dump_enabled,
+                            "auto_dump_storefronts": auto_dump_storefronts,
+                            "apple_rip_enabled": true,
+                            "qobuz_rip_enabled": true,
+                        });
+                        (json_val, updated_at)
+                    }
+                };
                 diesel::update(settings::table.filter(settings::id.eq(1_i16)))
                     .set((
-                        settings::ripping_mode.eq(row.ripping_mode),
-                        settings::album_rip_enabled.eq(row.album_rip_enabled),
-                        settings::playlist_rip_enabled.eq(row.playlist_rip_enabled),
-                        settings::artist_rip_enabled.eq(row.artist_rip_enabled),
-                        settings::txt_rip_enabled.eq(row.txt_rip_enabled),
-                        settings::multi_link_rip_enabled.eq(row.multi_link_rip_enabled),
-                        settings::max_collection_tracks.eq(row.max_collection_tracks),
-                        settings::auto_dump_enabled.eq(row.auto_dump_enabled),
-                        settings::auto_dump_storefronts.eq(row.auto_dump_storefronts),
-                        settings::updated_at.eq(row.updated_at),
+                        settings::data.eq(data),
+                        settings::updated_at.eq(updated_at),
                     ))
                     .execute(&mut *transaction)
                     .await?;

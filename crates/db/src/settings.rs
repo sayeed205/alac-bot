@@ -7,9 +7,9 @@ use serde_json::{json, Value};
 
 use crate::{models::SettingsRow, schema::settings, DbError, DbPool};
 
-/// The settings table is a one-row, typed configuration record.  The JSON
-/// value accepted by `set_setting` remains as the service boundary used by
-/// the bot, but it is decoded once and never stored as untyped JSON.
+/// The settings table is a one-row, JSONB-backed configuration record.
+/// Unknown keys are preserved in `BotSettings.extra` to ensure future settings
+/// require zero database schema migrations.
 pub struct SettingsStore {
     pool: DbPool,
     cached_settings: RwLock<BotSettings>,
@@ -27,7 +27,7 @@ impl SettingsStore {
         self.reload().await
     }
 
-    /// Reload the cache from PostgreSQL.  This is intentionally fallible: a
+    /// Reload the cache from PostgreSQL. This is intentionally fallible: a
     /// stale in-memory snapshot is unsafe after a restore or a reconnect.
     pub async fn reload(&self) -> Result<(), DbError> {
         let result = self.load().await?;
@@ -56,16 +56,19 @@ impl SettingsStore {
     }
 
     /// Set one externally named setting while persisting the complete typed
-    /// singleton. Unknown or incorrectly typed values are ignored, matching
-    /// the service's previous non-throwing boundary without coercion.
+    /// singleton. Unknown keys are preserved into `extra` dynamically.
     pub async fn set_setting(&self, key: &str, value: Value) -> BotSettings {
-        let key = canonical_key(key);
-        let Some(key) = key else {
-            return self.get_settings();
-        };
         let mut next = self.get_settings();
-        if !apply_value(&mut next, key, &value) {
-            return next;
+        let canonical = canonical_key(key);
+        let applied = match canonical {
+            Some(k) => apply_value(&mut next, k, &value),
+            None => {
+                next.extra.insert(key.to_owned(), value);
+                true
+            }
+        };
+        if !applied {
+            return self.get_settings();
         }
         if let Err(error) = self.persist(&next).await {
             tracing::error!(%error, setting = key, "failed to persist setting");
@@ -80,18 +83,10 @@ impl SettingsStore {
 
     async fn persist(&self, value: &BotSettings) -> Result<(), DbError> {
         let mut connection = self.pool.connection().await?;
+        let data_json = serde_json::to_value(value).map_err(|e| DbError::Row(e.to_string()))?;
         diesel::update(settings::table.filter(settings::id.eq(1_i16)))
             .set((
-                settings::ripping_mode.eq(value.ripping_mode.as_str()),
-                settings::album_rip_enabled.eq(value.album_rip_enabled),
-                settings::playlist_rip_enabled.eq(value.playlist_rip_enabled),
-                settings::artist_rip_enabled.eq(value.artist_rip_enabled),
-                settings::txt_rip_enabled.eq(value.txt_rip_enabled),
-                settings::multi_link_rip_enabled.eq(value.multi_link_rip_enabled),
-                settings::max_collection_tracks.eq(i32::try_from(value.max_collection_tracks)
-                    .map_err(|error| DbError::Row(error.to_string()))?),
-                settings::auto_dump_enabled.eq(value.auto_dump_enabled),
-                settings::auto_dump_storefronts.eq(&value.auto_dump_storefronts),
+                settings::data.eq(data_json),
                 settings::updated_at.eq(diesel::dsl::now),
             ))
             .execute(&mut *connection)
@@ -106,6 +101,12 @@ impl SettingsStore {
             .ripping_mode
     }
 
+    pub async fn toggle_apple(&self) -> bool {
+        self.toggle("apple_rip_enabled").await
+    }
+    pub async fn toggle_qobuz(&self) -> bool {
+        self.toggle("qobuz_rip_enabled").await
+    }
     pub async fn toggle_album(&self) -> bool {
         self.toggle("album_rip_enabled").await
     }
@@ -128,6 +129,8 @@ impl SettingsStore {
     async fn toggle(&self, key: &str) -> bool {
         let current = self.get_settings();
         let value = match key {
+            "apple_rip_enabled" => !current.apple_rip_enabled,
+            "qobuz_rip_enabled" => !current.qobuz_rip_enabled,
             "album_rip_enabled" => !current.album_rip_enabled,
             "playlist_rip_enabled" => !current.playlist_rip_enabled,
             "artist_rip_enabled" => !current.artist_rip_enabled,
@@ -137,6 +140,8 @@ impl SettingsStore {
         };
         let settings = self.set_setting(key, json!(value)).await;
         match key {
+            "apple_rip_enabled" => settings.apple_rip_enabled,
+            "qobuz_rip_enabled" => settings.qobuz_rip_enabled,
             "album_rip_enabled" => settings.album_rip_enabled,
             "playlist_rip_enabled" => settings.playlist_rip_enabled,
             "artist_rip_enabled" => settings.artist_rip_enabled,
@@ -201,29 +206,17 @@ impl SettingsStore {
 }
 
 fn from_row(row: SettingsRow) -> BotSettings {
-    BotSettings {
-        ripping_mode: RippingMode::parse(&row.ripping_mode).unwrap_or_default(),
-        album_rip_enabled: row.album_rip_enabled,
-        playlist_rip_enabled: row.playlist_rip_enabled,
-        artist_rip_enabled: row.artist_rip_enabled,
-        txt_rip_enabled: row.txt_rip_enabled,
-        multi_link_rip_enabled: row.multi_link_rip_enabled,
-        max_collection_tracks: u32::try_from(row.max_collection_tracks)
-            .ok()
-            .filter(|value| engine::limits::validate_collection_limit(*value))
-            .unwrap_or(50),
-        auto_dump_enabled: row.auto_dump_enabled,
-        auto_dump_storefronts: if row.auto_dump_storefronts.is_empty() {
-            vec!["us".to_owned()]
-        } else {
-            row.auto_dump_storefronts
-        },
-    }
+    serde_json::from_value(row.data).unwrap_or_else(|error| {
+        tracing::warn!(%error, "failed to decode stored settings; using defaults");
+        default_settings()
+    })
 }
 
 fn canonical_key(key: &str) -> Option<&'static str> {
     match key {
         "ripping_mode" | "rippingMode" => Some("ripping_mode"),
+        "apple_rip_enabled" | "appleRipEnabled" | "apple" => Some("apple_rip_enabled"),
+        "qobuz_rip_enabled" | "qobuzRipEnabled" | "qobuz" => Some("qobuz_rip_enabled"),
         "album_rip_enabled" | "albumRipEnabled" => Some("album_rip_enabled"),
         "playlist_rip_enabled" | "playlistRipEnabled" => Some("playlist_rip_enabled"),
         "artist_rip_enabled" | "artistRipEnabled" => Some("artist_rip_enabled"),
@@ -242,6 +235,14 @@ fn apply_value(settings: &mut BotSettings, key: &str, value: &Value) -> bool {
             .as_str()
             .and_then(RippingMode::parse)
             .map(|mode| settings.ripping_mode = mode)
+            .is_some(),
+        "apple_rip_enabled" => value
+            .as_bool()
+            .map(|v| settings.apple_rip_enabled = v)
+            .is_some(),
+        "qobuz_rip_enabled" => value
+            .as_bool()
+            .map(|v| settings.qobuz_rip_enabled = v)
             .is_some(),
         "album_rip_enabled" => value
             .as_bool()

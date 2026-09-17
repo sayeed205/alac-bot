@@ -4,8 +4,25 @@
 //! lives in the db crate; this module carries the domain types,
 //! defaults, and permission logic.
 
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_50() -> u32 {
+    50
+}
+
+fn default_storefronts() -> Vec<String> {
+    vec!["us".to_string()]
+}
+
 /// Whether the bot rips live, serves cache only, or is paused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RippingMode {
     #[default]
     Live,
@@ -35,31 +52,54 @@ impl RippingMode {
 }
 
 /// The bot's runtime settings.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BotSettings {
+    #[serde(default)]
     pub ripping_mode: RippingMode,
+    #[serde(default = "default_true")]
     pub album_rip_enabled: bool,
+    #[serde(default = "default_true")]
     pub playlist_rip_enabled: bool,
+    #[serde(default = "default_true")]
     pub artist_rip_enabled: bool,
+    #[serde(default = "default_true")]
     pub txt_rip_enabled: bool,
+    #[serde(default = "default_true")]
     pub multi_link_rip_enabled: bool,
+    #[serde(default = "default_50")]
     pub max_collection_tracks: u32,
+    #[serde(default = "default_true")]
     pub auto_dump_enabled: bool,
+    #[serde(default = "default_storefronts")]
     pub auto_dump_storefronts: Vec<String>,
+    #[serde(default = "default_true")]
+    pub apple_rip_enabled: bool,
+    #[serde(default = "default_true")]
+    pub qobuz_rip_enabled: bool,
+    #[serde(flatten, default)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
-/// Default settings.
-pub const DEFAULT_SETTINGS: BotSettings = BotSettings {
-    ripping_mode: RippingMode::Live,
-    album_rip_enabled: true,
-    playlist_rip_enabled: true,
-    artist_rip_enabled: true,
-    txt_rip_enabled: true,
-    multi_link_rip_enabled: true,
-    max_collection_tracks: 50,
-    auto_dump_enabled: true,
-    auto_dump_storefronts: Vec::new(), // filled by `default_settings()` — see below
-};
+impl Default for BotSettings {
+    fn default() -> Self {
+        Self {
+            ripping_mode: RippingMode::Live,
+            album_rip_enabled: true,
+            playlist_rip_enabled: true,
+            artist_rip_enabled: true,
+            txt_rip_enabled: true,
+            multi_link_rip_enabled: true,
+            max_collection_tracks: 50,
+            auto_dump_enabled: true,
+            auto_dump_storefronts: vec!["us".to_string()],
+            apple_rip_enabled: true,
+            qobuz_rip_enabled: true,
+            extra: HashMap::new(),
+        }
+    }
+}
+
+
 
 impl BotSettings {
     /// Admins can always rip live; users need mode `'live'`.
@@ -68,6 +108,25 @@ impl BotSettings {
             return true;
         }
         self.ripping_mode == RippingMode::Live
+    }
+
+    /// Check if live ripping is enabled for the specified provider.
+    pub fn can_rip_provider(&self, provider: music::Provider, is_admin: bool) -> bool {
+        if is_admin {
+            return true;
+        }
+        match provider {
+            music::Provider::Apple => self.apple_rip_enabled,
+            music::Provider::Qobuz => self.qobuz_rip_enabled,
+        }
+    }
+
+    pub fn can_rip_apple(&self, is_admin: bool) -> bool {
+        self.can_rip_provider(music::Provider::Apple, is_admin)
+    }
+
+    pub fn can_rip_qobuz(&self, is_admin: bool) -> bool {
+        self.can_rip_provider(music::Provider::Qobuz, is_admin)
     }
 
     /// Admins can always serve cache; users need mode `!= 'paused'`.
@@ -111,10 +170,7 @@ impl BotSettings {
 /// `DEFAULT_SETTINGS` with its `autoDumpStorefronts: ['us']` — the const
 /// cannot hold a `Vec<String>`, so callers use this constructor.
 pub fn default_settings() -> BotSettings {
-    BotSettings {
-        auto_dump_storefronts: vec!["us".to_string()],
-        ..DEFAULT_SETTINGS.clone()
-    }
+    BotSettings::default()
 }
 
 #[cfg(test)]
@@ -133,6 +189,8 @@ mod tests {
         assert_eq!(d.max_collection_tracks, 50);
         assert!(d.auto_dump_enabled);
         assert_eq!(d.auto_dump_storefronts, vec!["us".to_string()]);
+        assert!(d.apple_rip_enabled);
+        assert!(d.qobuz_rip_enabled);
     }
 
     #[test]
@@ -166,6 +224,30 @@ mod tests {
     }
 
     #[test]
+    fn can_rip_provider_admin_bypass() {
+        let mut s = default_settings();
+        s.apple_rip_enabled = false;
+        s.qobuz_rip_enabled = false;
+
+        assert!(!s.can_rip_apple(false));
+        assert!(!s.can_rip_qobuz(false));
+        // Admins bypass
+        assert!(s.can_rip_apple(true));
+        assert!(s.can_rip_qobuz(true));
+    }
+
+    #[test]
+    fn json_serialization_roundtrip_with_extra() {
+        let mut s = default_settings();
+        s.extra.insert("custom_feature".to_string(), serde_json::json!(true));
+
+        let json_str = serde_json::to_string(&s).expect("serialize");
+        let deserialized: BotSettings = serde_json::from_str(&json_str).expect("deserialize");
+        assert_eq!(deserialized.apple_rip_enabled, true);
+        assert_eq!(deserialized.extra.get("custom_feature"), Some(&serde_json::json!(true)));
+    }
+
+    #[test]
     fn can_serve_cache_blocks_only_when_paused() {
         let live = default_settings();
         let cache = BotSettings {
@@ -184,8 +266,8 @@ mod tests {
     }
 
     #[test]
-    fn flag_gates_respect_admin_bypass() {
-        let all_off = BotSettings {
+    fn collection_toggles_admin_bypass() {
+        let disabled = BotSettings {
             album_rip_enabled: false,
             playlist_rip_enabled: false,
             artist_rip_enabled: false,
@@ -194,33 +276,36 @@ mod tests {
             ..default_settings()
         };
 
-        assert!(!all_off.can_rip_album(false));
-        assert!(!all_off.can_rip_playlist(false));
-        assert!(!all_off.can_rip_artist(false));
-        assert!(!all_off.can_rip_txt(false));
-        assert!(!all_off.can_rip_multi_link(false));
-        assert!(all_off.can_rip_album(true));
-        assert!(all_off.can_rip_playlist(true));
-        assert!(all_off.can_rip_artist(true));
-        assert!(all_off.can_rip_txt(true));
-        assert!(all_off.can_rip_multi_link(true));
+        assert!(!disabled.can_rip_album(false));
+        assert!(disabled.can_rip_album(true));
+        assert!(!disabled.can_rip_playlist(false));
+        assert!(disabled.can_rip_playlist(true));
+        assert!(!disabled.can_rip_artist(false));
+        assert!(disabled.can_rip_artist(true));
+        assert!(!disabled.can_rip_txt(false));
+        assert!(disabled.can_rip_txt(true));
+        assert!(!disabled.can_rip_multi_link(false));
+        assert!(disabled.can_rip_multi_link(true));
     }
 
     #[test]
-    fn mode_cycles_like_ts() {
+    fn cycled_mode_loops_correctly() {
         let live = default_settings();
-        assert_eq!(live.cycled_mode(), RippingMode::CacheOnly);
-
         let cache = BotSettings {
-            ripping_mode: RippingMode::CacheOnly,
+            ripping_mode: live.cycled_mode(),
             ..default_settings()
         };
-        assert_eq!(cache.cycled_mode(), RippingMode::Paused);
-
         let paused = BotSettings {
-            ripping_mode: RippingMode::Paused,
+            ripping_mode: cache.cycled_mode(),
             ..default_settings()
         };
-        assert_eq!(paused.cycled_mode(), RippingMode::Live);
+        let back_to_live = BotSettings {
+            ripping_mode: paused.cycled_mode(),
+            ..default_settings()
+        };
+
+        assert_eq!(cache.ripping_mode, RippingMode::CacheOnly);
+        assert_eq!(paused.ripping_mode, RippingMode::Paused);
+        assert_eq!(back_to_live.ripping_mode, RippingMode::Live);
     }
 }

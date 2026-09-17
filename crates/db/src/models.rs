@@ -74,15 +74,7 @@ pub struct Request {
 #[diesel(table_name = settings)]
 pub struct SettingsRow {
     pub id: i16,
-    pub ripping_mode: String,
-    pub album_rip_enabled: bool,
-    pub playlist_rip_enabled: bool,
-    pub artist_rip_enabled: bool,
-    pub txt_rip_enabled: bool,
-    pub multi_link_rip_enabled: bool,
-    pub max_collection_tracks: i32,
-    pub auto_dump_enabled: bool,
-    pub auto_dump_storefronts: Vec<String>,
+    pub data: serde_json::Value,
     pub updated_at: DateTime<Utc>,
 }
 

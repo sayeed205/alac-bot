@@ -1455,7 +1455,7 @@ impl RipOrchestrator {
         // A single-track album remains an ordinary track delivery; it does
         // not create an empty or one-track archive.
         let zip_deliver = is_album_job && !options.is_cache_only;
-        let warnings = Vec::new();
+        let mut warnings = Vec::new();
         // Generation identity of the resolved track set. Cached ZIP
         // parts recorded with this hash can be reused instead of rebuilt.
         let zip_generation_hash = zip_build.then(|| {
@@ -1709,6 +1709,23 @@ impl RipOrchestrator {
         }
         let mut uncached_items = pipeline_items;
         let has_fresh = uncached_items.iter().any(|item| item.cached.is_none());
+        let cache_hits_present = uncached_items.iter().any(|item| item.cached.is_some());
+        let can_rip_live = settings.can_rip_live(options.is_admin)
+            && settings.can_rip_provider(options.provider, options.is_admin);
+
+        if !can_rip_live
+            && !settings.can_rip_provider(options.provider, options.is_admin)
+            && (has_fresh || !cache_hits_present)
+        {
+            warnings.push(format!(
+                "{} live ripping is currently disabled by administrator.",
+                match options.provider {
+                    music::Provider::Apple => "Apple Music",
+                    music::Provider::Qobuz => "Qobuz",
+                }
+            ));
+        }
+
         // Delivery metadata for the ZIP details message. Populated by
         // the reuse and rebuild finalization paths; None on cache-only.
         let zip_delivery: Option<ZipDeliveryInfo> = None;
@@ -1748,8 +1765,7 @@ impl RipOrchestrator {
         // Maintenance mode skips misses. Cache-only jobs still rip
         // uncached tracks, but keep the resulting audio in the dump channel
         // instead of delivering a copy to the requester.
-        let cache_hits_present = uncached_items.iter().any(|item| item.cached.is_some());
-        if !settings.can_rip_live(options.is_admin)
+        if !can_rip_live
             && (!zip_build || has_fresh)
             && !cache_hits_present
         {
@@ -1783,7 +1799,7 @@ impl RipOrchestrator {
                 first_delivered_msg_id,
             ));
         }
-        if !settings.can_rip_live(options.is_admin) && has_fresh && cache_hits_present {
+        if !can_rip_live && has_fresh && cache_hits_present {
             let skipped: Vec<String> = uncached_items
                 .iter()
                 .filter(|item| item.cached.is_none() && item.rendition == Rendition::Primary)

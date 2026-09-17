@@ -48,15 +48,7 @@ diesel::table! {
 diesel::table! {
     settings (id) {
         id -> SmallInt,
-        ripping_mode -> Text,
-        album_rip_enabled -> Bool,
-        playlist_rip_enabled -> Bool,
-        artist_rip_enabled -> Bool,
-        txt_rip_enabled -> Bool,
-        multi_link_rip_enabled -> Bool,
-        max_collection_tracks -> Integer,
-        auto_dump_enabled -> Bool,
-        auto_dump_storefronts -> Array<Text>,
+        data -> Jsonb,
         updated_at -> Timestamptz,
     }
 }

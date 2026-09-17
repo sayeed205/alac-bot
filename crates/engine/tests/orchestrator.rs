@@ -1417,6 +1417,53 @@ async fn maintenance_mode_skips_uncached_tracks() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_disabled_skips_uncached_and_adds_warning() {
+    let (orch, deps, _, events) = setup();
+    deps.set_settings(|s| s.apple_rip_enabled = false);
+
+    let summary = run_async(&orch, &deps, &options(vec![track_item("1")], false))
+        .await
+        .expect("provider disabled completes with skipped uncached");
+    assert_eq!(summary.skipped_uncached_tracks, vec!["1"]);
+    assert_eq!(summary.cached_count, 0);
+    assert_eq!(summary.ripped_count, 0);
+    assert!(summary.warnings.iter().any(|w| w.contains("Apple Music live ripping is currently disabled")));
+    assert!(events.snapshot().contains(&"completed".to_string()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_disabled_serves_cached_track() {
+    let (orch, deps, _, _) = setup();
+    deps.set_settings(|s| s.apple_rip_enabled = false);
+    deps.cache_track("1", 99);
+
+    let summary = run_async(&orch, &deps, &options(vec![track_item("1")], false))
+        .await
+        .expect("cached delivery succeeds when provider live ripping is disabled");
+    assert_eq!(summary.cached_count, 1);
+    assert_eq!(summary.ripped_count, 0);
+    assert_eq!(summary.skipped_uncached_tracks.len(), 0);
+    assert_eq!(summary.warnings.len(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_disabled_admin_bypasses() {
+    let (orch, deps, _, _) = setup();
+    deps.set_settings(|s| s.apple_rip_enabled = false);
+    deps.rip_scripts
+        .lock()
+        .unwrap()
+        .insert("1".to_owned(), RipScript::OkWithFile(vec![1, 2, 3]));
+
+    let summary = run_async(&orch, &deps, &options(vec![track_item("1")], true))
+        .await
+        .expect("admin bypasses provider disabled gate");
+    assert_eq!(summary.ripped_count, 1);
+    assert_eq!(summary.skipped_uncached_tracks.len(), 0);
+    assert_eq!(summary.warnings.len(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn maintenance_gate_allows_admin_and_cache_only() {
     let (orch, deps, _, _) = setup();
     deps.set_settings(|s| s.ripping_mode = RippingMode::Paused);
