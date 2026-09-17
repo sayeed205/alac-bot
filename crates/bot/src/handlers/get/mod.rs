@@ -10,8 +10,8 @@ pub mod gates;
 pub mod input;
 
 use std::sync::Arc;
-use engine::orchestrator::deps::{CollectionResolver, ProviderAccess, ProviderComposition};
 
+use engine::orchestrator::deps::{CollectionResolver, ProviderAccess, ProviderComposition};
 use ferogram::{
     filters::{self, Dispatcher},
     InputMessage,
@@ -285,10 +285,7 @@ async fn handle_command(state: Arc<BotState>, msg: ferogram::update::IncomingMes
                         total_tracks += summary.total_tracks;
                     }
                     Err(engine::orchestrator::OrchestratorError::Cancelled) => {
-                        tracing::info!(
-                            user_id = owner_id,
-                            "album sequence cancelled by user"
-                        );
+                        tracing::info!(user_id = owner_id, "album sequence cancelled by user");
                         break;
                     }
                     Err(error) => {

@@ -24,8 +24,10 @@ static QOBUZ_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static QOBUZ_URI_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)^qobuz:(track|album|artist|interpreter|interprete|playlist):([a-zA-Z0-9_-]+)$"#)
-        .expect("valid regex")
+    Regex::new(
+        r#"(?i)^qobuz:(track|album|artist|interpreter|interprete|playlist):([a-zA-Z0-9_-]+)$"#,
+    )
+    .expect("valid regex")
 });
 
 pub fn parse_qobuz_url(input: &str) -> Option<QobuzEntity> {

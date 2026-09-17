@@ -594,7 +594,6 @@ async fn clear_cache_forces_refetch() {
     assert_eq!(catalog.transport().served().len(), 2);
 }
 
-
 #[tokio::test]
 async fn album_filters_out_music_videos() {
     let json = r#"{
@@ -630,7 +629,11 @@ async fn album_filters_out_music_videos() {
         .fetch_album_tracks("1753101056", "us")
         .await
         .expect("album tracks");
-    assert_eq!(res.tracks.len(), 1, "music video filtered out from audio album");
+    assert_eq!(
+        res.tracks.len(),
+        1,
+        "music video filtered out from audio album"
+    );
     assert_eq!(res.tracks[0].id, "1753101068");
     assert_eq!(res.tracks[0].title, "IDK HOW");
 }

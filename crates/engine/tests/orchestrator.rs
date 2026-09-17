@@ -1427,7 +1427,10 @@ async fn provider_disabled_skips_uncached_and_adds_warning() {
     assert_eq!(summary.skipped_uncached_tracks, vec!["1"]);
     assert_eq!(summary.cached_count, 0);
     assert_eq!(summary.ripped_count, 0);
-    assert!(summary.warnings.iter().any(|w| w.contains("Apple Music live ripping is currently disabled")));
+    assert!(summary
+        .warnings
+        .iter()
+        .any(|w| w.contains("Apple Music live ripping is currently disabled")));
     assert!(events.snapshot().contains(&"completed".to_string()));
 }
 

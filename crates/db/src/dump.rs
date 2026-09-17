@@ -421,10 +421,7 @@ impl DbDumpService {
                     }
                 };
                 diesel::update(settings::table.filter(settings::id.eq(1_i16)))
-                    .set((
-                        settings::data.eq(data),
-                        settings::updated_at.eq(updated_at),
-                    ))
+                    .set((settings::data.eq(data), settings::updated_at.eq(updated_at)))
                     .execute(&mut *transaction)
                     .await?;
                 Ok::<(), DbError>(())

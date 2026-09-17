@@ -1765,10 +1765,7 @@ impl RipOrchestrator {
         // Maintenance mode skips misses. Cache-only jobs still rip
         // uncached tracks, but keep the resulting audio in the dump channel
         // instead of delivering a copy to the requester.
-        if !can_rip_live
-            && (!zip_build || has_fresh)
-            && !cache_hits_present
-        {
+        if !can_rip_live && (!zip_build || has_fresh) && !cache_hits_present {
             let skipped: Vec<String> = uncached_items
                 .iter()
                 .filter(|item| item.cached.is_none() && item.rendition == Rendition::Primary)

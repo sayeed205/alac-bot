@@ -20,6 +20,10 @@ fn default_storefronts() -> Vec<String> {
     vec!["us".to_string()]
 }
 
+fn default_stream_server_port() -> u16 {
+    4444
+}
+
 /// Whether the bot rips live, serves cache only, or is paused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -76,6 +80,10 @@ pub struct BotSettings {
     pub apple_rip_enabled: bool,
     #[serde(default = "default_true")]
     pub qobuz_rip_enabled: bool,
+    #[serde(default)]
+    pub stream_public_url: Option<String>,
+    #[serde(default = "default_stream_server_port")]
+    pub stream_server_port: u16,
     #[serde(flatten, default)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -94,12 +102,12 @@ impl Default for BotSettings {
             auto_dump_storefronts: vec!["us".to_string()],
             apple_rip_enabled: true,
             qobuz_rip_enabled: true,
+            stream_public_url: None,
+            stream_server_port: 4444,
             extra: HashMap::new(),
         }
     }
 }
-
-
 
 impl BotSettings {
     /// Admins can always rip live; users need mode `'live'`.
@@ -191,6 +199,8 @@ mod tests {
         assert_eq!(d.auto_dump_storefronts, vec!["us".to_string()]);
         assert!(d.apple_rip_enabled);
         assert!(d.qobuz_rip_enabled);
+        assert_eq!(d.stream_public_url, None);
+        assert_eq!(d.stream_server_port, 4444);
     }
 
     #[test]
@@ -239,12 +249,16 @@ mod tests {
     #[test]
     fn json_serialization_roundtrip_with_extra() {
         let mut s = default_settings();
-        s.extra.insert("custom_feature".to_string(), serde_json::json!(true));
+        s.extra
+            .insert("custom_feature".to_string(), serde_json::json!(true));
 
         let json_str = serde_json::to_string(&s).expect("serialize");
         let deserialized: BotSettings = serde_json::from_str(&json_str).expect("deserialize");
-        assert_eq!(deserialized.apple_rip_enabled, true);
-        assert_eq!(deserialized.extra.get("custom_feature"), Some(&serde_json::json!(true)));
+        assert!(deserialized.apple_rip_enabled);
+        assert_eq!(
+            deserialized.extra.get("custom_feature"),
+            Some(&serde_json::json!(true))
+        );
     }
 
     #[test]

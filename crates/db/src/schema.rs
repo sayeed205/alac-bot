@@ -71,4 +71,65 @@ diesel::table! {
     }
 }
 
-diesel::allow_tables_to_appear_in_same_query!(users, tracks, requests, settings, albums);
+diesel::table! {
+    user_sessions (id) {
+        id -> Text,
+        telegram_id -> BigInt,
+        refresh_token_hash -> Text,
+        device_name -> Nullable<Text>,
+        platform -> Nullable<Text>,
+        created_at -> Timestamptz,
+        last_active_at -> Timestamptz,
+        expires_at -> Timestamptz,
+        revoked -> Bool,
+    }
+}
+
+diesel::table! {
+    one_time_auth_codes (code) {
+        code -> Varchar,
+        telegram_id -> BigInt,
+        created_at -> Timestamptz,
+        expires_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    user_favorites (telegram_id, track_id) {
+        telegram_id -> BigInt,
+        track_id -> Integer,
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    user_playlists (id) {
+        id -> Integer,
+        telegram_id -> BigInt,
+        name -> Text,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    user_playlist_tracks (playlist_id, track_id) {
+        playlist_id -> Integer,
+        track_id -> Integer,
+        position -> Integer,
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::allow_tables_to_appear_in_same_query!(
+    users,
+    tracks,
+    requests,
+    settings,
+    albums,
+    user_sessions,
+    one_time_auth_codes,
+    user_favorites,
+    user_playlists,
+    user_playlist_tracks
+);

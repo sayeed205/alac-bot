@@ -99,12 +99,17 @@ fn format_stats_html(stats: &db::AlacStats) -> String {
                 };
                 let display_text = match (&track.title, &track.artist) {
                     (Some(title), Some(artist)) if !title.is_empty() && !artist.is_empty() => {
-                        format!("{} — {}", crate::html::escape(title), crate::html::escape(artist))
+                        format!(
+                            "{} — {}",
+                            crate::html::escape(title),
+                            crate::html::escape(artist)
+                        )
                     }
-                    (Some(title), _) if !title.is_empty() => {
-                        crate::html::escape(title)
-                    }
-                    _ => format!("<code>{}</code>", crate::html::escape(&track.track_key.track_id)),
+                    (Some(title), _) if !title.is_empty() => crate::html::escape(title),
+                    _ => format!(
+                        "<code>{}</code>",
+                        crate::html::escape(&track.track_key.track_id)
+                    ),
                 };
                 format!(
                     "{}. <a href=\"{url}\">{display_text}</a> — <b>{}</b> request{}",

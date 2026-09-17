@@ -97,6 +97,12 @@ fn provider_setting_callbacks_round_trip() {
     assert_eq!(apple_action.encode(), "settings:apple");
     assert_eq!(qobuz_action.encode(), "settings:qobuz");
 
-    assert_eq!(TelegramAction::decode("settings:apple").unwrap(), apple_action);
-    assert_eq!(TelegramAction::decode("settings:qobuz").unwrap(), qobuz_action);
+    assert_eq!(
+        TelegramAction::decode("settings:apple").unwrap(),
+        apple_action
+    );
+    assert_eq!(
+        TelegramAction::decode("settings:qobuz").unwrap(),
+        qobuz_action
+    );
 }

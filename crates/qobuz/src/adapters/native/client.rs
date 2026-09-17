@@ -437,7 +437,9 @@ impl QobuzGateway for NativeRipperAdapter {
                 .map_err(|e| QobuzError::Network(e.to_string()))?;
 
             if res.status() == reqwest::StatusCode::NOT_FOUND {
-                return Err(QobuzError::NotFound(format!("Artist {artist_id} not found")));
+                return Err(QobuzError::NotFound(format!(
+                    "Artist {artist_id} not found"
+                )));
             }
             if !res.status().is_success() {
                 return Err(QobuzError::Message(format!(

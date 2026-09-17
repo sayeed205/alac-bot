@@ -9,10 +9,12 @@ use diesel_async::{pooled_connection::bb8::Pool, AsyncPgConnection, RunQueryDsl}
 
 mod albums;
 mod auth;
+mod library;
 mod migrations;
 mod models;
 mod requests;
 mod schema;
+mod session;
 mod settings;
 mod tracks;
 
@@ -23,10 +25,15 @@ pub use albums::AlbumsRepository;
 pub use auth::{Auth, AuthedPeer};
 pub use dump::{DbDumpService, DumpStats, RestoreStats};
 pub use engine::orchestrator::deps::{CachedTrack, RequestLog, SaveTrackInput};
+pub use library::{LibraryManager, PlaylistDetails, UserPlaylistSummary};
 pub use migrations::migrate;
-pub use models::{Album, NewAlbum, Request, SettingsRow, Track, User};
+pub use models::{
+    Album, NewAlbum, OneTimeAuthCode, Request, SettingsRow, Track, User, UserFavorite,
+    UserPlaylist, UserPlaylistTrack, UserSession,
+};
 pub use music::{Provider, TrackKey};
 pub use requests::RequestLogRepository;
+pub use session::{ClientMetadata, SessionIdentity, SessionManager, SessionTokens};
 pub use settings::SettingsStore;
 pub use stats::{AlacStats, StatsRepository, TopTrackStat};
 pub use tracks::TracksRepository;
@@ -116,6 +123,12 @@ pub enum DbError {
     Migration(String),
     #[error("database row error: {0}")]
     Row(String),
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
+    #[error("validation error: {0}")]
+    Validation(String),
 }
 
 impl From<Box<dyn std::error::Error + Send + Sync>> for DbError {
