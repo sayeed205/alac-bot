@@ -17,6 +17,7 @@ pub mod settings;
 mod spec;
 mod start;
 mod status;
+pub(crate) mod stream;
 
 #[path = "../callbacks.rs"]
 mod callbacks;
@@ -136,6 +137,7 @@ pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
     search::register(dp, Arc::clone(&state));
     random::register(dp, Arc::clone(&state));
     dump::register(dp, Arc::clone(&state));
+    stream::register(dp, Arc::clone(&state));
 
     let callback_state = Arc::clone(&state);
     dp.on_callback_query(filters::all::<CallbackQuery>(), move |query| {

@@ -54,7 +54,7 @@ pub struct StreamEngine {
     cache: Arc<ChunkCache>,
     metadata_cache: Cache<i32, Arc<TrackMediaMetadata>>,
     tracks_repo: db::TracksRepository,
-    primary_client: ferogram::Client,
+    primary_client: Option<ferogram::Client>,
     dump_peer: PeerRef,
 }
 
@@ -63,7 +63,7 @@ impl StreamEngine {
         worker_pool: Arc<StreamWorkerPool>,
         cache: Arc<ChunkCache>,
         tracks_repo: db::TracksRepository,
-        primary_client: ferogram::Client,
+        primary_client: Option<ferogram::Client>,
         dump_peer: PeerRef,
     ) -> Self {
         let metadata_cache = Cache::builder()
@@ -99,8 +99,12 @@ impl StreamEngine {
             .await?
             .ok_or(StreamError::TrackNotFound(track_id))?;
 
-        let messages = self
+        let client = self
             .primary_client
+            .as_ref()
+            .ok_or(StreamError::AllWorkersUnavailable)?;
+
+        let messages = client
             .get_messages(self.dump_peer.clone(), &[track.message_id])
             .await
             .map_err(StreamError::Telegram)?;

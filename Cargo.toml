@@ -9,6 +9,7 @@ members = [
     "crates/db",
     "crates/media",
     "crates/stream",
+    "crates/server",
     "crates/bot",
 ]
 
@@ -58,7 +59,12 @@ id3 = "1.17"
 font8x8 = "0.3"
 temari = { git = "https://github.com/WorldObservationLog/Temari" }
 moka = { version = "0.12", features = ["future"] }
-aes-gcm = "0.10"
+aes-gcm = "0.11"
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.7", features = ["cors", "trace"] }
+utoipa = { version = "5", features = ["axum_extras", "chrono", "yaml"] }
+hmac = "0.13"
 
 
 

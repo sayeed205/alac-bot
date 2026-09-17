@@ -192,9 +192,97 @@ async fn main() -> Result<()> {
         worker_pool,
         Arc::new(stream::ChunkCache::default()),
         db::TracksRepository::new(database.clone()),
-        client.clone(),
+        Some(client.clone()),
         PeerRef::from(env.dump_channel_id),
     ));
+
+    let session_manager = Arc::new(db::SessionManager::new(database.clone(), env.admin_id));
+    let library_manager = Arc::new(db::LibraryManager::new(database.clone()));
+    let tracks_repo = Arc::new(db::TracksRepository::new(database.clone()));
+    let settings_store = Arc::new(db::SettingsStore::new(database.clone()));
+    let app_key = std::env::var("APP_KEY")
+        .unwrap_or_else(|_| "IQfVm8yrIR83zlWvEZ5Fr9fpN6lGgWhV".to_string());
+
+    let initial_settings = settings_store.get_settings();
+    let port = std::env::var("STREAM_SERVER_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(initial_settings.stream_server_port);
+
+    let server_config = server::ServerConfig {
+        host: [0, 0, 0, 0].into(),
+        port,
+        app_key: app_key.clone(),
+        cors_origins: vec!["*".to_string()],
+    };
+
+    let apple_catalog = Arc::new(apple::Catalog::new(apple::ReqwestTransport::new()));
+    let orchestrator_for_tasks = orchestrator.clone();
+    let rip_deps_for_tasks = rip_deps.clone();
+    let rip_task_runner: server::RipTaskRunner = Arc::new(
+        move |task_id, provider, track_id, codec, user_id| {
+            let orchestrator = orchestrator_for_tasks.clone();
+            let rip_deps = rip_deps_for_tasks.clone();
+            tokio::spawn(async move {
+                let item = engine::types::ParsedTargetItem {
+                    id: track_id.clone(),
+                    kind: music::TargetKind::Track,
+                    storefront: Some("us".to_string()),
+                };
+                let codec_preference = codec.map(|c| match c {
+                    music::Codec::Alac | music::Codec::Flac => music::CodecPreference::HighestQuality,
+                    music::Codec::Aac => music::CodecPreference::LosslessCd,
+                    _ => music::CodecPreference::HighestQuality,
+                });
+                let options = engine::orchestrator::types::RipJobOptions {
+                    provider,
+                    chat_id: 0,
+                    user_id,
+                    user_name: None,
+                    delivery_chat_id: 0,
+                    is_group: false,
+                    is_force: false,
+                    is_cache_only: false,
+                    single_storefront: Some("us".to_string()),
+                    parsed_items: vec![item],
+                    reply_to_message_id: None,
+                    status_msg_id: 0,
+                    is_admin: false,
+                    codec_preference,
+                    rendition_policy: engine::orchestrator::types::RenditionPolicy::PrimaryOnly,
+                };
+
+                tracing::info!(task_id = %task_id, "Executing background rip task via RipOrchestrator");
+                if let Err(e) = orchestrator.start_job(rip_deps, &options).await {
+                    tracing::warn!(task_id = %task_id, error = %e, "Background rip task failed");
+                }
+            })
+        },
+    );
+
+    let server_state = Arc::new(
+        server::ServerState::new(
+            stream_engine.clone(),
+            session_manager.clone(),
+            library_manager,
+            tracks_repo,
+            settings_store,
+            orchestrator.clone(),
+            app_key,
+        )
+        .with_catalog_service(apple_catalog)
+        .with_rip_task_runner(rip_task_runner),
+    );
+
+    let server_shutdown = tokio_util::sync::CancellationToken::new();
+    let server_task = tokio::spawn({
+        let server_shutdown = server_shutdown.clone();
+        async move {
+            if let Err(e) = server::run_server(server_config, server_state, server_shutdown).await {
+                tracing::error!(error = %e, "Axum streaming server failed");
+            }
+        }
+    });
 
     let state = Arc::new(BotState {
         client: client.clone(),
@@ -210,6 +298,7 @@ async fn main() -> Result<()> {
         db_client: database.clone(),
         started_at: std::time::Instant::now(),
         stream_engine: Some(stream_engine),
+        session_manager,
     });
 
     // Bridge subscribes once; its consumer renders status messages + dashboard.
@@ -258,5 +347,7 @@ async fn main() -> Result<()> {
     }
     info!("Shutting down bot...");
     shutdown.cancel();
+    server_shutdown.cancel();
+    let _ = server_task.await;
     Ok(())
 }

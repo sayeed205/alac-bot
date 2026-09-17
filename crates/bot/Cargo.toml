@@ -19,6 +19,7 @@ lyrics = { path = "../lyrics", features = ["lrclib", "betterlyrics", "paxsenix"]
 music = { path = "../music" }
 media = { path = "../media" }
 stream = { path = "../stream" }
+server = { path = "../server" }
 ferogram.workspace = true
 
 regex.workspace = true

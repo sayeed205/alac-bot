@@ -45,7 +45,16 @@ pub struct StreamWorkerPool {
 }
 
 impl StreamWorkerPool {
-    /// Initialize worker pool from tokens.
+    /// Create an empty worker pool (e.g. for testing environments).
+    pub fn empty() -> Arc<Self> {
+        Arc::new(Self {
+            workers: Vec::new(),
+            circuit_breaker: CircuitBreaker::new(0),
+            rr_cursor: AtomicUsize::new(0),
+            primary_fallback: None,
+        })
+    }
+
     ///
     /// If `tokens` is empty or all blank, falls back to wrapping `primary_fallback` if provided.
     pub async fn new(

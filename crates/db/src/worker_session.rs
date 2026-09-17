@@ -59,10 +59,11 @@ impl WorkerSessionStore {
             if let Ok(decoded) = BASE64.decode(&raw_data) {
                 if decoded.len() >= 12 {
                     let (nonce_bytes, ciphertext) = decoded.split_at(12);
-                    let nonce = Nonce::from_slice(nonce_bytes);
-                    if let Ok(plaintext) = c.decrypt(nonce, ciphertext) {
-                        if let Ok(session_str) = String::from_utf8(plaintext) {
-                            return Ok(Some(session_str));
+                    if let Ok(nonce) = Nonce::try_from(nonce_bytes) {
+                        if let Ok(plaintext) = c.decrypt(&nonce, ciphertext) {
+                            if let Ok(session_str) = String::from_utf8(plaintext) {
+                                return Ok(Some(session_str));
+                            }
                         }
                     }
                 }
@@ -79,9 +80,9 @@ impl WorkerSessionStore {
         let mut conn = self.pool.connection().await?;
         let to_save = if let Some(ref c) = self.cipher {
             let nonce_bytes: [u8; 12] = rand::random();
-            let nonce = Nonce::from_slice(&nonce_bytes);
+            let nonce = Nonce::from(nonce_bytes);
             let ciphertext = c
-                .encrypt(nonce, session_data.as_bytes())
+                .encrypt(&nonce, session_data.as_bytes())
                 .map_err(|e| DbError::Row(format!("encryption failed: {e}")))?;
             let mut combined = Vec::with_capacity(12 + ciphertext.len());
             combined.extend_from_slice(&nonce_bytes);

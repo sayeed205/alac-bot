@@ -37,7 +37,7 @@ pub use requests::RequestLogRepository;
 pub use session::{hash_token, ClientMetadata, SessionIdentity, SessionManager, SessionTokens};
 pub use settings::SettingsStore;
 pub use stats::{AlacStats, StatsRepository, TopTrackStat};
-pub use tracks::TracksRepository;
+pub use tracks::{AlbumArtist, TracksRepository};
 pub use worker_session::WorkerSessionStore;
 
 type DieselManager =

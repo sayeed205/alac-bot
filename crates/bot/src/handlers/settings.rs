@@ -190,7 +190,9 @@ pub fn render_settings_text(settings: &engine::settings::BotSettings) -> String 
 • <b>Multi-Link Ripping:</b> {}<br/>\
 • <b>Auto-Dump New Music:</b> {}<br/>\
 • <b>Auto-Dump Storefronts:</b> <code>{sf_list}</code><br/>\
-• <b>Max Collection Limit:</b> <code>{limit_text}</code><br/><br/>\
+• <b>Max Collection Limit:</b> <code>{limit_text}</code><br/>\
+• <b>Stream Public URL:</b> <code>{}</code><br/>\
+• <b>Stream Server Port:</b> <code>{}</code><br/><br/>\
 <blockquote><i>Use the buttons below to toggle settings. Owner requests bypass these limits.</i></blockquote>",
         mode_description(settings.ripping_mode),
         flag(settings.apple_rip_enabled),
@@ -205,6 +207,8 @@ pub fn render_settings_text(settings: &engine::settings::BotSettings) -> String 
         } else {
             "Disabled"
         },
+        settings.stream_public_url.as_deref().unwrap_or("Not configured"),
+        settings.stream_server_port,
     )
 }
 
@@ -440,6 +444,35 @@ async fn subcommand_reply(
                     "Usage: <code>/settings limit &lt;number (0 for unlimited)&gt;</code>"
                         .to_owned(),
                 )
+            }
+        }
+        "stream_url" | "stream" | "url" => {
+            if matches!(raw_value, "clear" | "none" | "remove" | "reset") {
+                settings_store
+                    .set_setting("stream_public_url", serde_json::Value::Null)
+                    .await;
+                Some("Stream public URL cleared".to_owned())
+            } else if raw_value.starts_with("http://") || raw_value.starts_with("https://") {
+                let clean = raw_value.trim_end_matches('/');
+                settings_store
+                    .set_setting("stream_public_url", serde_json::json!(clean))
+                    .await;
+                Some(format!("Stream public URL set to: <code>{clean}</code>"))
+            } else {
+                Some(
+                    "Usage: <code>/settings stream_url &lt;http(s)://domain.com | clear&gt;</code>"
+                        .to_owned(),
+                )
+            }
+        }
+        "stream_port" | "port" => {
+            if let Ok(port) = raw_value.parse::<u16>() {
+                settings_store
+                    .set_setting("stream_server_port", serde_json::json!(port))
+                    .await;
+                Some(format!("Stream server port set to: <b>{port}</b>"))
+            } else {
+                Some("Usage: <code>/settings stream_port &lt;1024-65535&gt;</code>".to_owned())
             }
         }
         _ => None,

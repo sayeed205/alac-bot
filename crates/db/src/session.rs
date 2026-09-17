@@ -334,4 +334,16 @@ impl SessionManager {
         .await?;
         Ok(affected)
     }
+
+    pub async fn get_user_name(&self, telegram_id: i64) -> Result<Option<String>, DbError> {
+        let mut conn = self.pool.connection().await?;
+        let name = users::table
+            .filter(users::telegram_id.eq(telegram_id))
+            .select(users::name)
+            .first::<Option<String>>(&mut *conn)
+            .await
+            .optional()?
+            .flatten();
+        Ok(name)
+    }
 }

@@ -28,6 +28,13 @@ fn cached_track(track: Track) -> CachedTrack {
     }
 }
 
+/// Distinct album and artist pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlbumArtist {
+    pub album: String,
+    pub artist: String,
+}
+
 /// Database repository for the Telegram audio cache.
 #[derive(Clone)]
 pub struct TracksRepository {
@@ -266,5 +273,50 @@ impl TracksRepository {
             })
             .await
             .map_err(DbError::from)
+    }
+
+    pub async fn list_distinct_albums(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AlbumArtist>, DbError> {
+        let mut connection = self.pool.connection().await?;
+        let rows = tracks::table
+            .select((tracks::album, tracks::artist))
+            .distinct()
+            .order(tracks::album.asc())
+            .limit(limit)
+            .offset(offset)
+            .load::<(String, String)>(&mut *connection)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(album, artist)| AlbumArtist { album, artist })
+            .collect())
+    }
+
+    pub async fn find_tracks_by_album(&self, album_name: &str) -> Result<Vec<Track>, DbError> {
+        let mut connection = self.pool.connection().await?;
+        Ok(tracks::table
+            .filter(tracks::album.eq(album_name))
+            .order(tracks::track_number.asc())
+            .select(Track::as_select())
+            .load::<Track>(&mut *connection)
+            .await?)
+    }
+
+    pub async fn find_tracks_by_artist(
+        &self,
+        artist_name: &str,
+        limit: i64,
+    ) -> Result<Vec<Track>, DbError> {
+        let mut connection = self.pool.connection().await?;
+        Ok(tracks::table
+            .filter(tracks::artist.ilike(format!("%{artist_name}%")))
+            .order(tracks::id.desc())
+            .limit(limit)
+            .select(Track::as_select())
+            .load::<Track>(&mut *connection)
+            .await?)
     }
 }

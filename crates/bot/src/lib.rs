@@ -42,6 +42,8 @@ pub struct BotState {
     pub started_at: Instant,
     /// Streaming engine coordinating MTProto worker pool and chunk cache.
     pub stream_engine: Option<Arc<stream::StreamEngine>>,
+    /// Session manager handling OTP codes, refresh tokens, and sliding sessions.
+    pub session_manager: Arc<db::SessionManager>,
 }
 
 
