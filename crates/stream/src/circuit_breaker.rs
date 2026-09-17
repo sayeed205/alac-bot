@@ -73,6 +73,19 @@ impl CircuitBreaker {
             _ => None,
         }
     }
+
+    /// Number of currently healthy and available workers.
+    pub fn available_count(&self) -> usize {
+        let states = self.worker_states.read().unwrap();
+        let now = Instant::now();
+        states
+            .iter()
+            .filter(|s| match s {
+                WorkerState::Healthy => true,
+                WorkerState::Quarantined { until } => now >= *until,
+            })
+            .count()
+    }
 }
 
 #[cfg(test)]

@@ -52,7 +52,10 @@ impl ByteRange {
         let (start, end) = match (parts[0].trim(), parts[1].trim()) {
             ("", end_str) => {
                 let suffix = parse_num(end_str)?;
-                (file_size.saturating_sub(suffix), file_size.saturating_sub(1))
+                (
+                    file_size.saturating_sub(suffix),
+                    file_size.saturating_sub(1),
+                )
             }
             (start_str, "") => (parse_num(start_str)?, file_size.saturating_sub(1)),
             (start_str, end_str) => (parse_num(start_str)?, parse_num(end_str)?),
@@ -93,8 +96,9 @@ impl Stream for ChunkStream {
 }
 
 pub type LocationRefresher = Arc<
-    dyn Fn() -> Pin<Box<dyn Future<Output = Result<tl::enums::InputFileLocation, StreamError>> + Send>>
-        + Send
+    dyn Fn() -> Pin<
+            Box<dyn Future<Output = Result<tl::enums::InputFileLocation, StreamError>> + Send>,
+        > + Send
         + Sync,
 >;
 
@@ -134,48 +138,83 @@ pub fn create_stream_pipe(
                 if tx.is_closed() {
                     break;
                 }
-                // Fetch from MTProto worker pool
+                // Fetch from MTProto worker pool with retries
                 let offset = (chunk_idx * chunk_size_u64) as i64;
                 let limit = CHUNK_SIZE as i32;
 
-                let current_loc = params.location.read().await.clone();
-                match worker_pool
-                    .fetch_chunk(&current_loc, &params.dc_id, offset, limit)
-                    .await
-                {
-                    Ok(bytes) => {
-                        cache.insert(params.document_id, chunk_idx, bytes.clone()).await;
-                        bytes
+                let mut fetched = None;
+                for attempt in 0..3 {
+                    if tx.is_closed() {
+                        break;
                     }
-                    Err(StreamError::FileReferenceExpired) if params.refresh_location.is_some() => {
-                        let refresher = params.refresh_location.as_ref().unwrap();
-                        match refresher().await {
-                            Ok(new_loc) => {
-                                *params.location.write().await = new_loc.clone();
-                                match worker_pool
-                                    .fetch_chunk(&new_loc, &params.dc_id, offset, limit)
-                                    .await
-                                {
-                                    Ok(bytes) => {
-                                        cache.insert(params.document_id, chunk_idx, bytes.clone()).await;
-                                        bytes
-                                    }
-                                    Err(err) => {
-                                        let io_err = std::io::Error::other(err.to_string());
-                                        let _ = tx.send(Err(io_err)).await;
-                                        break;
+                    let current_loc = params.location.read().await.clone();
+                    match worker_pool
+                        .fetch_chunk(&current_loc, &params.dc_id, offset, limit)
+                        .await
+                    {
+                        Ok(bytes) => {
+                            cache
+                                .insert(params.document_id, chunk_idx, bytes.clone())
+                                .await;
+                            fetched = Some(bytes);
+                            break;
+                        }
+                        Err(StreamError::FileReferenceExpired)
+                            if params.refresh_location.is_some() =>
+                        {
+                            let refresher = params.refresh_location.as_ref().unwrap();
+                            match refresher().await {
+                                Ok(new_loc) => {
+                                    *params.location.write().await = new_loc.clone();
+                                    match worker_pool
+                                        .fetch_chunk(&new_loc, &params.dc_id, offset, limit)
+                                        .await
+                                    {
+                                        Ok(bytes) => {
+                                            cache
+                                                .insert(
+                                                    params.document_id,
+                                                    chunk_idx,
+                                                    bytes.clone(),
+                                                )
+                                                .await;
+                                            fetched = Some(bytes);
+                                            break;
+                                        }
+                                        Err(err) => {
+                                            tracing::warn!(chunk_idx, attempt, %err, "Failed to fetch chunk after location refresh; retrying");
+                                            tokio::time::sleep(std::time::Duration::from_millis(
+                                                300 * (attempt + 1),
+                                            ))
+                                            .await;
+                                        }
                                     }
                                 }
-                            }
-                            Err(err) => {
-                                let io_err = std::io::Error::other(err.to_string());
-                                let _ = tx.send(Err(io_err)).await;
-                                break;
+                                Err(err) => {
+                                    tracing::warn!(chunk_idx, attempt, %err, "Failed to refresh file location; retrying");
+                                    tokio::time::sleep(std::time::Duration::from_millis(
+                                        300 * (attempt + 1),
+                                    ))
+                                    .await;
+                                }
                             }
                         }
+                        Err(err) => {
+                            tracing::warn!(chunk_idx, attempt, %err, "Transient error fetching chunk; retrying");
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                300 * (attempt + 1),
+                            ))
+                            .await;
+                        }
                     }
-                    Err(err) => {
-                        let io_err = std::io::Error::other(err.to_string());
+                }
+
+                match fetched {
+                    Some(bytes) => bytes,
+                    None => {
+                        let io_err = std::io::Error::other(format!(
+                            "Failed to fetch chunk {chunk_idx} after retries"
+                        ));
                         let _ = tx.send(Err(io_err)).await;
                         break;
                     }

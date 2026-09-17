@@ -1,10 +1,7 @@
 use std::time::Duration;
 
-
 use bytes::Bytes;
-use stream::{
-    hash_bot_token, ByteRange, ChunkCache, CircuitBreaker, CHUNK_SIZE,
-};
+use stream::{hash_bot_token, ByteRange, ChunkCache, CircuitBreaker, CHUNK_SIZE};
 
 #[test]
 fn test_hash_bot_token_deterministic() {
@@ -23,7 +20,6 @@ fn test_hash_bot_token_deterministic() {
 fn test_uniform_chunk_size() {
     assert_eq!(CHUNK_SIZE, 512 * 1024);
 }
-
 
 #[tokio::test]
 async fn test_chunk_cache_concurrency_and_lru() {

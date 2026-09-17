@@ -9,18 +9,41 @@ use utoipa::{IntoParams, ToSchema};
 
 use crate::{error::ServerError, ServerState};
 
-#[derive(Debug, Serialize, ToSchema)]
+/// Summary information for a track in catalog listings.
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TrackSummaryDto {
+    /// Unique database track ID (0 for uncached live tracks).
+    #[schema(example = 42)]
     pub id: i32,
+    /// Music provider name (`apple`, `qobuz`).
+    #[schema(example = "apple")]
     pub provider: String,
+    /// Provider-native track identifier.
+    #[schema(example = "1440857781")]
     pub track_id: String,
+    /// Track title.
+    #[schema(example = "Blank Space")]
     pub title: String,
+    /// Primary artist name.
+    #[schema(example = "Taylor Swift")]
     pub artist: String,
+    /// Album name.
+    #[schema(example = "1989")]
     pub album: String,
+    /// Duration of the audio track in seconds.
+    #[schema(example = 231)]
     pub duration: i32,
+    /// Lossless or compressed audio codec.
+    #[schema(example = "alac")]
     pub codec: String,
+    /// Audio bit depth (e.g. 16 or 24).
+    #[schema(example = 24)]
     pub bit_depth: Option<i32>,
+    /// Audio sample rate in Hz (e.g. 44100, 96000).
+    #[schema(example = 44100)]
     pub sample_rate: Option<i32>,
+    /// Whether this track is cached in Telegram and playable instantly.
+    #[schema(example = true)]
     pub is_cached: bool,
 }
 
@@ -42,28 +65,65 @@ impl From<db::Track> for TrackSummaryDto {
     }
 }
 
+/// Comprehensive track metadata and technical specifications.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TrackDetailDto {
+    /// Unique database track ID.
+    #[schema(example = 42)]
     pub id: i32,
+    /// Music provider (`apple`, `qobuz`).
+    #[schema(example = "apple")]
     pub provider: String,
+    /// Provider-native track ID.
+    #[schema(example = "1440857781")]
     pub track_id: String,
+    /// Track title.
+    #[schema(example = "Blank Space")]
     pub title: String,
+    /// Primary artist name.
+    #[schema(example = "Taylor Swift")]
     pub artist: String,
+    /// Album name.
+    #[schema(example = "1989")]
     pub album: String,
+    /// Duration in seconds.
+    #[schema(example = 231)]
     pub duration: i32,
+    /// Codec identifier (`alac`, `flac`, `aac`).
+    #[schema(example = "alac")]
     pub codec: String,
+    /// Bit depth.
+    #[schema(example = 24)]
     pub bit_depth: i32,
+    /// Sample rate in Hz.
+    #[schema(example = 44100)]
     pub sample_rate: i32,
+    /// Musical genre.
+    #[schema(example = "Pop")]
     pub genre: String,
+    /// Release date string (YYYY-MM-DD).
+    #[schema(example = "2014-10-27")]
     pub release_date: String,
+    /// Track sequence number on disc.
+    #[schema(example = 2)]
     pub track_number: i32,
+    /// Total tracks on disc.
+    #[schema(example = 13)]
     pub track_count: i32,
+    /// True if already cached in Telegram dump channel.
+    #[schema(example = true)]
     pub is_cached: bool,
+    /// International Standard Recording Code.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "USCJY1431245")]
     pub isrc: Option<String>,
+    /// Track composer.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "Taylor Swift, Max Martin, Shellback")]
     pub composer: Option<String>,
+    /// Disc number for multi-disc releases.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 1)]
     pub disc_number: Option<i32>,
 }
 
@@ -92,40 +152,72 @@ impl From<db::Track> for TrackDetailDto {
     }
 }
 
+/// Representation of an uncached live catalog track discovered via provider search.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct UncachedTrackDto {
+    /// Music provider (`apple`, `qobuz`).
+    #[schema(example = "apple")]
     pub provider: String,
+    /// Provider item or store identifier.
+    #[schema(example = "1440857781")]
     pub item_id: String,
+    /// Provider track identifier.
+    #[schema(example = "1440857781")]
     pub track_id: String,
+    /// Track title.
+    #[schema(example = "Blank Space")]
     pub title: String,
+    /// Artist name.
+    #[schema(example = "Taylor Swift")]
     pub artist: String,
+    /// Album name.
+    #[schema(example = "1989")]
     pub album: String,
+    /// Duration in seconds.
+    #[schema(example = 231)]
     pub duration: i32,
+    /// False for uncached live search results.
+    #[schema(example = false)]
     pub is_cached: bool,
 }
 
+/// Search query parameters.
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct SearchQuery {
+    /// Search query string (song title, artist, or album).
+    #[param(example = "Taylor Swift Blank Space")]
     pub q: String,
+    /// Target provider filter (`apple` or `qobuz`).
+    #[param(example = "apple")]
     pub provider: Option<String>,
+    /// Page number (1-based pagination).
+    #[param(example = 1)]
     pub page: Option<i64>,
+    /// Results per page (default: 20, max: 100).
+    #[param(example = 20)]
     pub limit: Option<i64>,
 }
 
+/// Unified search response containing both cached and live catalog results.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SearchResponse {
+    /// Cached tracks playable instantly without ripping.
     pub cached: Vec<TrackSummaryDto>,
+    /// Live provider catalog tracks that can be ripped on-demand.
     pub live: Vec<UncachedTrackDto>,
 }
 
 #[utoipa::path(
     get,
     path = "/api/v1/search",
+    tag = "catalog",
+    summary = "Search Cached & Live Music Catalog",
+    description = "Searches tracks with pagination (`page`, `limit`). Returns both instantly playable cached tracks and live provider catalog results.",
     params(
         SearchQuery
     ),
     responses(
-        (status = 200, description = "Search cached and live catalog", body = SearchResponse)
+        (status = 200, description = "Deduplicated cached and live search results", body = SearchResponse)
     )
 )]
 pub async fn search_catalog(
@@ -181,12 +273,18 @@ pub async fn search_catalog(
 #[utoipa::path(
     get,
     path = "/api/v1/tracks/{id}",
+    tag = "catalog",
+    summary = "Get Track Metadata & Audio Specs",
+    description = "Retrieves full track details including codec, bit depth, sample rate, ISRC, composer, and cached status.",
     params(
-        ("id" = i32, Path, description = "Track ID")
+        ("id" = i32, Path, description = "Unique database track ID", example = 42)
     ),
     responses(
-        (status = 200, description = "Detailed track metadata", body = TrackDetailDto),
-        (status = 404, description = "Track not found")
+        (status = 200, description = "Comprehensive track metadata", body = TrackDetailDto),
+        (status = 404, description = "Track not found in database cache")
+    ),
+    security(
+        ("bearer_auth" = [])
     )
 )]
 pub async fn get_track(
@@ -203,26 +301,42 @@ pub async fn get_track(
     Ok(Json(track.into()))
 }
 
+/// Summary of a distinct cached album.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AlbumSummaryDto {
+    /// Album title.
+    #[schema(example = "1989")]
     pub album: String,
+    /// Primary album artist.
+    #[schema(example = "Taylor Swift")]
     pub artist: String,
 }
 
+/// Standard pagination query parameters.
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct PaginationQuery {
+    /// Page number (1-based index).
+    #[param(example = 1)]
     pub page: Option<i64>,
+    /// Number of items per page (default: 30, max: 100).
+    #[param(example = 30)]
     pub limit: Option<i64>,
 }
 
 #[utoipa::path(
     get,
     path = "/api/v1/albums",
+    tag = "catalog",
+    summary = "List Cached Albums",
+    description = "Returns paginated list of distinct albums and artists cached in the database.",
     params(
         PaginationQuery
     ),
     responses(
-        (status = 200, description = "Paginated list of albums", body = Vec<AlbumSummaryDto>)
+        (status = 200, description = "Paginated list of distinct cached albums", body = Vec<AlbumSummaryDto>)
+    ),
+    security(
+        ("bearer_auth" = [])
     )
 )]
 pub async fn list_albums(
@@ -250,23 +364,37 @@ pub async fn list_albums(
     Ok(Json(albums))
 }
 
+/// Album details with complete tracklist.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AlbumDetailsDto {
+    /// Album title.
+    #[schema(example = "1989")]
     pub album: String,
+    /// Album artist.
+    #[schema(example = "Taylor Swift")]
     pub artist: String,
+    /// Total count of tracks in this album.
+    #[schema(example = 13)]
     pub track_count: usize,
+    /// Ordered list of tracks in the album.
     pub tracks: Vec<TrackSummaryDto>,
 }
 
 #[utoipa::path(
     get,
     path = "/api/v1/albums/{id}",
+    tag = "catalog",
+    summary = "Get Album Tracklist",
+    description = "Returns the complete ordered tracklist for an album, checking the database cache first and falling back to live Apple Music catalog if uncached.",
     params(
-        ("id" = String, Path, description = "Album Name or Track/Collection ID")
+        ("id" = String, Path, description = "Album title, collection ID, or track ID", example = "1989")
     ),
     responses(
-        (status = 200, description = "Tracks in the specified album", body = AlbumDetailsDto),
-        (status = 404, description = "Album not found")
+        (status = 200, description = "Album metadata and ordered tracklist", body = AlbumDetailsDto),
+        (status = 404, description = "Album not found in cache or live catalog")
+    ),
+    security(
+        ("bearer_auth" = [])
     )
 )]
 pub async fn get_album_tracks(
@@ -322,10 +450,10 @@ pub async fn get_album_tracks(
                 }));
             }
         }
-        return Err(ServerError::NotFound(format!("Album '{id_or_name}' not found")));
+        return Err(ServerError::NotFound(format!(
+            "Album '{id_or_name}' not found"
+        )));
     }
-
-
 
     let album = tracks[0].album.clone();
     let artist = tracks[0].artist.clone();
@@ -343,11 +471,17 @@ pub async fn get_album_tracks(
 #[utoipa::path(
     get,
     path = "/api/v1/artists/{name}/tracks",
+    tag = "catalog",
+    summary = "Get Artist Tracks",
+    description = "Returns all cached tracks for a specified artist.",
     params(
-        ("name" = String, Path, description = "Artist Name")
+        ("name" = String, Path, description = "Artist name", example = "Taylor Swift")
     ),
     responses(
-        (status = 200, description = "Tracks by artist", body = Vec<TrackSummaryDto>)
+        (status = 200, description = "List of cached tracks by artist", body = Vec<TrackSummaryDto>)
+    ),
+    security(
+        ("bearer_auth" = [])
     )
 )]
 pub async fn get_artist_tracks(

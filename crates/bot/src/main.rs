@@ -19,7 +19,6 @@ struct Env {
     stream_worker_bot_tokens: Vec<String>,
 }
 
-
 fn required(name: &str, invalid: &mut Vec<String>) -> String {
     match std::env::var(name) {
         Ok(value) if !value.trim().is_empty() => value,
@@ -93,7 +92,6 @@ fn load_env() -> Result<Env> {
         log_level,
         stream_worker_bot_tokens,
     })
-
 }
 
 fn init_tracing(log_level: &str) {
@@ -105,7 +103,8 @@ fn init_tracing(log_level: &str) {
     } else {
         log_level
     };
-    let filter = format!("warn,bot={level},db={level},engine={level}");
+    let filter =
+        format!("warn,bot={level},db={level},engine={level},stream={level},server={level}");
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(filter))
         .add_directive(
@@ -200,8 +199,8 @@ async fn main() -> Result<()> {
     let library_manager = Arc::new(db::LibraryManager::new(database.clone()));
     let tracks_repo = Arc::new(db::TracksRepository::new(database.clone()));
     let settings_store = Arc::new(db::SettingsStore::new(database.clone()));
-    let app_key = std::env::var("APP_KEY")
-        .unwrap_or_else(|_| "IQfVm8yrIR83zlWvEZ5Fr9fpN6lGgWhV".to_string());
+    let app_key =
+        std::env::var("APP_KEY").unwrap_or_else(|_| "IQfVm8yrIR83zlWvEZ5Fr9fpN6lGgWhV".to_string());
 
     let initial_settings = settings_store.get_settings();
     let port = std::env::var("STREAM_SERVER_PORT")
@@ -230,7 +229,9 @@ async fn main() -> Result<()> {
                     storefront: Some("us".to_string()),
                 };
                 let codec_preference = codec.map(|c| match c {
-                    music::Codec::Alac | music::Codec::Flac => music::CodecPreference::HighestQuality,
+                    music::Codec::Alac | music::Codec::Flac => {
+                        music::CodecPreference::HighestQuality
+                    }
                     music::Codec::Aac => music::CodecPreference::LosslessCd,
                     _ => music::CodecPreference::HighestQuality,
                 });
@@ -265,10 +266,10 @@ async fn main() -> Result<()> {
             stream_engine.clone(),
             session_manager.clone(),
             library_manager,
-            tracks_repo,
+            tracks_repo.clone(),
             settings_store,
             orchestrator.clone(),
-            app_key,
+            app_key.clone(),
         )
         .with_catalog_service(apple_catalog)
         .with_rip_task_runner(rip_task_runner),
@@ -299,6 +300,8 @@ async fn main() -> Result<()> {
         started_at: std::time::Instant::now(),
         stream_engine: Some(stream_engine),
         session_manager,
+        app_key: app_key.clone(),
+        tracks_repo: tracks_repo.clone(),
     });
 
     // Bridge subscribes once; its consumer renders status messages + dashboard.

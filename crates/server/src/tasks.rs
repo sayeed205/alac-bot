@@ -11,32 +11,60 @@ use utoipa::ToSchema;
 
 use crate::{auth::AuthedUser, error::ServerError, ServerState};
 
+/// Request payload to trigger an on-demand provider ripping job.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct RipTaskRequest {
+    /// Music provider name (`apple` or `qobuz`).
+    #[schema(example = "apple")]
     pub provider: String,
+    /// Provider-native track identifier.
+    #[schema(example = "1440857781")]
     pub track_id: String,
+    /// Desired lossless or compressed codec (`alac`, `flac`, `aac`).
+    #[schema(example = "alac")]
     pub codec: Option<String>,
 }
 
+/// Initial response returned when an on-demand rip task is queued.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RipTaskResponse {
+    /// Unique task identifier for subscribing to SSE progress events.
+    #[schema(example = "task_01h7xyz...")]
     pub task_id: String,
+    /// Initial task status (`queued`).
+    #[schema(example = "queued")]
     pub status: String,
 }
 
+/// Real-time progress event emitted over Server-Sent Events (SSE).
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TaskProgressEvent {
+    /// Task identifier.
+    #[schema(example = "task_01h7xyz...")]
     pub task_id: String,
+    /// Current pipeline stage (`queued`, `downloading`, `decrypting`, `tagging`, `uploading_telegram`, `completed`, `failed`).
+    #[schema(example = "downloading")]
     pub stage: String,
+    /// Download or upload progress percentage (0.0 to 100.0).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 45.2)]
     pub percent: Option<f32>,
+    /// Download/upload throughput speed string (e.g. `8.5 MB/s`).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "8.5 MB/s")]
     pub speed: Option<String>,
+    /// Database track ID once ripping and caching completes.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 142)]
     pub track_id: Option<i32>,
+    /// True when track is cached in Telegram dump channel.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = true)]
     pub is_cached: Option<bool>,
+    /// True if the task has concluded.
+    #[schema(example = false)]
     pub completed: bool,
+    /// Error message if the ripping job failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -44,11 +72,14 @@ pub struct TaskProgressEvent {
 #[utoipa::path(
     post,
     path = "/api/v1/tasks/rip",
+    tag = "tasks",
+    summary = "Create On-Demand Rip Task",
+    description = "Dispatches an asynchronous background ripping job via RipOrchestrator for uncached provider tracks. Returns a `task_id` for monitoring real-time SSE progress at `/api/v1/tasks/{id}/events`.",
     request_body = RipTaskRequest,
     responses(
-        (status = 200, description = "Rip task queued", body = RipTaskResponse),
-        (status = 400, description = "Invalid request payload"),
-        (status = 401, description = "Unauthorized")
+        (status = 200, description = "Rip task queued successfully", body = RipTaskResponse),
+        (status = 400, description = "Invalid request payload or unsupported provider"),
+        (status = 401, description = "Unauthorized - Missing or invalid Bearer token")
     ),
     security(
         ("bearer_auth" = [])
@@ -122,11 +153,14 @@ pub async fn create_rip_task(
 #[utoipa::path(
     get,
     path = "/api/v1/tasks/{id}/events",
+    tag = "tasks",
+    summary = "Stream Task Progress Events (SSE)",
+    description = "Streams real-time Server-Sent Events (SSE) broadcasting downloading, decrypting, tagging, and Telegram upload progress until completion.",
     params(
-        ("id" = String, Path, description = "Task ID")
+        ("id" = String, Path, description = "Task ID returned by /api/v1/tasks/rip", example = "task_01h7xyz...")
     ),
     responses(
-        (status = 200, description = "Server-Sent Events progress stream", content_type = "text/event-stream")
+        (status = 200, description = "Real-time Server-Sent Events stream", content_type = "text/event-stream")
     )
 )]
 pub async fn task_events(

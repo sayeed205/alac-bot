@@ -44,8 +44,11 @@ pub struct BotState {
     pub stream_engine: Option<Arc<stream::StreamEngine>>,
     /// Session manager handling OTP codes, refresh tokens, and sliding sessions.
     pub session_manager: Arc<db::SessionManager>,
+    /// App HMAC secret key for generating signed playback tickets.
+    pub app_key: String,
+    /// Tracks repository for audio catalog lookups.
+    pub tracks_repo: Arc<db::TracksRepository>,
 }
-
 
 pub type SharedState = Arc<BotState>;
 

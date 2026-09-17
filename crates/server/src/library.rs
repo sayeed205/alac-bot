@@ -10,17 +10,23 @@ use utoipa::ToSchema;
 
 use crate::{auth::AuthedUser, catalog::TrackSummaryDto, error::ServerError, ServerState};
 
+/// Response listing user's bookmarked track IDs.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct FavoritesResponse {
+    /// List of track IDs marked as favorite.
+    #[schema(example = json!([42, 108, 256]))]
     pub track_ids: Vec<i32>,
 }
 
 #[utoipa::path(
     get,
     path = "/api/v1/me/favorites",
+    tag = "library",
+    summary = "List User Favorite Track IDs",
+    description = "Returns all track IDs bookmarked as favorites by the authenticated user.",
     responses(
         (status = 200, description = "List of user favorited track IDs", body = FavoritesResponse),
-        (status = 401, description = "Unauthorized")
+        (status = 401, description = "Unauthorized - Missing or invalid Bearer token")
     ),
     security(
         ("bearer_auth" = [])
@@ -42,12 +48,15 @@ pub async fn list_favorites(
 #[utoipa::path(
     post,
     path = "/api/v1/me/favorites/{track_id}",
+    tag = "library",
+    summary = "Add Track to Favorites",
+    description = "Bookmarks a track in the authenticated user's favorites library.",
     params(
-        ("track_id" = i32, Path, description = "Track ID to bookmark")
+        ("track_id" = i32, Path, description = "Unique database track ID", example = 42)
     ),
     responses(
-        (status = 200, description = "Track added to favorites"),
-        (status = 401, description = "Unauthorized")
+        (status = 200, description = "Track successfully added to favorites"),
+        (status = 401, description = "Unauthorized - Missing or invalid Bearer token")
     ),
     security(
         ("bearer_auth" = [])
@@ -70,12 +79,15 @@ pub async fn add_favorite(
 #[utoipa::path(
     delete,
     path = "/api/v1/me/favorites/{track_id}",
+    tag = "library",
+    summary = "Remove Track from Favorites",
+    description = "Removes a track from the authenticated user's favorites library.",
     params(
-        ("track_id" = i32, Path, description = "Track ID to remove from bookmarks")
+        ("track_id" = i32, Path, description = "Unique database track ID", example = 42)
     ),
     responses(
-        (status = 200, description = "Track removed from favorites"),
-        (status = 401, description = "Unauthorized")
+        (status = 200, description = "Track successfully removed from favorites"),
+        (status = 401, description = "Unauthorized - Missing or invalid Bearer token")
     ),
     security(
         ("bearer_auth" = [])
@@ -95,12 +107,21 @@ pub async fn remove_favorite(
     Ok(Json(serde_json::json!({ "removed": removed })))
 }
 
+/// Summary information for a user playlist.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PlaylistSummaryDto {
+    /// Playlist database identifier.
+    #[schema(example = 1)]
     pub id: i32,
+    /// Custom playlist name.
+    #[schema(example = "Late Night Lossless")]
     pub name: String,
+    /// Total number of tracks in the playlist.
+    #[schema(example = 24)]
     pub track_count: i64,
+    /// Playlist creation timestamp.
     pub created_at: DateTime<Utc>,
+    /// Last modification timestamp.
     pub updated_at: DateTime<Utc>,
 }
 
@@ -116,31 +137,48 @@ impl From<db::UserPlaylistSummary> for PlaylistSummaryDto {
     }
 }
 
+/// Request payload to create a new user playlist.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreatePlaylistRequest {
+    /// Custom playlist name.
+    #[schema(example = "Late Night Lossless")]
     pub name: String,
 }
 
+/// Playlist details including full ordered list of tracks.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PlaylistWithTracksDto {
+    /// Playlist database identifier.
+    #[schema(example = 1)]
     pub id: i32,
+    /// Playlist title.
+    #[schema(example = "Late Night Lossless")]
     pub name: String,
+    /// Ordered list of tracks in the playlist.
     pub tracks: Vec<TrackSummaryDto>,
+    /// Creation timestamp.
     pub created_at: DateTime<Utc>,
+    /// Modification timestamp.
     pub updated_at: DateTime<Utc>,
 }
 
+/// Request payload to reorder or set tracks in a playlist.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdatePlaylistRequest {
+    /// Complete ordered array of database track IDs.
+    #[schema(example = json!([42, 108, 256]))]
     pub track_ids: Vec<i32>,
 }
 
 #[utoipa::path(
     get,
     path = "/api/v1/me/playlists",
+    tag = "library",
+    summary = "List User Playlists",
+    description = "Returns summaries of all custom playlists created by the authenticated user.",
     responses(
         (status = 200, description = "List of user playlists", body = Vec<PlaylistSummaryDto>),
-        (status = 401, description = "Unauthorized")
+        (status = 401, description = "Unauthorized - Missing or invalid Bearer token")
     ),
     security(
         ("bearer_auth" = [])
@@ -162,11 +200,14 @@ pub async fn list_playlists(
 #[utoipa::path(
     post,
     path = "/api/v1/me/playlists",
+    tag = "library",
+    summary = "Create Custom Playlist",
+    description = "Creates a new custom user playlist.",
     request_body = CreatePlaylistRequest,
     responses(
-        (status = 200, description = "Playlist created", body = PlaylistSummaryDto),
-        (status = 400, description = "Invalid name"),
-        (status = 401, description = "Unauthorized")
+        (status = 200, description = "Playlist created successfully", body = PlaylistSummaryDto),
+        (status = 400, description = "Invalid playlist name"),
+        (status = 401, description = "Unauthorized - Missing or invalid Bearer token")
     ),
     security(
         ("bearer_auth" = [])
@@ -194,12 +235,15 @@ pub async fn create_playlist(
 #[utoipa::path(
     get,
     path = "/api/v1/me/playlists/{id}",
+    tag = "library",
+    summary = "Get Playlist with Tracks",
+    description = "Retrieves a custom playlist and its ordered list of tracks.",
     params(
-        ("id" = i32, Path, description = "Playlist ID")
+        ("id" = i32, Path, description = "Unique playlist database ID", example = 1)
     ),
     responses(
-        (status = 200, description = "Playlist details with tracks", body = PlaylistWithTracksDto),
-        (status = 401, description = "Unauthorized"),
+        (status = 200, description = "Playlist details with ordered tracklist", body = PlaylistWithTracksDto),
+        (status = 401, description = "Unauthorized - Missing or invalid Bearer token"),
         (status = 404, description = "Playlist not found")
     ),
     security(
@@ -230,13 +274,16 @@ pub async fn get_playlist(
 #[utoipa::path(
     put,
     path = "/api/v1/me/playlists/{id}",
+    tag = "library",
+    summary = "Update Playlist Tracks (Reorder / Set)",
+    description = "Replaces or reorders the track IDs within a custom playlist.",
     params(
-        ("id" = i32, Path, description = "Playlist ID")
+        ("id" = i32, Path, description = "Unique playlist database ID", example = 1)
     ),
     request_body = UpdatePlaylistRequest,
     responses(
-        (status = 200, description = "Playlist reordered"),
-        (status = 401, description = "Unauthorized"),
+        (status = 200, description = "Playlist tracks successfully updated"),
+        (status = 401, description = "Unauthorized - Missing or invalid Bearer token"),
         (status = 404, description = "Playlist not found")
     ),
     security(
@@ -260,12 +307,15 @@ pub async fn update_playlist(
 #[utoipa::path(
     delete,
     path = "/api/v1/me/playlists/{id}",
+    tag = "library",
+    summary = "Delete Custom Playlist",
+    description = "Deletes a custom user playlist from the database.",
     params(
-        ("id" = i32, Path, description = "Playlist ID")
+        ("id" = i32, Path, description = "Unique playlist database ID", example = 1)
     ),
     responses(
-        (status = 200, description = "Playlist deleted"),
-        (status = 401, description = "Unauthorized"),
+        (status = 200, description = "Playlist successfully deleted"),
+        (status = 401, description = "Unauthorized - Missing or invalid Bearer token"),
         (status = 404, description = "Playlist not found")
     ),
     security(

@@ -11,21 +11,27 @@ use utoipa::{IntoParams, ToSchema};
 
 use crate::{error::ServerError, ServerState};
 
+/// Query parameters for fetching artwork images.
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct ArtworkQuery {
+    /// Desired square image dimension in pixels (e.g. 300, 600, 1200). Default is 600.
+    #[param(example = 600)]
     pub size: Option<u16>,
 }
 
 #[utoipa::path(
     get,
     path = "/api/v1/assets/tracks/{id}/artwork",
+    tag = "assets",
+    summary = "Get Track Artwork (HTTP 307 Redirect)",
+    description = "Returns an HTTP 307 temporary redirect to the high-resolution album artwork image on provider CDNs, scaled to the requested pixel dimensions.",
     params(
-        ("id" = i32, Path, description = "Track ID"),
+        ("id" = i32, Path, description = "Unique database track ID", example = 42),
         ArtworkQuery
     ),
     responses(
-        (status = 307, description = "Redirect to high-resolution album artwork"),
-        (status = 404, description = "Track or artwork not found")
+        (status = 307, description = "Temporary redirect to provider CDN artwork URL"),
+        (status = 404, description = "Track not found or artwork unavailable")
     )
 )]
 pub async fn get_artwork(
@@ -46,9 +52,8 @@ pub async fn get_artwork(
     // Apple Music artwork URLs follow standard format or catalog lookup
     let artwork_url = match track.provider {
         music::Provider::Apple => {
-            let fallback_url = format!(
-                "https://is1-ssl.mzstatic.com/image/thumb/Music/{size}x{size}bb.jpg"
-            );
+            let fallback_url =
+                format!("https://is1-ssl.mzstatic.com/image/thumb/Music/{size}x{size}bb.jpg");
             let lookup_url = format!(
                 "https://itunes.apple.com/lookup?id={}&entity=song",
                 track.track_id
@@ -71,12 +76,10 @@ pub async fn get_artwork(
             };
             Some(resolved_url)
         }
-        music::Provider::Qobuz => {
-            Some(format!(
-                "https://static.qobuz.com/images/covers/{}_{size}.jpg",
-                track.track_id
-            ))
-        }
+        music::Provider::Qobuz => Some(format!(
+            "https://static.qobuz.com/images/covers/{}_{size}.jpg",
+            track.track_id
+        )),
     };
 
     if let Some(url) = artwork_url {
@@ -122,38 +125,68 @@ fn parse_lrc_timestamp(tag: &str) -> Option<i64> {
     }
 }
 
+/// Word-by-word synchronized timing snippet.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct LyricsWordDto {
+    /// Text snippet or syllable.
+    #[schema(example = "Hello")]
     pub text: String,
+    /// Millisecond offset from start of audio.
+    #[schema(example = 1240)]
     pub start_ms: i64,
+    /// Millisecond offset when snippet ends.
+    #[schema(example = 1800)]
     pub end_ms: i64,
 }
 
+/// Line-by-line synchronized lyric entry.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct LyricsLineDto {
+    /// Full line text string.
+    #[schema(example = "Hello from the other side")]
     pub text: String,
+    /// Start time of the line in milliseconds.
+    #[schema(example = 1240)]
     pub start_ms: i64,
+    /// End time of the line in milliseconds.
+    #[schema(example = 3500)]
     pub end_ms: i64,
+    /// Syllable or word-level timings when available.
     pub words: Vec<LyricsWordDto>,
 }
 
+/// Synchronized lyrics response.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct LyricsResponse {
+    /// Track database identifier.
+    #[schema(example = 42)]
     pub track_id: i32,
+    /// Format of the returned lyrics (`ttml_synced`, `lrc_synced`, `plain`).
+    #[schema(example = "ttml_synced")]
     pub format: String,
+    /// Full plain text representation of lyrics.
+    #[schema(example = "Hello from the other side...")]
     pub plain_text: Option<String>,
+    /// Chronologically ordered synchronized lyric lines.
     pub lines: Vec<LyricsLineDto>,
 }
 
 #[utoipa::path(
     get,
     path = "/api/v1/assets/tracks/{id}/lyrics",
+    tag = "assets",
+    summary = "Get Synchronized Lyrics",
+    description = "Resolves word-by-word or line-by-line synchronized TTML/LRC lyrics using multi-provider engine (LRCLIB, BetterLyrics, Paxsenix). Returns structured timestamped lines and words.",
     params(
-        ("id" = i32, Path, description = "Track ID")
+        ("id" = i32, Path, description = "Unique database track ID", example = 42)
     ),
     responses(
-        (status = 200, description = "Synced or plain lyrics for the track", body = LyricsResponse),
-        (status = 404, description = "Lyrics not found")
+        (status = 200, description = "Synchronized lyrics lines and timing metadata", body = LyricsResponse),
+        (status = 401, description = "Unauthorized - Missing or invalid Bearer token"),
+        (status = 404, description = "Lyrics not found for track")
+    ),
+    security(
+        ("bearer_auth" = [])
     )
 )]
 pub async fn get_lyrics(

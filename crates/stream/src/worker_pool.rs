@@ -7,11 +7,11 @@ use std::{
 };
 
 use bytes::Bytes;
+pub use db::hash_token as hash_bot_token;
 use ferogram::{tl, ErrorKind, InvocationErrorExt};
+use tokio::sync::Mutex;
 
 use crate::{circuit_breaker::CircuitBreaker, StreamError};
-
-pub use db::hash_token as hash_bot_token;
 
 struct InFlightGuard<'a>(&'a AtomicUsize);
 
@@ -34,6 +34,7 @@ pub struct WorkerInstance {
     pub client: ferogram::Client,
     pub in_flight: AtomicUsize,
     pub username: Option<String>,
+    pub dc_lock: Arc<Mutex<()>>,
 }
 
 /// Manages a pool of auxiliary Telegram bot clients for high-throughput media streaming.
@@ -82,6 +83,7 @@ impl StreamWorkerPool {
                         client: primary,
                         in_flight: AtomicUsize::new(0),
                         username: me.and_then(|u| u.username),
+                        dc_lock: Arc::new(Mutex::new(())),
                     }],
                     None,
                 )
@@ -96,6 +98,7 @@ impl StreamWorkerPool {
                     client: primary.clone(),
                     in_flight: AtomicUsize::new(0),
                     username: me.and_then(|u| u.username),
+                    dc_lock: Arc::new(Mutex::new(())),
                 })
             } else {
                 None
@@ -191,6 +194,7 @@ impl StreamWorkerPool {
                     client,
                     in_flight: AtomicUsize::new(0),
                     username,
+                    dc_lock: Arc::new(Mutex::new(())),
                 });
             }
 
@@ -252,6 +256,11 @@ impl StreamWorkerPool {
                 Err(StreamError::AllWorkersUnavailable) => {
                     if let Some(ref primary) = self.primary_fallback {
                         (primary, true)
+                    } else if !self.workers.is_empty() {
+                        // All pool workers temporarily quarantined; wait briefly and fall back to first worker
+                        tracing::warn!("All workers quarantined in circuit breaker; waiting 500ms before retry");
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        (&self.workers[0], false)
                     } else {
                         return Err(StreamError::AllWorkersUnavailable);
                     }
@@ -260,6 +269,7 @@ impl StreamWorkerPool {
             };
 
             let guard = InFlightGuard::new(&worker.in_flight);
+            let dc_guard = worker.dc_lock.lock().await;
             let req = tl::functions::upload::GetFile {
                 precise: true,
                 cdn_supported: false,
@@ -268,7 +278,27 @@ impl StreamWorkerPool {
                 limit,
             };
 
-            let result = worker.client.invoke_on_dc(target_dc, &req).await;
+            let invoke_fut = worker.client.invoke_on_dc(target_dc, &req);
+            let result = match tokio::time::timeout(Duration::from_secs(15), invoke_fut).await {
+                Ok(res) => res,
+                Err(_) => {
+                    drop(dc_guard);
+                    drop(guard);
+                    attempts += 1;
+                    tracing::warn!(
+                        attempts,
+                        max_attempts,
+                        offset,
+                        "Telegram invoke_on_dc timed out after 15s; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(200 * attempts as u64)).await;
+                    if attempts >= max_attempts {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            drop(dc_guard);
             drop(guard);
 
             match result {
@@ -281,49 +311,77 @@ impl StreamWorkerPool {
                 Ok(tl::enums::upload::File::CdnRedirect(_)) => {
                     return Err(StreamError::UnsupportedCdnRedirect);
                 }
-                Err(err) => {
-                    match err.kind() {
-                        ErrorKind::FloodWait(secs) => {
-                            attempts += 1;
+                Err(err) => match err.kind() {
+                    ErrorKind::FloodWait(secs) => {
+                        attempts += 1;
+                        tracing::warn!(
+                            secs,
+                            worker_id = worker.id,
+                            "MTProto upload.getFile returned FloodWait"
+                        );
+                        if !is_primary {
+                            self.circuit_breaker.quarantine(
+                                worker.id,
+                                Duration::from_secs(secs + 1),
+                                format!("FloodWait({secs}s)"),
+                            );
+                        }
+                        if self.workers.len() <= 1 || self.circuit_breaker.available_count() == 0 {
+                            tracing::info!(secs, "Single worker or all workers quarantined; sleeping through FloodWait");
+                            tokio::time::sleep(Duration::from_secs(secs + 1)).await;
                             if !is_primary {
-                                self.circuit_breaker.quarantine(
-                                    worker.id,
-                                    Duration::from_secs(secs + 1),
-                                    format!("FloodWait({secs}s)"),
-                                );
-                            }
-                            if attempts >= max_attempts {
-                                break;
+                                self.circuit_breaker.record_success(worker.id);
                             }
                             continue;
                         }
-                        ErrorKind::Rpc { ref name, .. } if name == "FILE_REFERENCE_EXPIRED" => {
-                            return Err(StreamError::FileReferenceExpired);
+                        if attempts >= max_attempts {
+                            break;
                         }
-                        ErrorKind::Migration(new_dc) => {
-                            tracing::info!(from_dc = target_dc, to_dc = new_dc, "Telegram DC migration redirect");
-                            target_dc = new_dc;
-                            dc_id.store(new_dc, Ordering::Relaxed);
-                            continue;
-                        }
-                        ErrorKind::Network | ErrorKind::Transfer => {
-                            attempts += 1;
-                            if attempts >= max_attempts {
-                                break;
-                            }
-                            continue;
-                        }
-                        _ => {
-                            return Err(StreamError::Telegram(err));
-                        }
+                        continue;
                     }
-                }
+                    ErrorKind::Rpc { ref name, .. } if name == "FILE_REFERENCE_EXPIRED" => {
+                        return Err(StreamError::FileReferenceExpired);
+                    }
+                    ErrorKind::Rpc { ref name, .. } if name == "CONNECTION_NOT_INITED" => {
+                        attempts += 1;
+                        tracing::warn!(attempts, max_attempts, offset, target_dc, "Telegram CONNECTION_NOT_INITED during fetch_chunk; waiting 500ms before retry");
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        if attempts >= max_attempts {
+                            break;
+                        }
+                        continue;
+                    }
+                    ErrorKind::Migration(new_dc) => {
+                        tracing::info!(
+                            from_dc = target_dc,
+                            to_dc = new_dc,
+                            "Telegram DC migration redirect"
+                        );
+                        target_dc = new_dc;
+                        dc_id.store(new_dc, Ordering::Relaxed);
+                        continue;
+                    }
+                    ErrorKind::Network | ErrorKind::Transfer => {
+                        attempts += 1;
+                        tracing::warn!(attempts, max_attempts, %err, "Transient network/transfer error during fetch_chunk");
+                        tokio::time::sleep(Duration::from_millis(200 * attempts as u64)).await;
+                        if attempts >= max_attempts {
+                            break;
+                        }
+                        continue;
+                    }
+                    _ => {
+                        tracing::warn!(offset, limit, target_dc, %err, "Unhandled Telegram error during fetch_chunk");
+                        return Err(StreamError::Telegram(err));
+                    }
+                },
             }
         }
 
         // If retry loop finishes without success and primary_fallback is present, attempt a final fallback with primary
         if let Some(ref primary) = self.primary_fallback {
             let guard = InFlightGuard::new(&primary.in_flight);
+            let dc_guard = primary.dc_lock.lock().await;
             let req = tl::functions::upload::GetFile {
                 precise: true,
                 cdn_supported: false,
@@ -332,7 +390,16 @@ impl StreamWorkerPool {
                 limit,
             };
 
-            let result = primary.client.invoke_on_dc(target_dc, &req).await;
+            let invoke_fut = primary.client.invoke_on_dc(target_dc, &req);
+            let result = match tokio::time::timeout(Duration::from_secs(15), invoke_fut).await {
+                Ok(res) => res,
+                Err(_) => {
+                    drop(dc_guard);
+                    drop(guard);
+                    return Err(StreamError::AllWorkersUnavailable);
+                }
+            };
+            drop(dc_guard);
             drop(guard);
 
             match result {

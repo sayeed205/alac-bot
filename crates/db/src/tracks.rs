@@ -126,6 +126,16 @@ impl TracksRepository {
             .optional()?)
     }
 
+    pub async fn find_latest_track(&self) -> Result<Option<Track>, DbError> {
+        let mut connection = self.pool.connection().await?;
+        Ok(tracks::table
+            .order(tracks::created_at.desc())
+            .select(Track::as_select())
+            .first::<Track>(&mut *connection)
+            .await
+            .optional()?)
+    }
+
     pub async fn save_track<I>(&self, input: I) -> Result<Track, DbError>
     where
         I: Borrow<SaveTrackInput>,

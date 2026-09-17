@@ -2,10 +2,45 @@ use axum::{
     http::{header, StatusCode},
     response::{Html, IntoResponse, Response},
 };
-use utoipa::OpenApi;
+use utoipa::{
+    openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme},
+    Modify, OpenApi,
+};
+
+struct SecurityAddon;
+
+impl Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        if let Some(components) = openapi.components.as_mut() {
+            components.add_security_scheme(
+                "bearer_auth",
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Bearer)
+                        .bearer_format("Token")
+                        .description(Some(
+                            "Enter your access token generated via /api/v1/auth/exchange",
+                        ))
+                        .build(),
+                ),
+            );
+        }
+    }
+}
 
 #[derive(OpenApi)]
 #[openapi(
+    info(
+        title = "ALAC Lossless Media Streaming Server API",
+        version = "1.0.0",
+        description = "# Lossless Audio & Media Streaming Engine\n\nHigh-performance lossless audio streaming server powered by Telegram MTProto backend, providing direct bit-perfect ALAC/FLAC streaming, sliding session auth, live catalog discovery, on-demand ripping, and synchronized lyrics.\n\n### Core Workflows\n1. **Authentication**: Users authenticate via the Telegram bot command `/stream` to obtain a single-use OTP code, exchanged at `/api/v1/auth/exchange` for sliding session tokens.\n2. **Bit-Perfect Streaming**: Lossless streams are requested via `/api/v1/tracks/{id}/playback` and served at `/api/v1/stream` with full HTTP 206 Partial Content Range support.\n3. **Catalog & Discovery**: Query cached tracks and live Apple Music catalog items simultaneously via `/api/v1/search`.\n4. **On-Demand Ripping**: Trigger background rip jobs for uncached tracks via `/api/v1/tasks/rip` and monitor real-time progress via Server-Sent Events (SSE).",
+        license(name = "MIT")
+    ),
+    servers(
+        (url = "/", description = "Current Server Gateway"),
+        (url = "http://127.0.0.1:4444", description = "Local Development Server")
+    ),
+    modifiers(&SecurityAddon),
     paths(
         crate::auth::exchange,
         crate::auth::refresh,
@@ -62,12 +97,12 @@ use utoipa::OpenApi;
         )
     ),
     tags(
-        (name = "auth", description = "Telegram-gated authentication"),
-        (name = "stream", description = "Lossless audio streaming"),
-        (name = "catalog", description = "Music catalog search and discovery"),
-        (name = "tasks", description = "On-demand rip tasks and SSE progress"),
-        (name = "assets", description = "Artwork and lyrics"),
-        (name = "library", description = "User favorites and playlists"),
+        (name = "auth", description = "Telegram OTP exchange, sliding session refresh, and user profile management"),
+        (name = "stream", description = "Direct bit-perfect lossless audio streaming and HMAC-SHA256 playback ticket generation"),
+        (name = "catalog", description = "Music catalog search, track metadata, album tracklists, and artist discographies"),
+        (name = "tasks", description = "On-demand provider ripping and real-time Server-Sent Events (SSE) progress tracking"),
+        (name = "assets", description = "High-resolution album artwork redirection and synchronized TTML/LRC lyrics resolution"),
+        (name = "library", description = "User favorited tracks and custom playlist management"),
     )
 )]
 pub struct ApiDoc;
@@ -75,9 +110,10 @@ pub struct ApiDoc;
 const SCALAR_HTML: &str = r#"<!doctype html>
 <html>
   <head>
-    <title>ALAC Streaming Server API Reference</title>
+    <title>ALAC Lossless Streaming API Reference</title>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" type="image/svg+xml" href="https://scalar.com/favicon.svg" />
     <style>
       body {
         margin: 0;
@@ -88,7 +124,17 @@ const SCALAR_HTML: &str = r#"<!doctype html>
     <script
       id="api-reference"
       data-url="/api/v1/docs.json"
-      data-proxy-url=""
+      data-configuration='{
+        "theme": "purple",
+        "layout": "modern",
+        "showSidebar": true,
+        "searchHotKey": "k",
+        "hideModels": false,
+        "defaultHttpClient": {
+          "targetKey": "shell",
+          "clientKey": "curl"
+        }
+      }'
     ></script>
     <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
   </body>

@@ -904,7 +904,7 @@ dependencies = [
 [[package]]
 name = "ferogram"
 version = "0.6.5"
-source = "git+https://github.com/ankit-chaubey/ferogram?branch=main#7955d8d28029273930886b6f64ab68c0d1018cd8"
+source = "git+https://github.com/sayeed205/ferogram?branch=fix%2Fevict-connection-not-inited#d1e6a479042828194299109131b3bcc8a32f3af3"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -934,7 +934,7 @@ dependencies = [
 [[package]]
 name = "ferogram-connect"
 version = "0.6.5"
-source = "git+https://github.com/ankit-chaubey/ferogram?branch=main#7955d8d28029273930886b6f64ab68c0d1018cd8"
+source = "git+https://github.com/sayeed205/ferogram?branch=fix%2Fevict-connection-not-inited#d1e6a479042828194299109131b3bcc8a32f3af3"
 dependencies = [
  "ferogram-crypto",
  "ferogram-mtproto",
@@ -948,7 +948,7 @@ dependencies = [
 [[package]]
 name = "ferogram-crypto"
 version = "0.6.5"
-source = "git+https://github.com/ankit-chaubey/ferogram?branch=main#7955d8d28029273930886b6f64ab68c0d1018cd8"
+source = "git+https://github.com/sayeed205/ferogram?branch=fix%2Fevict-connection-not-inited#d1e6a479042828194299109131b3bcc8a32f3af3"
 dependencies = [
  "aes",
  "ctr",
@@ -965,7 +965,7 @@ dependencies = [
 [[package]]
 name = "ferogram-msgbox"
 version = "0.6.5"
-source = "git+https://github.com/ankit-chaubey/ferogram?branch=main#7955d8d28029273930886b6f64ab68c0d1018cd8"
+source = "git+https://github.com/sayeed205/ferogram?branch=fix%2Fevict-connection-not-inited#d1e6a479042828194299109131b3bcc8a32f3af3"
 dependencies = [
  "ferogram-tl-types",
  "tracing",
@@ -974,7 +974,7 @@ dependencies = [
 [[package]]
 name = "ferogram-mtproto"
 version = "0.6.5"
-source = "git+https://github.com/ankit-chaubey/ferogram?branch=main#7955d8d28029273930886b6f64ab68c0d1018cd8"
+source = "git+https://github.com/sayeed205/ferogram?branch=fix%2Fevict-connection-not-inited#d1e6a479042828194299109131b3bcc8a32f3af3"
 dependencies = [
  "ferogram-crypto",
  "ferogram-tl-types",
@@ -986,7 +986,7 @@ dependencies = [
 [[package]]
 name = "ferogram-mtsender"
 version = "0.6.5"
-source = "git+https://github.com/ankit-chaubey/ferogram?branch=main#7955d8d28029273930886b6f64ab68c0d1018cd8"
+source = "git+https://github.com/sayeed205/ferogram?branch=fix%2Fevict-connection-not-inited#d1e6a479042828194299109131b3bcc8a32f3af3"
 dependencies = [
  "ferogram-connect",
  "ferogram-crypto",
@@ -1000,7 +1000,7 @@ dependencies = [
 [[package]]
 name = "ferogram-parsers"
 version = "0.6.5"
-source = "git+https://github.com/ankit-chaubey/ferogram?branch=main#7955d8d28029273930886b6f64ab68c0d1018cd8"
+source = "git+https://github.com/sayeed205/ferogram?branch=fix%2Fevict-connection-not-inited#d1e6a479042828194299109131b3bcc8a32f3af3"
 dependencies = [
  "ferogram-tl-types",
 ]
@@ -1008,7 +1008,7 @@ dependencies = [
 [[package]]
 name = "ferogram-session"
 version = "0.6.5"
-source = "git+https://github.com/ankit-chaubey/ferogram?branch=main#7955d8d28029273930886b6f64ab68c0d1018cd8"
+source = "git+https://github.com/sayeed205/ferogram?branch=fix%2Fevict-connection-not-inited#d1e6a479042828194299109131b3bcc8a32f3af3"
 dependencies = [
  "base64 0.23.1",
  "thiserror",
@@ -1018,7 +1018,7 @@ dependencies = [
 [[package]]
 name = "ferogram-tl-gen"
 version = "0.6.5"
-source = "git+https://github.com/ankit-chaubey/ferogram?branch=main#7955d8d28029273930886b6f64ab68c0d1018cd8"
+source = "git+https://github.com/sayeed205/ferogram?branch=fix%2Fevict-connection-not-inited#d1e6a479042828194299109131b3bcc8a32f3af3"
 dependencies = [
  "ferogram-tl-parser",
 ]
@@ -1026,12 +1026,12 @@ dependencies = [
 [[package]]
 name = "ferogram-tl-parser"
 version = "0.6.5"
-source = "git+https://github.com/ankit-chaubey/ferogram?branch=main#7955d8d28029273930886b6f64ab68c0d1018cd8"
+source = "git+https://github.com/sayeed205/ferogram?branch=fix%2Fevict-connection-not-inited#d1e6a479042828194299109131b3bcc8a32f3af3"
 
 [[package]]
 name = "ferogram-tl-types"
 version = "0.6.5"
-source = "git+https://github.com/ankit-chaubey/ferogram?branch=main#7955d8d28029273930886b6f64ab68c0d1018cd8"
+source = "git+https://github.com/sayeed205/ferogram?branch=fix%2Fevict-connection-not-inited#d1e6a479042828194299109131b3bcc8a32f3af3"
 dependencies = [
  "ferogram-tl-gen",
  "ferogram-tl-parser",
