@@ -233,7 +233,14 @@ fn map_itunes_item(item: &ItunesRawItem) -> TrackMeta {
 }
 
 fn is_track_item(item: &ItunesRawItem) -> bool {
-    item.wrapper_type.as_deref() == Some("track") || item.kind.as_deref() == Some("song")
+    match item.kind.as_deref() {
+        Some("song") => true,
+        Some("music-video")
+        | Some("feature-movie")
+        | Some("tv-episode")
+        | Some("podcast-episode") => false,
+        _ => item.wrapper_type.as_deref() == Some("track"),
+    }
 }
 
 fn normalize_storefront(storefront: &str) -> String {
@@ -474,6 +481,25 @@ impl<T: Transport> Catalog<T> {
                 "iTunes found no song matching track ID {track_id}"
             )));
         };
+
+        if matches!(
+            track_item.kind.as_deref(),
+            Some("music-video")
+                | Some("feature-movie")
+                | Some("tv-episode")
+                | Some("podcast-episode")
+        ) {
+            let kind = match track_item.kind.as_deref() {
+                Some("music-video") => "music video",
+                Some("feature-movie") => "feature movie",
+                Some("tv-episode") => "TV episode",
+                Some("podcast-episode") => "podcast episode",
+                other => other.unwrap_or("video"),
+            };
+            return Err(CatalogError::Message(format!(
+                "iTunes item {track_id} is a {kind}; only audio tracks are supported"
+            )));
+        }
 
         let mut meta = map_itunes_item(track_item);
         meta.id = track_item
@@ -1106,7 +1132,7 @@ pub async fn fetch_discovery_album_tracks(
         Catalog::<ReqwestTransport>::parse_results(&body).map_err(|error| error.to_string())?;
     Ok(results
         .into_iter()
-        .filter(|item| item.wrapper_type.as_deref() == Some("track"))
+        .filter(is_track_item)
         .map(|item| map_itunes_item(&item))
         .collect())
 }

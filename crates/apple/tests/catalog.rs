@@ -593,3 +593,76 @@ async fn clear_cache_forces_refetch() {
         .expect("refetch after clear");
     assert_eq!(catalog.transport().served().len(), 2);
 }
+
+
+#[tokio::test]
+async fn album_filters_out_music_videos() {
+    let json = r#"{
+        "results": [
+            {
+                "wrapperType": "collection",
+                "collectionId": 1753101056,
+                "collectionName": "Four Me (Apple Music Edition) - EP",
+                "artistName": "Karan Aujla"
+            },
+            {
+                "wrapperType": "track",
+                "kind": "song",
+                "trackId": 1753101068,
+                "trackName": "IDK HOW",
+                "artistName": "Karan Aujla",
+                "trackTimeMillis": 180000
+            },
+            {
+                "wrapperType": "track",
+                "kind": "music-video",
+                "trackId": 1753101549,
+                "trackName": "Up Next: Karan Aujla (Exclusive)",
+                "artistName": "Karan Aujla",
+                "trackTimeMillis": 289000
+            }
+        ]
+    }"#;
+    let mut fake = FakeTransport::new();
+    fake.on("id=1753101056", json);
+    let catalog = Catalog::new(fake);
+    let res = catalog
+        .fetch_album_tracks("1753101056", "us")
+        .await
+        .expect("album tracks");
+    assert_eq!(res.tracks.len(), 1, "music video filtered out from audio album");
+    assert_eq!(res.tracks[0].id, "1753101068");
+    assert_eq!(res.tracks[0].title, "IDK HOW");
+}
+
+#[tokio::test]
+async fn fetch_track_rejects_music_videos() {
+    let json = r#"{
+        "results": [
+            {
+                "wrapperType": "track",
+                "kind": "music-video",
+                "trackId": 1753101549,
+                "trackName": "Up Next: Karan Aujla (Exclusive)",
+                "artistName": "Karan Aujla",
+                "trackTimeMillis": 289000
+            }
+        ]
+    }"#;
+    let mut fake = FakeTransport::new();
+    fake.on("id=1753101549", json);
+    let catalog = Catalog::new(fake);
+    let err = catalog
+        .fetch_track_meta("1753101549", "us")
+        .await
+        .expect_err("music video should be rejected");
+    match err {
+        CatalogError::Message(msg) => {
+            assert!(
+                msg.contains("music video") && msg.contains("only audio tracks are supported"),
+                "unexpected error message: {msg}"
+            );
+        }
+        other => panic!("expected CatalogError::Message, got {other:?}"),
+    }
+}
