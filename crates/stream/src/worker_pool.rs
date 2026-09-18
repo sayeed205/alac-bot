@@ -211,6 +211,16 @@ impl StreamWorkerPool {
         }))
     }
 
+    /// Total number of auxiliary workers configured in the pool.
+    pub fn worker_count(&self) -> usize {
+        self.workers.len()
+    }
+
+    /// Number of healthy workers currently available in the pool.
+    pub fn available_worker_count(&self) -> usize {
+        self.circuit_breaker.healthy_worker_count()
+    }
+
     /// Select the healthy worker with the fewest active in-flight chunk downloads,
     /// breaking ties using a round-robin cursor.
     pub fn pick_least_loaded(&self) -> Result<usize, StreamError> {

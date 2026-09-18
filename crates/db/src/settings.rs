@@ -61,7 +61,11 @@ impl SettingsStore {
         let mut next = self.get_settings();
         let canonical = canonical_key(key);
         let applied = match canonical {
-            Some(k) => apply_value(&mut next, k, &value),
+            Some(k) => {
+                next.extra.remove(key);
+                next.extra.remove(k);
+                apply_value(&mut next, k, &value)
+            }
             None => {
                 next.extra.insert(key.to_owned(), value);
                 true
@@ -206,10 +210,26 @@ impl SettingsStore {
 }
 
 fn from_row(row: SettingsRow) -> BotSettings {
-    serde_json::from_value(row.data).unwrap_or_else(|error| {
+    let mut settings: BotSettings = serde_json::from_value(row.data).unwrap_or_else(|error| {
         tracing::warn!(%error, "failed to decode stored settings; using defaults");
         default_settings()
-    })
+    });
+    if settings.stream_public_url.is_none() {
+        if let Some(val) = settings.extra.remove("stream_public_url") {
+            if let Some(s) = val.as_str() {
+                let trimmed = s.trim().trim_end_matches('/');
+                if !trimmed.is_empty() {
+                    settings.stream_public_url = Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+    if let Some(val) = settings.extra.remove("stream_server_port") {
+        if let Some(port) = val.as_u64().and_then(|v| u16::try_from(v).ok()) {
+            settings.stream_server_port = port;
+        }
+    }
+    settings
 }
 
 fn canonical_key(key: &str) -> Option<&'static str> {
@@ -225,6 +245,12 @@ fn canonical_key(key: &str) -> Option<&'static str> {
         "max_collection_tracks" | "maxCollectionTracks" => Some("max_collection_tracks"),
         "auto_dump_enabled" | "autoDumpEnabled" => Some("auto_dump_enabled"),
         "auto_dump_storefronts" | "autoDumpStorefronts" => Some("auto_dump_storefronts"),
+        "stream_public_url" | "streamPublicUrl" | "stream_url" | "streamUrl" => {
+            Some("stream_public_url")
+        }
+        "stream_server_port" | "streamServerPort" | "stream_port" | "streamPort" => {
+            Some("stream_server_port")
+        }
         _ => None,
     }
 }
@@ -288,6 +314,103 @@ fn apply_value(settings: &mut BotSettings, key: &str, value: &Value) -> bool {
                 }
             })
             .is_some(),
+        "stream_public_url" => {
+            if value.is_null() {
+                settings.stream_public_url = None;
+                true
+            } else if let Some(s) = value.as_str() {
+                let trimmed = s.trim().trim_end_matches('/');
+                if trimmed.is_empty() {
+                    settings.stream_public_url = None;
+                } else {
+                    settings.stream_public_url = Some(trimmed.to_string());
+                }
+                true
+            } else {
+                false
+            }
+        }
+        "stream_server_port" => value
+            .as_u64()
+            .and_then(|v| u16::try_from(v).ok())
+            .map(|v| settings.stream_server_port = v)
+            .is_some(),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_canonical_key_stream_settings() {
+        assert_eq!(canonical_key("stream_public_url"), Some("stream_public_url"));
+        assert_eq!(canonical_key("stream_url"), Some("stream_public_url"));
+        assert_eq!(canonical_key("streamUrl"), Some("stream_public_url"));
+        assert_eq!(canonical_key("stream_server_port"), Some("stream_server_port"));
+        assert_eq!(canonical_key("stream_port"), Some("stream_server_port"));
+    }
+
+    #[test]
+    fn test_apply_value_stream_settings() {
+        let mut settings = default_settings();
+        assert_eq!(settings.stream_public_url, None);
+
+        // Apply URL with trailing slash
+        assert!(apply_value(
+            &mut settings,
+            "stream_public_url",
+            &json!("http://192.168.0.6:4444/")
+        ));
+        assert_eq!(
+            settings.stream_public_url,
+            Some("http://192.168.0.6:4444".to_string())
+        );
+
+        // Clear URL with null
+        assert!(apply_value(
+            &mut settings,
+            "stream_public_url",
+            &serde_json::Value::Null
+        ));
+        assert_eq!(settings.stream_public_url, None);
+
+        // Clear URL with empty string
+        assert!(apply_value(
+            &mut settings,
+            "stream_public_url",
+            &json!("   ")
+        ));
+        assert_eq!(settings.stream_public_url, None);
+
+        // Apply port
+        assert!(apply_value(
+            &mut settings,
+            "stream_server_port",
+            &json!(8080)
+        ));
+        assert_eq!(settings.stream_server_port, 8080);
+    }
+
+    #[test]
+    fn test_from_row_recovers_stream_url_from_extra() {
+        let mut raw_data = serde_json::Map::new();
+        raw_data.insert(
+            "stream_public_url".to_string(),
+            json!("http://192.168.0.6:4444"),
+        );
+        let row = SettingsRow {
+            id: 1,
+            data: serde_json::Value::Object(raw_data),
+            updated_at: chrono::Utc::now(),
+        };
+
+        let parsed = from_row(row);
+        assert_eq!(
+            parsed.stream_public_url,
+            Some("http://192.168.0.6:4444".to_string())
+        );
     }
 }

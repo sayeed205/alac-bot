@@ -32,7 +32,8 @@ pub async fn stream_command(state: Arc<BotState>, msg: ferogram::update::Incomin
         }
     };
 
-    let is_auth = state.auth.is_admin(sender)
+    let is_admin = state.auth.is_admin(sender);
+    let is_auth = is_admin
         || state
             .auth
             .is_authorized(sender, None)
@@ -51,6 +52,31 @@ pub async fn stream_command(state: Arc<BotState>, msg: ferogram::update::Incomin
         return;
     }
 
+    let settings = state.rip_deps.settings_snapshot();
+    let public_url = settings
+        .stream_public_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty());
+
+    let clean_url = match public_url {
+        Some(url) => url.trim_end_matches('/'),
+        None => {
+            if !is_admin {
+                let text = "⚠️ <b>Server Not Configured.</b><br/>Please ask the bot administrator to set up the backend server URL properly before logging in.";
+                let _ = msg
+                    .reply(InputMessage::html(parse_dynamic_html(text)))
+                    .await;
+            } else {
+                let text = "⚠️ <b>Streaming Server URL Not Configured.</b><br/><br/>The public backend URL is not set. Please <b>reply to this message with your server URL</b> (e.g. <code>https://stream.example.com</code>) to configure it automatically.<br/><br/>Or run <code>/settings stream_url &lt;url&gt;</code>.";
+                let _ = msg
+                    .reply(InputMessage::html(parse_dynamic_html(text)))
+                    .await;
+            }
+            return;
+        }
+    };
+
     let code = match state.session_manager.create_login_code(sender).await {
         Ok(code) => code,
         Err(err) => {
@@ -63,91 +89,132 @@ pub async fn stream_command(state: Arc<BotState>, msg: ferogram::update::Incomin
         }
     };
 
-    let explicit_track_id: Option<i32> = msg
-        .text()
-        .and_then(|t| t.split_whitespace().nth(1))
-        .and_then(|s| s.parse().ok());
-
-    let sample_track: Option<db::Track> = if let Some(tid) = explicit_track_id {
-        state.tracks_repo.find_track_by_id(tid).await.ok().flatten()
-    } else {
-        state.tracks_repo.find_latest_track().await.ok().flatten()
-    };
-
-    let settings = state.rip_deps.settings_snapshot();
-    let default_url = format!("http://127.0.0.1:{}", settings.stream_server_port);
-    let public_url = settings
-        .stream_public_url
-        .as_deref()
-        .filter(|u| !u.trim().is_empty())
-        .unwrap_or(&default_url);
-
-    let clean_url = public_url.trim_end_matches('/');
-    let deep_link = format!("alac://auth?code={code}&server={clean_url}");
-
-    let (stream_url, direct_section) = if let Some(track) = sample_track {
-        let ticket =
-            server::streaming::create_playback_ticket(&state.app_key, track.id, sender, 86400);
-        let s_url = format!("{clean_url}/api/v1/stream?ticket={ticket}");
-        let d_url = format!("{clean_url}/api/v1/stream?track_id={}", track.id);
-        let section = format!(
-            "▶️ <b>Direct Playback Stream (Track #{}):</b><br/>\
-             <b>Title:</b> {} — {}<br/>\
-             <b>Format:</b> {} | {}Hz<br/>\
-             <b>Direct Stream URL:</b><br/>\
-             <code>{}</code><br/><br/>\
-             <b>Dev Quick URL:</b><br/>\
-             <code>{}</code><br/><br/>",
-            track.id,
-            crate::html::escape(&track.title),
-            crate::html::escape(&track.artist),
-            track.codec.as_str().to_uppercase(),
-            track.sample_rate,
-            s_url,
-            d_url,
-        );
-        (Some(s_url), section)
-    } else {
-        (None, String::new())
-    };
+    let open_gateway_url = format!("{clean_url}/open?code={code}");
 
     let text = format!(
         "🎧 <b>Lossless Audio Streaming</b><br/><br/>\
-         {direct_section}\
          🔑 <b>Single-Use Login Code:</b><br/>\
          <code>{code}</code><br/><br/>\
-         • <b>HTTP Server:</b> <code>{clean_url}</code><br/>\
-         • <b>Native App Quick-Connect:</b><br/>\
-         <code>{deep_link}</code>"
+         Click the button below to connect your Peerless player automatically:"
     );
 
-    let mut input = InputMessage::html(parse_dynamic_html(&text));
-    let mut buttons = Vec::new();
-    if let Some(ref s_url) = stream_url {
-        buttons.push(Button::url("▶️ Stream Now in Browser", s_url));
-    }
-    if clean_url.starts_with("http://") || clean_url.starts_with("https://") {
-        let docs_url = format!("{clean_url}/api/v1/docs");
-        buttons.push(Button::url("🌐 Interactive API Docs", docs_url));
-    }
-    if !buttons.is_empty() {
-        let mut kb = InlineKeyboard::new();
-        for btn in buttons {
-            kb = kb.row([btn]);
-        }
-        input = input.reply_markup(kb.into_markup());
-    }
+    let mut kb = InlineKeyboard::new();
+    kb = kb.row([Button::url("🎵 Open & Connect Peerless", open_gateway_url)]);
+
+    let input = InputMessage::html(parse_dynamic_html(&text)).reply_markup(kb.into_markup());
 
     if let Err(err) = msg.reply(input).await {
         tracing::error!(error = %err, user_id = sender, "failed to send /stream response");
     }
 }
 
+pub async fn handle_admin_url_config(
+    state: Arc<BotState>,
+    msg: ferogram::update::IncomingMessage,
+) -> bool {
+    if !msg.is_private() {
+        return false;
+    }
+
+    let sender = match msg.sender_user_id() {
+        Some(id) => id,
+        None => return false,
+    };
+
+    if !state.auth.is_admin(sender) {
+        return false;
+    }
+
+    let text = match msg.text() {
+        Some(t) => t.trim(),
+        None => return false,
+    };
+
+    if text.starts_with('/') {
+        return false;
+    }
+
+    if text.contains("music.apple.com") || text.contains("qobuz.com") {
+        return false;
+    }
+
+    let is_url = text.starts_with("http://") || text.starts_with("https://");
+    let is_reply = msg.reply_to_message_id().is_some();
+
+    if !is_url && !is_reply {
+        return false;
+    }
+
+    let candidate = if is_url {
+        text.to_string()
+    } else if text.contains('.') || text.contains(':') {
+        let trimmed = text
+            .trim_start_matches("https://")
+            .trim_start_matches("http://");
+        format!("https://{trimmed}")
+    } else {
+        return false;
+    };
+
+    let clean = candidate.trim().trim_end_matches('/').to_string();
+    if clean.is_empty() || (!clean.starts_with("http://") && !clean.starts_with("https://")) {
+        return false;
+    }
+
+    let settings_store = state.rip_deps.settings();
+    settings_store
+        .set_setting("stream_public_url", serde_json::json!(clean))
+        .await;
+
+    let confirm_text = format!(
+        "✅ <b>Server URL Configured!</b><br/>Public URL set to: <code>{clean}</code>"
+    );
+
+    if let Err(err) = msg
+        .reply(InputMessage::html(parse_dynamic_html(&confirm_text)))
+        .await
+    {
+        tracing::error!(
+            error = %err,
+            user_id = sender,
+            "failed to send URL configuration confirmation"
+        );
+    }
+
+    // Immediately invoke stream_command to deliver the login button!
+    stream_command(state, msg).await;
+    true
+}
+
 pub fn register(dp: &mut Dispatcher, state: Arc<BotState>) {
+    let stream_state = Arc::clone(&state);
     dp.on_message(filters::command("stream"), move |msg| {
-        let state = Arc::clone(&state);
+        let state = Arc::clone(&stream_state);
         async move {
             stream_command(state, msg).await;
         }
     });
+
+    let auto_state = Arc::clone(&state);
+    dp.on_message(
+        filters::custom(|msg| {
+            if let Some(t) = msg.text() {
+                let trimmed = t.trim();
+                !trimmed.starts_with('/')
+                    && !trimmed.contains("music.apple.com")
+                    && !trimmed.contains("qobuz.com")
+                    && (trimmed.starts_with("http://")
+                        || trimmed.starts_with("https://")
+                        || msg.reply_to_message_id().is_some())
+            } else {
+                false
+            }
+        }),
+        move |msg| {
+            let state = Arc::clone(&auto_state);
+            async move {
+                handle_admin_url_config(state, msg).await;
+            }
+        },
+    );
 }

@@ -1,0 +1,782 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#080a11">
+  <meta name="color-scheme" content="dark">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Peerless Lossless — Intent Gateway</title>
+  <style>
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    :root {
+      --bg-base: #080a11;
+      --card-bg: rgba(18, 22, 38, 0.68);
+      --card-border: rgba(255, 255, 255, 0.12);
+      --card-highlight: rgba(255, 255, 255, 0.2);
+      --accent-violet: #8b5cf6;
+      --accent-indigo: #6366f1;
+      --accent-fuchsia: #d946ef;
+      --accent-cyan: #06b6d4;
+      --accent-emerald: #22c55e;
+      --text-primary: #f8fafc;
+      --text-secondary: #94a3b8;
+      --text-muted: #64748b;
+      --font-stack: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    }
+
+    body {
+      min-height: 100vh;
+      min-height: 100dvh;
+      background-color: var(--bg-base);
+      background-image: 
+        radial-gradient(circle at 50% -10%, #1a1e38 0%, #0c0f1d 50%, #05060b 100%);
+      font-family: var(--font-stack);
+      color: var(--text-primary);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px 16px;
+      position: relative;
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    /* Ambient Lighting Mesh Glow */
+    .ambient-glow {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      pointer-events: none;
+      z-index: 0;
+      overflow: hidden;
+    }
+
+    .glow-orb {
+      position: absolute;
+      border-radius: 50%;
+      filter: blur(90px);
+      opacity: 0.6;
+      animation: ambientFloat 14s ease-in-out infinite alternate;
+    }
+
+    .orb-1 {
+      top: 5%;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 480px;
+      height: 380px;
+      background: radial-gradient(circle, rgba(124, 58, 237, 0.28) 0%, rgba(99, 102, 241, 0.12) 60%, transparent 80%);
+    }
+
+    .orb-2 {
+      bottom: 5%;
+      left: 10%;
+      width: 380px;
+      height: 340px;
+      background: radial-gradient(circle, rgba(6, 182, 212, 0.18) 0%, rgba(59, 130, 246, 0.08) 60%, transparent 80%);
+      animation-delay: -5s;
+    }
+
+    .orb-3 {
+      top: 40%;
+      right: 5%;
+      width: 320px;
+      height: 320px;
+      background: radial-gradient(circle, rgba(217, 70, 239, 0.16) 0%, rgba(139, 92, 246, 0.06) 60%, transparent 80%);
+      animation-delay: -9s;
+    }
+
+    @keyframes ambientFloat {
+      0% {
+        transform: translate(0, 0) scale(1);
+      }
+      50% {
+        transform: translate(18px, -24px) scale(1.06);
+      }
+      100% {
+        transform: translate(-15px, 20px) scale(0.95);
+      }
+    }
+
+    /* Glassmorphism Main Card */
+    .glass-card {
+      position: relative;
+      z-index: 10;
+      width: 100%;
+      max-width: 450px;
+      background: var(--card-bg);
+      backdrop-filter: blur(28px) saturate(190%);
+      -webkit-backdrop-filter: blur(28px) saturate(190%);
+      border: 1px solid var(--card-border);
+      border-radius: 28px;
+      padding: 36px 28px 30px;
+      box-shadow: 
+        0 24px 60px -12px rgba(0, 0, 0, 0.75),
+        0 0 40px -8px rgba(124, 58, 237, 0.16),
+        inset 0 1px 1px 0 var(--card-highlight);
+      text-align: center;
+      transition: border-color 0.3s ease, box-shadow 0.3s ease;
+    }
+
+    /* Subtle Glass Sheen at top */
+    .glass-card::before {
+      content: "";
+      position: absolute;
+      top: 0;
+      left: 15%;
+      right: 15%;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.4), transparent);
+      pointer-events: none;
+    }
+
+    /* Logo Emblem */
+    .brand-emblem {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 68px;
+      height: 68px;
+      border-radius: 20px;
+      background: linear-gradient(135deg, rgba(99, 102, 241, 0.22), rgba(168, 85, 247, 0.22));
+      border: 1px solid rgba(192, 132, 252, 0.35);
+      box-shadow: 
+        0 10px 25px -5px rgba(124, 58, 237, 0.35),
+        inset 0 1px 1px 0 rgba(255, 255, 255, 0.4);
+      margin-bottom: 16px;
+      position: relative;
+      transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.3s ease;
+    }
+
+    .brand-emblem:hover {
+      transform: scale(1.04) rotate(-2deg);
+      box-shadow: 
+        0 14px 30px -4px rgba(139, 92, 246, 0.5),
+        inset 0 1px 1px 0 rgba(255, 255, 255, 0.5);
+    }
+
+    .brand-emblem svg {
+      width: 36px;
+      height: 36px;
+      filter: drop-shadow(0 2px 8px rgba(168, 85, 247, 0.4));
+    }
+
+    /* Status Badge */
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 5px 13px;
+      border-radius: 9999px;
+      background: rgba(34, 197, 94, 0.12);
+      border: 1px solid rgba(34, 197, 94, 0.28);
+      color: #86efac;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      margin-bottom: 16px;
+      box-shadow: 0 2px 10px rgba(34, 197, 94, 0.15);
+    }
+
+    .status-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #22c55e;
+      box-shadow: 0 0 8px #22c55e;
+      position: relative;
+    }
+
+    .status-dot::after {
+      content: "";
+      position: absolute;
+      top: -3px;
+      left: -3px;
+      right: -3px;
+      bottom: -3px;
+      border-radius: 50%;
+      border: 1.5px solid rgba(34, 197, 94, 0.7);
+      animation: radarPing 2s cubic-bezier(0, 0, 0.2, 1) infinite;
+    }
+
+    @keyframes radarPing {
+      0% {
+        transform: scale(0.8);
+        opacity: 0.9;
+      }
+      80%, 100% {
+        transform: scale(2.2);
+        opacity: 0;
+      }
+    }
+
+    /* Typography */
+    .title {
+      font-size: 27px;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      line-height: 1.25;
+      background: linear-gradient(180deg, #ffffff 40%, #cbd5e1 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin-bottom: 8px;
+    }
+
+    .subtitle {
+      color: var(--text-secondary);
+      font-size: 14px;
+      line-height: 1.55;
+      max-width: 360px;
+      margin: 0 auto 28px;
+    }
+
+    /* Action Buttons */
+    .action-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      width: 100%;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      width: 100%;
+      border: none;
+      outline: none;
+      cursor: pointer;
+      text-decoration: none;
+      font-family: inherit;
+      font-weight: 600;
+      border-radius: 16px;
+      transition: all 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+      user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    .btn:active {
+      transform: scale(0.98);
+    }
+
+    /* Primary Action: Glowing Gradient */
+    .btn-primary {
+      height: 52px;
+      background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 50%, #d946ef 100%);
+      background-size: 160% auto;
+      color: #ffffff;
+      font-size: 16px;
+      box-shadow: 
+        0 8px 24px -4px rgba(139, 92, 246, 0.52),
+        inset 0 1px 1px 0 rgba(255, 255, 255, 0.38);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .btn-primary:hover {
+      background-position: right center;
+      transform: translateY(-2px);
+      box-shadow: 
+        0 12px 30px -4px rgba(139, 92, 246, 0.68),
+        inset 0 1px 1px 0 rgba(255, 255, 255, 0.45);
+    }
+
+    .btn-primary svg {
+      width: 20px;
+      height: 20px;
+      transition: transform 0.2s ease;
+    }
+
+    .btn-primary:hover svg {
+      transform: translateX(2px) translateY(-2px);
+    }
+
+    /* Secondary Action: Glass Border */
+    .btn-secondary {
+      height: 48px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--card-border);
+      color: var(--text-primary);
+      font-size: 14.5px;
+      font-weight: 500;
+    }
+
+    .btn-secondary:hover {
+      background: rgba(255, 255, 255, 0.09);
+      border-color: rgba(255, 255, 255, 0.22);
+      color: #ffffff;
+      transform: translateY(-1px);
+    }
+
+    .btn-secondary svg {
+      width: 18px;
+      height: 18px;
+      stroke: var(--text-secondary);
+      transition: stroke 0.2s ease;
+    }
+
+    .btn-secondary:hover svg {
+      stroke: #ffffff;
+    }
+
+    /* Button Copied State */
+    .btn-secondary.copied {
+      background: rgba(34, 197, 94, 0.15) !important;
+      border-color: rgba(34, 197, 94, 0.45) !important;
+      color: #86efac !important;
+      box-shadow: 0 0 18px rgba(34, 197, 94, 0.25);
+    }
+
+    .btn-secondary.copied svg {
+      stroke: #86efac !important;
+    }
+
+    /* Cross-device Instructions Card */
+    .guide-box {
+      margin-top: 26px;
+      background: rgba(10, 14, 26, 0.52);
+      border: 1px solid rgba(255, 255, 255, 0.07);
+      border-radius: 20px;
+      padding: 20px;
+      text-align: left;
+    }
+
+    .guide-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+
+    .guide-header svg {
+      width: 15px;
+      height: 15px;
+      stroke: var(--accent-violet);
+    }
+
+    .guide-title {
+      font-size: 11.5px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-muted);
+    }
+
+    .guide-steps {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .step-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+    }
+
+    .step-num {
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      background: rgba(99, 102, 241, 0.16);
+      border: 1px solid rgba(167, 139, 250, 0.3);
+      color: #c4b5fd;
+      font-size: 11px;
+      font-weight: 700;
+      margin-top: 1px;
+    }
+
+    .step-content {
+      flex: 1;
+    }
+
+    .step-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: #e2e8f0;
+      margin-bottom: 2px;
+    }
+
+    .step-desc {
+      font-size: 12px;
+      line-height: 1.45;
+      color: var(--text-secondary);
+    }
+
+    .step-desc strong {
+      color: #f1f5f9;
+      font-weight: 500;
+    }
+
+    /* Platform Badges */
+    .platform-pills {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 16px;
+      padding-top: 14px;
+      border-top: 1px solid rgba(255, 255, 255, 0.05);
+    }
+
+    .pill {
+      font-size: 10.5px;
+      font-weight: 500;
+      color: var(--text-muted);
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      border-radius: 6px;
+      padding: 2px 8px;
+      letter-spacing: 0.02em;
+    }
+
+    /* Footer Security Note */
+    .security-note {
+      margin-top: 18px;
+      font-size: 11px;
+      color: #475569;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 5px;
+      line-height: 1.4;
+    }
+
+    .security-note svg {
+      width: 12px;
+      height: 12px;
+      stroke: #64748b;
+      flex-shrink: 0;
+    }
+
+    /* Floating Toast Notification */
+    .toast {
+      position: fixed;
+      bottom: 28px;
+      left: 50%;
+      transform: translateX(-50%) translateY(30px);
+      opacity: 0;
+      pointer-events: none;
+      background: rgba(18, 24, 42, 0.94);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border: 1px solid rgba(34, 197, 94, 0.4);
+      border-radius: 12px;
+      padding: 10px 18px;
+      box-shadow: 
+        0 12px 30px -4px rgba(0, 0, 0, 0.65),
+        0 0 20px -4px rgba(34, 197, 94, 0.3);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      font-weight: 500;
+      color: #86efac;
+      z-index: 100;
+      transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    .toast.show {
+      transform: translateX(-50%) translateY(0);
+      opacity: 1;
+    }
+
+    .toast svg {
+      width: 16px;
+      height: 16px;
+      stroke: #86efac;
+      flex-shrink: 0;
+    }
+
+    /* Mobile adjustments */
+    @media (max-width: 480px) {
+      body {
+        padding: 16px 12px;
+      }
+      .glass-card {
+        padding: 28px 20px 24px;
+        border-radius: 24px;
+      }
+      .title {
+        font-size: 24px;
+      }
+      .subtitle {
+        font-size: 13.5px;
+        margin-bottom: 22px;
+      }
+      .btn-primary {
+        height: 50px;
+        font-size: 15.5px;
+      }
+      .btn-secondary {
+        height: 46px;
+        font-size: 14px;
+      }
+      .guide-box {
+        padding: 16px 14px;
+      }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Ambient Light Orbs -->
+  <div class="ambient-glow" aria-hidden="true">
+    <div class="glow-orb orb-1"></div>
+    <div class="glow-orb orb-2"></div>
+    <div class="glow-orb orb-3"></div>
+  </div>
+
+  <!-- Main Glass Container -->
+  <main class="glass-card">
+    <!-- Glowing Brand Emblem -->
+    <div class="brand-emblem" aria-label="Peerless Lossless Logo">
+      <!-- Modern Lossless Audio Wave + Supersonic Rocket SVG -->
+      <svg viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M18 4L22.5 12.5C24 15.5 25.5 18 29 19.5L25.5 23L22 21.5L19.5 24.5L20 28.5L18 31L16 28.5L16.5 24.5L14 21.5L10.5 23L7 19.5C10.5 18 12 15.5 13.5 12.5L18 4Z" fill="url(#brandGrad)" />
+        <circle cx="18" cy="14" r="2.5" fill="#ffffff" />
+        <path d="M12 28.5C10.5 29 7.5 30 5 32M24 28.5C25.5 29 28.5 30 31 32" stroke="url(#wingGrad)" stroke-width="2" stroke-linecap="round" />
+        <path d="M15 32.5L18 35.5L21 32.5" stroke="#f472b6" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+        <defs>
+          <linearGradient id="brandGrad" x1="7" y1="4" x2="29" y2="31" gradientUnits="userSpaceOnUse">
+            <stop stop-color="#818cf8" />
+            <stop offset="0.5" stop-color="#c084fc" />
+            <stop offset="1" stop-color="#f472b6" />
+          </linearGradient>
+          <linearGradient id="wingGrad" x1="5" y1="28" x2="31" y2="32" gradientUnits="userSpaceOnUse">
+            <stop stop-color="#60a5fa" />
+            <stop offset="1" stop-color="#a855f7" />
+          </linearGradient>
+        </defs>
+      </svg>
+    </div>
+
+    <!-- Live Status Badge -->
+    <div>
+      <div class="status-badge" role="status">
+        <span class="status-dot"></span>
+        <span>Instant Connection</span>
+      </div>
+    </div>
+
+    <!-- Header Titles -->
+    <h1 class="title">Peerless Lossless</h1>
+    <p class="subtitle">Bit-perfect audio gateway. Launch your native client to synchronize your session and begin streaming.</p>
+
+    <!-- Action Button Stack -->
+    <div class="action-stack">
+      <!-- Primary Action: Open App -->
+      <a id="openPeerlessBtn" class="btn btn-primary" href="peerless://auth?data={data}" rel="noopener">
+        <!-- Supersonic Rocket SVG -->
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/>
+          <path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/>
+          <path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/>
+          <path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"/>
+        </svg>
+        <span>Open Peerless</span>
+        <!-- Chevron Right -->
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="width: 16px; height: 16px; margin-left: auto;">
+          <path d="m9 18 6-6-6-6"/>
+        </svg>
+      </a>
+
+      <!-- Secondary Action: Copy Connection Key -->
+      <button id="copyBtn" class="btn btn-secondary" type="button" aria-label="Copy connection key to clipboard">
+        <!-- Clipboard Icon -->
+        <svg id="copyIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect width="8" height="4" x="8" y="2" rx="1" ry="1"/>
+          <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/>
+        </svg>
+        <!-- Success Check Icon (Hidden by default) -->
+        <svg id="checkIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display: none;">
+          <path d="M20 6 9 17l-5-5"/>
+        </svg>
+        <span id="copyBtnText">Copy Connection Key</span>
+      </button>
+    </div>
+
+    <!-- Informational Cross-Device Card -->
+    <section class="guide-box" aria-labelledby="guideHeading">
+      <div class="guide-header">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="12" y1="16" x2="12" y2="12"/>
+          <line x1="12" y1="8" x2="12.01" y2="8"/>
+        </svg>
+        <span id="guideHeading" class="guide-title">If the app doesn't open</span>
+      </div>
+
+      <div class="guide-steps">
+        <div class="step-item">
+          <div class="step-num">1</div>
+          <div class="step-content">
+            <p class="step-title">Install Peerless</p>
+            <p class="step-desc">Ensure the native player is installed on your Android, iOS, or desktop workstation.</p>
+          </div>
+        </div>
+
+        <div class="step-item">
+          <div class="step-num">2</div>
+          <div class="step-content">
+            <p class="step-title">Authorize Connection</p>
+            <p class="step-desc">Tap <strong>Open Peerless</strong> above, or paste the copied key into the app's login dialog.</p>
+          </div>
+        </div>
+
+        <div class="step-item">
+          <div class="step-num">3</div>
+          <div class="step-content">
+            <p class="step-title">Lossless Streaming</p>
+            <p class="step-desc">Your sliding session activates immediately for bit-perfect ALAC and FLAC playback.</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Supported Platforms Footer -->
+      <div class="platform-pills">
+        <span class="pill">Android</span>
+        <span class="pill">iOS</span>
+        <span class="pill">macOS</span>
+        <span class="pill">Windows</span>
+        <span class="pill">Linux</span>
+      </div>
+    </section>
+
+    <!-- Security & Obfuscation Note -->
+    <p class="security-note">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect width="18" height="11" x="3" y="11" rx="2" ry="2"/>
+        <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+      </svg>
+      <span>Zero endpoint exposure. Keys rotate securely via session ticket.</span>
+    </p>
+  </main>
+
+  <!-- Floating Toast Feedback -->
+  <div id="toast" class="toast" role="status" aria-live="polite">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M20 6 9 17l-5-5"/>
+    </svg>
+    <span>Connection key copied to clipboard!</span>
+  </div>
+
+  <!-- Inline Logic: Auto-Redirect & Intent Fallback -->
+  <script>
+    (function () {
+      "use strict";
+
+      const rawData = "{data}";
+      const primaryBtn = document.getElementById("openPeerlessBtn");
+      const copyBtn = document.getElementById("copyBtn");
+      const copyBtnText = document.getElementById("copyBtnText");
+      const copyIcon = document.getElementById("copyIcon");
+      const checkIcon = document.getElementById("checkIcon");
+      const toast = document.getElementById("toast");
+
+      // Calculate deep link URLs
+      const encodedData = encodeURIComponent(rawData);
+      const customSchemeUri = "peerless://auth?data=" + encodedData;
+      const androidIntentUri = "intent://auth?data=" + encodedData + "#Intent;scheme=peerless;end;";
+
+      // Ensure button href is populated
+      if (primaryBtn) {
+        primaryBtn.setAttribute("href", customSchemeUri);
+      }
+
+      // Check if data is actual payload or template placeholder
+      const isValidPayload = rawData && rawData !== "{" + "data" + "}" && rawData.trim() !== "";
+
+      // 1. Automatic redirect on DOMContentLoaded
+      function performAutoRedirect() {
+        if (!isValidPayload) return;
+
+        // Direct custom URI scheme execution
+        window.location.href = customSchemeUri;
+
+        // Fallback for Android intent if scheme isn't immediately caught
+        const isAndroid = /Android/i.test(navigator.userAgent);
+        if (isAndroid) {
+          setTimeout(function () {
+            window.location.href = androidIntentUri;
+          }, 1200);
+        }
+      }
+
+      if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", performAutoRedirect);
+      } else {
+        performAutoRedirect();
+      }
+
+      // 2. Interactive clipboard copy handler
+      if (copyBtn) {
+        let resetTimer = null;
+
+        copyBtn.addEventListener("click", async function () {
+          const textToCopy = isValidPayload ? rawData : customSchemeUri;
+
+          try {
+            if (navigator.clipboard && window.isSecureContext) {
+              await navigator.clipboard.writeText(textToCopy);
+            } else {
+              // Fallback for non-secure context or older webviews
+              const tempInput = document.createElement("textarea");
+              tempInput.value = textToCopy;
+              tempInput.style.position = "fixed";
+              tempInput.style.left = "-999999px";
+              tempInput.style.top = "-999999px";
+              document.body.appendChild(tempInput);
+              tempInput.focus();
+              tempInput.select();
+              document.execCommand("copy");
+              tempInput.remove();
+            }
+
+            // Visual feedback on button
+            copyBtn.classList.add("copied");
+            if (copyBtnText) copyBtnText.textContent = "Copied to Clipboard!";
+            if (copyIcon) copyIcon.style.display = "none";
+            if (checkIcon) checkIcon.style.display = "inline-block";
+
+            // Show floating toast
+            if (toast) {
+              toast.classList.add("show");
+            }
+
+            // Reset after 2.5s
+            if (resetTimer) clearTimeout(resetTimer);
+            resetTimer = setTimeout(function () {
+              copyBtn.classList.remove("copied");
+              if (copyBtnText) copyBtnText.textContent = "Copy Connection Key";
+              if (copyIcon) copyIcon.style.display = "inline-block";
+              if (checkIcon) checkIcon.style.display = "none";
+              if (toast) toast.classList.remove("show");
+            }, 2500);
+
+          } catch (err) {
+            console.error("Failed to copy connection key:", err);
+          }
+        });
+      }
+    })();
+  </script>
+</body>
+</html>

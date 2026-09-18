@@ -81,6 +81,16 @@ impl StreamEngine {
         }
     }
 
+    /// Access the underlying MTProto worker pool.
+    pub fn worker_pool(&self) -> &Arc<StreamWorkerPool> {
+        &self.worker_pool
+    }
+
+    /// Access the chunk cache.
+    pub fn cache(&self) -> &Arc<ChunkCache> {
+        &self.cache
+    }
+
     /// Resolve track document metadata from Dump Channel, with caching and on-demand refresh.
     pub async fn resolve_track_media(
         &self,

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use axum::{
     extract::{Path, Query, State},
@@ -6,10 +6,18 @@ use axum::{
     response::Response,
     Json,
 };
+use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::{error::ServerError, ServerState};
+
+static ARTWORK_CACHE: LazyLock<Cache<(String, u16), String>> = LazyLock::new(|| {
+    Cache::builder()
+        .max_capacity(10_000)
+        .time_to_live(std::time::Duration::from_secs(86400 * 7))
+        .build()
+});
 
 /// Query parameters for fetching artwork images.
 #[derive(Debug, Deserialize, IntoParams)]
@@ -47,42 +55,157 @@ pub async fn get_artwork(
         .ok_or_else(|| ServerError::NotFound(format!("Track {track_id} not found")))?;
 
     let size = query.size.unwrap_or(600).clamp(100, 3000);
+    let cache_key = (
+        format!("{}:{}", track.provider.as_str(), track.track_id),
+        size,
+    );
+
+    if let Some(cached_url) = ARTWORK_CACHE.get(&cache_key).await {
+        return Ok(Response::builder()
+            .status(StatusCode::TEMPORARY_REDIRECT)
+            .header(header::LOCATION, cached_url)
+            .header(header::CACHE_CONTROL, "public, max-age=86400")
+            .body(axum::body::Body::empty())
+            .map_err(|e| ServerError::Internal(e.to_string()))?);
+    }
 
     // If track is from Apple or Qobuz, try resolving CDN artwork
     // Apple Music artwork URLs follow standard format or catalog lookup
     let artwork_url = match track.provider {
         music::Provider::Apple => {
-            let fallback_url =
-                format!("https://is1-ssl.mzstatic.com/image/thumb/Music/{size}x{size}bb.jpg");
-            let lookup_url = format!(
-                "https://itunes.apple.com/lookup?id={}&entity=song",
-                track.track_id
-            );
-            let resolved_url = match state.http_client.get(&lookup_url).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    if let Ok(json) = resp.json::<serde_json::Value>().await {
-                        json.get("results")
-                            .and_then(|r| r.as_array())
-                            .and_then(|arr| arr.first())
-                            .and_then(|item| item.get("artworkUrl100"))
-                            .and_then(|url| url.as_str())
-                            .map(|url| url.replace("100x100bb", &format!("{size}x{size}bb")))
-                            .unwrap_or(fallback_url)
-                    } else {
-                        fallback_url
+            let mut resolved = None;
+
+            // 1. Try iTunes lookup: default storefront first, then regional storefronts (in, gb, us)
+            let countries = ["", "in", "gb", "us"];
+            for country in countries {
+                let url = if country.is_empty() {
+                    format!(
+                        "https://itunes.apple.com/lookup?id={}&entity=song",
+                        track.track_id
+                    )
+                } else {
+                    format!(
+                        "https://itunes.apple.com/lookup?id={}&entity=song&country={country}",
+                        track.track_id
+                    )
+                };
+
+                if let Ok(resp) = state.http_client.get(&url).send().await {
+                    if resp.status().is_success() {
+                        if let Ok(json) = resp.json::<serde_json::Value>().await {
+                            if let Some(url_str) = json
+                                .get("results")
+                                .and_then(|r| r.as_array())
+                                .and_then(|arr| arr.first())
+                                .and_then(|item| item.get("artworkUrl100"))
+                                .and_then(|u| u.as_str())
+                            {
+                                resolved =
+                                    Some(url_str.replace("100x100bb", &format!("{size}x{size}bb")));
+                                break;
+                            }
+                        }
                     }
                 }
-                _ => fallback_url,
-            };
-            Some(resolved_url)
+            }
+
+            // 2. Fallback: search iTunes catalog by title and artist
+            if resolved.is_none() {
+                let term = format!("{} {}", track.title, track.artist);
+                let encoded_term = urlencode(&term);
+                let search_countries = ["in", "us", "gb"];
+                for country in search_countries {
+                    let search_url = format!(
+                        "https://itunes.apple.com/search?term={encoded_term}&entity=song&limit=1&country={country}"
+                    );
+                    if let Ok(resp) = state.http_client.get(&search_url).send().await {
+                        if resp.status().is_success() {
+                            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                                if let Some(url_str) = json
+                                    .get("results")
+                                    .and_then(|r| r.as_array())
+                                    .and_then(|arr| arr.first())
+                                    .and_then(|item| item.get("artworkUrl100"))
+                                    .and_then(|u| u.as_str())
+                                {
+                                    resolved = Some(
+                                        url_str.replace("100x100bb", &format!("{size}x{size}bb")),
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            resolved
         }
-        music::Provider::Qobuz => Some(format!(
-            "https://static.qobuz.com/images/covers/{}_{size}.jpg",
-            track.track_id
-        )),
+        music::Provider::Qobuz => {
+            let backend_url = std::env::var("QOBUZ_BACKEND_URL")
+                .unwrap_or_else(|_| "https://qobuz.kanjijewels.com".to_string());
+            let clean_backend_url = backend_url.trim().trim_end_matches('/');
+            let backend_key = std::env::var("QOBUZ_BACKEND_KEY")
+                .ok()
+                .filter(|k| !k.trim().is_empty());
+
+            let mut req = state
+                .http_client
+                .get(format!("{clean_backend_url}/api/track/{}", track.track_id));
+            if let Some(ref key) = backend_key {
+                req = req.header("X-API-Key", key);
+            }
+
+            let mut resolved = None;
+            if let Ok(resp) = req.send().await {
+                if resp.status().is_success() {
+                    if let Ok(json) = resp.json::<serde_json::Value>().await {
+                        let track_obj = json.get("track").unwrap_or(&json);
+                        let img_url = track_obj
+                            .get("album")
+                            .and_then(|a| a.get("image"))
+                            .and_then(|img| {
+                                img.get("large")
+                                    .or_else(|| img.get("small"))
+                                    .or_else(|| img.get("thumbnail"))
+                            })
+                            .and_then(|u| u.as_str())
+                            .or_else(|| {
+                                track_obj
+                                    .get("tags")
+                                    .and_then(|t| {
+                                        t.get("coverUrl600").or_else(|| t.get("coverUrl"))
+                                    })
+                                    .and_then(|u| u.as_str())
+                            })
+                            .or_else(|| track_obj.get("originalCoverUrl").and_then(|u| u.as_str()));
+
+                        if let Some(base_url) = img_url {
+                            let mapped_url = if size > 600 {
+                                base_url
+                                    .replace("_600.jpg", "_org.jpg")
+                                    .replace("_230.jpg", "_org.jpg")
+                            } else if size <= 230 {
+                                base_url
+                                    .replace("_600.jpg", "_230.jpg")
+                                    .replace("_org.jpg", "_230.jpg")
+                            } else {
+                                base_url
+                                    .replace("_230.jpg", "_600.jpg")
+                                    .replace("_org.jpg", "_600.jpg")
+                            };
+                            resolved = Some(mapped_url);
+                        }
+                    }
+                }
+            }
+
+            resolved
+        }
     };
 
     if let Some(url) = artwork_url {
+        ARTWORK_CACHE.insert(cache_key, url.clone()).await;
         Ok(Response::builder()
             .status(StatusCode::TEMPORARY_REDIRECT)
             .header(header::LOCATION, url)
@@ -90,7 +213,9 @@ pub async fn get_artwork(
             .body(axum::body::Body::empty())
             .map_err(|e| ServerError::Internal(e.to_string()))?)
     } else {
-        Err(ServerError::NotFound("Artwork not found".into()))
+        Err(ServerError::NotFound(format!(
+            "Artwork not found for track {track_id}"
+        )))
     }
 }
 
@@ -309,4 +434,23 @@ pub async fn get_lyrics(
             words: Vec::new(),
         }],
     }))
+}
+
+fn urlencode(s: &str) -> String {
+    let mut encoded = String::with_capacity(s.len() * 3);
+    for byte in s.bytes() {
+        if byte.is_ascii_alphanumeric()
+            || byte == b'-'
+            || byte == b'_'
+            || byte == b'.'
+            || byte == b'~'
+        {
+            encoded.push(byte as char);
+        } else if byte == b' ' {
+            encoded.push('+');
+        } else {
+            encoded.push_str(&format!("%{:02X}", byte));
+        }
+    }
+    encoded
 }

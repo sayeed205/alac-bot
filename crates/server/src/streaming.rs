@@ -198,8 +198,6 @@ pub async fn get_playback_info(
 pub struct StreamQuery {
     /// Signed stream ticket generated via `/api/v1/tracks/{id}/playback`.
     pub ticket: Option<String>,
-    /// Fallback track ID when authenticating via `Authorization: Bearer <token>` header.
-    pub track_id: Option<i32>,
 }
 
 #[utoipa::path(
@@ -207,13 +205,14 @@ pub struct StreamQuery {
     path = "/api/v1/stream",
     tag = "stream",
     summary = "Direct Bit-Perfect Lossless Audio Stream (HTTP 206)",
-    description = "Streams lossless audio directly from Telegram MTProto chunk cache. Supports HTTP 206 Partial Content Range requests (`Range: bytes=start-end`) and HEAD preflight requests without downloading the entire file.",
+    description = "Streams lossless audio directly from Telegram MTProto chunk cache. Audio streaming strictly requires a valid signed HMAC ticket. Supports HTTP 206 Partial Content Range requests (`Range: bytes=start-end`) and HEAD preflight requests without downloading the entire file.",
     params(
         StreamQuery
     ),
     responses(
         (status = 200, description = "Full audio file stream"),
         (status = 206, description = "Partial content audio byte range stream (`Content-Range: bytes start-end/total`)"),
+        (status = 400, description = "Missing or empty stream ticket query parameter"),
         (status = 401, description = "Invalid, expired, or tampered stream ticket"),
         (status = 404, description = "Track not found in database or MTProto channel")
     )
@@ -224,57 +223,14 @@ pub async fn stream_handler(
     headers: axum::http::HeaderMap,
     Query(query): Query<StreamQuery>,
 ) -> Result<Response, ServerError> {
-    let track_id = if let Some(ref ticket) = query.ticket {
-        let (id, _user_id) = verify_playback_ticket(&state.app_key, ticket)?;
-        id
-    } else if let Some(id) = query.track_id {
-        if let Some(auth_header) = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-        {
-            let token = auth_header
-                .strip_prefix("Bearer ")
-                .ok_or_else(|| ServerError::Unauthorized("Invalid Authorization format".into()))?;
+    let ticket = query
+        .ticket
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| ServerError::BadRequest("Missing 'ticket' query parameter".into()))?;
 
-            if state.token_cache.get(token).await.is_none() {
-                let identity = state
-                    .session_mgr
-                    .verify_and_slide(token)
-                    .await
-                    .map_err(|e| ServerError::Unauthorized(e.to_string()))?;
-                let authed_user = AuthedUser {
-                    telegram_id: identity.telegram_id,
-                    session_id: identity.session_id,
-                };
-                state
-                    .token_cache
-                    .insert(token.to_string(), authed_user)
-                    .await;
-            }
-        } else {
-            let is_dev = cfg!(debug_assertions)
-                || state.app_key == "default_dev_key_change_in_production"
-                || std::env::var("APP_ENV")
-                    .map(|v| v != "production")
-                    .unwrap_or(true);
-
-            if is_dev {
-                tracing::info!(
-                    track_id = id,
-                    "Direct stream request permitted in dev mode without Bearer auth"
-                );
-            } else {
-                return Err(ServerError::Unauthorized(
-                    "Missing playback ticket or Bearer authorization".into(),
-                ));
-            }
-        }
-        id
-    } else {
-        return Err(ServerError::BadRequest(
-            "Missing 'ticket' or 'track_id' query parameter".into(),
-        ));
-    };
+    let (track_id, _user_id) = verify_playback_ticket(&state.app_key, ticket)?;
 
     let range_header = headers.get(header::RANGE).and_then(|h| h.to_str().ok());
 

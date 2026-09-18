@@ -179,6 +179,10 @@ pub struct UncachedTrackDto {
     /// False for uncached live search results.
     #[schema(example = false)]
     pub is_cached: bool,
+    /// High-resolution artwork URL from provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "https://is1-ssl.mzstatic.com/image/thumb/.../600x600bb.jpg")]
+    pub artwork_url: Option<String>,
 }
 
 /// Search query parameters.
@@ -245,7 +249,7 @@ pub async fn search_catalog(
     let mut live = Vec::new();
     if let Some(ref catalog) = state.catalog_service {
         let provider = query.provider.as_deref().unwrap_or("apple");
-        if provider.eq_ignore_ascii_case("apple") {
+        if provider.eq_ignore_ascii_case("apple") && !query.q.trim().is_empty() {
             if let Ok(results) = catalog.search_catalog(&query.q, 10, "us").await {
                 let cached_track_ids: std::collections::HashSet<&str> =
                     cached.iter().map(|c| c.track_id.as_str()).collect();
@@ -261,6 +265,11 @@ pub async fn search_catalog(
                         album: item.album,
                         duration: item.duration_secs as i32,
                         is_cached: false,
+                        artwork_url: if item.artwork_url.is_empty() {
+                            None
+                        } else {
+                            Some(item.artwork_url)
+                        },
                     })
                     .collect();
             }

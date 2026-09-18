@@ -10,22 +10,14 @@ use utoipa::ToSchema;
 
 use crate::{auth::AuthedUser, catalog::TrackSummaryDto, error::ServerError, ServerState};
 
-/// Response listing user's bookmarked track IDs.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct FavoritesResponse {
-    /// List of track IDs marked as favorite.
-    #[schema(example = json!([42, 108, 256]))]
-    pub track_ids: Vec<i32>,
-}
-
 #[utoipa::path(
     get,
     path = "/api/v1/me/favorites",
     tag = "library",
-    summary = "List User Favorite Track IDs",
-    description = "Returns all track IDs bookmarked as favorites by the authenticated user.",
+    summary = "List User Favorite Tracks",
+    description = "Returns all tracks bookmarked as favorites by the authenticated user with complete metadata.",
     responses(
-        (status = 200, description = "List of user favorited track IDs", body = FavoritesResponse),
+        (status = 200, description = "List of user favorited tracks", body = Vec<TrackSummaryDto>),
         (status = 401, description = "Unauthorized - Missing or invalid Bearer token")
     ),
     security(
@@ -35,14 +27,14 @@ pub struct FavoritesResponse {
 pub async fn list_favorites(
     State(state): State<Arc<ServerState>>,
     user: AuthedUser,
-) -> Result<Json<FavoritesResponse>, ServerError> {
-    let ids = state
+) -> Result<Json<Vec<TrackSummaryDto>>, ServerError> {
+    let tracks = state
         .library_mgr
-        .list_favorite_ids(user.telegram_id)
+        .list_favorites(user.telegram_id, 0, 1000)
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))?;
 
-    Ok(Json(FavoritesResponse { track_ids: ids }))
+    Ok(Json(tracks.into_iter().map(Into::into).collect()))
 }
 
 #[utoipa::path(

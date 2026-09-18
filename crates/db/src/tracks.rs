@@ -222,12 +222,17 @@ impl TracksRepository {
         limit: usize,
     ) -> Result<Vec<Track>, DbError> {
         let trimmed = query.trim();
-        if trimmed.is_empty() {
-            return Ok(Vec::new());
-        }
-        let pattern = format!("%{trimmed}%");
         let limit = i32::try_from(limit).unwrap_or(i32::MAX);
         let mut connection = self.pool.connection().await?;
+        if trimmed.is_empty() {
+            return Ok(tracks::table
+                .order(tracks::id.desc())
+                .limit(limit as i64)
+                .select(Track::as_select())
+                .load::<Track>(&mut *connection)
+                .await?);
+        }
+        let pattern = format!("%{trimmed}%");
         Ok(sql_query("SELECT * FROM tracks WHERE (provider = 'apple' AND track_id = $1) OR title ILIKE $2 OR artist ILIKE $2 OR album ILIKE $2 OR word_similarity($1, title || ' ' || artist || ' ' || album) >= 0.35 ORDER BY CASE WHEN provider = 'apple' AND track_id = $1 THEN 3 WHEN (title ILIKE $2 OR artist ILIKE $2 OR album ILIKE $2) THEN 2 ELSE 1 END DESC, word_similarity($1, title || ' ' || artist || ' ' || album) DESC LIMIT $3")
             .bind::<Text, _>(trimmed)
             .bind::<Text, _>(&pattern)

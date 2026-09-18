@@ -86,6 +86,11 @@ impl CircuitBreaker {
             })
             .count()
     }
+
+    /// Alias for healthy worker count.
+    pub fn healthy_worker_count(&self) -> usize {
+        self.available_count()
+    }
 }
 
 #[cfg(test)]

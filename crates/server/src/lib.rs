@@ -8,6 +8,8 @@ pub mod auth;
 pub mod catalog;
 pub mod docs;
 pub mod error;
+pub mod gateway;
+pub mod health;
 pub mod library;
 pub mod streaming;
 pub mod tasks;
@@ -70,6 +72,7 @@ pub struct ServerState {
     pub rip_task_runner: RipTaskRunner,
     pub app_key: String,
     pub cors_origins: Vec<String>,
+    pub started_at: std::time::Instant,
 }
 
 impl ServerState {
@@ -112,6 +115,7 @@ impl ServerState {
             rip_task_runner,
             app_key,
             cors_origins: vec!["*".to_string()],
+            started_at: std::time::Instant::now(),
         }
     }
 
@@ -200,6 +204,10 @@ pub fn create_router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/docs", get(docs::scalar_html))
         .route("/api/v1/docs.json", get(docs::openapi_json))
         .route("/api/v1/docs.yaml", get(docs::openapi_yaml))
+        // Intent Gateway
+        .route("/open", get(gateway::open_gateway))
+        // Health & Telemetry
+        .route("/api/v1/health", get(health::health_check))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)

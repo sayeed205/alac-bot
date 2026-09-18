@@ -58,6 +58,11 @@ impl ChunkCache {
         self.cache.insert(key, data).await;
     }
 
+    /// Total number of cached chunks.
+    pub fn entry_count(&self) -> u64 {
+        self.cache.entry_count()
+    }
+
     /// Current memory size in bytes consumed by chunks.
     pub fn weighted_size(&self) -> u64 {
         self.cache.weighted_size()

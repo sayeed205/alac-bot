@@ -65,6 +65,7 @@ impl Modify for SecurityAddon {
         crate::library::get_playlist,
         crate::library::update_playlist,
         crate::library::delete_playlist,
+        crate::health::health_check,
     ),
     components(
         schemas(
@@ -89,11 +90,11 @@ impl Modify for SecurityAddon {
             crate::assets::LyricsResponse,
             crate::assets::LyricsLineDto,
             crate::assets::LyricsWordDto,
-            crate::library::FavoritesResponse,
             crate::library::PlaylistSummaryDto,
             crate::library::CreatePlaylistRequest,
             crate::library::PlaylistWithTracksDto,
             crate::library::UpdatePlaylistRequest,
+            crate::health::HealthResponse,
         )
     ),
     tags(
@@ -103,6 +104,7 @@ impl Modify for SecurityAddon {
         (name = "tasks", description = "On-demand provider ripping and real-time Server-Sent Events (SSE) progress tracking"),
         (name = "assets", description = "High-resolution album artwork redirection and synchronized TTML/LRC lyrics resolution"),
         (name = "library", description = "User favorited tracks and custom playlist management"),
+        (name = "system", description = "Server health check, telemetry, and metrics"),
     )
 )]
 pub struct ApiDoc;

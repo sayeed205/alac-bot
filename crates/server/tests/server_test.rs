@@ -163,6 +163,44 @@ async fn test_docs_and_unauthorized_endpoints() {
         .unwrap();
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    // 8. Test /open endpoint
+    let req = Request::builder()
+        .uri("/open?code=test_code_123")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(html.contains("peerless://auth?data="));
+    assert!(html.contains("Open Peerless"));
+    assert!(html.contains("Copy Connection Key"));
+
+    // 9. Test /open without code (400 Bad Request)
+    let req = Request::builder().uri("/open").body(Body::empty()).unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    // 10. Test /api/v1/health endpoint
+    let req = Request::builder()
+        .uri("/api/v1/health")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let health_res: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(health_res["status"], "healthy");
+    assert!(health_res["workers_total"].as_u64().is_some());
+    assert!(health_res["workers_available"].as_u64().is_some());
+    assert!(health_res["cache_entries"].as_u64().is_some());
+    assert!(health_res["cache_bytes"].as_u64().is_some());
+    assert!(health_res["uptime_seconds"].as_u64().is_some());
 }
 
 #[tokio::test]
@@ -344,6 +382,20 @@ async fn test_auth_and_library_lifecycle() {
         .unwrap();
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+
+    // 5b. Test hydrated favorites endpoint /api/v1/me/favorites
+    let req = Request::builder()
+        .uri("/api/v1/me/favorites")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let favs_res: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(favs_res.is_array());
 
     // 6. Delete playlist
     let req = Request::builder()
