@@ -10,7 +10,9 @@ pub mod docs;
 pub mod error;
 pub mod gateway;
 pub mod health;
+pub mod integrations;
 pub mod library;
+pub mod playback_sync;
 pub mod streaming;
 pub mod tasks;
 
@@ -59,6 +61,7 @@ pub type RipTaskRunner = Arc<
 
 #[derive(Clone)]
 pub struct ServerState {
+    pub db: db::DbPool,
     pub stream_engine: Arc<stream::StreamEngine>,
     pub session_mgr: Arc<db::SessionManager>,
     pub library_mgr: Arc<db::LibraryManager>,
@@ -67,6 +70,7 @@ pub struct ServerState {
     pub rip_orchestrator: Arc<engine::orchestrator::RipOrchestrator>,
     pub token_cache: Arc<Cache<String, auth::AuthedUser>>,
     pub tasks_tx: broadcast::Sender<tasks::TaskProgressEvent>,
+    pub sync_hub: playback_sync::PlaybackSyncHub,
     pub http_client: reqwest::Client,
     pub catalog_service: Option<apple::SharedCatalog>,
     pub rip_task_runner: RipTaskRunner,
@@ -100,8 +104,10 @@ impl ServerState {
             Arc::new(|_task_id, _provider, _track_id, _codec, _user_id| {
                 tokio::spawn(async move {})
             });
+        let db = tracks_repo.pool().clone();
 
         Self {
+            db,
             stream_engine,
             session_mgr,
             library_mgr,
@@ -110,6 +116,7 @@ impl ServerState {
             rip_orchestrator,
             token_cache,
             tasks_tx,
+            sync_hub: playback_sync::PlaybackSyncHub::default(),
             http_client,
             catalog_service: None,
             rip_task_runner,
@@ -166,6 +173,7 @@ pub fn create_router(state: Arc<ServerState>) -> Router {
             "/api/v1/stream",
             get(streaming::stream_handler).head(streaming::stream_handler),
         )
+        .route("/api/v1/ws/playback", get(playback_sync::ws_handler))
         // Catalog & Search
         .route("/api/v1/search", get(catalog::search_catalog))
         .route("/api/v1/tracks/{id}", get(catalog::get_track))
@@ -200,6 +208,8 @@ pub fn create_router(state: Arc<ServerState>) -> Router {
                 .put(library::update_playlist)
                 .delete(library::delete_playlist),
         )
+        // Integrations
+        .nest("/api/v1/integrations/lastfm", integrations::router())
         // Scalar UI & OpenAPI Docs
         .route("/api/v1/docs", get(docs::scalar_html))
         .route("/api/v1/docs.json", get(docs::openapi_json))

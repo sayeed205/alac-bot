@@ -166,9 +166,8 @@ pub async fn handle_admin_url_config(
         .set_setting("stream_public_url", serde_json::json!(clean))
         .await;
 
-    let confirm_text = format!(
-        "✅ <b>Server URL Configured!</b><br/>Public URL set to: <code>{clean}</code>"
-    );
+    let confirm_text =
+        format!("✅ <b>Server URL Configured!</b><br/>Public URL set to: <code>{clean}</code>");
 
     if let Err(err) = msg
         .reply(InputMessage::html(parse_dynamic_html(&confirm_text)))

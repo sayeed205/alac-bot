@@ -223,6 +223,7 @@ async fn test_auth_and_library_lifecycle() {
     db::migrate(&pool).await.expect("database migrations");
 
     let admin_id = 888_000_123;
+    let _ = db::integrations::delete_integration(&pool, admin_id, "lastfm").await;
     let worker_pool = stream::StreamWorkerPool::empty();
     let stream_engine = Arc::new(stream::StreamEngine::new(
         worker_pool,
@@ -304,7 +305,24 @@ async fn test_auth_and_library_lifecycle() {
     assert_eq!(refresh_res["expires_in"], 259200);
     assert!(refresh_res["expires_at_unix"].as_i64().is_some());
 
-    // 2c. Test authorized POST /api/v1/tracks/1/playback
+    // 2c. Test authorized POST /api/v1/tracks/1/playback - forbidden without Last.fm connection
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/tracks/1/playback")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+    // Save Last.fm integration for admin
+    let cipher = db::crypto::CryptoCipher::new(app_key).unwrap();
+    let enc_key = cipher.encrypt("lastfm_test_session_key").unwrap();
+    db::integrations::save_integration(&pool, admin_id, "lastfm", "testuser", &enc_key)
+        .await
+        .unwrap();
+
+    // With Last.fm connected, playback succeeds
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/tracks/1/playback")
@@ -323,6 +341,62 @@ async fn test_auth_and_library_lifecycle() {
         .contains("/api/v1/stream?ticket="));
     assert_eq!(pb_res["expires_in"], 7200);
     assert!(pb_res["file_size"].as_i64().is_some());
+
+    // Test GET /api/v1/integrations/lastfm/status
+    let req = Request::builder()
+        .uri("/api/v1/integrations/lastfm/status")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let status_res: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status_res["connected"], true);
+    assert_eq!(status_res["username"], "testuser");
+    assert_eq!(status_res["session_key"], "lastfm_test_session_key");
+
+    // Test DELETE /api/v1/integrations/lastfm
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/api/v1/integrations/lastfm")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+    // After disconnect, status is not connected
+    let req = Request::builder()
+        .uri("/api/v1/integrations/lastfm/status")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let status_res: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status_res["connected"], false);
+    assert!(status_res["session_key"].is_null());
+
+    // Playback is forbidden again after disconnect
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/tracks/1/playback")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+    // Restore integration for any downstream test steps
+    db::integrations::save_integration(&pool, admin_id, "lastfm", "testuser", &enc_key)
+        .await
+        .unwrap();
 
     // Nonexistent track returns 404
     let req = Request::builder()
@@ -428,4 +502,5 @@ async fn test_auth_and_library_lifecycle() {
         .unwrap();
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let _ = db::integrations::delete_integration(&pool, admin_id, "lastfm").await;
 }

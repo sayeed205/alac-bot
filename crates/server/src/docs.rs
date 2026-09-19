@@ -65,6 +65,9 @@ impl Modify for SecurityAddon {
         crate::library::get_playlist,
         crate::library::update_playlist,
         crate::library::delete_playlist,
+        crate::integrations::login,
+        crate::integrations::status,
+        crate::integrations::disconnect,
         crate::health::health_check,
     ),
     components(
@@ -96,6 +99,8 @@ impl Modify for SecurityAddon {
             crate::library::CreatePlaylistRequest,
             crate::library::PlaylistWithTracksDto,
             crate::library::UpdatePlaylistRequest,
+            crate::integrations::LastfmLoginRequest,
+            crate::integrations::LastfmStatusResponse,
             crate::health::HealthResponse,
         )
     ),
@@ -106,6 +111,7 @@ impl Modify for SecurityAddon {
         (name = "tasks", description = "On-demand provider ripping and real-time Server-Sent Events (SSE) progress tracking"),
         (name = "assets", description = "High-resolution album artwork redirection and synchronized TTML/LRC lyrics resolution"),
         (name = "library", description = "User favorited tracks and custom playlist management"),
+        (name = "integrations", description = "Third-party integrations and Last.fm scrobbling authentication"),
         (name = "system", description = "Server health check, telemetry, and metrics"),
     )
 )]

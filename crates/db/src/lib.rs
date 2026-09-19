@@ -19,18 +19,21 @@ mod settings;
 mod tracks;
 mod worker_session;
 
+pub mod crypto;
 pub mod dump;
+pub mod integrations;
 mod stats;
 
 pub use albums::AlbumsRepository;
 pub use auth::{Auth, AuthedPeer};
+pub use crypto::CryptoCipher;
 pub use dump::{DbDumpService, DumpStats, RestoreStats};
 pub use engine::orchestrator::deps::{CachedTrack, RequestLog, SaveTrackInput};
 pub use library::{LibraryManager, PlaylistDetails, UserPlaylistSummary};
 pub use migrations::migrate;
 pub use models::{
-    Album, NewAlbum, OneTimeAuthCode, Request, SettingsRow, TgWorkerSession, Track, User,
-    UserFavorite, UserPlaylist, UserPlaylistTrack, UserSession,
+    Album, NewAlbum, NewUserIntegration, OneTimeAuthCode, Request, SettingsRow, TgWorkerSession,
+    Track, User, UserFavorite, UserIntegration, UserPlaylist, UserPlaylistTrack, UserSession,
 };
 pub use music::{Provider, TrackKey};
 pub use requests::RequestLogRepository;

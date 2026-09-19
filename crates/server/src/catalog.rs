@@ -266,17 +266,9 @@ pub async fn search_catalog(
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))?;
 
-    let cached_slice: Vec<db::Track> = cached_tracks
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .collect();
+    let cached_slice: Vec<db::Track> = cached_tracks.into_iter().skip(offset).take(limit).collect();
 
-    let cached: Vec<TrackSummaryDto> = cached_slice
-        .iter()
-        .cloned()
-        .map(Into::into)
-        .collect();
+    let cached: Vec<TrackSummaryDto> = cached_slice.iter().cloned().map(Into::into).collect();
 
     // Query live catalog from catalog_service if available
     let mut live = Vec::new();
@@ -432,7 +424,15 @@ pub fn build_canonical_tracks(
         let duration = item.duration_secs as i32;
 
         if let Some(existing) = canonical.iter_mut().find(|c| {
-            matches_canonical(c, isrc, provider, track_id, &item.title, &item.artist, duration)
+            matches_canonical(
+                c,
+                isrc,
+                provider,
+                track_id,
+                &item.title,
+                &item.artist,
+                duration,
+            )
         }) {
             if existing.artwork_url.is_none() && !item.artwork_url.is_empty() {
                 existing.artwork_url = Some(item.artwork_url.clone());
@@ -440,9 +440,11 @@ pub fn build_canonical_tracks(
             if existing.isrc.is_none() && isrc.is_some() {
                 existing.isrc = isrc.map(ToOwned::to_owned);
             }
-            if !existing.sources.iter().any(|s| {
-                s.provider.eq_ignore_ascii_case(provider) && s.track_id == *track_id
-            }) {
+            if !existing
+                .sources
+                .iter()
+                .any(|s| s.provider.eq_ignore_ascii_case(provider) && s.track_id == *track_id)
+            {
                 existing.sources.push(TrackSourceDto {
                     id: 0,
                     provider: provider.to_string(),
@@ -835,8 +837,14 @@ mod tests {
             Some("https://artwork.url/image.jpg")
         );
         assert_eq!(track.sources.len(), 2);
-        assert!(track.sources.iter().any(|s| s.provider == "apple" && s.id == 1));
-        assert!(track.sources.iter().any(|s| s.provider == "qobuz" && s.id == 2));
+        assert!(track
+            .sources
+            .iter()
+            .any(|s| s.provider == "apple" && s.id == 1));
+        assert!(track
+            .sources
+            .iter()
+            .any(|s| s.provider == "qobuz" && s.id == 2));
     }
 
     #[test]
@@ -954,13 +962,8 @@ mod tests {
         )];
 
         let live = vec![fake_track_meta(
-            "222",
-            "Song",
-            "Artist",
-            "Album",
-            205, // diff is 5 seconds (> 3s)
-            "",
-            None,
+            "222", "Song", "Artist", "Album", 205, // diff is 5 seconds (> 3s)
+            "", None,
         )];
 
         let canonical = build_canonical_tracks(&cached, &live);

@@ -131,6 +131,17 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    user_integrations (telegram_id, provider) {
+        telegram_id -> BigInt,
+        provider -> Varchar,
+        username -> Text,
+        encrypted_session_key -> Text,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
 diesel::allow_tables_to_appear_in_same_query!(
     users,
     tracks,
@@ -142,5 +153,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     user_favorites,
     user_playlists,
     user_playlist_tracks,
-    tg_worker_sessions
+    tg_worker_sessions,
+    user_integrations
 );

@@ -25,8 +25,9 @@ rand.workspace = true
 base64.workspace = true
 moka.workspace = true
 cuid2.workspace = true
+md-5 = "0.11"
 
-reqwest = { workspace = true, features = ["json"] }
+reqwest = { workspace = true, features = ["json", "form"] }
 
 music = { path = "../music" }
 apple = { path = "../apple" }

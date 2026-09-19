@@ -21,11 +21,7 @@ impl QobuzCatalog {
         Self { primary, fallback }
     }
 
-    pub async fn fetch_track_meta(
-        &self,
-        id: &str,
-        _storefront: &str,
-    ) -> Result<TrackMeta, String> {
+    pub async fn fetch_track_meta(&self, id: &str, _storefront: &str) -> Result<TrackMeta, String> {
         match self.primary.fetch_track_meta(id).await {
             Ok(track) => Ok(track),
             Err(err) => {

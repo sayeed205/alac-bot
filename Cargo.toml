@@ -60,7 +60,7 @@ font8x8 = "0.3"
 temari = { git = "https://github.com/WorldObservationLog/Temari" }
 moka = { version = "0.12", features = ["future"] }
 aes-gcm = "0.11"
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["cors", "trace"] }
 utoipa = { version = "5", features = ["axum_extras", "chrono", "yaml"] }

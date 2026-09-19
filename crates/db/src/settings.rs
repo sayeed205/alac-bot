@@ -341,15 +341,22 @@ fn apply_value(settings: &mut BotSettings, key: &str, value: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
+
+    use super::*;
 
     #[test]
     fn test_canonical_key_stream_settings() {
-        assert_eq!(canonical_key("stream_public_url"), Some("stream_public_url"));
+        assert_eq!(
+            canonical_key("stream_public_url"),
+            Some("stream_public_url")
+        );
         assert_eq!(canonical_key("stream_url"), Some("stream_public_url"));
         assert_eq!(canonical_key("streamUrl"), Some("stream_public_url"));
-        assert_eq!(canonical_key("stream_server_port"), Some("stream_server_port"));
+        assert_eq!(
+            canonical_key("stream_server_port"),
+            Some("stream_server_port")
+        );
         assert_eq!(canonical_key("stream_port"), Some("stream_server_port"));
     }
 

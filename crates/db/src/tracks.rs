@@ -46,6 +46,10 @@ impl TracksRepository {
         Self { pool }
     }
 
+    pub fn pool(&self) -> &DbPool {
+        &self.pool
+    }
+
     pub async fn find_cached_tracks(
         &self,
         track_keys: &[TrackKey],
@@ -191,9 +195,9 @@ impl TracksRepository {
                 tracks::release_date.eq(&input.release_date),
                 tracks::track_number.eq(track_number),
                 tracks::track_count.eq(track_count),
-                tracks::isrc.eq(diesel::dsl::sql::<diesel::sql_types::Nullable<diesel::sql_types::Text>>(
-                    "COALESCE(EXCLUDED.isrc, tracks.isrc)",
-                )),
+                tracks::isrc.eq(diesel::dsl::sql::<
+                    diesel::sql_types::Nullable<diesel::sql_types::Text>,
+                >("COALESCE(EXCLUDED.isrc, tracks.isrc)")),
                 tracks::updated_at.eq(now),
             ))
             .execute(&mut *connection)

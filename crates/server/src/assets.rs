@@ -61,12 +61,12 @@ pub async fn get_artwork(
     );
 
     if let Some(cached_url) = ARTWORK_CACHE.get(&cache_key).await {
-        return Ok(Response::builder()
+        return Response::builder()
             .status(StatusCode::TEMPORARY_REDIRECT)
             .header(header::LOCATION, cached_url)
             .header(header::CACHE_CONTROL, "public, max-age=86400")
             .body(axum::body::Body::empty())
-            .map_err(|e| ServerError::Internal(e.to_string()))?);
+            .map_err(|e| ServerError::Internal(e.to_string()));
     }
 
     // If track is from Apple or Qobuz, try resolving CDN artwork

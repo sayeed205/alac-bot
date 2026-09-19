@@ -10,7 +10,9 @@ use std::{
 
 use engine::{
     orchestrator::{
-        caption::{format_dump_caption, parse_dump_caption, parse_zip_dump_caption, DumpCaptionMetadata},
+        caption::{
+            format_dump_caption, parse_dump_caption, parse_zip_dump_caption, DumpCaptionMetadata,
+        },
         deps::{ProviderAccess, SaveTrackInput},
     },
     TrackKey,
@@ -254,7 +256,11 @@ async fn index_dump_channel(
                         }
                         music::Provider::Qobuz => {
                             if let Some(qobuz) = state.rip_deps.providers().qobuz() {
-                                match qobuz.catalog().fetch_track_meta(&meta.track_key.track_id, "qobuz").await {
+                                match qobuz
+                                    .catalog()
+                                    .fetch_track_meta(&meta.track_key.track_id, "qobuz")
+                                    .await
+                                {
                                     Ok(track_meta) => track_meta.isrc,
                                     Err(err) => {
                                         tracing::warn!(track_id = %meta.track_key.track_id, "Failed to resolve Qobuz ISRC: {err}");

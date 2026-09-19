@@ -266,3 +266,25 @@ pub struct NewTgWorkerSession<'a> {
     pub session_data: &'a str,
     pub updated_at: DateTime<Utc>,
 }
+
+#[derive(Debug, Clone, Queryable, Selectable, Identifiable)]
+#[diesel(table_name = crate::schema::user_integrations)]
+#[diesel(primary_key(telegram_id, provider))]
+pub struct UserIntegration {
+    pub telegram_id: i64,
+    pub provider: String,
+    pub username: String,
+    pub encrypted_session_key: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Insertable, AsChangeset)]
+#[diesel(table_name = crate::schema::user_integrations)]
+pub struct NewUserIntegration<'a> {
+    pub telegram_id: i64,
+    pub provider: &'a str,
+    pub username: &'a str,
+    pub encrypted_session_key: &'a str,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}

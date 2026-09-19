@@ -150,6 +150,7 @@ pub struct PlaybackInfo {
     responses(
         (status = 200, description = "Signed stream ticket and audio format metadata", body = PlaybackInfo),
         (status = 401, description = "Unauthorized - Missing or invalid Bearer token"),
+        (status = 403, description = "Forbidden - Last.fm account connection required"),
         (status = 404, description = "Track not found in database cache")
     ),
     security(
@@ -161,6 +162,12 @@ pub async fn get_playback_info(
     user: AuthedUser,
     axum::extract::Path(track_id): axum::extract::Path<i32>,
 ) -> Result<Json<PlaybackInfo>, ServerError> {
+    if !db::integrations::has_integration(&state.db, user.telegram_id, "lastfm").await? {
+        return Err(ServerError::Forbidden(
+            "Last.fm account connection is required to stream audio".into(),
+        ));
+    }
+
     let track = state
         .tracks_repo
         .find_track_by_id(track_id)
