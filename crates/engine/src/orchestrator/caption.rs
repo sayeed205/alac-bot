@@ -85,6 +85,7 @@ pub struct DumpCaptionMetadata<'a> {
     pub release_date: Option<&'a str>,
     pub track_number: Option<i64>,
     pub track_count: Option<i64>,
+    pub isrc: Option<&'a str>,
 }
 
 impl<'a> From<(&'a TrackRipResult, Provider, &'a str)> for DumpCaptionMetadata<'a> {
@@ -102,6 +103,7 @@ impl<'a> From<(&'a TrackRipResult, Provider, &'a str)> for DumpCaptionMetadata<'
             release_date: Some(&rip.release_date),
             track_number: Some(rip.track_number),
             track_count: Some(rip.track_count),
+            isrc: rip.isrc.as_deref(),
         }
     }
 }
@@ -295,7 +297,7 @@ pub fn format_dump_caption(meta: &DumpCaptionMetadata<'_>) -> String {
     };
 
     let make_payload = |artist: &str, title: &str, album: &str| {
-        serde_json::json!({
+        let mut obj = serde_json::json!({
             "provider": meta.track_key.provider,
             "track_id": meta.track_key.track_id,
             "codec": canonical_codec,
@@ -309,7 +311,11 @@ pub fn format_dump_caption(meta: &DumpCaptionMetadata<'_>) -> String {
             "date": meta.release_date.unwrap_or(""),
             "trk": meta.track_number.unwrap_or(1),
             "cnt": meta.track_count.unwrap_or(1),
-        })
+        });
+        if let Some(isrc) = meta.isrc.filter(|s| !s.is_empty()) {
+            obj["isrc"] = serde_json::Value::String(isrc.to_owned());
+        }
+        obj
     };
 
     // 1. Preferred layout: full human summary + pretty indented JSON
@@ -482,6 +488,7 @@ pub struct ParsedDumpMetadata {
     pub release_date: String,
     pub track_number: i64,
     pub track_count: i64,
+    pub isrc: Option<String>,
 }
 
 /// Extracts structured track metadata from a message caption. Returns
@@ -520,6 +527,11 @@ pub fn parse_dump_caption(text: Option<&str>) -> Option<ParsedDumpMetadata> {
         release_date: string_field(&parsed, "date"),
         track_number: number_field(&parsed, "trk", 1),
         track_count: number_field(&parsed, "cnt", 1),
+        isrc: parsed
+            .get("isrc")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned),
     })
 }
 
@@ -671,6 +683,7 @@ mod tests {
             release_date: Some("2021-06-04"),
             track_number: Some(2),
             track_count: Some(10),
+            isrc: Some("USUM71703861"),
         }
     }
 
@@ -808,6 +821,7 @@ mod tests {
             release_date: Some("2024-04-25"),
             track_number: Some(16),
             track_count: Some(20),
+            isrc: None,
         };
         let caption = format_dump_caption(&meta);
         assert!(caption.contains("<code>FLAC · 24-bit · 48.0 kHz</code>"));
@@ -847,6 +861,7 @@ mod tests {
         assert_eq!(parsed.release_date, "2021-06-04");
         assert_eq!(parsed.track_number, 2);
         assert_eq!(parsed.track_count, 10);
+        assert_eq!(parsed.isrc.as_deref(), Some("USUM71703861"));
     }
 
     #[test]
@@ -875,6 +890,7 @@ mod tests {
             release_date: Some("2024-01-01"),
             track_number: Some(1),
             track_count: Some(1),
+            isrc: None,
         };
         let caption = format_dump_caption(&meta);
         let utf16_len = estimate_html_utf16_len(&caption);
@@ -900,6 +916,7 @@ mod tests {
             release_date: Some("2020-08-25"),
             track_number: Some(1),
             track_count: Some(1),
+            isrc: None,
         };
         let caption = format_dump_caption(&meta);
         let utf16_len = estimate_html_utf16_len(&caption);

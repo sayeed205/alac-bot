@@ -145,11 +145,37 @@ impl From<db::Track> for TrackDetailDto {
             track_number: t.track_number,
             track_count: t.track_count,
             is_cached: true,
-            isrc: None,
+            isrc: t.isrc,
             composer: None,
             disc_number: None,
         }
     }
+}
+
+/// A specific audio source/rendition available for a canonical track.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct TrackSourceDto {
+    pub id: i32,
+    pub provider: String,
+    pub track_id: String,
+    pub codec: String,
+    pub bit_depth: Option<i32>,
+    pub sample_rate: Option<i32>,
+    pub is_cached: bool,
+}
+
+/// Canonical representation of a unique music recording, aggregating sources
+/// across providers and cache tiers.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CanonicalTrackDto {
+    pub id: String,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub duration: i32,
+    pub artwork_url: Option<String>,
+    pub isrc: Option<String>,
+    pub sources: Vec<TrackSourceDto>,
 }
 
 /// Representation of an uncached live catalog track discovered via provider search.
@@ -202,13 +228,15 @@ pub struct SearchQuery {
     pub limit: Option<i64>,
 }
 
-/// Unified search response containing both cached and live catalog results.
+/// Unified search response containing both cached, live, and canonical catalog results.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SearchResponse {
     /// Cached tracks playable instantly without ripping.
     pub cached: Vec<TrackSummaryDto>,
     /// Live provider catalog tracks that can be ripped on-demand.
     pub live: Vec<UncachedTrackDto>,
+    /// Unified canonical tracks grouping sources across providers and cache states.
+    pub canonical: Vec<CanonicalTrackDto>,
 }
 
 #[utoipa::path(
@@ -238,45 +266,221 @@ pub async fn search_catalog(
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))?;
 
-    let cached: Vec<TrackSummaryDto> = cached_tracks
+    let cached_slice: Vec<db::Track> = cached_tracks
         .into_iter()
         .skip(offset)
         .take(limit)
+        .collect();
+
+    let cached: Vec<TrackSummaryDto> = cached_slice
+        .iter()
+        .cloned()
         .map(Into::into)
         .collect();
 
     // Query live catalog from catalog_service if available
     let mut live = Vec::new();
+    let mut live_results: Vec<music::TrackMeta> = Vec::new();
     if let Some(ref catalog) = state.catalog_service {
         let provider = query.provider.as_deref().unwrap_or("apple");
         if provider.eq_ignore_ascii_case("apple") && !query.q.trim().is_empty() {
             if let Ok(results) = catalog.search_catalog(&query.q, 10, "us").await {
                 let cached_track_ids: std::collections::HashSet<&str> =
                     cached.iter().map(|c| c.track_id.as_str()).collect();
-                live = results
-                    .into_iter()
-                    .filter(|item| !cached_track_ids.contains(item.id.as_str()))
-                    .map(|item| UncachedTrackDto {
-                        provider: "apple".to_string(),
-                        item_id: item.id.clone(),
-                        track_id: item.id,
-                        title: item.title,
-                        artist: item.artist,
-                        album: item.album,
-                        duration: item.duration_secs as i32,
-                        is_cached: false,
-                        artwork_url: if item.artwork_url.is_empty() {
-                            None
-                        } else {
-                            Some(item.artwork_url)
-                        },
-                    })
-                    .collect();
+                for item in &results {
+                    if !cached_track_ids.contains(item.id.as_str()) {
+                        live.push(UncachedTrackDto {
+                            provider: "apple".to_string(),
+                            item_id: item.id.clone(),
+                            track_id: item.id.clone(),
+                            title: item.title.clone(),
+                            artist: item.artist.clone(),
+                            album: item.album.clone(),
+                            duration: item.duration_secs as i32,
+                            is_cached: false,
+                            artwork_url: if item.artwork_url.is_empty() {
+                                None
+                            } else {
+                                Some(item.artwork_url.clone())
+                            },
+                        });
+                    }
+                }
+                live_results = results;
             }
         }
     }
 
-    Ok(Json(SearchResponse { cached, live }))
+    let canonical = build_canonical_tracks(&cached_slice, &live_results);
+
+    Ok(Json(SearchResponse {
+        cached,
+        live,
+        canonical,
+    }))
+}
+
+fn normalize_for_canonical(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+fn matches_canonical(
+    canonical: &CanonicalTrackDto,
+    candidate_isrc: Option<&str>,
+    candidate_provider: &str,
+    candidate_track_id: &str,
+    candidate_title: &str,
+    candidate_artist: &str,
+    candidate_duration: i32,
+) -> bool {
+    let same_provider_track = canonical.sources.iter().any(|s| {
+        s.provider.eq_ignore_ascii_case(candidate_provider) && s.track_id == candidate_track_id
+    });
+    if same_provider_track {
+        return true;
+    }
+
+    if let (Some(c_isrc), Some(cand_isrc)) = (canonical.isrc.as_deref(), candidate_isrc) {
+        let c_trim = c_isrc.trim();
+        let cand_trim = cand_isrc.trim();
+        if !c_trim.is_empty() && !cand_trim.is_empty() {
+            return c_trim.eq_ignore_ascii_case(cand_trim);
+        }
+    }
+
+    let norm_can_title = normalize_for_canonical(&canonical.title);
+    let norm_cand_title = normalize_for_canonical(candidate_title);
+    let norm_can_artist = normalize_for_canonical(&canonical.artist);
+    let norm_cand_artist = normalize_for_canonical(candidate_artist);
+
+    if !norm_can_title.is_empty()
+        && norm_can_title == norm_cand_title
+        && !norm_can_artist.is_empty()
+        && norm_can_artist == norm_cand_artist
+        && (canonical.duration - candidate_duration).abs() <= 3
+    {
+        return true;
+    }
+
+    false
+}
+
+pub fn build_canonical_tracks(
+    cached: &[db::Track],
+    live_meta: &[music::TrackMeta],
+) -> Vec<CanonicalTrackDto> {
+    let mut canonical: Vec<CanonicalTrackDto> = Vec::new();
+
+    // 1. Group cached tracks
+    for t in cached {
+        let provider = t.provider.as_str();
+        let track_id = &t.track_id;
+        let isrc = t.isrc.as_deref().filter(|s| !s.trim().is_empty());
+
+        if let Some(existing) = canonical.iter_mut().find(|c| {
+            matches_canonical(c, isrc, provider, track_id, &t.title, &t.artist, t.duration)
+        }) {
+            if existing.isrc.is_none() && isrc.is_some() {
+                existing.isrc = isrc.map(ToOwned::to_owned);
+            }
+            if !existing.sources.iter().any(|s| {
+                s.provider.eq_ignore_ascii_case(provider)
+                    && s.track_id == *track_id
+                    && s.codec.eq_ignore_ascii_case(t.codec.as_str())
+            }) {
+                existing.sources.push(TrackSourceDto {
+                    id: t.id,
+                    provider: provider.to_string(),
+                    track_id: track_id.clone(),
+                    codec: t.codec.as_str().to_string(),
+                    bit_depth: Some(t.bit_depth),
+                    sample_rate: Some(t.sample_rate),
+                    is_cached: true,
+                });
+            }
+        } else {
+            let canon_id = isrc.unwrap_or(track_id).to_owned();
+            canonical.push(CanonicalTrackDto {
+                id: canon_id,
+                title: t.title.clone(),
+                artist: t.artist.clone(),
+                album: t.album.clone(),
+                duration: t.duration,
+                artwork_url: None,
+                isrc: isrc.map(ToOwned::to_owned),
+                sources: vec![TrackSourceDto {
+                    id: t.id,
+                    provider: provider.to_string(),
+                    track_id: track_id.clone(),
+                    codec: t.codec.as_str().to_string(),
+                    bit_depth: Some(t.bit_depth),
+                    sample_rate: Some(t.sample_rate),
+                    is_cached: true,
+                }],
+            });
+        }
+    }
+
+    // 2. Group live catalog results
+    for item in live_meta {
+        let provider = "apple";
+        let track_id = &item.id;
+        let isrc = item.isrc.as_deref().filter(|s| !s.trim().is_empty());
+        let duration = item.duration_secs as i32;
+
+        if let Some(existing) = canonical.iter_mut().find(|c| {
+            matches_canonical(c, isrc, provider, track_id, &item.title, &item.artist, duration)
+        }) {
+            if existing.artwork_url.is_none() && !item.artwork_url.is_empty() {
+                existing.artwork_url = Some(item.artwork_url.clone());
+            }
+            if existing.isrc.is_none() && isrc.is_some() {
+                existing.isrc = isrc.map(ToOwned::to_owned);
+            }
+            if !existing.sources.iter().any(|s| {
+                s.provider.eq_ignore_ascii_case(provider) && s.track_id == *track_id
+            }) {
+                existing.sources.push(TrackSourceDto {
+                    id: 0,
+                    provider: provider.to_string(),
+                    track_id: track_id.clone(),
+                    codec: "alac".to_string(),
+                    bit_depth: None,
+                    sample_rate: None,
+                    is_cached: false,
+                });
+            }
+        } else {
+            let canon_id = isrc.unwrap_or(track_id).to_owned();
+            canonical.push(CanonicalTrackDto {
+                id: canon_id,
+                title: item.title.clone(),
+                artist: item.artist.clone(),
+                album: item.album.clone(),
+                duration,
+                artwork_url: if item.artwork_url.is_empty() {
+                    None
+                } else {
+                    Some(item.artwork_url.clone())
+                },
+                isrc: isrc.map(ToOwned::to_owned),
+                sources: vec![TrackSourceDto {
+                    id: 0,
+                    provider: provider.to_string(),
+                    track_id: track_id.clone(),
+                    codec: "alac".to_string(),
+                    bit_depth: None,
+                    sample_rate: None,
+                    is_cached: false,
+                }],
+            });
+        }
+    }
+
+    canonical
 }
 
 #[utoipa::path(
@@ -504,4 +708,262 @@ pub async fn get_artist_tracks(
         .map_err(|e| ServerError::Internal(e.to_string()))?;
 
     Ok(Json(tracks.into_iter().map(Into::into).collect()))
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use music::{Codec, Provider, TrackMeta};
+
+    use super::*;
+
+    fn fake_db_track(
+        id: i32,
+        provider: Provider,
+        track_id: &str,
+        codec: Codec,
+        title: &str,
+        artist: &str,
+        album: &str,
+        duration: i32,
+        isrc: Option<&str>,
+    ) -> db::Track {
+        db::Track {
+            id,
+            provider,
+            track_id: track_id.to_string(),
+            codec,
+            message_id: 100 + id,
+            file_id: format!("file_{id}"),
+            file_unique_id: format!("uniq_{id}"),
+            title: title.to_string(),
+            artist: artist.to_string(),
+            album: album.to_string(),
+            duration,
+            bit_depth: 24,
+            sample_rate: 48000,
+            genre: "Pop".to_string(),
+            release_date: "2024-01-01".to_string(),
+            track_number: 1,
+            track_count: 1,
+            isrc: isrc.map(ToOwned::to_owned),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn fake_track_meta(
+        id: &str,
+        title: &str,
+        artist: &str,
+        album: &str,
+        duration_secs: i64,
+        artwork_url: &str,
+        isrc: Option<&str>,
+    ) -> TrackMeta {
+        TrackMeta {
+            id: id.to_string(),
+            title: title.to_string(),
+            artist: artist.to_string(),
+            album: album.to_string(),
+            album_artist: artist.to_string(),
+            genre: Some("Pop".to_string()),
+            release_date: "2024-01-01".to_string(),
+            composer: None,
+            track_number: Some(1),
+            track_count: Some(1),
+            disc_number: Some(1),
+            disc_count: Some(1),
+            duration_secs,
+            explicit: false,
+            content_advisory: None,
+            artwork_url: artwork_url.to_string(),
+            album_id: None,
+            artist_id: None,
+            isrc: isrc.map(ToOwned::to_owned),
+            record_label: None,
+            copyright: None,
+            upc: None,
+            is_streamable: Some(true),
+        }
+    }
+
+    #[test]
+    fn groups_tracks_by_isrc_across_providers() {
+        let cached = vec![
+            fake_db_track(
+                1,
+                Provider::Apple,
+                "1440857781",
+                Codec::Alac,
+                "Blank Space",
+                "Taylor Swift",
+                "1989",
+                231,
+                Some("USCJY1431245"),
+            ),
+            fake_db_track(
+                2,
+                Provider::Qobuz,
+                "8888888",
+                Codec::Flac,
+                "Blank Space (Qobuz Master)",
+                "Taylor Swift",
+                "1989 Deluxe",
+                231,
+                Some("USCJY1431245"),
+            ),
+        ];
+
+        let live = vec![fake_track_meta(
+            "1440857781",
+            "Blank Space",
+            "Taylor Swift",
+            "1989",
+            231,
+            "https://artwork.url/image.jpg",
+            Some("USCJY1431245"),
+        )];
+
+        let canonical = build_canonical_tracks(&cached, &live);
+        assert_eq!(canonical.len(), 1);
+        let track = &canonical[0];
+        assert_eq!(track.id, "USCJY1431245");
+        assert_eq!(track.isrc.as_deref(), Some("USCJY1431245"));
+        assert_eq!(
+            track.artwork_url.as_deref(),
+            Some("https://artwork.url/image.jpg")
+        );
+        assert_eq!(track.sources.len(), 2);
+        assert!(track.sources.iter().any(|s| s.provider == "apple" && s.id == 1));
+        assert!(track.sources.iter().any(|s| s.provider == "qobuz" && s.id == 2));
+    }
+
+    #[test]
+    fn groups_tracks_by_provider_track_id() {
+        let cached = vec![
+            fake_db_track(
+                1,
+                Provider::Apple,
+                "1440857781",
+                Codec::Alac,
+                "Blank Space",
+                "Taylor Swift",
+                "1989",
+                231,
+                None,
+            ),
+            fake_db_track(
+                2,
+                Provider::Apple,
+                "1440857781",
+                Codec::Ec3,
+                "Blank Space",
+                "Taylor Swift",
+                "1989",
+                231,
+                None,
+            ),
+        ];
+
+        let canonical = build_canonical_tracks(&cached, &[]);
+        assert_eq!(canonical.len(), 1);
+        let track = &canonical[0];
+        assert_eq!(track.sources.len(), 2);
+        assert!(track.sources.iter().any(|s| s.codec == "alac"));
+        assert!(track.sources.iter().any(|s| s.codec == "ec-3"));
+    }
+
+    #[test]
+    fn groups_tracks_by_normalized_title_artist_and_duration_within_3s() {
+        let cached = vec![fake_db_track(
+            1,
+            Provider::Apple,
+            "111",
+            Codec::Alac,
+            "Blank Space!",
+            "Taylor Swift",
+            "1989",
+            231,
+            None,
+        )];
+
+        let live = vec![fake_track_meta(
+            "222",
+            "blank space",
+            "taylor   swift",
+            "1989 (Live)",
+            233, // diff is 2 seconds (<= 3s)
+            "https://artwork.url/thumb.jpg",
+            None,
+        )];
+
+        let canonical = build_canonical_tracks(&cached, &live);
+        assert_eq!(canonical.len(), 1);
+        let track = &canonical[0];
+        assert_eq!(track.sources.len(), 2);
+        assert_eq!(
+            track.artwork_url.as_deref(),
+            Some("https://artwork.url/thumb.jpg")
+        );
+    }
+
+    #[test]
+    fn does_not_group_tracks_with_different_isrcs() {
+        let cached = vec![
+            fake_db_track(
+                1,
+                Provider::Apple,
+                "111",
+                Codec::Alac,
+                "Song A",
+                "Artist",
+                "Album",
+                200,
+                Some("ISRC11111111"),
+            ),
+            fake_db_track(
+                2,
+                Provider::Apple,
+                "222",
+                Codec::Alac,
+                "Song A",
+                "Artist",
+                "Album",
+                200,
+                Some("ISRC22222222"),
+            ),
+        ];
+
+        let canonical = build_canonical_tracks(&cached, &[]);
+        assert_eq!(canonical.len(), 2);
+    }
+
+    #[test]
+    fn does_not_group_tracks_with_duration_diff_greater_than_3s() {
+        let cached = vec![fake_db_track(
+            1,
+            Provider::Apple,
+            "111",
+            Codec::Alac,
+            "Song",
+            "Artist",
+            "Album",
+            200,
+            None,
+        )];
+
+        let live = vec![fake_track_meta(
+            "222",
+            "Song",
+            "Artist",
+            "Album",
+            205, // diff is 5 seconds (> 3s)
+            "",
+            None,
+        )];
+
+        let canonical = build_canonical_tracks(&cached, &live);
+        assert_eq!(canonical.len(), 2);
+    }
 }

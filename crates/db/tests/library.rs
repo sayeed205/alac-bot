@@ -18,6 +18,7 @@ fn test_track(id: &str, title: &str) -> SaveTrackInput {
         release_date: "2026".to_owned(),
         track_number: 1,
         track_count: 10,
+        isrc: None,
     }
 }
 

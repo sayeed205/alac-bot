@@ -451,6 +451,7 @@ pub struct TrackRipResult {
     pub release_date: String,
     pub track_number: i64,
     pub track_count: i64,
+    pub isrc: Option<String>,
 }
 
 #[cfg(test)]

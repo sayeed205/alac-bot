@@ -25,6 +25,7 @@ diesel::table! {
         release_date -> Text,
         track_number -> Integer,
         track_count -> Integer,
+        isrc -> Nullable<Text>,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
     }

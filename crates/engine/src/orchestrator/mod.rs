@@ -4619,6 +4619,7 @@ where
         release_date: Some(&rip_result.release_date),
         track_number: Some(rip_result.track_number),
         track_count: Some(rip_result.track_count),
+        isrc: rip_result.isrc.as_deref(),
     });
     let plain_caption = format!(
         "{} - {}\n{}",

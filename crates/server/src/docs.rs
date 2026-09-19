@@ -81,6 +81,8 @@ impl Modify for SecurityAddon {
             crate::catalog::TrackSummaryDto,
             crate::catalog::TrackDetailDto,
             crate::catalog::UncachedTrackDto,
+            crate::catalog::TrackSourceDto,
+            crate::catalog::CanonicalTrackDto,
             crate::catalog::SearchResponse,
             crate::catalog::AlbumSummaryDto,
             crate::catalog::AlbumDetailsDto,

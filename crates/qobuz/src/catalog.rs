@@ -6,7 +6,7 @@ use engine::{
     orchestrator::deps::CollectionResolver,
     types::{AlbumTracks, ArtistTracks},
 };
-use music::PlaylistData;
+use music::{PlaylistData, TrackMeta};
 
 use crate::gateway::QobuzGateway;
 
@@ -19,6 +19,27 @@ pub struct QobuzCatalog {
 impl QobuzCatalog {
     pub fn new(primary: Arc<dyn QobuzGateway>, fallback: Option<Arc<dyn QobuzGateway>>) -> Self {
         Self { primary, fallback }
+    }
+
+    pub async fn fetch_track_meta(
+        &self,
+        id: &str,
+        _storefront: &str,
+    ) -> Result<TrackMeta, String> {
+        match self.primary.fetch_track_meta(id).await {
+            Ok(track) => Ok(track),
+            Err(err) => {
+                if let Some(fallback) = &self.fallback {
+                    tracing::warn!("Primary Qobuz catalog failed ({err}), trying fallback");
+                    fallback
+                        .fetch_track_meta(id)
+                        .await
+                        .map_err(|e| e.to_string())
+                } else {
+                    Err(err.to_string())
+                }
+            }
+        }
     }
 }
 

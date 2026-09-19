@@ -43,6 +43,7 @@ fn track(id: &str, title: &str) -> SaveTrackInput {
         release_date: "2026-01-01".to_owned(),
         track_number: 1,
         track_count: 1,
+        isrc: None,
     }
 }
 

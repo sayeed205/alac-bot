@@ -171,6 +171,7 @@ impl TracksRepository {
             release_date: &input.release_date,
             track_number,
             track_count,
+            isrc: input.isrc.as_deref(),
         };
         diesel::insert_into(tracks::table)
             .values(new_track)
@@ -190,6 +191,9 @@ impl TracksRepository {
                 tracks::release_date.eq(&input.release_date),
                 tracks::track_number.eq(track_number),
                 tracks::track_count.eq(track_count),
+                tracks::isrc.eq(diesel::dsl::sql::<diesel::sql_types::Nullable<diesel::sql_types::Text>>(
+                    "COALESCE(EXCLUDED.isrc, tracks.isrc)",
+                )),
                 tracks::updated_at.eq(now),
             ))
             .execute(&mut *connection)
@@ -333,5 +337,56 @@ impl TracksRepository {
             .select(Track::as_select())
             .load::<Track>(&mut *connection)
             .await?)
+    }
+
+    pub async fn find_tracks_without_isrc(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<(i32, Provider, String)>, DbError> {
+        self.find_tracks_without_isrc_after(0, limit).await
+    }
+
+    pub async fn find_tracks_without_isrc_after(
+        &self,
+        after_id: i32,
+        limit: i64,
+    ) -> Result<Vec<(i32, Provider, String)>, DbError> {
+        let mut connection = self.pool.connection().await?;
+        Ok(tracks::table
+            .filter(tracks::isrc.is_null())
+            .filter(tracks::id.gt(after_id))
+            .order(tracks::id.asc())
+            .limit(limit)
+            .select((tracks::id, tracks::provider, tracks::track_id))
+            .load::<(i32, Provider, String)>(&mut *connection)
+            .await?)
+    }
+
+    pub async fn update_isrc(&self, id: i32, isrc: &str) -> Result<usize, DbError> {
+        let mut connection = self.pool.connection().await?;
+        let updated = diesel::update(tracks::table.filter(tracks::id.eq(id)))
+            .set(tracks::isrc.eq(isrc))
+            .execute(&mut *connection)
+            .await?;
+        Ok(updated)
+    }
+
+    pub async fn update_isrc_by_provider_track_id(
+        &self,
+        provider: Provider,
+        track_id: &str,
+        isrc: &str,
+    ) -> Result<usize, DbError> {
+        let mut connection = self.pool.connection().await?;
+        let updated = diesel::update(
+            tracks::table
+                .filter(tracks::provider.eq(provider))
+                .filter(tracks::track_id.eq(track_id))
+                .filter(tracks::isrc.is_null()),
+        )
+        .set(tracks::isrc.eq(isrc))
+        .execute(&mut *connection)
+        .await?;
+        Ok(updated)
     }
 }

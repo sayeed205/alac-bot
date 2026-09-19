@@ -10,8 +10,8 @@ use std::{
 
 use engine::{
     orchestrator::{
-        caption::{parse_dump_caption, parse_zip_dump_caption},
-        deps::SaveTrackInput,
+        caption::{format_dump_caption, parse_dump_caption, parse_zip_dump_caption, DumpCaptionMetadata},
+        deps::{ProviderAccess, SaveTrackInput},
     },
     TrackKey,
 };
@@ -224,10 +224,77 @@ async fn index_dump_channel(
                     });
 
             if let Some(audio) = maybe_audio {
-                let Some(meta) = parse_dump_caption(message.text()) else {
+                let Some(mut meta) = parse_dump_caption(message.text()) else {
                     skipped += 1;
                     continue;
                 };
+
+                // Backfill ISRC for older tracks if missing
+                if meta.isrc.is_none() {
+                    let resolved_isrc = match meta.track_key.provider {
+                        music::Provider::Apple => {
+                            match state
+                                .rip_deps
+                                .playlist()
+                                .fetch_song_isrc(&meta.track_key.track_id, "us")
+                                .await
+                            {
+                                Ok(Some(isrc)) => Some(isrc),
+                                _ => {
+                                    // Fallback to IN storefront for regional/Indian tracks
+                                    state
+                                        .rip_deps
+                                        .playlist()
+                                        .fetch_song_isrc(&meta.track_key.track_id, "in")
+                                        .await
+                                        .ok()
+                                        .flatten()
+                                }
+                            }
+                        }
+                        music::Provider::Qobuz => {
+                            if let Some(qobuz) = state.rip_deps.providers().qobuz() {
+                                match qobuz.catalog().fetch_track_meta(&meta.track_key.track_id, "qobuz").await {
+                                    Ok(track_meta) => track_meta.isrc,
+                                    Err(err) => {
+                                        tracing::warn!(track_id = %meta.track_key.track_id, "Failed to resolve Qobuz ISRC: {err}");
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                    };
+
+                    if let Some(isrc) = resolved_isrc {
+                        let isrc_clone = isrc.clone();
+                        meta.isrc = Some(isrc);
+                        let updated_caption = format_dump_caption(&DumpCaptionMetadata {
+                            track_key: meta.track_key.clone(),
+                            title: &meta.title,
+                            artist: &meta.artist,
+                            album: &meta.album,
+                            duration: meta.duration,
+                            bit_depth: meta.bit_depth,
+                            sample_rate: meta.sample_rate,
+                            codec: Some(meta.codec.as_str()),
+                            genre: Some(&meta.genre),
+                            release_date: Some(&meta.release_date),
+                            track_number: Some(meta.track_number),
+                            track_count: Some(meta.track_count),
+                            isrc: Some(&isrc_clone),
+                        });
+                        let _ = state
+                            .client
+                            .edit_message(
+                                state.dump_peer.clone(),
+                                message.id(),
+                                InputMessage::html(parse_dynamic_html(&updated_caption)),
+                            )
+                            .await;
+                    }
+                }
 
                 let (file_id, file_unique_id) = file_ids(&document);
                 state
@@ -281,6 +348,7 @@ async fn index_dump_channel(
                         } else {
                             1
                         },
+                        isrc: meta.isrc,
                     })
                     .await
                     .map_err(|error| error.to_string())?;

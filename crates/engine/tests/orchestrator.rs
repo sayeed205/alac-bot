@@ -256,6 +256,7 @@ impl FakeDeps {
             release_date: "2021-06-04".into(),
             track_number: 2,
             track_count: 10,
+            isrc: None,
         }
     }
 

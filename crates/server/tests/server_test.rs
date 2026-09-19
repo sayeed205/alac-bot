@@ -60,6 +60,7 @@ async fn test_docs_and_unauthorized_endpoints() {
             return;
         }
     };
+    db::migrate(&pool).await.expect("database migrations");
 
     let worker_pool = stream::StreamWorkerPool::empty();
     let stream_engine = Arc::new(stream::StreamEngine::new(
@@ -219,6 +220,7 @@ async fn test_auth_and_library_lifecycle() {
             return;
         }
     };
+    db::migrate(&pool).await.expect("database migrations");
 
     let admin_id = 888_000_123;
     let worker_pool = stream::StreamWorkerPool::empty();

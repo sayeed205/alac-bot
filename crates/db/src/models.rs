@@ -52,6 +52,8 @@ pub struct Track {
     pub track_number: i32,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     pub track_count: i32,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    pub isrc: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
     pub created_at: DateTime<Utc>,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
@@ -125,6 +127,7 @@ pub struct NewTrack<'a> {
     pub release_date: &'a str,
     pub track_number: i32,
     pub track_count: i32,
+    pub isrc: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Insertable)]

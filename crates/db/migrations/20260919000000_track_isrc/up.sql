@@ -1,0 +1,2 @@
+ALTER TABLE tracks ADD COLUMN IF NOT EXISTS isrc VARCHAR(32);
+CREATE INDEX IF NOT EXISTS tracks_isrc_idx ON tracks (isrc);

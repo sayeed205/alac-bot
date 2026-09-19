@@ -10,6 +10,7 @@
 //! against canned responses.
 
 use std::{
+    collections::HashMap,
     future::Future,
     sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -405,6 +406,78 @@ impl<H: PlaylistHttp> PlaylistClient<H> {
             tracks,
         })
     }
+
+    /// Fetch ISRCs for a batch of Apple track IDs via the Apple Music Catalog API.
+    pub async fn fetch_songs_isrc(
+        &self,
+        song_ids: &[&str],
+        storefront: &str,
+    ) -> Result<HashMap<String, String>, PlaylistError> {
+        if song_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let sf_raw = storefront.to_ascii_lowercase();
+        let sf = if sf_raw.is_empty() { "us" } else { &sf_raw };
+
+        let ids_param = song_ids.join(",");
+        let url = format!(
+            "https://amp-api.music.apple.com/v1/catalog/{}/songs?ids={}",
+            url_encode(sf),
+            ids_param
+        );
+
+        let mut token = self
+            .get_developer_token()
+            .await
+            .map_err(PlaylistError::Other)?;
+
+        let body = match self
+            .http
+            .get(&url, &auth_headers(&token), Duration::from_secs(20))
+            .await
+        {
+            Ok(b) => b,
+            Err(PlaylistHttpError::Status(401 | 403)) => {
+                self.invalidate_developer_token();
+                token = self
+                    .get_developer_token()
+                    .await
+                    .map_err(PlaylistError::Other)?;
+                self.http
+                    .get(&url, &auth_headers(&token), Duration::from_secs(20))
+                    .await
+                    .map_err(|e| PlaylistError::Other(e.to_string()))?
+            }
+            Err(e) => return Err(PlaylistError::Other(e.to_string())),
+        };
+
+        let res: RawSongsResponse =
+            serde_json::from_str(&body).map_err(|e| PlaylistError::Other(e.to_string()))?;
+
+        let mut map = HashMap::new();
+        if let Some(items) = res.data {
+            for item in items {
+                if let Some(attrs) = item.attributes {
+                    if let Some(isrc) = attrs.isrc.filter(|s| !s.is_empty()) {
+                        map.insert(item.id, isrc);
+                    }
+                }
+            }
+        }
+
+        Ok(map)
+    }
+
+    /// Single-song ISRC lookup convenience helper.
+    pub async fn fetch_song_isrc(
+        &self,
+        song_id: &str,
+        storefront: &str,
+    ) -> Result<Option<String>, PlaylistError> {
+        let map = self.fetch_songs_isrc(&[song_id], storefront).await?;
+        Ok(map.get(song_id).cloned())
+    }
 }
 
 fn map_track(t: &RawTrack) -> PlaylistTrack {
@@ -602,6 +675,25 @@ struct RawTrackAttributes {
     artist_name: Option<String>,
     #[serde(default)]
     duration_in_millis: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSongsResponse {
+    #[serde(default)]
+    data: Option<Vec<RawSongItem>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSongItem {
+    id: String,
+    #[serde(default)]
+    attributes: Option<RawSongAttributes>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSongAttributes {
+    #[serde(default)]
+    isrc: Option<String>,
 }
 
 #[cfg(test)]
@@ -934,5 +1026,32 @@ mod tests {
         assert_eq!(url_encode("us"), "us");
         assert_eq!(url_encode("pl.1234"), "pl.1234");
         assert_eq!(url_encode("a b/c"), "a%20b%2Fc");
+    }
+
+    #[tokio::test]
+    async fn fetch_songs_isrc_batch_and_single() {
+        let songs_json = r#"{"data":[
+            {"id":"1001","attributes":{"isrc":"USUM71703861"}},
+            {"id":"1002","attributes":{"isrc":"GBAYE0601498"}},
+            {"id":"1003","attributes":{"isrc":""}},
+            {"id":"1004","attributes":{}}
+        ]}"#;
+        let http = FakeHttp::new(vec![Ok(BROWSE_HTML), Ok(JS_ASSET_VAR), Ok(songs_json)]);
+        let client = PlaylistClient::new(http);
+        let map = client
+            .fetch_songs_isrc(&["1001", "1002", "1003", "1004"], "us")
+            .await
+            .unwrap();
+
+        assert_eq!(map.get("1001").map(|s| s.as_str()), Some("USUM71703861"));
+        assert_eq!(map.get("1002").map(|s| s.as_str()), Some("GBAYE0601498"));
+        assert_eq!(map.get("1003"), None);
+        assert_eq!(map.get("1004"), None);
+
+        let requests = client.http.requests();
+        assert_eq!(
+            requests[2].0,
+            "https://amp-api.music.apple.com/v1/catalog/us/songs?ids=1001,1002,1003,1004"
+        );
     }
 }
